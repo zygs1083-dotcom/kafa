@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     fm_add.add_argument("--trigger", required=True)
     fm_add.add_argument("--expected", required=True)
     fm_add.add_argument("--risk", default="medium", choices=["low", "medium", "high", "critical"])
-    fm_add.add_argument("--status", default="identified", choices=["identified", "covered", "accepted", "exempt"])
+    fm_add.add_argument("--status", default="identified", choices=["identified", "accepted", "exempt"])
     fm_add.add_argument("--acceptance", default="")
     fm_add.add_argument("--recovery", default="")
     fm_add.add_argument("--data-safety", default="")

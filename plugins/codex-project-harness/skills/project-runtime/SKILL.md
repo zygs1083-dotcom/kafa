@@ -186,6 +186,6 @@ Before claiming delivery readiness:
 2. Run `harness.py --root . validate --delivery`.
 3. Confirm validation evidence exists.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
-5. Confirm high/critical failure modes are covered or explicitly accepted.
+5. Confirm high/critical failure modes are covered by passing validation or explicitly accepted.
 6. Confirm delivery record includes local or external collaboration links.
 7. State any warnings or residual risk.

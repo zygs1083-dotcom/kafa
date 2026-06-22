@@ -80,7 +80,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             *command,
         )
 
-    def add_failure_mode(self, root: Path, status: str = "covered") -> None:
+    def add_failure_mode(self, root: Path, status: str = "identified") -> None:
         run_script(
             root,
             "add_failure_mode.py",
@@ -122,7 +122,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_delivery_passes_with_closed_failure_mode_and_passing_gate(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_failure_mode(root, status="covered")
+            self.add_failure_mode(root)
             self.add_pass_validation(root)
             self.add_quality_gate(root, result="pass")
 
@@ -134,7 +134,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_empty_quality_gate_table_is_not_a_gate(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_failure_mode(root, status="covered")
+            self.add_failure_mode(root)
             self.add_pass_validation(root)
 
             result = self.validate(root)
@@ -145,7 +145,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_failed_quality_gate_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_failure_mode(root, status="covered")
+            self.add_failure_mode(root)
             self.add_pass_validation(root)
             self.add_quality_gate(root, result="fail")
 
@@ -157,7 +157,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_failed_validation_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_failure_mode(root, status="covered")
+            self.add_failure_mode(root)
             run_script(
                 root,
                 "record_validation.py",

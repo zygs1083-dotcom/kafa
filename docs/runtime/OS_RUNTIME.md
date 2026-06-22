@@ -185,7 +185,9 @@ harness.py --root . failure-mode add \
 
 High and critical failure modes must be covered by passing validation or formally accepted before delivery readiness can pass.
 
-For high and critical risks, `covered` is not a self-attested flag. Delivery readiness requires at least one passing validation explicitly linked with `--failure-mode FMx`, unless the risk is accepted or exempted with accepted-by, acceptance-reason, acceptance-scope, accepted-revision, and expires-at.
+For high and critical risks, `covered` is not a self-attested flag and is not an allowed stored failure-mode status. Delivery readiness requires at least one passing validation explicitly linked with `--failure-mode FMx`, unless the risk is accepted or exempted with accepted-by, acceptance-reason, acceptance-scope, accepted-revision, and expires-at.
+
+`failure_modes.status` records risk disposition only: `identified`, `accepted`, or `exempt`. The generated Failure Modes view includes `Derived Coverage`, which is computed from passing validation records.
 
 Accepted risks can record:
 
@@ -218,6 +220,8 @@ harness.py --root . evidence record --id EV1 --kind command --summary "npm test 
 harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence EV1
 harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity medium --status open --summary "Needs follow-up"
 ```
+
+Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, and `project_revision`. Delivery readiness fails if a passing validation was recorded against an older code snapshot.
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 

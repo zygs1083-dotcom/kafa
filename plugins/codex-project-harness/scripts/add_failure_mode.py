@@ -19,7 +19,7 @@ def main() -> int:
     parser.add_argument("--data-safety", default="")
     parser.add_argument("--risk", choices=["low", "medium", "high", "critical"], default="medium")
     parser.add_argument("--test-mapping", default="")
-    parser.add_argument("--status", choices=["identified", "covered", "accepted", "exempt"], default="identified")
+    parser.add_argument("--status", choices=["identified", "accepted", "exempt"], default="identified")
     parser.add_argument("--accepted-by", default="")
     parser.add_argument("--acceptance-reason", default="")
     parser.add_argument("--acceptance-scope", default="")

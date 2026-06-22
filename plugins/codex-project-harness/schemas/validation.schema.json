@@ -12,6 +12,10 @@
     "findings": { "type": "string" },
     "result": { "type": "string", "enum": ["pass", "fail", "blocked", "partial"] },
     "residual_risk": { "type": "string" },
+    "head_commit": { "type": "string" },
+    "source_tree_hash": { "type": "string" },
+    "tracked_diff_hash": { "type": "string" },
+    "project_revision": { "type": "integer" },
     "created_at": { "type": "string" }
   },
   "additionalProperties": true

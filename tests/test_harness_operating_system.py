@@ -484,6 +484,74 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertNotEqual(validate.returncode, 0)
             self.assertIn("failure mode risk acceptance expired", validate.stdout)
 
+    def test_failure_mode_coverage_is_derived_from_passing_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+
+            manual_covered = run_harness(
+                root,
+                "failure-mode",
+                "add",
+                "--id",
+                "FM1",
+                "--feature",
+                "Example",
+                "--scenario",
+                "Risk",
+                "--trigger",
+                "bad input",
+                "--expected",
+                "safe",
+                "--risk",
+                "critical",
+                "--status",
+                "covered",
+                "--acceptance",
+                "AC1",
+                check=False,
+            )
+            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "critical", "--acceptance", "AC1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--failure-mode", "FM1", "--commands", "test", "--findings", "passed", "--result", "pass")
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                status = conn.execute("select status from failure_modes where id = 'FM1'").fetchone()[0]
+            rendered = (root / ".ai-team/requirements/failure-modes.md").read_text(encoding="utf-8")
+
+            self.assertNotEqual(manual_covered.returncode, 0)
+            self.assertIn("invalid choice", manual_covered.stderr)
+            self.assertEqual(status, "identified")
+            self.assertIn("Derived Coverage", rendered)
+            self.assertIn("covered", rendered)
+
+    def test_delivery_blocks_when_validation_code_snapshot_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, text=True, capture_output=True, check=True)
+            (root / "app.txt").write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.txt"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
+            run_harness(root, "init")
+            run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "critical", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1", "--failure-mode", "FM1")
+            claim_start_submit(root, "T1")
+            review_accept(root, "T1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--failure-mode", "FM1", "--commands", "test", "--findings", "passed", "--result", "pass")
+            (root / "app.txt").write_text("v2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.txt"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "change app"], cwd=root, text=True, capture_output=True, check=True)
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("validation source tree hash does not match current code", validate.stdout)
+
     def test_evidence_test_and_finding_records_are_structured(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

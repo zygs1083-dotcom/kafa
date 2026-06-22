@@ -62,6 +62,8 @@ TASK_STATUSES = {
     "skipped",
 }
 
+FAILURE_MODE_STATUSES = {"identified", "accepted", "exempt"}
+
 
 class HarnessError(Exception):
     """User-facing runtime error."""
@@ -200,6 +202,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             findings text not null,
             result text not null,
             residual_risk text not null default '',
+            head_commit text not null default '',
+            source_tree_hash text not null default '',
+            tracked_diff_hash text not null default '',
+            project_revision integer not null default 0,
             created_at text not null
         );
         create table if not exists validation_failure_modes (
@@ -334,6 +340,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "head_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
+    ensure_column(conn, "validations", "head_commit", "text not null default ''")
+    ensure_column(conn, "validations", "source_tree_hash", "text not null default ''")
+    ensure_column(conn, "validations", "tracked_diff_hash", "text not null default ''")
+    ensure_column(conn, "validations", "project_revision", "integer not null default 0")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -411,6 +421,10 @@ def lease_deadline() -> str:
 def is_expired(value: str | None) -> bool:
     parsed = parse_time(value)
     return bool(parsed and parsed <= datetime.now(timezone.utc))
+
+
+def normalize_failure_mode_status(status: str) -> str:
+    return status if status in FAILURE_MODE_STATUSES else "identified"
 
 
 def bump_project(conn: sqlite3.Connection, **updates: str) -> None:
@@ -583,7 +597,7 @@ def migrate_markdown_v1(root: Path) -> None:
                     cells[5] if len(cells) > 5 else "",
                     cells[6] if len(cells) > 6 else "",
                     cells[7] if len(cells) > 7 else "medium",
-                    cells[9] if len(cells) > 9 else "identified",
+                    normalize_failure_mode_status(cells[9] if len(cells) > 9 else "identified"),
                 ),
             )
             if len(cells) > 8:
@@ -758,6 +772,8 @@ def add_failure_mode(
     with transaction(root) as conn:
         existing = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
         accepted_revision = None
+        if status not in FAILURE_MODE_STATUSES:
+            raise HarnessError("failure mode status must be identified, accepted, or exempt; coverage is derived from passing validation")
         if status in {"accepted", "exempt"}:
             if not accepted_by or not acceptance_reason or not acceptance_scope or not expires_at:
                 raise HarnessError("accepted or exempt failure modes require accepted-by, acceptance-reason, acceptance-scope, and expires-at")
@@ -1201,14 +1217,33 @@ def record_decision(root: Path, decision: str, reason: str) -> None:
 
 
 def record_validation(root: Path, surface: str, findings: str, result: str, *, acceptance: str = "", commands: str = "", risk: str = "", failure_modes: str = "") -> None:
+    current_sha = git_head_sha(root) or "no-git"
+    source_hash = git_source_tree_hash(root) or ""
+    tracked_diff_hash = git_tracked_diff_hash(root) or ""
     with transaction(root) as conn:
         validation_id = str(uuid.uuid4())
+        project_revision = int(project_row(conn)["revision"])
         conn.execute(
             """
-            insert into validations (id, surface, acceptance_id, commands, findings, result, residual_risk, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            insert into validations
+            (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
+             source_tree_hash, tracked_diff_hash, project_revision, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (validation_id, surface, acceptance, commands, findings, result, risk, now_iso()),
+            (
+                validation_id,
+                surface,
+                acceptance,
+                commands,
+                findings,
+                result,
+                risk,
+                current_sha,
+                source_hash,
+                tracked_diff_hash,
+                project_revision,
+                now_iso(),
+            ),
         )
         if acceptance:
             resolve_invalidations(conn, source_type="acceptance", source_id=acceptance)
@@ -1448,7 +1483,7 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
     enum_checks = [
         ("tasks", "status", TASK_STATUSES, "task status"),
         ("failure_modes", "risk", {"low", "medium", "high", "critical"}, "failure mode risk"),
-        ("failure_modes", "status", {"identified", "covered", "accepted", "exempt"}, "failure mode status"),
+        ("failure_modes", "status", FAILURE_MODE_STATUSES, "failure mode status"),
         ("validations", "result", {"pass", "fail", "blocked", "partial"}, "validation result"),
         ("quality_gates", "reviewer_context", {"fresh", "same-context-degraded", "external"}, "quality gate reviewer context"),
         ("quality_gates", "result", {"pass", "fail", "conditional", "blocked"}, "quality gate result"),
@@ -1482,12 +1517,19 @@ def validate_delivery(conn: sqlite3.Connection, root: Path) -> list[str]:
     for task in active_tasks:
         issues.append(f"task is not accepted: {task['id']} status={task['status']}")
 
-    validations = conn.execute("select surface, result from validations order by created_at, id").fetchall()
+    current_sha = git_head_sha(root)
+    current_source_hash = (git_source_tree_hash(root) or "") if current_sha else ""
+    validations = conn.execute("select surface, result, source_tree_hash from validations order by created_at, id").fetchall()
     if not validations:
         issues.append("delivery requires validation evidence")
     for validation in validations:
         if validation["result"] != "pass":
             issues.append(f"validation is not pass: {validation['surface']}={validation['result']}")
+        if current_sha and validation["source_tree_hash"] and validation["source_tree_hash"] != current_source_hash:
+            issues.append(
+                f"validation source tree hash does not match current code: {validation['surface']} "
+                f"validation={validation['source_tree_hash']} current={current_source_hash}"
+            )
 
     risky_failure_modes = conn.execute(
         """
@@ -1530,14 +1572,12 @@ def validate_delivery(conn: sqlite3.Connection, root: Path) -> list[str]:
         ).fetchone()
         if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
             issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")
-        current_sha = git_head_sha(root)
         if current_sha:
             if git_dirty(root):
                 issues.append("git worktree is dirty after quality gate")
-            source_hash = git_source_tree_hash(root) or ""
-            if latest_gate["diff_hash"] and latest_gate["diff_hash"] != source_hash:
+            if latest_gate["diff_hash"] and latest_gate["diff_hash"] != current_source_hash:
                 issues.append(
-                    f"latest quality gate source tree hash does not match current code: gate={latest_gate['diff_hash']} current={source_hash}"
+                    f"latest quality gate source tree hash does not match current code: gate={latest_gate['diff_hash']} current={current_source_hash}"
                 )
     return issues
 
@@ -1645,7 +1685,18 @@ def render_failure_modes(root: Path) -> None:
                 "select failure_mode_id, group_concat(acceptance_id, ', ') as ids from failure_mode_acceptance group by failure_mode_id"
             )
         }
-    lines = ["# Failure Modes", "", "| ID | Feature | Scenario | Trigger | Expected Behavior | Recovery | Data Safety | Risk | Test Mapping | Status | Accepted By | Acceptance Reason | Acceptance Scope | Accepted Revision | Expires At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+        covered = {
+            row["failure_mode_id"]
+            for row in conn.execute(
+                """
+                select distinct vfm.failure_mode_id
+                from validation_failure_modes vfm
+                join validations v on v.id = vfm.validation_id
+                where v.result = 'pass'
+                """
+            )
+        }
+    lines = ["# Failure Modes", "", "| ID | Feature | Scenario | Trigger | Expected Behavior | Recovery | Data Safety | Risk | Test Mapping | Status | Derived Coverage | Accepted By | Acceptance Reason | Acceptance Scope | Accepted Revision | Expires At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         lines.append(
             markdown_row(
@@ -1660,6 +1711,7 @@ def render_failure_modes(root: Path) -> None:
                     row["risk"],
                     mappings.get(row["id"], ""),
                     row["status"],
+                    "covered" if row["id"] in covered else "",
                     row["accepted_by"] or "",
                     row["acceptance_reason"] or "",
                     row["acceptance_scope"] or "",
@@ -1710,8 +1762,26 @@ def render_validation(root: Path) -> None:
     with connection(root) as conn:
         rows = conn.execute("select * from validations order by created_at, id").fetchall()
         failure_modes = grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
-    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Tool Context | Commands | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["surface"], row["acceptance_id"], failure_modes.get(row["id"], ""), "", row["commands"], row["findings"], row["result"], row["residual_risk"]]) for row in rows)
+    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(
+        markdown_row(
+            [
+                row["surface"],
+                row["acceptance_id"],
+                failure_modes.get(row["id"], ""),
+                row["head_commit"],
+                row["source_tree_hash"],
+                row["tracked_diff_hash"],
+                row["project_revision"],
+                "",
+                row["commands"],
+                row["findings"],
+                row["result"],
+                row["residual_risk"],
+            ]
+        )
+        for row in rows
+    )
     write_view(root, "docs/harness/validation.md", "\n".join(lines))
 
 

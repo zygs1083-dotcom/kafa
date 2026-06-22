@@ -16,7 +16,7 @@ Prepare evidence for verified code delivery.
 5. Identify changed files, contracts, data structures, configuration, and documentation.
 6. Note local migration or data-shape implications when code changes include them.
 7. Summarize Git/GitHub branch, PR, issue, check, and review evidence when available.
-8. Confirm failure modes are covered, accepted, or explicitly exempt.
+8. Confirm failure modes are covered by passing validation, accepted, or explicitly exempt.
 9. Confirm quality gate result, reviewed commit/revision, and reviewer context.
 10. Summarize Linear issue status, Notion delivery notes, Figma design status, and Slack handoff status when useful.
 11. List known gaps, skipped checks, and follow-up tasks.
