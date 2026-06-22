@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from harness_lib import append_event, append_table_row
+from harness_lib import append_event, append_table_row, git_dirty, git_head_sha
 
 
 HEADER = """# Quality Gates
@@ -18,7 +18,7 @@ HEADER = """# Quality Gates
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gate", default="independent_qa")
-    parser.add_argument("--commit", required=True)
+    parser.add_argument("--commit", default="auto")
     parser.add_argument(
         "--reviewer-context",
         choices=["fresh", "same-context-degraded", "external"],
@@ -32,12 +32,20 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path.cwd()
+    commit = args.commit
+    if commit in {"auto", "HEAD"}:
+        commit = git_head_sha(root) or "no-git"
+    dirty = git_dirty(root)
+    if args.result == "pass" and dirty:
+        print("ERROR: cannot record a passing quality gate with a dirty git worktree")
+        return 1
+
     append_table_row(
         root,
         "docs/harness/quality-gates.md",
         [
             args.gate,
-            args.commit,
+            commit,
             args.reviewer_context,
             args.result,
             args.blocking_findings,
@@ -50,7 +58,7 @@ def main() -> int:
     append_event(
         root,
         "quality_gate_recorded",
-        {"gate": args.gate, "commit": args.commit, "result": args.result},
+        {"gate": args.gate, "commit": commit, "result": args.result},
     )
     print(f"OK: quality gate recorded {args.gate}={args.result}")
     return 0

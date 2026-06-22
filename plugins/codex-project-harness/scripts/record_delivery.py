@@ -17,6 +17,9 @@ def main() -> int:
     parser.add_argument("--validation", default="")
     parser.add_argument("--qa", default="")
     parser.add_argument("--collaboration-links", default="")
+    parser.add_argument("--failure-mode-coverage", default="")
+    parser.add_argument("--quality-gate", default="")
+    parser.add_argument("--data-config-notes", default="")
     parser.add_argument("--known-gaps", default="")
     parser.add_argument("--handoff", default="")
     args = parser.parse_args()
@@ -41,6 +44,15 @@ def main() -> int:
 
 ### Collaboration Links
 {args.collaboration_links}
+
+### Failure Mode Coverage
+{args.failure_mode_coverage}
+
+### Quality Gate
+{args.quality_gate}
+
+### Data / Config Notes
+{args.data_config_notes}
 
 ### Known Gaps
 {args.known_gaps}

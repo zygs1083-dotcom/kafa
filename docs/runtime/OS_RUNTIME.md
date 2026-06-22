@@ -112,6 +112,7 @@ Enables decoupled communication between agents and system components.
 ```text
 Event = {
   id,
+  schema_version,
   type,
   source,
   target,
@@ -140,6 +141,7 @@ Event = {
 - Events are immutable
 - Events are the only communication mechanism between agents
 - Runtime scripts append events to `.ai-team/runtime/events.jsonl`
+- Runtime events include an event ID, schema version, source, and target so later tooling can reason about causality and migration.
 
 ---
 

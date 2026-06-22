@@ -16,6 +16,7 @@ def main() -> int:
     parser.add_argument("--owner")
     parser.add_argument("--status")
     parser.add_argument("--acceptance")
+    parser.add_argument("--failure-modes")
     parser.add_argument("--depends-on")
     parser.add_argument("--tool-link")
     parser.add_argument("--evidence")
@@ -26,6 +27,7 @@ def main() -> int:
         "owner": args.owner,
         "status": args.status,
         "acceptance": args.acceptance,
+        "failure_modes": args.failure_modes,
         "depends_on": args.depends_on,
         "tool_link": args.tool_link,
         "evidence": args.evidence,

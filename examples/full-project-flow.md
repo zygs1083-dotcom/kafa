@@ -136,8 +136,8 @@ Task Board:
 Codex should record these tasks through `project-runtime`, for example:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/add_task.py --id T1 --task "Data model and local storage" --owner architect --acceptance AC1
 python3 plugins/codex-project-harness/scripts/add_failure_mode.py --id FM1 --feature "Relative profile CRUD" --scenario "Duplicate submit" --trigger "same form submitted twice" --expected "only one record is created" --risk high --test-mapping AC1
+python3 plugins/codex-project-harness/scripts/add_task.py --id T1 --task "Data model and local storage" --owner architect --acceptance AC1 --failure-mode FM1
 ```
 
 ## 6. Implementation
@@ -178,8 +178,7 @@ The quality gate must include the reviewed commit or revision and reviewer conte
 
 ```bash
 python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
-  --commit HEAD \
-  --reviewer-context same-context-degraded \
+  --reviewer-context fresh \
   --result pass \
   --commands "npm test" \
   --evidence "QA-A/QA-B/QA-C reviewed acceptance and failure modes"

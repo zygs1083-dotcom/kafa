@@ -136,6 +136,10 @@ def main() -> int:
         if not script_path.exists():
             errors.append(f"missing runtime script: {script_path}")
 
+    runtime_cli = root / "skills" / "project-runtime" / "scripts" / "harness.py"
+    if not runtime_cli.exists():
+        errors.append(f"missing project-runtime self-contained CLI: {runtime_cli}")
+
     for schema in REQUIRED_SCHEMAS:
         schema_path = root / "schemas" / schema
         if not schema_path.exists():

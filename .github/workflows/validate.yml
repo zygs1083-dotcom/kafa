@@ -1,0 +1,31 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Validate plugin structure
+        run: python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
+
+      - name: Validate JSON files
+        run: |
+          python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
+          find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec python3 -m json.tool {} \; >/dev/null
+
+      - name: Compile Python
+        run: python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_harness_runtime.py
+
+      - name: Run runtime tests
+        run: python3 -m unittest tests/test_harness_runtime.py

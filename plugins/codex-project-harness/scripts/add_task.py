@@ -11,8 +11,8 @@ from harness_lib import append_event, append_table_row
 
 HEADER = """# Task Board
 
-| ID | Task | Owner | Status | Acceptance | Depends On | Tool Link | Evidence |
-| --- | --- | --- | --- | --- | --- | --- | --- |"""
+| ID | Task | Owner | Status | Acceptance | Failure Modes | Depends On | Tool Link | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |"""
 
 
 def main() -> int:
@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--owner", default="unassigned")
     parser.add_argument("--status", default="planned")
     parser.add_argument("--acceptance", default="")
+    parser.add_argument("--failure-mode", action="append", default=[])
     parser.add_argument("--depends-on", default="")
     parser.add_argument("--tool-link", default="")
     parser.add_argument("--evidence", default="")
@@ -37,6 +38,7 @@ def main() -> int:
             args.owner,
             args.status,
             args.acceptance,
+            ", ".join(args.failure_mode),
             args.depends_on,
             args.tool_link,
             args.evidence,

@@ -13,21 +13,30 @@ When the project changes phase, task state, decisions, validation evidence, or d
 
 ## Scripts
 
-Run scripts from the project root where `.ai-team/` and `docs/harness/` live.
+Prefer the self-contained CLI in this skill when the plugin is installed outside the target project:
+
+```bash
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate
+```
+
+The CLI locates the installed plugin scripts from the skill directory and runs them with the target project root as `cwd`.
+
+When the plugin source is vendored in the target project, scripts may also be run from the project root where `.ai-team/` and `docs/harness/` live.
 
 | Need | Script |
 | --- | --- |
-| Show current state | `scripts/harness_status.py` |
-| Move phase | `scripts/update_phase.py` |
-| Add acceptance criterion | `scripts/add_acceptance.py` |
-| Add failure mode | `scripts/add_failure_mode.py` |
-| Add task | `scripts/add_task.py` |
-| Update task | `scripts/update_task.py` |
-| Record decision | `scripts/record_decision.py` |
-| Record QA / validation | `scripts/record_validation.py` |
-| Record quality gate | `scripts/record_quality_gate.py` |
-| Record delivery | `scripts/record_delivery.py` |
-| Validate local harness state | `scripts/validate_harness_state.py` |
+| Show current state | `harness.py status` or `scripts/harness_status.py` |
+| Move phase | `harness.py phase` or `scripts/update_phase.py` |
+| Add acceptance criterion | `harness.py acceptance-add` or `scripts/add_acceptance.py` |
+| Add failure mode | `harness.py failure-mode-add` or `scripts/add_failure_mode.py` |
+| Add task | `harness.py task-add` or `scripts/add_task.py` |
+| Update task | `harness.py task-update` or `scripts/update_task.py` |
+| Record decision | `harness.py decision-record` or `scripts/record_decision.py` |
+| Record QA / validation | `harness.py validation-record` or `scripts/record_validation.py` |
+| Record quality gate | `harness.py gate-record` or `scripts/record_quality_gate.py` |
+| Record delivery | `harness.py delivery-record` or `scripts/record_delivery.py` |
+| Validate local harness state | `harness.py validate` or `scripts/validate_harness_state.py` |
 
 ## Phase Protocol
 
@@ -72,6 +81,7 @@ python3 plugins/codex-project-harness/scripts/add_task.py \
   --task "Implement profile CRUD" \
   --owner developer \
   --acceptance AC1 \
+  --failure-mode FM1 \
   --tool-link "Linear ABC-123"
 ```
 
@@ -80,7 +90,7 @@ Update task state as implementation progresses:
 ```bash
 python3 plugins/codex-project-harness/scripts/update_task.py \
   --id T1 \
-  --status done \
+  --status accepted \
   --evidence "npm test -- profile-crud passed"
 ```
 
@@ -101,7 +111,6 @@ Record the independent quality gate before handoff:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
-  --commit HEAD \
   --reviewer-context fresh \
   --result pass \
   --commands "npm test"
@@ -114,7 +123,9 @@ python3 plugins/codex-project-harness/scripts/record_delivery.py \
   --scope "Profile CRUD and birthday list" \
   --acceptance "AC1, AC2" \
   --validation "Unit and integration checks passed" \
-  --qa "Independent QA found no blocking issues"
+  --qa "Independent QA found no blocking issues" \
+  --failure-mode-coverage "FM1 covered by profile CRUD tests" \
+  --quality-gate "independent_qa pass for current commit"
 ```
 
 ## External Tool Sync
@@ -128,5 +139,7 @@ Before claiming delivery readiness:
 1. Run `scripts/harness_status.py`.
 2. Run `scripts/validate_harness_state.py`.
 3. Confirm validation evidence exists.
-4. Confirm delivery record includes local or external collaboration links.
-5. State any warnings or residual risk.
+4. Confirm the latest quality gate is `pass` for the reviewed revision.
+5. Confirm high/critical failure modes are covered or explicitly accepted.
+6. Confirm delivery record includes local or external collaboration links.
+7. State any warnings or residual risk.

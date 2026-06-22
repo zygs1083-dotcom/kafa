@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,8 +69,12 @@ def append_event(root: Path, event_type: str, payload: dict[str, str]) -> None:
     path = root / EVENT_PATH
     ensure_parent(path)
     event = {
+        "id": str(uuid.uuid4()),
+        "schema_version": "2",
         "timestamp": now_iso(),
         "type": event_type,
+        "source": "harness-runtime",
+        "target": "project",
         "payload": payload,
     }
     with path.open("a", encoding="utf-8") as handle:
@@ -86,6 +92,38 @@ def append_markdown(root: Path, relpath: str, content: str) -> None:
 def markdown_row(values: list[str]) -> str:
     safe_values = [str(value).replace("\n", " ").replace("|", "\\|") for value in values]
     return "| " + " | ".join(safe_values) + " |"
+
+
+def split_markdown_row(line: str) -> list[str]:
+    return [cell.strip().replace("\\|", "|") for cell in line.strip().strip("|").split("|")]
+
+
+def git_head_sha(root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def git_dirty(root: Path) -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(result.stdout.strip())
 
 
 def append_table_row(root: Path, relpath: str, row: list[str], header: str) -> None:
@@ -110,10 +148,20 @@ def replace_task_row(root: Path, task_id: str, updates: dict[str, str]) -> bool:
         stripped = line.strip()
         if not stripped.startswith("|"):
             continue
-        cells = [cell.strip().replace("\\|", "|") for cell in stripped.strip("|").split("|")]
+        cells = split_markdown_row(stripped)
         if len(cells) < 8 or cells[0] != task_id:
             continue
-        fields = ["id", "task", "owner", "status", "acceptance", "depends_on", "tool_link", "evidence"]
+        fields = [
+            "id",
+            "task",
+            "owner",
+            "status",
+            "acceptance",
+            "failure_modes",
+            "depends_on",
+            "tool_link",
+            "evidence",
+        ]
         current = dict(zip(fields, cells, strict=False))
         current.update({key: value for key, value in updates.items() if value is not None})
         lines[index] = markdown_row(
@@ -123,6 +171,7 @@ def replace_task_row(root: Path, task_id: str, updates: dict[str, str]) -> bool:
                 current.get("owner", ""),
                 current.get("status", ""),
                 current.get("acceptance", ""),
+                current.get("failure_modes", ""),
                 current.get("depends_on", ""),
                 current.get("tool_link", ""),
                 current.get("evidence", ""),

@@ -167,6 +167,7 @@ plugins/codex-project-harness/
     delivery-readiness/
     harness-audit/
     project-retrospective/
+    project-runtime/scripts/harness.py
   scripts/
     init_project_harness.py
     validate_structure.py
@@ -216,6 +217,16 @@ plugins/codex-project-harness/
 
 这些脚本让方法论不只停留在 Markdown 文档里。
 
+如果插件安装在目标项目之外，优先使用 `project-runtime` skill 内的自包含 CLI：
+
+```bash
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . task-add --id T1 --task "Example" --acceptance AC1
+```
+
+这个入口会从 skill 目录定位插件脚本，并以 `--root` 指定的目标项目作为工作目录执行。下面的直接脚本路径适用于插件源码被 vendored 到目标项目中的情况。
+
 初始化本地控制面：
 
 ```bash
@@ -262,7 +273,8 @@ python3 plugins/codex-project-harness/scripts/add_task.py \
   --id T1 \
   --task "Implement profile CRUD" \
   --owner developer \
-  --acceptance AC1
+  --acceptance AC1 \
+  --failure-mode FM1
 ```
 
 记录验证证据：
@@ -280,8 +292,7 @@ python3 plugins/codex-project-harness/scripts/record_validation.py \
 
 ```bash
 python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
-  --commit HEAD \
-  --reviewer-context same-context-degraded \
+  --reviewer-context fresh \
   --result pass \
   --commands "npm test" \
   --evidence "Acceptance and failure modes reviewed"
@@ -294,7 +305,9 @@ python3 plugins/codex-project-harness/scripts/record_delivery.py \
   --scope "Profile CRUD" \
   --acceptance "AC1" \
   --validation "Tests passed" \
-  --qa "Quality gate passed"
+  --qa "Quality gate passed" \
+  --failure-mode-coverage "FM1 covered by duplicate-submit test" \
+  --quality-gate "independent_qa pass"
 ```
 
 校验目标项目的 harness 状态：
@@ -454,10 +467,19 @@ $delivery-readiness
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
 python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
 python3 -m py_compile plugins/codex-project-harness/scripts/*.py
+python3 -m unittest tests/test_harness_runtime.py
 git diff --check
 ```
 
-如果修改了 skill，建议对每个 skill 运行 Codex skill 校验工具。当前仓库的脚本和 schema 均保持无第三方运行依赖，方便在普通 Python 环境中验证。
+如果修改了 skill，建议对每个 skill 运行 Codex skill 校验工具。当前仓库的脚本、schema 和运行时单测均保持无第三方运行依赖，方便在普通 Python 环境中验证。
+
+仓库还提供 GitHub Actions workflow：
+
+```text
+.github/workflows/validate.yml
+```
+
+它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译和运行时回归测试。
 
 ## 版本状态
 
