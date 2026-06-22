@@ -1,8 +1,10 @@
-# Codex OS Runtime Layer v2.6
+# Codex OS Runtime Layer v3.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
+
+Kernel v3.0 is an architecture generation for runtime consistency. The repository release remains a beta release, while the runtime implementation version is `3.0.0` and the database schema version is `9`.
 
 ## Fact Source
 
@@ -16,6 +18,21 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
+## Kernel v3.0
+
+The executable runtime is organized around `plugins/codex-project-harness/core/`:
+
+- `api.py` is the write facade used by the CLI and compatibility wrappers.
+- `scheduler.py` owns dependency resolution, ready queues, and cycle checks.
+- `lock_manager.py` owns task revision and lease validation.
+- `gate_engine.py` owns delivery readiness and delivery record barriers.
+- `schema_guard.py` performs pre-write entity validation and reuses row-level schema checks.
+- `event_bus.py` emits, stores, validates, dispatches, and replays checkpoint-era events.
+- `invariant_checker.py` verifies constraints that must not be bypassed by manual DB edits.
+- `projections.py` is the only Markdown projection writer.
+
+SQLite state tables remain the primary runtime fact source. Events are audit and replay support, not the primary source of truth.
+
 ## Unified CLI
 
 Use:
@@ -26,8 +43,11 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 8
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 9
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
+python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
+python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
+python3 plugins/codex-project-harness/scripts/harness.py --root . kernel doctor
 ```
 
 When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:
@@ -46,6 +66,12 @@ python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
 - project metadata with `schema_version`, `runtime_version`, `project_id`, and `revision`
 
 `harness doctor` checks required state, generated views, runtime Git hygiene, and DB rows against the machine-readable schema contracts.
+
+`harness kernel doctor` runs the regular doctor plus Kernel v3.0 invariant checks through the core API.
+
+`harness invariant validate` runs the invariant checker directly.
+
+`harness projection rebuild` regenerates all Markdown views from SQLite through the core projection module.
 
 `harness repair` recreates missing runtime state and views without deleting existing project files. Use `harness repair --dry-run` to see the planned repair actions without writing state.
 
@@ -379,9 +405,12 @@ harness.py --root . delivery record \
 Runtime behavior is covered by:
 
 ```bash
+python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
+python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py
 python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
+python3 plugins/codex-project-harness/scripts/run_forward_eval.py
 python3 plugins/codex-project-harness/scripts/run_skill_eval.py
 ```
 
-GitHub Actions runs structure checks, JSON checks, Python compilation, and runtime tests on push and pull request.
+GitHub Actions runs structure checks, JSON checks, Python compilation, runtime tests, runtime smoke, forward wrapper, local skill eval, and a Kernel diagnostic smoke on push and pull request.

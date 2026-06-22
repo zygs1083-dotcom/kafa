@@ -150,7 +150,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 8)
+            self.assertEqual(project[0], 9)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
 
@@ -301,7 +301,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "8")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "9")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -640,7 +640,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "8", "--dry-run")
+            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "9", "--dry-run")
             repair_plan = run_harness(root, "repair", "--dry-run")
 
             self.assertEqual(migrate.returncode, 0, migrate.stdout + migrate.stderr)
@@ -797,7 +797,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "8")
+            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "9")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 acceptance = conn.execute("select criterion from acceptance where id = 'AC1'").fetchone()[0]
@@ -1060,6 +1060,95 @@ class HarnessOperatingSystemTest(unittest.TestCase):
 
             self.assertIn("swept 1 expired", swept.stdout)
             self.assertEqual(status, ("identified", None))
+
+    def test_kernel_cli_commands_and_core_api_boundary_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+
+            kernel = run_harness(root, "kernel", "doctor")
+            invariant = run_harness(root, "invariant", "validate")
+            projection = run_harness(root, "projection", "rebuild")
+
+            harness_text = HARNESS.read_text(encoding="utf-8")
+            api_text = (REPO_ROOT / "plugins/codex-project-harness/core/api.py").read_text(encoding="utf-8")
+
+            self.assertIn("OK: kernel doctor passed", kernel.stdout)
+            self.assertIn("OK: runtime invariants hold", invariant.stdout)
+            self.assertIn("OK: projections rebuilt", projection.stdout)
+            self.assertIn("from core.api import", harness_text)
+            self.assertIn("def invariant_validate", api_text)
+
+    def test_schema_guard_blocks_invalid_writes_before_db_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+
+            invalid = run_harness(root, "task", "add", "--id", "", "--task", "Bad", "--acceptance", "AC1", check=False)
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                count = conn.execute("select count(*) from tasks").fetchone()[0]
+
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn("task id is required", invalid.stdout)
+            self.assertEqual(count, 0)
+
+    def test_invariant_checker_detects_tampered_accepted_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update tasks set status = 'accepted', evidence = '', accepted_by = '' where id = 'T1'")
+                conn.commit()
+
+            invariant = run_harness(root, "invariant", "validate", check=False)
+
+            self.assertNotEqual(invariant.returncode, 0)
+            self.assertIn("accepted task has no evidence", invariant.stdout)
+            self.assertIn("accepted task has no accept actor/event", invariant.stdout)
+
+    def test_event_validate_requires_replay_snapshots_after_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "checkpoint", "create", "--label", "start")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    """
+                    insert into events
+                    (id, schema_version, type, source, target, payload_json, created_at)
+                    values ('bad-replay-event', 9, 'task_tampered', 'test', 'task:T1',
+                            '{"entity_type":"task","entity_id":"T1","command":"tamper"}', 'now')
+                    """
+                )
+                conn.commit()
+
+            event_validate = run_harness(root, "event", "validate", check=False)
+
+            self.assertNotEqual(event_validate.returncode, 0)
+            self.assertIn("missing after", event_validate.stdout)
+
+    def test_projection_rebuild_restores_generated_views(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            view = root / ".ai-team/requirements/acceptance.md"
+            view.write_text("stale\n", encoding="utf-8")
+
+            run_harness(root, "projection", "rebuild")
+
+            self.assertIn("AC1", view.read_text(encoding="utf-8"))
+
+    def test_projection_writes_are_isolated_to_core_projection_module(self) -> None:
+        harness_db = REPO_ROOT / "plugins/codex-project-harness/scripts/harness_db.py"
+        projections = REPO_ROOT / "plugins/codex-project-harness/core/projections.py"
+
+        self.assertNotIn("write_state(", harness_db.read_text(encoding="utf-8"))
+        self.assertIn("write_state(", projections.read_text(encoding="utf-8"))
 
     def test_legacy_decision_wrapper_writes_sqlite_and_rendered_view(self) -> None:
         legacy_init = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "init_project_harness.py"

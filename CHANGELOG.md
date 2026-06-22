@@ -4,6 +4,31 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v0.7.0-beta.1 - 2026-06-22
+
+### Added
+
+- Codex Harness Kernel v3.0 core package with dedicated API, scheduler, lock manager, gate engine, schema guard, event bus, invariant checker, and projection modules.
+- Kernel diagnostics through `kernel doctor`, explicit runtime invariant checks through `invariant validate`, and generated view recovery through `projection rebuild`.
+- Scheduler enforcement that `task next` only returns tasks whose dependencies are accepted, with dependency resolution centralized in the core scheduler.
+- Lock enforcement for task revision checks, lease owner/token validation, lease expiration, and stale recovery through the core lock manager.
+- Replay-compatible event validation and replay rebuilding through the core event bus, starting from explicit checkpoints.
+- Runtime invariant checks for illegal task states, stale active leases, accepted-task evidence/reviewer separation, delivery alignment, high/critical risk state, and checkpoint-era event completeness.
+
+### Changed
+
+- Runtime schema version is now `9`; runtime implementation version is now `3.0.0`.
+- CLI and legacy wrappers now route through the `core.api` facade while preserving existing public commands.
+- Delivery readiness, `validate --delivery`, and `delivery record` share the same core gate engine.
+- Markdown projections are centralized in `core/projections.py`; SQLite remains the primary runtime fact source.
+- Task records include `submitted_by` and `accepted_by` audit fields for invariant validation.
+
+### Boundaries
+
+- SQLite state tables remain the source of truth; the event bus records, validates, dispatches, and replays from checkpoints but does not replace SQLite with event sourcing.
+- This release still stops at verified code delivery.
+- Real external writes and real Codex sub-session creation remain host/connector capabilities, represented locally by adapter and dispatch records.
+
 ## v0.6.0-beta.1 - 2026-06-22
 
 ### Added

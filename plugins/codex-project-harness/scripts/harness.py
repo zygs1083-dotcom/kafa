@@ -7,7 +7,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from harness_db import (
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+from core.api import (
     HarnessError,
     accept_task,
     adapter_plan,
@@ -34,7 +38,9 @@ from harness_db import (
     export_events,
     freeze_baseline,
     import_checkpoint,
+    invariant_validate,
     init_runtime,
+    kernel_doctor,
     link_requirement_acceptance,
     list_checkpoints,
     migrate,
@@ -48,6 +54,7 @@ from harness_db import (
     record_test,
     record_validation,
     replay_events,
+    projection_rebuild,
     heartbeat_task,
     recover_stale_leases,
     release_task,
@@ -376,6 +383,18 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_sub.add_parser("recover-stale")
     dispatch_sub.add_parser("status")
 
+    invariant = sub.add_parser("invariant")
+    invariant_sub = invariant.add_subparsers(dest="invariant_command", required=True)
+    invariant_sub.add_parser("validate")
+
+    projection = sub.add_parser("projection")
+    projection_sub = projection.add_subparsers(dest="projection_command", required=True)
+    projection_sub.add_parser("rebuild")
+
+    kernel = sub.add_parser("kernel")
+    kernel_sub = kernel.add_subparsers(dest="kernel_command", required=True)
+    kernel_sub.add_parser("doctor")
+
     return parser
 
 
@@ -665,6 +684,23 @@ def main() -> int:
             print(f"OK: dispatch recovered {count} stale assignment(s)")
         elif args.command == "dispatch" and args.dispatch_command == "status":
             print("\n".join(dispatch_status(root)))
+        elif args.command == "invariant" and args.invariant_command == "validate":
+            issues = invariant_validate(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: runtime invariants hold")
+        elif args.command == "projection" and args.projection_command == "rebuild":
+            projection_rebuild(root)
+            print("OK: projections rebuilt")
+        elif args.command == "kernel" and args.kernel_command == "doctor":
+            issues = kernel_doctor(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: kernel doctor passed")
         else:
             parser.error("unknown command")
     except HarnessError as exc:

@@ -28,6 +28,18 @@ REQUIRED_REFERENCES = [
     "tool-adapters.md",
 ]
 
+REQUIRED_CORE = [
+    "__init__.py",
+    "api.py",
+    "scheduler.py",
+    "gate_engine.py",
+    "lock_manager.py",
+    "schema_guard.py",
+    "event_bus.py",
+    "invariant_checker.py",
+    "projections.py",
+]
+
 REQUIRED_SCRIPTS = [
     "init_project_harness.py",
     "validate_structure.py",
@@ -151,6 +163,11 @@ def main() -> int:
         ref_path = root / "references" / ref
         if not ref_path.exists():
             errors.append(f"missing reference file: {ref_path}")
+
+    for core_file in REQUIRED_CORE:
+        core_path = root / "core" / core_file
+        if not core_path.exists():
+            errors.append(f"missing kernel core file: {core_path}")
 
     for script in REQUIRED_SCRIPTS:
         script_path = root / "scripts" / script

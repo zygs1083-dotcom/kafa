@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 8`, `harness.py --root . migrate --from-version markdown-v1 --to-version 8 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 9`, `harness.py --root . migrate --from-version markdown-v1 --to-version 9 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -56,6 +56,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Checkpoint / replay events | `harness.py --root . checkpoint create`, `harness.py --root . checkpoint export`, `harness.py --root . checkpoint import`, `harness.py --root . event validate`, `harness.py --root . event replay` |
 | Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
 | Sweep expired accepted risk | `harness.py --root . risk sweep-expired` |
+| Kernel diagnostics / projections | `harness.py --root . kernel doctor`, `harness.py --root . invariant validate`, `harness.py --root . projection rebuild` |
 | Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
 
 ## Phase Protocol
