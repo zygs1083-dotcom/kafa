@@ -2,6 +2,8 @@
 
 ## Selected Patterns
 
+## Delivery Boundary
+
 ## Agents
 
 | Agent | Role | Trigger | Output |
@@ -11,6 +13,11 @@
 
 | Skill | Purpose | Trigger |
 | --- | --- | --- |
+
+## Tool Ownership
+
+| Tool | Owner | Purpose | Write Policy |
+| --- | --- | --- | --- |
 
 ## Review Gates
 

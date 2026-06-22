@@ -1,22 +1,45 @@
 # Codex OS Runtime Layer v0.1
 
-This document defines the initial runtime layer for Codex OS inside the kafa system. It formalizes execution primitives that connect the existing Harness methodology with an operational system layer.
+This document defines the initial runtime layer for Codex OS inside the kafa system. It formalizes execution primitives that connect the existing Harness methodology with an operational code-delivery layer.
 
 ---
 
 # 1. Purpose
 
-The runtime layer introduces three core execution primitives:
+The runtime layer introduces four core execution primitives:
 
+- Project Bootstrap (workspace and collaboration control plane)
 - Task Scheduler (control flow)
 - State Machine (system state tracking)
 - Event Bus (system communication)
 
-These components transform the current Harness from a methodology into a partially executable operating model.
+These components transform the current Harness from a methodology into a partially executable code-delivery operating model.
+
+The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
 ---
 
-# 2. Task Scheduler (Core Orchestrator)
+# 2. Project Bootstrap
+
+## Responsibility
+
+The bootstrap layer determines:
+
+- Whether git exists and whether a branch is needed
+- Whether `.ai-team/` and `docs/harness/` exist
+- Whether GitHub, Linear, Notion, Figma, or Slack should be used
+- Which artifact is the source of truth for requirements, tasks, design, validation, and delivery
+
+## Rules
+
+- Local harness files are always a fallback
+- Codex decides which tools are useful from context
+- High-impact external actions require confirmation
+- Missing external tools do not block local code delivery
+
+---
+
+# 3. Task Scheduler (Core Orchestrator)
 
 ## Responsibility
 
@@ -48,7 +71,7 @@ Task = {
 
 ---
 
-# 3. State Machine
+# 4. State Machine
 
 ## Purpose
 
@@ -57,7 +80,7 @@ Provides a single source of truth for task lifecycle.
 ## States
 
 ```text
-created → planned → in_progress → testing → review → done → archived
+created -> bootstrapped -> planned -> in_progress -> testing -> review -> delivery_ready -> archived
 ```
 
 ## Rules
@@ -68,7 +91,7 @@ created → planned → in_progress → testing → review → done → archived
 
 ---
 
-# 4. Event Bus
+# 5. Event Bus
 
 ## Purpose
 
@@ -90,12 +113,14 @@ Event = {
 ## Core Events
 
 - task_created
+- project_bootstrapped
 - task_assigned
 - task_started
 - task_completed
 - task_failed
 - review_requested
 - review_completed
+- delivery_ready
 
 ## Rules
 
@@ -105,22 +130,25 @@ Event = {
 
 ---
 
-# 5. Integration with Existing Harness
+# 6. Integration with Existing Harness
 
 This runtime layer extends the existing system:
 
-- project-harness → becomes entry point into runtime
-- team-architecture → maps agents to scheduler assignments
-- skills → become executable behaviors triggered by events
+- project-harness -> becomes entry point into runtime
+- project-bootstrap -> checks workspace and collaboration control plane
+- team-architecture -> maps agents to scheduler assignments
+- skills -> become executable behaviors triggered by events
 
 ---
 
-# 6. Execution Flow
+# 7. Execution Flow
 
 ```text
 User Request
   ↓
 project-harness
+  ↓
+project-bootstrap
   ↓
 Task Scheduler
   ↓
@@ -130,19 +158,20 @@ Agent Execution (Skills)
   ↓
 Event Bus updates
   ↓
-QA / Release / Feedback loop
+QA / Delivery / Feedback loop
 ```
 
 ---
 
-# 7. Constraints
+# 8. Constraints
 
 - No task executes outside scheduler
 - No state mutation without event emission
 - No agent operates without assignment
+- No deployment or production operation executes inside this runtime
 
 ---
 
-# 8. Version
+# 9. Version
 
 v0.1 (Initial runtime abstraction layer)

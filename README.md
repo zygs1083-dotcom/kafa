@@ -1,8 +1,12 @@
-# Codex Project Harness (Extended Architecture v2)
+# Codex Project Harness (Code Delivery Architecture v2)
 
-Codex Project Harness is a Codex-native project operating system that orchestrates end-to-end software delivery using structured workflows, dynamic team generation, and skill-based execution.
+Codex Project Harness is a Codex-native project operating system that orchestrates verified code delivery using structured workflows, dynamic team generation, collaboration-tool mapping, and skill-based execution.
 
-This version introduces a **3-layer execution model** and a **Failure Mode Engineering system** inspired by agent workflow research and production systems.
+This version introduces a **3-layer execution model** and a **Failure Mode Engineering system** for delivering code with clear requirements, tests, independent QA, and handoff evidence.
+
+The harness stops at code delivery. It does not perform deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation.
+
+It can use Git/GitHub, Linear, Notion, Figma, and Slack during delivery when useful. Codex decides which tools are needed from project context, with local `.ai-team/` and `docs/harness/` files as fallback. High-impact external actions still require confirmation.
 
 ---
 
@@ -33,14 +37,15 @@ This version introduces a **3-layer execution model** and a **Failure Mode Engin
 ## 2. Execution Flow
 
 1. Project Manager receives idea
-2. Performs requirement baseline and clarification
-3. Generates or selects team architecture
-4. Creates domain sessions (Product / Dev / QA etc.)
-5. Domain sessions break work into subagents
-6. Subagents execute isolated tasks
-7. QA and validation run independently
-8. Results are aggregated by Project Manager
-9. Release readiness + deployment approval
+2. Runs project bootstrap: workspace, git, harness files, and useful collaboration tools
+3. Performs requirement baseline and clarification
+4. Generates or selects team architecture
+5. Creates domain sessions (Product / Dev / QA etc.)
+6. Domain sessions break work into subagents
+7. Subagents execute isolated tasks
+8. QA and validation run independently
+9. Results are aggregated by Project Manager
+10. Delivery readiness + code handoff
 
 ---
 
@@ -54,7 +59,7 @@ Every feature must explicitly model:
 - Concurrency issues
 - Partial failure states
 - Recovery strategies
-- Rollback plan
+- Reversal or local rollback plan
 
 ### Required Output Artifact
 Each feature must generate:
@@ -78,7 +83,7 @@ Subagents must now include:
 - Explicit failure assumptions
 - Retry behavior
 - Idempotency guarantees
-- Rollback awareness
+- Reversal awareness
 - Test linkage
 
 ---
@@ -89,6 +94,7 @@ Subagents must now include:
 - Separation of reasoning (domain sessions) and execution (subagents)
 - Failure is first-class, not optional
 - All flows must be reversible or recoverable
+- Delivery ends with verified code and evidence, not deployment
 
 ---
 
@@ -96,12 +102,15 @@ Subagents must now include:
 
 This upgrade is fully compatible with existing skills:
 - project-harness
+- project-bootstrap
 - team-architecture
 - minimal-safe-change
 - test-first-delivery
 - bug-fix-loop
-- release-readiness
+- delivery-readiness
 - independent-quality-gate
+
+See `examples/full-project-flow.md` for a complete request-to-delivery walkthrough.
 
 ---
 

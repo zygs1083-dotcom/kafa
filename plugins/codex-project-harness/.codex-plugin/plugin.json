@@ -2,18 +2,19 @@
   "schema_version": "1.0",
   "name": "codex-project-harness",
   "display_name": "Codex 项目小队操作系统",
-  "version": "1.0.0",
-  "description": "A Codex-native project methodology plugin with project orchestration, generated agent teams, reusable skills, quality gates, release readiness, and retrospectives.",
+  "version": "1.2.0",
+  "description": "A Codex-native code-delivery methodology plugin with project bootstrap, GitHub/Linear/Notion/Figma/Slack collaboration mapping, generated agent teams, reusable skills, quality gates, delivery readiness, and retrospectives. It stops at verified code handoff and does not perform deployment.",
   "author": "zygs1083-dotcom",
   "skills": [
     "skills/project-harness",
+    "skills/project-bootstrap",
     "skills/requirement-baseline",
     "skills/team-architecture",
     "skills/minimal-safe-change",
     "skills/test-first-delivery",
     "skills/bug-fix-loop",
     "skills/independent-quality-gate",
-    "skills/release-readiness",
+    "skills/delivery-readiness",
     "skills/harness-audit",
     "skills/project-retrospective"
   ]
