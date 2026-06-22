@@ -9,13 +9,18 @@
     "owner": { "type": "string" },
     "status": {
       "type": "string",
-      "enum": ["draft", "ready", "planned", "in_progress", "needs_input", "blocked", "testing", "review", "done", "accepted", "failed", "cancelled", "skipped", "partial"]
+      "enum": ["ready", "claimed", "in_progress", "blocked", "accepted", "failed", "cancelled", "skipped"]
     },
     "acceptance_ids": { "type": "array", "items": { "type": "string" } },
     "failure_mode_ids": { "type": "array", "items": { "type": "string" } },
     "dependencies": { "type": "array", "items": { "type": "string" } },
     "tool_link": { "type": "string" },
-    "evidence": { "type": "string" }
+    "evidence": { "type": "string" },
+    "lease_agent": { "type": ["string", "null"] },
+    "lease_token": { "type": ["string", "null"] },
+    "retry_count": { "type": "integer" },
+    "retry_budget": { "type": "integer" },
+    "revision": { "type": "integer" }
   },
   "additionalProperties": true
 }

@@ -2,6 +2,20 @@
 
 Use these prompts to validate whether the harness skills produce the intended behavior in fresh Codex sessions.
 
+Executable runtime forward evals live in:
+
+```bash
+python3 plugins/codex-project-harness/scripts/run_forward_eval.py
+```
+
+The runner writes regression results to:
+
+```text
+docs/runtime/forward-eval-results.json
+```
+
+The prompts below are still useful for fresh-session qualitative evaluation.
+
 ## Full Project
 
 ```text

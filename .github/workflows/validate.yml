@@ -28,4 +28,7 @@ jobs:
         run: python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_harness_runtime.py
 
       - name: Run runtime tests
-        run: python3 -m unittest tests/test_harness_runtime.py
+        run: python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
+
+      - name: Run forward eval
+        run: python3 plugins/codex-project-harness/scripts/run_forward_eval.py

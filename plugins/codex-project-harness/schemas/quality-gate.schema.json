@@ -2,10 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Quality Gate",
   "type": "object",
-  "required": ["gate", "commit", "reviewer_context", "result"],
+  "required": ["gate", "reviewed_commit", "reviewer_context", "result"],
   "properties": {
     "gate": { "type": "string" },
-    "commit": { "type": "string" },
+    "reviewed_commit": { "type": "string" },
+    "evidence_commit": { "type": "string" },
+    "diff_hash": { "type": "string" },
     "reviewer_context": {
       "type": "string",
       "enum": ["fresh", "same-context-degraded", "external"]

@@ -99,7 +99,17 @@ Harness 应该按以下方式工作：
 
 ## 本地运行时控制面
 
-Harness 会在目标项目中维护两类本地事实源。
+Harness 会在目标项目中维护一个结构化事实源，并生成两类 Markdown 视图。
+
+结构化事实源：
+
+```text
+.ai-team/state/harness.db
+```
+
+这是 SQLite 数据库，保存 project、acceptance、failure modes、tasks、validations、quality gates、deliveries、adapter mappings、agents、migrations 和 events。SQLite 使用事务、WAL、外键、唯一约束和 task revision/lease 来支持多会话和多 agent 协作。
+
+Markdown 文件是面向人的派生视图。
 
 `.ai-team/` 用于项目控制、需求和计划：
 
@@ -169,6 +179,8 @@ plugins/codex-project-harness/
     project-retrospective/
     project-runtime/scripts/harness.py
   scripts/
+    harness.py
+    harness_db.py
     init_project_harness.py
     validate_structure.py
     harness_status.py
@@ -187,10 +199,15 @@ plugins/codex-project-harness/
     tool-adapters.md
   schemas/
     project-state.schema.json
+    acceptance.schema.json
     task.schema.json
     event.schema.json
     failure-mode.schema.json
     quality-gate.schema.json
+    validation.schema.json
+    delivery.schema.json
+    adapter.schema.json
+    agent.schema.json
   templates/
     agents/
     project/
@@ -217,15 +234,43 @@ plugins/codex-project-harness/
 
 这些脚本让方法论不只停留在 Markdown 文档里。
 
-如果插件安装在目标项目之外，优先使用 `project-runtime` skill 内的自包含 CLI：
+推荐使用统一 CLI：
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . init
+python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
+python3 plugins/codex-project-harness/scripts/harness.py --root . task next
+```
+
+如果插件安装在目标项目之外，使用 `project-runtime` skill 内的代理 CLI：
 
 ```bash
 python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
 python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate
-python3 <project-runtime-skill-dir>/scripts/harness.py --root . task-add --id T1 --task "Example" --acceptance AC1
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . task add --id T1 --task "Example" --acceptance AC1
 ```
 
-这个入口会从 skill 目录定位插件脚本，并以 `--root` 指定的目标项目作为工作目录执行。下面的直接脚本路径适用于插件源码被 vendored 到目标项目中的情况。
+这个入口会从 skill 目录定位插件脚本，并以 `--root` 指定的目标项目作为工作目录执行。下面的 legacy 直接脚本路径适用于插件源码被 vendored 到目标项目中的情况。
+
+统一 CLI 支持：
+
+```bash
+harness.py --root . init
+harness.py --root . doctor
+harness.py --root . repair
+harness.py --root . migrate --from-version 1 --to-version 2
+harness.py --root . phase project_bootstrap
+harness.py --root . acceptance add --id AC1 --criterion "Example acceptance"
+harness.py --root . failure-mode add --id FM1 --feature "Example" --scenario "Risk" --trigger "Bad input" --expected "Safe handling" --acceptance AC1
+harness.py --root . task add --id T1 --task "Implement example" --acceptance AC1 --failure-mode FM1
+harness.py --root . task next
+harness.py --root . task claim T1 --agent developer --expected-revision 1
+harness.py --root . task start T1 --agent developer
+harness.py --root . task complete T1 --evidence "tests passed"
+harness.py --root . validation record --surface "Example" --findings "passed" --result pass
+harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command"
+harness.py --root . adapter record --tool github --mode read-only --artifact Tasks --external-id issue-1 --idempotency-key codex-project-harness:project:task:T1
+```
 
 初始化本地控制面：
 
@@ -467,7 +512,8 @@ $delivery-readiness
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
 python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
 python3 -m py_compile plugins/codex-project-harness/scripts/*.py
-python3 -m unittest tests/test_harness_runtime.py
+python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
+python3 plugins/codex-project-harness/scripts/run_forward_eval.py
 git diff --check
 ```
 
@@ -479,7 +525,7 @@ git diff --check
 .github/workflows/validate.yml
 ```
 
-它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译和运行时回归测试。
+它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译、运行时回归测试和 forward eval。
 
 ## 版本状态
 

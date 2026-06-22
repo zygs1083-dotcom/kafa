@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Delivery Record",
+  "type": "object",
+  "required": ["id", "scope", "created_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "scope": { "type": "string" },
+    "acceptance": { "type": "string" },
+    "changed_files": { "type": "string" },
+    "validation": { "type": "string" },
+    "qa": { "type": "string" },
+    "failure_mode_coverage": { "type": "string" },
+    "quality_gate": { "type": "string" },
+    "data_config_notes": { "type": "string" },
+    "collaboration_links": { "type": "string" },
+    "known_gaps": { "type": "string" },
+    "handoff": { "type": "string" },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

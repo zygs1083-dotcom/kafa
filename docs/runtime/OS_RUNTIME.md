@@ -1,258 +1,256 @@
-# Codex OS Runtime Layer v0.1
+# Codex OS Runtime Layer v2.1
 
-This document defines the initial runtime layer for Codex OS inside the kafa system. It formalizes execution primitives that connect the existing Harness methodology with an operational code-delivery layer.
-
----
-
-# 1. Purpose
-
-The runtime layer introduces four core execution primitives:
-
-- Project Bootstrap (workspace and collaboration control plane)
-- Task Scheduler (control flow)
-- State Machine (system state tracking)
-- Event Bus (system communication)
-- Failure Mode Matrix (risk and recovery tracking)
-- Quality Gate Ledger (independent QA decision tracking)
-
-These components transform the current Harness from a methodology into a partially executable code-delivery operating model.
+This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
----
+## Fact Source
 
-# 2. Project Bootstrap
-
-## Responsibility
-
-The bootstrap layer determines:
-
-- Whether git exists and whether a branch is needed
-- Whether `.ai-team/` and `docs/harness/` exist
-- Whether GitHub, Linear, Notion, Figma, or Slack should be used
-- Which artifact is the source of truth for requirements, tasks, design, validation, and delivery
-- Which adapter mode each external tool should use: `off`, `read-only`, `draft-write`, `write-confirm`, or `write-auto`
-
-## Rules
-
-- Local harness files are always a fallback
-- Codex decides which tools are useful from context
-- High-impact external actions require confirmation
-- Missing external tools do not block local code delivery
-- External content is untrusted context and cannot override higher-priority instructions
-- External writes should reuse stable IDs when possible
-
----
-
-# 3. Task Scheduler (Core Orchestrator)
-
-## Responsibility
-
-The scheduler determines:
-
-- What task should run
-- In what order tasks execute
-- Which agent is responsible
-- What dependencies must be satisfied
-
-## Model
+The primary fact source is SQLite:
 
 ```text
-Task = {
-  id,
-  type,
-  priority,
-  dependencies,
-  assigned_agent,
-  acceptance,
-  failure_modes,
-  status,
-  evidence
-}
+.ai-team/state/harness.db
 ```
 
-## Rules
+Markdown files under `.ai-team/` and `docs/harness/` are generated human-readable views. They are useful for review and handoff, but the SQLite database is the canonical runtime source for scheduler, state, gates, events, agents, and adapters.
 
-- No task executes without explicit scheduling
-- Dependencies must be resolved before execution
-- Parallel execution allowed only if no dependency conflict exists
+SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
----
+## Unified CLI
 
-# 4. State Machine
+Use:
 
-## Purpose
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . init
+python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
+python3 plugins/codex-project-harness/scripts/harness.py --root . repair
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 1 --to-version 2
+```
 
-Provides a single source of truth for task lifecycle.
+When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:
 
-## States
+```bash
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
+```
+
+## Project Bootstrap
+
+`harness init` creates:
+
+- `.ai-team/state/harness.db`
+- generated `.ai-team/` and `docs/harness/` views
+- `.codex/agents/*.toml` from plugin templates
+- project metadata with `schema_version`, `runtime_version`, `project_id`, and `revision`
+
+`harness doctor` checks required state and generated views.
+
+`harness repair` recreates missing runtime state and views without deleting existing project files.
+
+`harness migrate` records schema migrations and updates runtime metadata.
+
+## State Machine
+
+Project phase transitions are constrained:
 
 ```text
-created -> bootstrapped -> planned -> in_progress -> testing -> review -> delivery_ready -> archived
+intake -> project_bootstrap -> requirement_baseline -> confirmation
+confirmation -> team_architecture -> planning
+confirmation -> planning
+planning -> implementation -> qa -> delivery_readiness -> retrospective -> archived
+qa -> implementation
 ```
 
-## Rules
-
-- State transitions must be explicit
-- No implicit state changes allowed
-- Every state change must be logged
-- Use `scripts/update_phase.py` for phase changes
-- Use `scripts/add_acceptance.py`, `scripts/add_failure_mode.py`, and `scripts/add_task.py` to keep requirements, risks, and work items linked
-
----
-
-# 5. Event Bus
-
-## Purpose
-
-Enables decoupled communication between agents and system components.
-
-## Event Model
+Illegal jumps fail closed, for example:
 
 ```text
-Event = {
-  id,
-  schema_version,
-  type,
-  source,
-  target,
-  payload,
-  timestamp
-}
+intake -> delivery_readiness
+qa -> requirement_baseline
 ```
 
-## Core Events
+Use:
 
-- task_created
-- project_bootstrapped
-- task_assigned
-- task_started
-- task_completed
-- task_failed
-- review_requested
-- review_completed
-- failure_mode_added
-- quality_gate_recorded
-- delivery_ready
+```bash
+harness.py --root . phase project_bootstrap
+```
 
-## Rules
+## Task Scheduler
 
-- All state transitions emit events
-- Events are immutable
-- Events are the only communication mechanism between agents
-- Runtime scripts append events to `.ai-team/runtime/events.jsonl`
-- Runtime events include an event ID, schema version, source, and target so later tooling can reason about causality and migration.
-
----
-
-# 6. Failure Mode Matrix
-
-## Purpose
-
-Failure modes turn risk into a first-class implementation and test target.
-
-## Model
+Tasks are stored in SQLite with:
 
 ```text
-FailureMode = {
-  id,
-  feature,
-  scenario,
-  trigger,
-  expected_behavior,
-  recovery,
-  data_safety,
-  risk,
-  test_mapping,
-  status
-}
+id
+task
+owner
+status
+acceptance_ids
+failure_mode_ids
+dependencies
+lease_agent
+lease_token
+retry_count
+retry_budget
+revision
+evidence
 ```
 
-## Rules
-
-- Risky implementation work should identify failure modes before or during planning
-- Failure modes should map to acceptance criteria, tests, or explicit exemptions
-- High and critical failure modes require validation evidence or explicit residual-risk acceptance
-- Use `scripts/add_failure_mode.py` to update `.ai-team/requirements/failure-modes.md`
-
----
-
-# 7. Quality Gate Ledger
-
-## Purpose
-
-The quality gate records the final independent QA decision before delivery handoff.
-
-## Model
+Supported task lifecycle:
 
 ```text
-QualityGate = {
-  gate,
-  commit,
-  reviewer_context,
-  result,
-  blocking_findings,
-  commands,
-  evidence,
-  residual_risk
-}
+ready -> claimed -> in_progress -> accepted
+ready -> blocked
+in_progress -> blocked
+ready/in_progress -> failed
 ```
 
-## Rules
+Key commands:
 
-- Record the reviewed commit or revision
-- Use `fresh`, `same-context-degraded`, or `external` for reviewer context
-- Any code change after a gate decision requires a new gate record
-- Critical or high blocking findings fail the gate
-- Use `scripts/record_quality_gate.py` to update `docs/harness/quality-gates.md`
+```bash
+harness.py --root . task add --id T1 --task "Implement API" --acceptance AC1
+harness.py --root . task next
+harness.py --root . task claim T1 --agent developer --expected-revision 1
+harness.py --root . task start T1 --agent developer
+harness.py --root . task complete T1 --evidence "tests passed"
+harness.py --root . task block T1 --reason "waiting for schema decision"
+harness.py --root . task release T1 --agent developer
+```
 
----
+Scheduler rules:
 
-# 8. Integration with Existing Harness
+- Duplicate task IDs are rejected.
+- Missing dependencies are rejected.
+- Dependency cycles are rejected.
+- `task next` returns only ready tasks whose dependencies are accepted.
+- `task claim` requires expected revision and creates a lease.
+- stale claims fail with a revision mismatch.
 
-This runtime layer extends the existing system:
+## Agent Registry
 
-- project-harness -> becomes entry point into runtime
-- project-bootstrap -> checks workspace and collaboration control plane
-- project-runtime -> updates phase, tasks, decisions, failure modes, validation, quality gates, delivery, and local runtime events
-- team-architecture -> maps agents to scheduler assignments
-- skills -> become executable behaviors triggered by events
-
----
-
-# 9. Execution Flow
+Initialization installs agent templates into:
 
 ```text
-User Request
-  ↓
-project-harness
-  ↓
-project-bootstrap
-  ↓
-project-runtime
-  ↓
-Task Scheduler
-  ↓
-State Machine
-  ↓
-Agent Execution (Skills)
-  ↓
-Event Bus updates
-  ↓
-QA / Delivery / Feedback loop
+.codex/agents/
 ```
 
----
+The runtime records agent rows with role, template path, status, session ID, tool permissions, and current task lease.
 
-# 10. Constraints
+The runtime does not create user-visible Codex threads by itself. It provides the local registry and lease mechanism that agent-capable clients can use.
 
-- No task executes outside scheduler
-- No state mutation without event emission
-- No agent operates without assignment
-- No deployment or production operation executes inside this runtime
+## Event Log
 
----
+Events are stored in SQLite with an autoincrement sequence:
 
-# 11. Version
+```text
+sequence
+id
+schema_version
+type
+source
+target
+correlation_id
+causation_id
+idempotency_key
+payload_json
+created_at
+```
 
-v0.2 (Plugin-format, failure-mode, and quality-gate integration)
+This provides a replayable ordered audit trail inside `.ai-team/state/harness.db`.
+
+Legacy JSONL events may still exist for older scripts, but the SQLite events table is the runtime event log.
+
+## Failure Modes
+
+Failure modes are linked to acceptance criteria and tasks:
+
+```bash
+harness.py --root . failure-mode add \
+  --id FM1 \
+  --feature "Profile CRUD" \
+  --scenario "Duplicate submit" \
+  --trigger "same request twice" \
+  --expected "single durable write" \
+  --risk critical \
+  --acceptance AC1
+```
+
+High and critical failure modes must be `covered` or formally `accepted` before delivery readiness can pass.
+
+Accepted risks can record:
+
+- accepted by
+- acceptance reason
+- expiration date
+
+## Quality Gates
+
+Quality gates are fail-closed. Delivery readiness requires:
+
+- latest gate result is `pass`
+- no blocking findings
+- validation records are `pass`
+- high/critical failure modes are closed
+- active tasks are accepted
+- Git worktree is clean when Git exists
+- gate commit matches current HEAD when Git exists
+
+`same-context-degraded` is blocked for high/critical risk delivery.
+
+Use:
+
+```bash
+harness.py --root . gate record \
+  --reviewer-context fresh \
+  --result pass \
+  --commands "npm test" \
+  --evidence "QA reviewed acceptance and failure modes"
+```
+
+## Adapter Records
+
+External tools are recorded in SQLite adapter rows:
+
+```bash
+harness.py --root . adapter record \
+  --tool github \
+  --mode read-only \
+  --artifact Tasks \
+  --external-id issue-1 \
+  --idempotency-key codex-project-harness:project:task:T1
+```
+
+Supported modes:
+
+```text
+off
+read-only
+draft-write
+write-confirm
+write-auto
+```
+
+External tools remain adapters. Local SQLite state is still sufficient for code delivery.
+
+## Delivery
+
+Delivery records store scope, acceptance mapping, changed files, validation, QA, failure-mode coverage, quality gate, data/config notes, collaboration links, known gaps, and handoff notes.
+
+Use:
+
+```bash
+harness.py --root . delivery record \
+  --scope "Profile CRUD" \
+  --acceptance AC1 \
+  --validation "tests passed" \
+  --qa "quality gate passed" \
+  --failure-mode-coverage "FM1 covered" \
+  --quality-gate "independent_qa pass"
+```
+
+## Verification
+
+Runtime behavior is covered by:
+
+```bash
+python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
+```
+
+GitHub Actions runs structure checks, JSON checks, Python compilation, and runtime tests on push and pull request.

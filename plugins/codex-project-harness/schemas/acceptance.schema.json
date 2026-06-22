@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Acceptance Criterion",
+  "type": "object",
+  "required": ["id", "criterion", "status"],
+  "properties": {
+    "id": { "type": "string" },
+    "criterion": { "type": "string" },
+    "priority": { "type": "string" },
+    "tool_link": { "type": "string" },
+    "status": { "type": "string" },
+    "revision": { "type": "integer" }
+  },
+  "additionalProperties": true
+}

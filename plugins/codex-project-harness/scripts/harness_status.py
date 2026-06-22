@@ -7,6 +7,8 @@ from pathlib import Path
 
 from harness_lib import EVENT_PATH, read_state
 
+HEADER_PREFIXES = ("| id ", "| surface ", "| gate ", "| artifact ", "| date ")
+
 
 def count_table_rows(path: Path) -> int:
     if not path.exists():
@@ -18,8 +20,7 @@ def count_table_rows(path: Path) -> int:
         if (
             stripped.startswith("|")
             and "---" not in stripped
-            and not lower.startswith("| id ")
-            and not lower.startswith("| surface ")
+            and not lower.startswith(HEADER_PREFIXES)
         ):
             rows += 1
     return rows

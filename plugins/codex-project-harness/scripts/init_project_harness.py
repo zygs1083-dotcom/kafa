@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from harness_db import init_runtime
+
 
 FILES = {
     ".ai-team/control/capability-report.md": "# Capability Report\n\n| Capability | Status | Evidence | Fallback |\n| --- | --- | --- | --- |\n| Git | pending | | local files |\n| GitHub | pending | | git diff |\n| Linear | pending | | `.ai-team/planning/task-board.md` |\n| Notion | pending | | `docs/harness/` |\n| Figma | pending | | `docs/harness/design-context.md` |\n| Slack | pending | | final response |\n",
@@ -50,6 +52,8 @@ def main() -> int:
             gitignore.write_text(text.rstrip() + "\n" + line, encoding="utf-8")
     else:
         gitignore.write_text(line, encoding="utf-8")
+
+    init_runtime(root)
 
     print("OK: project harness initialized")
     return 0

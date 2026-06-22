@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Validation Record",
+  "type": "object",
+  "required": ["id", "surface", "findings", "result", "created_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "surface": { "type": "string" },
+    "acceptance_id": { "type": "string" },
+    "commands": { "type": "string" },
+    "findings": { "type": "string" },
+    "result": { "type": "string", "enum": ["pass", "fail", "blocked", "partial"] },
+    "residual_risk": { "type": "string" },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}
