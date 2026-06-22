@@ -18,6 +18,7 @@ from harness_db import (
     complete_task,
     doctor,
     init_runtime,
+    link_requirement_acceptance,
     migrate,
     ready_tasks,
     record_adapter,
@@ -36,6 +37,8 @@ from harness_db import (
     start_task,
     status_lines,
     submit_task,
+    trace_show,
+    trace_validate,
     transition_phase,
     update_task,
     validate_runtime,
@@ -54,11 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor")
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--delivery", action="store_true")
-    sub.add_parser("repair")
+    repair_parser = sub.add_parser("repair")
+    repair_parser.add_argument("--dry-run", action="store_true")
 
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("--from-version", required=True)
     migrate_parser.add_argument("--to-version", type=int, required=True)
+    migrate_parser.add_argument("--dry-run", action="store_true")
 
     phase = sub.add_parser("phase")
     phase.add_argument("phase")
@@ -82,6 +87,15 @@ def build_parser() -> argparse.ArgumentParser:
     requirement_add.add_argument("--priority", default="")
     requirement_add.add_argument("--status", default="active")
     requirement_add.add_argument("--tool-link", default="")
+    requirement_link = requirement_sub.add_parser("link")
+    requirement_link.add_argument("--requirement", required=True)
+    requirement_link.add_argument("--acceptance", required=True)
+
+    trace = sub.add_parser("trace")
+    trace_sub = trace.add_subparsers(dest="trace_command", required=True)
+    trace_show_parser = trace_sub.add_parser("show")
+    trace_show_parser.add_argument("--requirement")
+    trace_sub.add_parser("validate")
 
     fm = sub.add_parser("failure-mode")
     fm_sub = fm.add_subparsers(dest="failure_mode_command", required=True)
@@ -295,10 +309,21 @@ def main() -> int:
                 return 1
             print("OK: harness state is valid")
         elif args.command == "repair":
-            repair(root)
+            plan = repair(root, dry_run=args.dry_run)
+            if args.dry_run:
+                print("DRY-RUN: repair plan")
+                for item in plan:
+                    print(f"- {item}")
+                return 0
             print("OK: repair complete")
         elif args.command == "migrate":
-            migrate(root, args.from_version, args.to_version)
+            report = migrate(root, args.from_version, args.to_version, dry_run=args.dry_run)
+            if args.dry_run:
+                print(f"DRY-RUN: would migrate {args.from_version}->{args.to_version}")
+                if report:
+                    for entity, count in sorted(report["imported"].items()):
+                        print(f"- {entity}: {count}")
+                return 0
             print(f"OK: migrated {args.from_version}->{args.to_version}")
         elif args.command == "phase":
             transition_phase(root, args.phase, status=args.status, owner=args.owner)
@@ -309,6 +334,18 @@ def main() -> int:
         elif args.command == "requirement" and args.requirement_command == "add":
             add_requirement(root, args.id, args.kind, args.body, priority=args.priority, status=args.status, tool_link=args.tool_link)
             print(f"OK: requirement added {args.id}")
+        elif args.command == "requirement" and args.requirement_command == "link":
+            link_requirement_acceptance(root, args.requirement, args.acceptance)
+            print(f"OK: requirement linked {args.requirement}->{args.acceptance}")
+        elif args.command == "trace" and args.trace_command == "show":
+            print("\n".join(trace_show(root, args.requirement)))
+        elif args.command == "trace" and args.trace_command == "validate":
+            issues = trace_validate(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: traceability is valid")
         elif args.command == "failure-mode" and args.failure_mode_command == "add":
             add_failure_mode(
                 root,

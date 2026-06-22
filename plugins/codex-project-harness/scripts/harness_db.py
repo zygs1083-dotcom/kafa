@@ -6,20 +6,26 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import subprocess
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, write_state
 
 
-SCHEMA_VERSION = 6
-RUNTIME_VERSION = "2.4.0"
+SCHEMA_VERSION = 7
+RUNTIME_VERSION = "2.5.0"
 DB_PATH = Path(".ai-team/state/harness.db")
 ADAPTER_MODES = {"read-only", "draft-write", "write-confirm", "write-auto", "disabled"}
 LEASE_TTL_SECONDS = 3600
+RUNTIME_GITIGNORE_PATTERNS = [
+    ".ai-team/state/",
+    ".ai-team/backups/",
+    ".ai-team/runtime/",
+]
 
 PHASES = [
     "intake",
@@ -157,6 +163,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             expires_at text,
             revision integer not null default 1
         );
+        create table if not exists requirement_acceptance (
+            requirement_id text not null references requirements(id) on delete cascade,
+            acceptance_id text not null references acceptance(id) on delete cascade,
+            primary key (requirement_id, acceptance_id)
+        );
         create table if not exists failure_mode_acceptance (
             failure_mode_id text not null references failure_modes(id) on delete cascade,
             acceptance_id text not null references acceptance(id) on delete cascade,
@@ -245,6 +256,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             known_gaps text not null default '',
             handoff text not null default '',
             created_at text not null
+        );
+        create table if not exists delivery_acceptance (
+            delivery_id text not null references deliveries(id) on delete cascade,
+            acceptance_id text not null references acceptance(id) on delete cascade,
+            primary key (delivery_id, acceptance_id)
         );
         create table if not exists evidence (
             id text primary key,
@@ -346,6 +362,55 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "project_revision", "integer not null default 0")
 
 
+def ensure_runtime_gitignore(root: Path) -> None:
+    path = root / ".gitignore"
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    normalized = {line.strip() for line in existing}
+    missing = [pattern for pattern in RUNTIME_GITIGNORE_PATTERNS if pattern not in normalized]
+    if not missing:
+        return
+    ensure_parent(path)
+    lines = existing[:]
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append("# Codex Project Harness runtime state")
+    lines.extend(missing)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def git_tracked_runtime_paths(root: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", ".ai-team/state", ".ai-team/backups", ".ai-team/runtime"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def gitignore_runtime_issues(root: Path) -> list[str]:
+    issues: list[str] = []
+    path = root / ".gitignore"
+    lines = {line.strip() for line in path.read_text(encoding="utf-8").splitlines()} if path.exists() else set()
+    for pattern in RUNTIME_GITIGNORE_PATTERNS:
+        if pattern not in lines:
+            issues.append(f"missing .gitignore runtime pattern: {pattern}")
+    tracked = git_tracked_runtime_paths(root)
+    if tracked:
+        issues.append(
+            "runtime state is tracked by git: "
+            + ", ".join(tracked)
+            + " (fix with: git rm --cached "
+            + " ".join(tracked)
+            + ")"
+        )
+    return issues
+
+
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
     columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
     if column not in columns:
@@ -402,6 +467,67 @@ def payload(**values: object) -> str:
     return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def row_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+def trace_snapshot(conn: sqlite3.Connection, requirement_id: str) -> dict[str, Any]:
+    return {
+        "requirement_id": requirement_id,
+        "acceptance_ids": [
+            row["acceptance_id"]
+            for row in conn.execute(
+                "select acceptance_id from requirement_acceptance where requirement_id = ? order by acceptance_id",
+                (requirement_id,),
+            )
+        ],
+    }
+
+
+def emit_audit_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    *,
+    entity_type: str,
+    entity_id: str,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+    actor: str = "",
+    command: str = "",
+    extra: dict[str, Any] | None = None,
+) -> None:
+    correlation_id = str(uuid.uuid4())
+    before_status = before.get("status") if before else None
+    after_status = after.get("status") if after else None
+    before_revision = before.get("revision") if before else None
+    after_revision = after.get("revision") if after else None
+    data: dict[str, Any] = {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "previous_status": before_status,
+        "new_status": after_status,
+        "previous_revision": before_revision,
+        "new_revision": after_revision,
+        "actor": actor,
+        "command": command,
+        "correlation_id": correlation_id,
+        "before": before,
+        "after": after,
+    }
+    if extra:
+        data.update(extra)
+    emit_event(
+        conn,
+        event_type,
+        payload(**data),
+        source="harness-runtime",
+        target=f"{entity_type}:{entity_id}",
+        correlation_id=correlation_id,
+    )
+
+
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -453,6 +579,14 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
         )
         targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates"))
     elif source_type == "requirement":
+        acceptance_ids = [
+            row["acceptance_id"]
+            for row in conn.execute("select acceptance_id from requirement_acceptance where requirement_id = ?", (source_id,))
+        ]
+        for acceptance_id in acceptance_ids:
+            targets.append(("acceptance", acceptance_id))
+            targets.extend(("task", row["task_id"]) for row in conn.execute("select task_id from task_acceptance where acceptance_id = ?", (acceptance_id,)))
+            targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ?", (acceptance_id,)))
         targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates"))
     for target_type, target_id in targets:
         exists = conn.execute(
@@ -490,6 +624,7 @@ def resolve_invalidations(conn: sqlite3.Connection, *, source_type: str | None =
 
 
 def init_runtime(root: Path) -> None:
+    ensure_runtime_gitignore(root)
     if not db_file(root).exists() and has_legacy_markdown_data(root):
         migrate_markdown_v1(root)
         return
@@ -562,13 +697,77 @@ def markdown_table_rows(path: Path) -> list[list[str]]:
     return rows
 
 
-def migrate_markdown_v1(root: Path) -> None:
+def empty_migration_report(dry_run: bool) -> dict[str, Any]:
+    return {
+        "dry_run": dry_run,
+        "imported": {},
+        "skipped": {},
+        "unrecognized": [],
+    }
+
+
+def report_count(report: dict[str, Any], bucket: str, entity: str, count: int = 1) -> None:
+    report[bucket][entity] = int(report[bucket].get(entity, 0)) + count
+
+
+def write_migration_report(root: Path, report: dict[str, Any]) -> None:
+    lines = [
+        "# Migration Report",
+        "",
+        f"dry_run: {'yes' if report['dry_run'] else 'no'}",
+        "",
+        "## Imported",
+        "",
+        "| Entity | Count |",
+        "| --- | --- |",
+    ]
+    for entity, count in sorted(report["imported"].items()):
+        lines.append(markdown_row([entity, count]))
+    lines.extend(["", "## Skipped", "", "| Entity | Count |", "| --- | --- |"])
+    for entity, count in sorted(report["skipped"].items()):
+        lines.append(markdown_row([entity, count]))
+    lines.extend(["", "## Unrecognized", ""])
+    if report["unrecognized"]:
+        lines.extend(f"- {item}" for item in report["unrecognized"])
+    else:
+        lines.append("- none")
+    write_view(root, "docs/harness/migration-report.md", "\n".join(lines))
+
+
+def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    report = empty_migration_report(dry_run)
+    acceptance_rows = markdown_table_rows(root / ".ai-team/requirements/acceptance.md")
+    requirement_rows = markdown_table_rows(root / ".ai-team/requirements/requirements.md")
+    failure_mode_rows = markdown_table_rows(root / ".ai-team/requirements/failure-modes.md")
+    task_rows = markdown_table_rows(root / ".ai-team/planning/task-board.md")
+    validation_rows = markdown_table_rows(root / "docs/harness/validation.md")
+    gate_rows = markdown_table_rows(root / "docs/harness/quality-gates.md")
+    decision_rows = markdown_table_rows(root / ".ai-team/control/decision-log.md")
+    delivery_path = root / "docs/harness/delivery.md"
+    delivery_text = delivery_path.read_text(encoding="utf-8") if delivery_path.exists() else ""
+
+    for entity, rows in [
+        ("acceptance", acceptance_rows),
+        ("requirement", requirement_rows),
+        ("failure_mode", failure_mode_rows),
+        ("task", task_rows),
+        ("validation", validation_rows),
+        ("quality_gate", gate_rows),
+        ("decision", decision_rows),
+    ]:
+        report_count(report, "imported", entity, len(rows))
+    if delivery_text.strip():
+        report_count(report, "imported", "delivery", delivery_text.count("## Delivery Record") or 1)
+    if dry_run:
+        return report
+
     backup_runtime(root, "markdown-v1")
     with transaction(root) as conn:
         create_schema(conn)
         initialize_project(conn)
-        for cells in markdown_table_rows(root / ".ai-team/requirements/acceptance.md"):
+        for cells in acceptance_rows:
             if len(cells) < 2:
+                report_count(report, "skipped", "acceptance")
                 continue
             conn.execute(
                 """
@@ -578,8 +777,30 @@ def migrate_markdown_v1(root: Path) -> None:
                 """,
                 (cells[0], cells[1], cells[2] if len(cells) > 2 else "", cells[3] if len(cells) > 3 else "", cells[4] if len(cells) > 4 else "active"),
             )
-        for cells in markdown_table_rows(root / ".ai-team/requirements/failure-modes.md"):
+        for cells in requirement_rows:
+            if len(cells) < 3:
+                report_count(report, "skipped", "requirement")
+                continue
+            conn.execute(
+                """
+                insert into requirements (id, kind, body, priority, status, tool_link, revision, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(id) do nothing
+                """,
+                (
+                    cells[0],
+                    cells[1],
+                    cells[2],
+                    cells[3] if len(cells) > 3 else "",
+                    cells[4] if len(cells) > 4 else "active",
+                    cells[5] if len(cells) > 5 else "",
+                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 1,
+                    now_iso(),
+                ),
+            )
+        for cells in failure_mode_rows:
             if len(cells) < 8:
+                report_count(report, "skipped", "failure_mode")
                 continue
             conn.execute(
                 """
@@ -607,8 +828,9 @@ def migrate_markdown_v1(root: Path) -> None:
                             "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
                             (cells[0], acceptance_id),
                         )
-        for cells in markdown_table_rows(root / ".ai-team/planning/task-board.md"):
+        for cells in task_rows:
             if len(cells) < 4:
+                report_count(report, "skipped", "task")
                 continue
             status = cells[3] if cells[3] in TASK_STATUSES else "ready"
             conn.execute(
@@ -633,13 +855,94 @@ def migrate_markdown_v1(root: Path) -> None:
             for fm_id in parse_ids(cells[5] if len(cells) > 5 else ""):
                 if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
                     conn.execute("insert or ignore into task_failure_modes (task_id, failure_mode_id) values (?, ?)", (cells[0], fm_id))
+        for cells in validation_rows:
+            if len(cells) < 10:
+                report_count(report, "skipped", "validation")
+                continue
+            validation_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                insert into validations
+                (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
+                 source_tree_hash, tracked_diff_hash, project_revision, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    validation_id,
+                    cells[0],
+                    cells[1] if len(cells) > 1 else "",
+                    cells[8] if len(cells) > 8 else "",
+                    cells[9] if len(cells) > 9 else "",
+                    cells[10] if len(cells) > 10 else "partial",
+                    cells[11] if len(cells) > 11 else "",
+                    cells[3] if len(cells) > 3 else "",
+                    cells[4] if len(cells) > 4 else "",
+                    cells[5] if len(cells) > 5 else "",
+                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
+                    now_iso(),
+                ),
+            )
+            for fm_id in parse_ids(cells[2] if len(cells) > 2 else ""):
+                if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
+                    conn.execute(
+                        "insert or ignore into validation_failure_modes (validation_id, failure_mode_id) values (?, ?)",
+                        (validation_id, fm_id),
+                    )
+        for cells in gate_rows:
+            if len(cells) < 9:
+                report_count(report, "skipped", "quality_gate")
+                continue
+            conn.execute(
+                """
+                insert into quality_gates
+                (id, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
+                 project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    cells[0],
+                    cells[1],
+                    cells[1],
+                    cells[4] if len(cells) > 4 else "",
+                    cells[2] if len(cells) > 2 else "",
+                    cells[3] if len(cells) > 3 else "",
+                    cells[5] if len(cells) > 5 else "",
+                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
+                    cells[7] if len(cells) > 7 else "external",
+                    cells[8] if len(cells) > 8 else "blocked",
+                    cells[9] if len(cells) > 9 else "",
+                    cells[10] if len(cells) > 10 else "",
+                    cells[11] if len(cells) > 11 else "",
+                    cells[12] if len(cells) > 12 else "",
+                    now_iso(),
+                ),
+            )
+        for cells in decision_rows:
+            if len(cells) < 3:
+                report_count(report, "skipped", "decision")
+                continue
+            conn.execute(
+                "insert into decisions (id, decision, reason, created_at) values (?, ?, ?, ?)",
+                (str(uuid.uuid4()), cells[1], cells[2], cells[0] or now_iso()),
+            )
+        if delivery_text.strip():
+            conn.execute(
+                """
+                insert into deliveries (id, scope, handoff, created_at)
+                values (?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), "Imported markdown-v1 delivery history", delivery_text.strip(), now_iso()),
+            )
         conn.execute(
             "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
             (1, SCHEMA_VERSION, now_iso()),
         )
         emit_event(conn, "markdown_v1_migrated", payload(to=SCHEMA_VERSION))
     render_all(root)
+    write_migration_report(root, report)
     install_agents(root)
+    return report
 
 
 def install_agents(root: Path) -> None:
@@ -691,7 +994,18 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
         if owner:
             updates["current_owner"] = owner
         bump_project(conn, **updates)
-        emit_event(conn, "phase_updated", payload(**{"from": current, "to": phase}))
+        after = project_row(conn)
+        emit_audit_event(
+            conn,
+            "phase_updated",
+            entity_type="project",
+            entity_id=str(row["project_id"]),
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=owner or "",
+            command="phase",
+            extra={"from": current, "to": phase},
+        )
     render_all(root)
 
 
@@ -729,7 +1043,17 @@ def add_requirement(root: Path, requirement_id: str, kind: str, body: str, prior
         )
         if existing and (existing["kind"], existing["body"], existing["priority"], existing["status"], existing["tool_link"]) != (kind, body, priority, status, tool_link):
             invalidate_downstream(conn, "requirement", requirement_id, "requirement changed")
-        emit_event(conn, "requirement_recorded", payload(id=requirement_id, kind=kind))
+        after = conn.execute("select * from requirements where id = ?", (requirement_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "requirement_recorded",
+            entity_type="requirement",
+            entity_id=requirement_id,
+            before=row_snapshot(existing),
+            after=row_snapshot(after),
+            command="requirement add",
+            extra={"kind": kind},
+        )
     render_all(root)
 
 
@@ -747,7 +1071,16 @@ def add_acceptance(root: Path, acceptance_id: str, criterion: str, priority: str
         )
         if existing and (existing["criterion"], existing["priority"], existing["tool_link"]) != (criterion, priority, tool_link):
             invalidate_downstream(conn, "acceptance", acceptance_id, "acceptance criterion changed")
-        emit_event(conn, "acceptance_added", payload(id=acceptance_id))
+        after = conn.execute("select * from acceptance where id = ?", (acceptance_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "acceptance_recorded",
+            entity_type="acceptance",
+            entity_id=acceptance_id,
+            before=row_snapshot(existing),
+            after=row_snapshot(after),
+            command="acceptance add",
+        )
     render_all(root)
 
 
@@ -822,13 +1155,50 @@ def add_failure_mode(
             existing["status"],
         ) != (feature, scenario, trigger, expected, risk, status):
             invalidate_downstream(conn, "failure_mode", fm_id, "failure mode changed")
-        emit_event(conn, "failure_mode_added", payload(id=fm_id, risk=risk))
+        after = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "failure_mode_recorded",
+            entity_type="failure_mode",
+            entity_id=fm_id,
+            before=row_snapshot(existing),
+            after=row_snapshot(after),
+            command="failure-mode add",
+            extra={"risk": risk},
+        )
     render_all(root)
 
 
 def require_acceptance(conn: sqlite3.Connection, acceptance_id: str) -> None:
     if not conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
         raise HarnessError(f"missing acceptance: {acceptance_id}")
+
+
+def require_requirement(conn: sqlite3.Connection, requirement_id: str) -> None:
+    if not conn.execute("select id from requirements where id = ?", (requirement_id,)).fetchone():
+        raise HarnessError(f"missing requirement: {requirement_id}")
+
+
+def link_requirement_acceptance(root: Path, requirement_id: str, acceptance_id: str) -> None:
+    with transaction(root) as conn:
+        require_requirement(conn, requirement_id)
+        require_acceptance(conn, acceptance_id)
+        before = trace_snapshot(conn, requirement_id)
+        conn.execute(
+            "insert or ignore into requirement_acceptance (requirement_id, acceptance_id) values (?, ?)",
+            (requirement_id, acceptance_id),
+        )
+        after = trace_snapshot(conn, requirement_id)
+        emit_audit_event(
+            conn,
+            "requirement_acceptance_linked",
+            entity_type="requirement",
+            entity_id=requirement_id,
+            before=before,
+            after=after,
+            command="requirement link",
+        )
+    render_all(root)
 
 
 def require_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -920,7 +1290,17 @@ def add_task(
             require_task(conn, dep)
             assert_no_dependency_cycle(conn, task_id, dep)
             conn.execute("insert into task_dependencies (task_id, depends_on) values (?, ?)", (task_id, dep))
-        emit_event(conn, "task_created", payload(id=task_id))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_created",
+            entity_type="task",
+            entity_id=task_id,
+            before=None,
+            after=row_snapshot(after),
+            actor=owner,
+            command="task add",
+        )
     render_all(root)
 
 
@@ -944,7 +1324,16 @@ def update_task(root: Path, task_id: str, *, depends_on: str | None = None, stat
             )
         else:
             conn.execute("update tasks set revision = revision + 1, updated_at = ? where id = ?", (now_iso(), task_id))
-        emit_event(conn, "task_updated", payload(id=row["id"]))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_updated",
+            entity_type="task",
+            entity_id=row["id"],
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            command="task update",
+        )
     render_all(root)
 
 
@@ -1017,7 +1406,17 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
             """,
             (task_id, now_iso(), agent),
         )
-        emit_event(conn, "task_claimed", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_claimed",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task claim",
+        )
     render_all(root)
     return token
 
@@ -1032,7 +1431,17 @@ def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expec
             "update tasks set lease_heartbeat_at = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ? where id = ?",
             (now_iso(), lease_deadline(), now_iso(), task_id),
         )
-        emit_event(conn, "task_heartbeat", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_heartbeat",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task heartbeat",
+        )
     render_all(root)
 
 
@@ -1082,7 +1491,17 @@ def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | Non
             (now_iso(), task_id),
         )
         conn.execute("update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?", (now_iso(), agent))
-        emit_event(conn, "task_released", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_released",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task release",
+        )
     render_all(root)
 
 
@@ -1101,7 +1520,17 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
             """,
             (agent, now_iso(), task_id),
         )
-        emit_event(conn, "task_started", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_started",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task start",
+        )
     render_all(root)
 
 
@@ -1125,7 +1554,17 @@ def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        emit_event(conn, "task_submitted", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_submitted",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task submit",
+        )
     render_all(root)
 
 
@@ -1156,7 +1595,17 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int) ->
             "update agents set lease_task_id = ?, status = 'leased', updated_at = ? where id = ?",
             (task_id, now_iso(), agent),
         )
-        emit_event(conn, "task_review_started", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_review_started",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task review",
+        )
     render_all(root)
     return token
 
@@ -1181,7 +1630,17 @@ def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        emit_event(conn, "task_accepted", payload(id=task_id, agent=agent))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_accepted",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task accept",
+        )
     render_all(root)
 
 
@@ -1202,7 +1661,17 @@ def block_task(root: Path, task_id: str, reason: str, *, agent: str, lease_token
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        emit_event(conn, "task_blocked", payload(id=task_id))
+        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "task_blocked",
+            entity_type="task",
+            entity_id=task_id,
+            before=row_snapshot(row),
+            after=row_snapshot(after),
+            actor=agent,
+            command="task block",
+        )
     render_all(root)
 
 
@@ -1255,7 +1724,17 @@ def record_validation(root: Path, surface: str, findings: str, result: str, *, a
                 (validation_id, fm_id),
             )
             resolve_invalidations(conn, source_type="failure_mode", source_id=fm_id)
-        emit_event(conn, "validation_recorded", payload(surface=surface, result=result))
+        after = conn.execute("select * from validations where id = ?", (validation_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "validation_recorded",
+            entity_type="validation",
+            entity_id=validation_id,
+            before=None,
+            after=row_snapshot(after),
+            command="validation record",
+            extra={"surface": surface, "result": result},
+        )
     render_all(root)
 
 
@@ -1317,6 +1796,7 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
         raise HarnessError("cannot record a passing quality gate with a dirty git worktree")
     with transaction(root) as conn:
         project_revision = int(project_row(conn)["revision"])
+        gate_id = str(uuid.uuid4())
         conn.execute(
             """
             insert into quality_gates
@@ -1325,7 +1805,7 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid.uuid4()),
+                gate_id,
                 gate,
                 current_sha,
                 current_sha,
@@ -1345,7 +1825,17 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
         )
         if result == "pass":
             resolve_invalidations(conn, target_type="quality_gate")
-        emit_event(conn, "quality_gate_recorded", payload(gate=gate, result=result))
+        after = conn.execute("select * from quality_gates where id = ?", (gate_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "quality_gate_recorded",
+            entity_type="quality_gate",
+            entity_id=gate_id,
+            before=None,
+            after=row_snapshot(after),
+            command="gate record",
+            extra={"gate": gate, "result": result},
+        )
     render_all(root)
 
 
@@ -1368,6 +1858,7 @@ def record_delivery(
         issues = validate_delivery(conn, root)
         if issues:
             raise HarnessError("delivery record blocked: " + "; ".join(issues))
+        delivery_id = str(uuid.uuid4())
         conn.execute(
             """
             insert into deliveries
@@ -1376,7 +1867,7 @@ def record_delivery(
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid.uuid4()),
+                delivery_id,
                 scope,
                 acceptance,
                 changed_files,
@@ -1391,7 +1882,24 @@ def record_delivery(
                 now_iso(),
             ),
         )
-        emit_event(conn, "delivery_recorded", payload(scope=scope))
+        for acceptance_id in parse_ids(acceptance):
+            if not conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+                continue
+            conn.execute(
+                "insert or ignore into delivery_acceptance (delivery_id, acceptance_id) values (?, ?)",
+                (delivery_id, acceptance_id),
+            )
+        after = conn.execute("select * from deliveries where id = ?", (delivery_id,)).fetchone()
+        emit_audit_event(
+            conn,
+            "delivery_recorded",
+            entity_type="delivery",
+            entity_id=delivery_id,
+            before=None,
+            after=row_snapshot(after),
+            command="delivery record",
+            extra={"scope": scope},
+        )
     render_all(root)
 
 
@@ -1426,10 +1934,16 @@ def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id:
     render_tooling_map(root)
 
 
-def migrate(root: Path, from_version: str, to_version: int) -> None:
+def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = False) -> dict[str, Any] | None:
     if from_version == "markdown-v1":
-        migrate_markdown_v1(root)
-        return
+        return migrate_markdown_v1(root, dry_run=dry_run)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "imported": {"schema_migration": 1},
+            "skipped": {},
+            "unrecognized": [],
+        }
     backup_runtime(root, "migrate")
     from_version_int = int(from_version)
     with transaction(root) as conn:
@@ -1442,10 +1956,12 @@ def migrate(root: Path, from_version: str, to_version: int) -> None:
         conn.execute("update project set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ? where id = 1", (to_version, RUNTIME_VERSION, now_iso()))
         emit_event(conn, "migration_applied", payload(**{"from": from_version_int, "to": to_version}))
     render_all(root)
+    return None
 
 
 def doctor(root: Path) -> list[str]:
     issues: list[str] = []
+    issues.extend(gitignore_runtime_issues(root))
     path = db_file(root)
     if not path.exists():
         return ["missing sqlite state: .ai-team/state/harness.db"]
@@ -1498,11 +2014,226 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
             json.loads(row["payload_json"])
         except json.JSONDecodeError as exc:
             issues.append(f"invalid event payload_json: {row['id']} {exc.msg}")
+    issues.extend(schema_contract_issues(conn))
     return issues
+
+
+def schema_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "schemas"
+
+
+def load_schema(name: str) -> dict[str, Any]:
+    return json.loads((schema_dir() / name).read_text(encoding="utf-8"))
+
+
+def json_type_matches(value: Any, expected: str | list[str]) -> bool:
+    options = expected if isinstance(expected, list) else [expected]
+    for option in options:
+        if option == "null" and value is None:
+            return True
+        if option == "string" and isinstance(value, str):
+            return True
+        if option == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if option == "array" and isinstance(value, list):
+            return True
+        if option == "object" and isinstance(value, dict):
+            return True
+        if option == "boolean" and isinstance(value, bool):
+            return True
+    return False
+
+
+def validate_object_against_schema(label: str, data: dict[str, Any], schema: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for field in schema.get("required", []):
+        if field not in data or data[field] is None:
+            issues.append(f"schema contract failed: {label}.{field} is required")
+    properties = schema.get("properties", {})
+    if schema.get("additionalProperties") is False:
+        for field in data:
+            if field not in properties:
+                issues.append(f"schema contract failed: {label}.{field} is not declared")
+    for field, definition in properties.items():
+        if field not in data:
+            continue
+        value = data[field]
+        expected_type = definition.get("type")
+        if expected_type is not None and not json_type_matches(value, expected_type):
+            issues.append(f"schema contract failed: {label}.{field} expected {expected_type}, got {type(value).__name__}")
+            continue
+        if "enum" in definition and value not in definition["enum"]:
+            issues.append(f"schema contract failed: {label}.{field}={value} not in {definition['enum']}")
+        if definition.get("type") == "array" and isinstance(value, list):
+            item_type = definition.get("items", {}).get("type")
+            if item_type:
+                for index, item in enumerate(value):
+                    if not json_type_matches(item, item_type):
+                        issues.append(f"schema contract failed: {label}.{field}[{index}] expected {item_type}")
+    return issues
+
+
+def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    tasks = []
+    task_acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id")
+    task_failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id")
+    task_dependencies = grouped(conn, "task_dependencies", "task_id", "depends_on")
+    for row in conn.execute("select * from tasks order by id"):
+        data = row_snapshot(row) or {}
+        data["acceptance_ids"] = parse_ids(task_acceptance.get(row["id"], ""))
+        data["failure_mode_ids"] = parse_ids(task_failure_modes.get(row["id"], ""))
+        data["dependencies"] = parse_ids(task_dependencies.get(row["id"], ""))
+        tasks.append(data)
+
+    validations = []
+    validation_failure_modes = grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
+    for row in conn.execute("select * from validations order by id"):
+        data = row_snapshot(row) or {}
+        data["failure_mode_ids"] = parse_ids(validation_failure_modes.get(row["id"], ""))
+        validations.append(data)
+
+    project = conn.execute(
+        """
+        select status, phase, scope_status, current_owner, schema_version, runtime_version, project_id, revision, updated_at
+        from project where id = 1
+        """
+    ).fetchall()
+
+    return [
+        ("project-state.schema.json", "project", [row_snapshot(row) or {} for row in project]),
+        ("acceptance.schema.json", "acceptance", [row_snapshot(row) or {} for row in conn.execute("select * from acceptance")]),
+        ("requirement.schema.json", "requirements", [row_snapshot(row) or {} for row in conn.execute("select * from requirements")]),
+        ("failure-mode.schema.json", "failure_modes", [row_snapshot(row) or {} for row in conn.execute("select * from failure_modes")]),
+        ("task.schema.json", "tasks", tasks),
+        ("validation.schema.json", "validations", validations),
+        ("quality-gate.schema.json", "quality_gates", [row_snapshot(row) or {} for row in conn.execute("select * from quality_gates")]),
+        ("delivery.schema.json", "deliveries", [row_snapshot(row) or {} for row in conn.execute("select * from deliveries")]),
+        ("evidence.schema.json", "evidence", [row_snapshot(row) or {} for row in conn.execute("select * from evidence")]),
+        ("test.schema.json", "tests", [row_snapshot(row) or {} for row in conn.execute("select * from tests")]),
+        ("finding.schema.json", "findings", [row_snapshot(row) or {} for row in conn.execute("select * from findings")]),
+        ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
+        ("agent.schema.json", "agents", [row_snapshot(row) or {} for row in conn.execute("select * from agents")]),
+        ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),
+        ("event.schema.json", "events", [row_snapshot(row) or {} for row in conn.execute("select * from events")]),
+    ]
+
+
+def schema_contract_issues(conn: sqlite3.Connection) -> list[str]:
+    issues: list[str] = []
+    for schema_name, entity, rows in schema_entity_rows(conn):
+        schema = load_schema(schema_name)
+        for row in rows:
+            label = f"{entity}.{row.get('id', row.get('sequence', 'row'))}"
+            issues.extend(validate_object_against_schema(label, row, schema))
+    return issues
+
+
+def trace_rows(conn: sqlite3.Connection, requirement_id: str | None = None) -> list[dict[str, str]]:
+    clauses = ["r.status != 'cancelled'"]
+    values: list[object] = []
+    if requirement_id:
+        clauses.append("r.id = ?")
+        values.append(requirement_id)
+    rows = conn.execute(
+        f"""
+        select
+          r.id as requirement_id,
+          r.kind as requirement_kind,
+          r.body as requirement_body,
+          ra.acceptance_id,
+          a.criterion as acceptance_criterion,
+          group_concat(distinct ta.task_id) as task_ids,
+          group_concat(distinct v.id) as validation_ids,
+          group_concat(distinct vfm.failure_mode_id) as failure_mode_ids,
+          group_concat(distinct da.delivery_id) as delivery_ids
+        from requirements r
+        left join requirement_acceptance ra on ra.requirement_id = r.id
+        left join acceptance a on a.id = ra.acceptance_id
+        left join task_acceptance ta on ta.acceptance_id = ra.acceptance_id
+        left join validations v on v.acceptance_id = ra.acceptance_id and v.result = 'pass'
+        left join validation_failure_modes vfm on vfm.validation_id = v.id
+        left join delivery_acceptance da on da.acceptance_id = ra.acceptance_id
+        where {' and '.join(clauses)}
+        group by r.id, ra.acceptance_id
+        order by r.id, ra.acceptance_id
+        """,
+        values,
+    ).fetchall()
+    return [{key: row[key] or "" for key in row.keys()} for row in rows]
+
+
+def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = None) -> list[str]:
+    issues: list[str] = []
+    req_clause = "where status != 'cancelled'"
+    values: list[object] = []
+    if requirement_id:
+        req_clause += " and id = ?"
+        values.append(requirement_id)
+    requirements = conn.execute(f"select id from requirements {req_clause} order by id", values).fetchall()
+    for requirement in requirements:
+        links = conn.execute(
+            "select acceptance_id from requirement_acceptance where requirement_id = ? order by acceptance_id",
+            (requirement["id"],),
+        ).fetchall()
+        if not links:
+            issues.append(f"requirement has no acceptance link: {requirement['id']}")
+            continue
+        for link in links:
+            acceptance_id = link["acceptance_id"]
+            accepted_task = conn.execute(
+                """
+                select 1 from task_acceptance ta
+                join tasks t on t.id = ta.task_id
+                where ta.acceptance_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
+                limit 1
+                """,
+                (acceptance_id,),
+            ).fetchone()
+            if not accepted_task:
+                issues.append(f"acceptance has no completed task in trace: {requirement['id']} -> {acceptance_id}")
+            passing_validation = conn.execute(
+                "select 1 from validations where acceptance_id = ? and result = 'pass' limit 1",
+                (acceptance_id,),
+            ).fetchone()
+            if not passing_validation:
+                issues.append(f"acceptance has no passing validation in trace: {requirement['id']} -> {acceptance_id}")
+    return issues
+
+
+def trace_show(root: Path, requirement_id: str | None = None) -> list[str]:
+    with connection(root) as conn:
+        rows = trace_rows(conn, requirement_id)
+        issues = traceability_issues(conn, requirement_id)
+    lines = ["# Traceability", "", "| Requirement | Kind | Acceptance | Tasks | Validations | Failure Modes | Deliveries |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        lines.append(
+            markdown_row(
+                [
+                    row["requirement_id"],
+                    row["requirement_kind"],
+                    row["acceptance_id"],
+                    row["task_ids"],
+                    row["validation_ids"],
+                    row["failure_mode_ids"],
+                    row["delivery_ids"],
+                ]
+            )
+        )
+    lines.extend(["", "## Issues", ""])
+    lines.extend(f"- {issue}" for issue in issues) if issues else lines.append("- none")
+    return lines
+
+
+def trace_validate(root: Path) -> list[str]:
+    with connection(root) as conn:
+        return traceability_issues(conn)
 
 
 def validate_delivery(conn: sqlite3.Connection, root: Path) -> list[str]:
     issues: list[str] = []
+    if conn.execute("select 1 from requirements where status != 'cancelled' limit 1").fetchone():
+        issues.extend(traceability_issues(conn))
+
     stale_rows = conn.execute(
         "select source_type, source_id, target_type, target_id, reason from invalidations where resolved_at is null order by created_at, id"
     ).fetchall()
@@ -1614,16 +2345,27 @@ def status_lines(root: Path) -> list[str]:
     ]
 
 
-def repair(root: Path) -> None:
+def repair(root: Path, *, dry_run: bool = False) -> list[str]:
+    if dry_run:
+        issues = doctor(root)
+        plan = [
+            "ensure runtime .gitignore patterns",
+            "initialize missing sqlite state",
+            f"migrate schema to {SCHEMA_VERSION}",
+            "render generated harness views",
+        ]
+        return issues + [f"repair action: {item}" for item in plan]
     backup_runtime(root, "repair")
     init_runtime(root)
     migrate(root, str(SCHEMA_VERSION), SCHEMA_VERSION)
     render_all(root)
+    return []
 
 
 def render_all(root: Path) -> None:
     render_project_state(root)
     render_requirements(root)
+    render_traceability(root)
     render_acceptance(root)
     render_failure_modes(root)
     render_tasks(root)
@@ -1666,6 +2408,10 @@ def render_requirements(root: Path) -> None:
     lines = ["# Requirements", "", "| ID | Kind | Body | Priority | Status | Tool Link | Revision |", "| --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["id"], row["kind"], row["body"], row["priority"], row["status"], row["tool_link"], row["revision"]]) for row in rows)
     write_view(root, ".ai-team/requirements/requirements.md", "\n".join(lines))
+
+
+def render_traceability(root: Path) -> None:
+    write_view(root, ".ai-team/requirements/traceability.md", "\n".join(trace_show(root)))
 
 
 def render_acceptance(root: Path) -> None:

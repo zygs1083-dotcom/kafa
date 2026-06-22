@@ -31,10 +31,12 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Need | Script |
 | --- | --- |
 | Show current state | `harness.py --root . status` |
-| Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair` |
-| Migrate state | `harness.py --root . migrate --from-version 5 --to-version 6` |
+| Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 7`, `harness.py --root . migrate --from-version markdown-v1 --to-version 7 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Add requirement baseline record | `harness.py --root . requirement add` |
+| Link requirement to acceptance | `harness.py --root . requirement link --requirement R1 --acceptance AC1` |
+| Show / validate traceability | `harness.py --root . trace show`, `harness.py --root . trace validate` |
 | Add acceptance criterion | `harness.py --root . acceptance add` |
 | Add failure mode | `harness.py --root . failure-mode add` |
 | Add task | `harness.py --root . task add` |
@@ -78,6 +80,10 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . requirement ad
 python3 plugins/codex-project-harness/scripts/harness.py --root . acceptance add \
   --id AC1 \
   --criterion "User can create, read, update, and delete profiles"
+
+python3 plugins/codex-project-harness/scripts/harness.py --root . requirement link \
+  --requirement R1 \
+  --acceptance AC1
 ```
 
 For risky work, record failure modes before implementation:

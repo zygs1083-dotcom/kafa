@@ -1,20 +1,20 @@
-# Forward Test Prompts
+# Runtime Smoke And Fresh Eval Prompts
 
 Use these prompts to validate whether the harness skills produce the intended behavior in fresh Codex sessions.
 
-Executable runtime forward evals live in:
+Executable runtime smoke checks live in:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/run_forward_eval.py
+python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
 ```
 
 The runner writes regression results to:
 
 ```text
-docs/runtime/forward-eval-results.json
+docs/runtime/runtime-smoke-results.json
 ```
 
-The prompts below are still useful for fresh-session qualitative evaluation.
+`run_forward_eval.py` remains as a compatibility wrapper. The prompts below are still useful for fresh-session qualitative evaluation.
 
 ## Full Project
 

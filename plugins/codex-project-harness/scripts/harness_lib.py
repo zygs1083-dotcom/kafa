@@ -14,6 +14,7 @@ from pathlib import Path
 STATE_PATH = Path(".ai-team/control/project-state.yaml")
 EVENT_PATH = Path(".ai-team/runtime/events.jsonl")
 HARNESS_GIT_PREFIXES = (
+    ".gitignore",
     ".ai-team/",
     ".codex/agents/",
     "docs/harness/",
@@ -195,6 +196,7 @@ def git_tracked_diff_hash(root: Path) -> str | None:
                 "HEAD",
                 "--",
                 ".",
+                ":(exclude).gitignore",
                 ":(exclude).ai-team/**",
                 ":(exclude).codex/agents/**",
                 ":(exclude)docs/harness/**",

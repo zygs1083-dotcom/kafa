@@ -46,6 +46,7 @@ REQUIRED_SCRIPTS = [
     "validate_harness_state.py",
     "harness_db.py",
     "harness.py",
+    "run_runtime_smoke.py",
     "run_forward_eval.py",
 ]
 

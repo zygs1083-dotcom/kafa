@@ -1,4 +1,4 @@
-# Codex OS Runtime Layer v2.4
+# Codex OS Runtime Layer v2.5
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
@@ -25,7 +25,9 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . init
 python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 5 --to-version 6
+python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 7
+python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 ```
 
 When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:
@@ -43,11 +45,11 @@ python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
 - `.codex/agents/*.toml` from plugin templates
 - project metadata with `schema_version`, `runtime_version`, `project_id`, and `revision`
 
-`harness doctor` checks required state and generated views.
+`harness doctor` checks required state, generated views, runtime Git hygiene, and DB rows against the machine-readable schema contracts.
 
-`harness repair` recreates missing runtime state and views without deleting existing project files.
+`harness repair` recreates missing runtime state and views without deleting existing project files. Use `harness repair --dry-run` to see the planned repair actions without writing state.
 
-`harness migrate` records schema migrations and updates runtime metadata.
+`harness migrate` records schema migrations and updates runtime metadata. Markdown v1 migration supports `--dry-run` and writes `docs/harness/migration-report.md` on real migration.
 
 ## State Machine
 
@@ -212,6 +214,16 @@ harness.py --root . requirement add \
 ```
 
 Confirmation, team architecture, and planning require at least one requirement baseline record and at least one acceptance criterion.
+
+Traceability links requirements to acceptance criteria:
+
+```bash
+harness.py --root . requirement link --requirement R1 --acceptance AC1
+harness.py --root . trace show --requirement R1
+harness.py --root . trace validate
+```
+
+When a requirement baseline exists, delivery readiness requires a complete requirement -> acceptance -> task -> passing validation chain.
 
 Evidence, test records, and findings are also structured:
 
