@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Project State",
+  "type": "object",
+  "required": ["status", "phase", "scope_status", "current_owner"],
+  "properties": {
+    "status": { "type": "string" },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "intake",
+        "project_bootstrap",
+        "requirement_baseline",
+        "confirmation",
+        "team_architecture",
+        "planning",
+        "implementation",
+        "qa",
+        "delivery_readiness",
+        "retrospective",
+        "archived"
+      ]
+    },
+    "scope_status": { "type": "string" },
+    "current_owner": { "type": "string" },
+    "blocked_reason": { "type": ["string", "null"] },
+    "updated_at": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

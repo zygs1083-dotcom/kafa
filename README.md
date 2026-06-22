@@ -1,12 +1,12 @@
 # Codex Project Harness (Code Delivery Architecture v2)
 
-Codex Project Harness is a Codex-native project operating system that orchestrates verified code delivery using executable local runtime state, structured workflows, dynamic team generation, collaboration-tool mapping, and skill-based execution.
+Codex Project Harness is a Codex-native, general-purpose project operating system that orchestrates verified code delivery using executable local runtime state, structured workflows, dynamic team generation, collaboration-tool mapping, and skill-based execution.
 
-This version introduces a **3-layer execution model** and a **Failure Mode Engineering system** for delivering code with clear requirements, tests, independent QA, and handoff evidence.
+This version introduces a **3-layer execution model**, official Codex plugin metadata, executable runtime checks, a **Failure Mode Engineering system**, and an independent quality-gate contract for delivering code with clear requirements, tests, independent QA, and handoff evidence.
 
 The harness stops at code delivery. It does not perform deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation.
 
-It can use Git/GitHub, Linear, Notion, Figma, and Slack during delivery when useful. Codex decides which tools are needed from project context, with local `.ai-team/` and `docs/harness/` files as fallback. High-impact external actions still require confirmation.
+It can use Git/GitHub, Linear, Notion, Figma, and Slack during delivery when useful. Codex decides which tools are needed from project context, with local `.ai-team/` and `docs/harness/` files as fallback. External tools are adapters, not prerequisites. High-impact external actions still require confirmation.
 
 ---
 
@@ -67,12 +67,27 @@ Each feature must generate:
 
 ```
 Failure Mode Matrix
+- ID
+- Feature
 - Scenario
 - Trigger
 - Expected system behavior
 - Recovery strategy
 - Data safety guarantee
+- Risk level
 - Test coverage mapping
+```
+
+Runtime artifact:
+
+```text
+.ai-team/requirements/failure-modes.md
+```
+
+Use:
+
+```bash
+python3 plugins/codex-project-harness/scripts/add_failure_mode.py --id FM1 --feature "Feature" --scenario "Scenario" --trigger "Trigger" --expected "Expected behavior"
 ```
 
 ---
@@ -89,22 +104,72 @@ Subagents must now include:
 
 ---
 
-## 5. Design Principles
+## 5. Independent Quality Gate
+
+Before handoff, QA records must identify:
+
+- reviewed commit or revision,
+- reviewer context: `fresh`, `same-context-degraded`, or `external`,
+- result: `pass`, `fail`, `conditional`, or `blocked`,
+- blocking findings,
+- commands and evidence,
+- residual risk.
+
+Runtime artifact:
+
+```text
+docs/harness/quality-gates.md
+```
+
+Use:
+
+```bash
+python3 plugins/codex-project-harness/scripts/record_quality_gate.py --commit HEAD --reviewer-context same-context-degraded --result pass --commands "test command"
+```
+
+---
+
+## 6. Collaboration Tool Policy
+
+Tool usage is universal and context-sensitive:
+
+- Use local harness files for every project.
+- Use Git/GitHub when repo, PR, issue, checks, or review context exists.
+- Use Linear when task tracking is useful.
+- Use Notion when shared PRD, decision, QA, or handoff notes are useful.
+- Use Figma when design context or visual acceptance matters.
+- Use Slack for coordination drafts or confirmed team messages.
+
+Adapter modes:
+
+```text
+off -> read-only -> draft-write -> write-confirm -> write-auto
+```
+
+High-impact, public, destructive, paid, permission-changing, or production-affecting actions must not run automatically.
+
+---
+
+## 7. Design Principles
 
 - No single agent owns full lifecycle decisions
 - Separation of reasoning (domain sessions) and execution (subagents)
 - Failure is first-class, not optional
 - All flows must be reversible or recoverable
+- External tools enrich the flow but do not replace local state
 - Delivery ends with verified code and evidence, not deployment
 
 ---
 
-## 6. Compatibility
+## 8. Compatibility
 
-This upgrade is fully compatible with existing skills:
+This is a v2 plugin-format upgrade. Install the whole plugin directory so skills can share plugin-level `scripts/`, `references/`, `templates/`, and `schemas/`.
+
+Included skills:
 - project-harness
 - project-bootstrap
 - project-runtime
+- requirement-baseline
 - team-architecture
 - minimal-safe-change
 - test-first-delivery

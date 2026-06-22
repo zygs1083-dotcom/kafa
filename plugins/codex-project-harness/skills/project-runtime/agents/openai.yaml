@@ -1,0 +1,6 @@
+interface:
+  display_name: "项目运行时"
+  short_description: "更新阶段、任务、验收、QA、决策和交付记录。"
+  default_prompt: "Use $project-runtime to update local harness phase, tasks, acceptance criteria, validation evidence, and delivery records."
+policy:
+  allow_implicit_invocation: true

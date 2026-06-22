@@ -1,0 +1,6 @@
+interface:
+  display_name: "独立质量门"
+  short_description: "独立检查实现、测试、契约、风险和交付证据。"
+  default_prompt: "Use $independent-quality-gate to review implementation against acceptance criteria, tests, integration contracts, and residual risk."
+policy:
+  allow_implicit_invocation: true

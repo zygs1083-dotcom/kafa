@@ -20,10 +20,12 @@ Run scripts from the project root where `.ai-team/` and `docs/harness/` live.
 | Show current state | `scripts/harness_status.py` |
 | Move phase | `scripts/update_phase.py` |
 | Add acceptance criterion | `scripts/add_acceptance.py` |
+| Add failure mode | `scripts/add_failure_mode.py` |
 | Add task | `scripts/add_task.py` |
 | Update task | `scripts/update_task.py` |
 | Record decision | `scripts/record_decision.py` |
 | Record QA / validation | `scripts/record_validation.py` |
+| Record quality gate | `scripts/record_quality_gate.py` |
 | Record delivery | `scripts/record_delivery.py` |
 | Validate local harness state | `scripts/validate_harness_state.py` |
 
@@ -49,6 +51,19 @@ Add tasks only after the scope is clear enough to map work to acceptance criteri
 python3 plugins/codex-project-harness/scripts/add_acceptance.py \
   --id AC1 \
   --criterion "User can create, read, update, and delete profiles"
+```
+
+For risky work, record failure modes before implementation:
+
+```bash
+python3 plugins/codex-project-harness/scripts/add_failure_mode.py \
+  --id FM1 \
+  --feature "Profile CRUD" \
+  --scenario "duplicate submission" \
+  --trigger "same request submitted twice" \
+  --expected "only one profile is created" \
+  --risk high \
+  --test-mapping AC1
 ```
 
 ```bash
@@ -80,6 +95,16 @@ python3 plugins/codex-project-harness/scripts/record_validation.py \
   --commands "npm test -- profile-crud" \
   --findings "CRUD contract passed" \
   --result pass
+```
+
+Record the independent quality gate before handoff:
+
+```bash
+python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
+  --commit HEAD \
+  --reviewer-context fresh \
+  --result pass \
+  --commands "npm test"
 ```
 
 Record delivery when QA has acceptable evidence:

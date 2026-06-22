@@ -32,14 +32,16 @@ Bootstrap owns local setup, capability discovery, tool mapping, and safe recomme
 
 Codex should decide whether GitHub, Linear, Notion, Figma, or Slack is useful. Do not ask the user to choose tools unless the project context is genuinely ambiguous.
 
-Proceed without extra confirmation for low-risk project-management writes when the tool is clearly useful and the target is clear:
+Proceed without extra confirmation for low-risk local setup, read-only inspection, and draft artifacts when the target is clear:
 
 - local git initialization or feature branch creation,
 - local harness file initialization,
 - draft Notion/project documentation,
-- Linear or GitHub issue/task creation for the confirmed scope,
-- draft GitHub PR creation after code is ready,
+- draft Linear or GitHub issue/task content for the confirmed scope,
+- draft GitHub PR body after code is ready,
 - updating local task-board or delivery records.
+
+For external writes, use `references/tool-adapters.md` and select the least powerful adapter mode that completes the work. Use `write-auto` only when the user request already implies the write, the target is clear, the action is low risk, and the write can be safely repeated or updated.
 
 Ask before high-impact external actions:
 

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Harness 审计"
+  short_description: "检查控制面、任务、验收、工具映射和代码现实是否漂移。"
+  default_prompt: "Use $harness-audit to inspect local harness files, runtime state, tool mappings, and code reality for drift."
+policy:
+  allow_implicit_invocation: true

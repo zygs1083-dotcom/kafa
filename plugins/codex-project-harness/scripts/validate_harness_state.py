@@ -13,9 +13,11 @@ REQUIRED_FILES = [
     ".ai-team/control/tooling-map.md",
     ".ai-team/requirements/requirements.md",
     ".ai-team/requirements/acceptance.md",
+    ".ai-team/requirements/failure-modes.md",
     ".ai-team/planning/task-board.md",
     "docs/harness/bootstrap.md",
     "docs/harness/validation.md",
+    "docs/harness/quality-gates.md",
     "docs/harness/delivery.md",
 ]
 
@@ -66,8 +68,10 @@ def main() -> int:
         errors.append("project state missing phase")
 
     acceptance_rows = table_rows(root / ".ai-team/requirements/acceptance.md")
+    failure_mode_rows = table_rows(root / ".ai-team/requirements/failure-modes.md")
     task_rows = table_rows(root / ".ai-team/planning/task-board.md")
     validation_rows = table_rows(root / "docs/harness/validation.md")
+    quality_gate_rows = table_rows(root / "docs/harness/quality-gates.md")
 
     if phase in {"planning", "implementation", "qa", "delivery_readiness", "retrospective"} and not task_rows:
         errors.append("phase requires task-board rows, but no tasks were found")
@@ -75,6 +79,8 @@ def main() -> int:
         warnings.append("implementation-phase work has no acceptance criteria rows")
     if phase in {"delivery_readiness", "retrospective"} and not validation_rows:
         errors.append("delivery requires validation evidence, but no validation rows were found")
+    if phase in {"delivery_readiness", "retrospective"} and not quality_gate_rows:
+        warnings.append("delivery has no quality gate record")
 
     for row in task_rows:
         while len(row) < 8:
@@ -86,6 +92,8 @@ def main() -> int:
             warnings.append(f"task has no concrete owner: {task_id}")
         if not acceptance:
             warnings.append(f"task has no acceptance mapping: {task_id}")
+        if failure_mode_rows and not any(task_id in "|".join(fm_row) or acceptance in "|".join(fm_row) for fm_row in failure_mode_rows):
+            warnings.append(f"task has no failure-mode mapping: {task_id}")
         if status in {"done", "qa", "delivery_ready"} and not evidence:
             warnings.append(f"completed task has no evidence: {task_id}")
 

@@ -1,17 +1,20 @@
 ---
 name: "independent-quality-gate"
-description: "Use when the user asks for independent QA, code review, acceptance review, system consistency checks, or validation before code delivery or merge. Reviews implementation, tests, and delivery evidence; does not approve deployment or production release."
+description: "Use when the user asks for independent QA, code review, acceptance review, system consistency checks, or validation before code delivery or merge. Trigger for 独立验收, 代码审查, QA, 质量门, 合并前检查, 交付前检查, independent review, quality gate. Reviews implementation, tests, and delivery evidence; does not approve deployment or production release."
 ---
 
 # Independent Quality Gate
 
 Review as an independent evaluator. Prioritize bugs, regressions, missing tests, security issues, and integration mismatches.
 
+Prefer fresh-context review when possible. If the same conversation produced the implementation, mark the review as `same-context-degraded` and apply a stricter posture.
+
 ## Review Focus
 
 Check:
 
 - requirement to implementation traceability,
+- failure mode coverage for risky behavior,
 - Linear/GitHub/Notion/Figma mappings against local acceptance criteria when present,
 - GitHub PR diff, checks, and review context when available,
 - tests proving meaningful behavior,
@@ -34,6 +37,7 @@ For broad changes, split QA into short-lived subagents by risk surface. Examples
 
 Each subagent must return evidence: files inspected, commands run, findings, and residual risk.
 Record each material QA result with `scripts/record_validation.py`.
+Record the gate decision with `scripts/record_quality_gate.py`, including the reviewed commit or revision.
 
 Use this output shape for each QA subagent:
 
@@ -52,6 +56,14 @@ Residual Risk:
 ## Producer Separation
 
 The reviewer should not rubber-stamp their own implementation. If you produced the change, switch into a stricter review stance and say so.
+
+## Blocking Rules
+
+- Critical or high findings fail the gate.
+- Missing required validation fails or blocks the gate.
+- Medium findings require explicit residual-risk acceptance.
+- Same-context review can pass only with `reviewer_context: same-context-degraded` and clear residual-risk notes.
+- Code changes after QA require a new gate record for the new commit or revision.
 
 ## Output
 

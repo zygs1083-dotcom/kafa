@@ -35,12 +35,22 @@ REQUIRED_SCRIPTS = [
     "harness_status.py",
     "update_phase.py",
     "add_acceptance.py",
+    "add_failure_mode.py",
     "add_task.py",
     "update_task.py",
     "record_decision.py",
     "record_validation.py",
+    "record_quality_gate.py",
     "record_delivery.py",
     "validate_harness_state.py",
+]
+
+REQUIRED_SCHEMAS = [
+    "project-state.schema.json",
+    "task.schema.json",
+    "event.schema.json",
+    "quality-gate.schema.json",
+    "failure-mode.schema.json",
 ]
 
 
@@ -60,15 +70,38 @@ def main() -> int:
     errors: list[str] = []
     if data.get("name") != "codex-project-harness":
         errors.append("plugin name must be codex-project-harness")
+    if "schema_version" in data:
+        errors.append("plugin.json must not use legacy schema_version")
+    if "display_name" in data:
+        errors.append("plugin.json must not use legacy display_name")
+    if not isinstance(data.get("author"), dict):
+        errors.append("plugin author must be an object")
+    if data.get("skills") != "./skills/":
+        errors.append('plugin skills must be the relative string "./skills/"')
 
-    manifest_skills = data.get("skills", [])
-    for skill in REQUIRED_SKILLS:
-        expected_path = f"skills/{skill}"
-        if expected_path not in manifest_skills:
-            errors.append(f"manifest missing skill path: {expected_path}")
+    interface = data.get("interface")
+    if not isinstance(interface, dict):
+        errors.append("plugin interface is required")
+    else:
+        for key in [
+            "displayName",
+            "shortDescription",
+            "longDescription",
+            "developerName",
+            "category",
+            "capabilities",
+            "defaultPrompt",
+        ]:
+            if key not in interface:
+                errors.append(f"plugin interface missing field: {key}")
+        if "capabilities" in interface and not isinstance(interface["capabilities"], list):
+            errors.append("plugin interface.capabilities must be a list")
+        if "defaultPrompt" in interface and not isinstance(interface["defaultPrompt"], list):
+            errors.append("plugin interface.defaultPrompt must be a list")
 
     for skill in REQUIRED_SKILLS:
-        skill_md = root / "skills" / skill / "SKILL.md"
+        skill_dir = root / "skills" / skill
+        skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             errors.append(f"missing skill file: {skill_md}")
             continue
@@ -77,6 +110,21 @@ def main() -> int:
             errors.append(f"missing front matter: {skill_md}")
         if f'name: "{skill}"' not in text and f"name: {skill}" not in text:
             errors.append(f"skill name mismatch: {skill_md}")
+        if "description:" not in text.split("---", 2)[1]:
+            errors.append(f"missing description in front matter: {skill_md}")
+        openai_yaml = skill_dir / "agents" / "openai.yaml"
+        if not openai_yaml.exists():
+            errors.append(f"missing skill UI metadata: {openai_yaml}")
+        else:
+            yaml_text = openai_yaml.read_text(encoding="utf-8")
+            for required in ["interface:", "display_name:", "short_description:", "default_prompt:"]:
+                if required not in yaml_text:
+                    errors.append(f"openai.yaml missing {required}: {openai_yaml}")
+
+    skill_dirs = {path.name for path in (root / "skills").iterdir() if path.is_dir()}
+    extra_skills = sorted(skill_dirs - set(REQUIRED_SKILLS))
+    for skill in extra_skills:
+        errors.append(f"unexpected skill directory: {root / 'skills' / skill}")
 
     for ref in REQUIRED_REFERENCES:
         ref_path = root / "references" / ref
@@ -87,6 +135,20 @@ def main() -> int:
         script_path = root / "scripts" / script
         if not script_path.exists():
             errors.append(f"missing runtime script: {script_path}")
+
+    for schema in REQUIRED_SCHEMAS:
+        schema_path = root / "schemas" / schema
+        if not schema_path.exists():
+            errors.append(f"missing schema file: {schema_path}")
+            continue
+        try:
+            json.loads(schema_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append(f"invalid schema json {schema_path}: {exc}")
+
+    install_md = root.parent.parent / "INSTALL.md"
+    if install_md.exists() and "Copy every folder under" in install_md.read_text(encoding="utf-8"):
+        errors.append("INSTALL.md still documents broken copy-skills installation mode")
 
     stale_paths = [
         root / "skills" / "release-readiness" / "SKILL.md",

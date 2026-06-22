@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Event",
+  "type": "object",
+  "required": ["timestamp", "type", "payload"],
+  "properties": {
+    "timestamp": { "type": "string" },
+    "type": { "type": "string" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

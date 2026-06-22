@@ -1,6 +1,6 @@
 ---
 name: "requirement-baseline"
-description: "Use when requirements are vague, changing, or need to be turned into a confirmed code-delivery baseline with acceptance criteria, non-goals, risks, and traceability before implementation. Use before building a project or feature when Codex must clarify scope with the user before producing code."
+description: "Use when requirements are vague, changing, or need to be turned into a confirmed code-delivery baseline with acceptance criteria, non-goals, risks, failure modes, and traceability before implementation. Trigger for 需求澄清, 需求基线, 验收标准, 范围确认, clarify requirements, acceptance criteria, scope baseline. Use before building a project or feature when Codex must clarify scope with the user before producing code."
 ---
 
 # Requirement Baseline
@@ -16,7 +16,9 @@ Turn an idea into an executable requirement baseline.
 5. Record assumptions and open questions.
 6. Ask only high-leverage questions; continue with stated assumptions when safe.
 7. Freeze a baseline before implementation when scope is broad.
-8. Map the baseline to useful collaboration tools when context supports it:
+8. Assign stable IDs for requirements and acceptance criteria when implementation will proceed.
+9. Identify failure modes for risky work and record them with `scripts/add_failure_mode.py`.
+10. Map the baseline to useful collaboration tools when context supports it:
    - Notion for PRD and decision records.
    - Linear or GitHub issues for scope, tasks, and acceptance checklists.
    - Figma for design inputs, prototypes, component constraints, and visual acceptance.
@@ -34,6 +36,10 @@ Codex should decide whether external tools are useful. Use local harness files a
 - If Linear or GitHub issue tracking is useful, map each acceptance criterion to an issue/task/checklist item.
 - If Figma is relevant, record design links, frames, unresolved design questions, and visual acceptance criteria.
 - If Slack would reduce coordination friction, prepare a summary; ask before sending to a channel or person.
+
+## Failure Mode Policy
+
+Create Failure Mode IDs such as `FM1`, `FM2` when the work touches data writes, external APIs, permissions, concurrency, retry behavior, message processing, migrations, billing, or irreversible behavior. Pure copy/style changes may be exempt, but record the exemption reason in risks or assumptions.
 
 ## Confirmation Gate
 
@@ -64,6 +70,7 @@ Use this structure:
 ## Functional Requirements
 ## Non-Functional Requirements
 ## Acceptance Criteria
+## Failure Modes
 ## Non-Goals
 ## Delivery Boundary
 ## Tool Mapping

@@ -62,6 +62,14 @@ Expected output:
 
 For example, if a GitHub remote exists and the task is large, Codex may use GitHub issues or a draft PR. If no Linear/Notion/Figma/Slack context is present, Codex should continue with local harness files instead of stopping.
 
+External tools should be selected by adapter mode:
+
+```text
+off | read-only | draft-write | write-confirm | write-auto
+```
+
+Public, destructive, paid, permission-changing, or production-affecting actions require confirmation and are outside normal code delivery.
+
 ## 3. Requirement Baseline
 
 Codex should produce a baseline and ask for confirmation when scope is broad.
@@ -73,6 +81,7 @@ Codex should produce a baseline and ask for confirmation when scope is broad.
 - 必须实现：亲友档案 CRUD、生日字段、近期生日列表、基础关系图展示。
 - 暂不实现：云端同步、社交邀请、复杂权限、部署上线。
 - 验收标准：能新增/编辑/删除亲友；能看到 30 天内生日；能查看基础关系图；关键流程有测试或可执行验证。
+- 失败模式：重复提交、无效日期、关系数据循环、存储失败、空数据状态。
 - 工具映射：本地 `.ai-team` 作为默认事实源；如检测到 GitHub/Linear/Notion/Figma 上下文则自动映射。
 - 风险和待确认：数据存储方式、提醒方式、关系图复杂度。
 
@@ -100,15 +109,26 @@ Agents:
 
 ## 5. Planning
 
-Codex should break confirmed scope into implementation tasks tied to acceptance criteria.
+Codex should break confirmed scope into implementation tasks tied to acceptance criteria and failure-mode IDs.
 
 ```text
+Acceptance:
+- AC1 Relative profile CRUD
+- AC2 30-day birthday reminder list
+- AC3 Basic relationship graph
+
+Failure Modes:
+- FM1 Duplicate profile submit creates duplicated records
+- FM2 Invalid birthday causes broken reminder sorting
+- FM3 Relationship loop crashes graph rendering
+- FM4 Local storage write fails mid-operation
+
 Task Board:
-- T1 Data model and local storage | Tool link: local or Linear/GitHub
-- T2 Relative profile CRUD | Tool link: local or Linear/GitHub
-- T3 Birthday reminder list | Tool link: local or Linear/GitHub
-- T4 Relationship graph view | Tool link: local or Linear/GitHub/Figma
-- T5 Tests and validation | Tool link: local or GitHub checks
+- T1 Data model and local storage | Acceptance: AC1 | Failure: FM4 | Tool link: local or Linear/GitHub
+- T2 Relative profile CRUD | Acceptance: AC1 | Failure: FM1 | Tool link: local or Linear/GitHub
+- T3 Birthday reminder list | Acceptance: AC2 | Failure: FM2 | Tool link: local or Linear/GitHub
+- T4 Relationship graph view | Acceptance: AC3 | Failure: FM3 | Tool link: local or Linear/GitHub/Figma
+- T5 Tests and validation | Acceptance: AC1, AC2, AC3 | Failure: FM1-FM4 | Tool link: local or GitHub checks
 - T6 Independent QA | Tool link: local or GitHub review/Notion note
 - T7 Delivery readiness | Tool link: local or GitHub PR/Notion handoff
 ```
@@ -117,6 +137,7 @@ Codex should record these tasks through `project-runtime`, for example:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/add_task.py --id T1 --task "Data model and local storage" --owner architect --acceptance AC1
+python3 plugins/codex-project-harness/scripts/add_failure_mode.py --id FM1 --feature "Relative profile CRUD" --scenario "Duplicate submit" --trigger "same form submitted twice" --expected "only one record is created" --risk high --test-mapping AC1
 ```
 
 ## 6. Implementation
@@ -151,7 +172,18 @@ QA-D: permission/security review when relevant
 ```
 
 Each QA subagent must return findings, evidence, and residual risk.
-Codex should record material QA results with `scripts/record_validation.py`.
+Codex should record material QA results with `scripts/record_validation.py` and the final gate with `scripts/record_quality_gate.py`.
+
+The quality gate must include the reviewed commit or revision and reviewer context:
+
+```bash
+python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
+  --commit HEAD \
+  --reviewer-context same-context-degraded \
+  --result pass \
+  --commands "npm test" \
+  --evidence "QA-A/QA-B/QA-C reviewed acceptance and failure modes"
+```
 
 ## 8. Delivery Readiness
 
@@ -166,6 +198,8 @@ Final output should package the code delivery:
 ## Validation
 ## Independent QA
 ## Collaboration Links
+## Failure Mode Coverage
+## Quality Gate
 ## Data / Config Notes
 ## Known Gaps
 ## Handoff Notes

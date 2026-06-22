@@ -1,0 +1,6 @@
+interface:
+  display_name: "项目交付总控"
+  short_description: "从需求到已验证代码交付的通用项目小队流程。"
+  default_prompt: "Use $project-harness to clarify the requirement, bootstrap the workspace, plan tasks, implement, validate, and hand off verified code."
+policy:
+  allow_implicit_invocation: true

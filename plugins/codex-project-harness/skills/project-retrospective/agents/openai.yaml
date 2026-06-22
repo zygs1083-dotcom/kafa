@@ -1,0 +1,6 @@
+interface:
+  display_name: "项目复盘"
+  short_description: "从交付证据中沉淀流程、技能、小队和工具改进。"
+  default_prompt: "Use $project-retrospective to summarize wins, problems, root causes, process changes, tooling changes, and follow-up tasks."
+policy:
+  allow_implicit_invocation: true

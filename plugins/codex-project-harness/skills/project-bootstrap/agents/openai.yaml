@@ -1,0 +1,6 @@
+interface:
+  display_name: "项目启动检查"
+  short_description: "检查 git、控制文件和可用协作工具，建立交付控制面。"
+  default_prompt: "Use $project-bootstrap to inspect the workspace, initialize harness files, and map useful collaboration tools."
+policy:
+  allow_implicit_invocation: true

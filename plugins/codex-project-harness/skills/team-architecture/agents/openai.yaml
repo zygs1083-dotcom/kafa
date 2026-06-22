@@ -1,0 +1,6 @@
+interface:
+  display_name: "小队架构"
+  short_description: "为通用代码交付选择最小有效 Agent 小队和审查门。"
+  default_prompt: "Use $team-architecture to choose the smallest effective team, role sessions, subagent split, and review gates for this delivery."
+policy:
+  allow_implicit_invocation: true

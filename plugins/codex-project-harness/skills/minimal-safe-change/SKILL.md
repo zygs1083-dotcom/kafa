@@ -1,6 +1,6 @@
 ---
 name: "minimal-safe-change"
-description: "Use when the user asks for the smallest complete safe code change, wants to avoid unrelated refactors, or needs a focused patch with verification and reversal awareness. Use for code delivery only; do not deploy or perform production operations."
+description: "Use when the user asks for the smallest complete safe code change, wants to avoid unrelated refactors, or needs a focused patch with verification and reversal awareness. Trigger for Chinese or English requests such as 最小改动, 不做无关重构, 字段兼容, 局部修复, 小范围修改, small focused patch, compatibility fix, narrow safe change. Use for code delivery only; do not deploy or perform production operations."
 ---
 
 # Minimal Safe Change

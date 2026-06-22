@@ -1,6 +1,6 @@
 ---
 name: "bug-fix-loop"
-description: "Use when fixing a bug, investigating an error, reproducing a failure, or preventing a regression from returning."
+description: "Use when fixing a bug, investigating an error, reproducing a failure, or preventing a regression from returning. Trigger for 修 bug, 排查错误, 复现问题, 失败定位, 防回归, fix bug, investigate error, reproduce failure, regression prevention."
 ---
 
 # Bug Fix Loop

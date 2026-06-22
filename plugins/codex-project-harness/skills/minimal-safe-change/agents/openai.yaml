@@ -1,0 +1,6 @@
+interface:
+  display_name: "最小安全改动"
+  short_description: "用最小完整改动完成局部修复并验证。"
+  default_prompt: "Use $minimal-safe-change to make the smallest complete safe code change with focused verification and no unrelated refactor."
+policy:
+  allow_implicit_invocation: true

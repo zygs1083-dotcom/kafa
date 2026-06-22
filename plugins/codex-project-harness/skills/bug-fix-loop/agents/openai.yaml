@@ -1,0 +1,6 @@
+interface:
+  display_name: "Bug 修复闭环"
+  short_description: "复现、定位、修复并防止回归。"
+  default_prompt: "Use $bug-fix-loop to reproduce the bug, identify root cause, apply a focused fix, and add regression evidence."
+policy:
+  allow_implicit_invocation: true

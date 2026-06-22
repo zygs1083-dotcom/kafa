@@ -98,17 +98,18 @@ Use this baseline confirmation shape before implementation on broad work:
 3. Use `project-runtime` to update the current phase and local control plane.
 4. Clarify only missing information that materially changes scope, risk, or acceptance.
 5. Build a requirement baseline with acceptance criteria and non-goals.
-6. Ask for confirmation before treating the baseline as execution scope when the project is ambiguous or high impact.
-7. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
-8. Use `team-architecture` logic to choose the smallest effective agent team.
-9. Add tasks through `project-runtime` with owners, acceptance mapping, tool mapping, dependencies, and evidence fields.
-10. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
-11. Keep producer and reviewer roles separate.
-12. Use a maximum of two producer-reviewer retry loops before escalating.
-13. Run integration coherence QA before declaring completion.
-14. Record QA and delivery evidence through `project-runtime`.
-15. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
-16. Finish with a concise delivery report and update the evolution log when useful.
+6. Identify failure modes for risky behavior and map them to acceptance criteria or explicit exemptions.
+7. Ask for confirmation before treating the baseline as execution scope when the project is ambiguous or high impact.
+8. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
+9. Use `team-architecture` logic to choose the smallest effective agent team.
+10. Add tasks through `project-runtime` with owners, acceptance mapping, failure-mode mapping, tool mapping, dependencies, and evidence fields.
+11. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
+12. Keep producer and reviewer roles separate.
+13. Use a maximum of two producer-reviewer retry loops before escalating.
+14. Run integration coherence QA before declaring completion.
+15. Record QA, quality-gate, and delivery evidence through `project-runtime`.
+16. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
+17. Finish with a concise delivery report and update the evolution log when useful.
 
 ## Skill Routing
 
@@ -164,11 +165,13 @@ Create or maintain these when the project is substantial:
 .ai-team/control/decision-log.md
 .ai-team/requirements/requirements.md
 .ai-team/requirements/acceptance.md
+.ai-team/requirements/failure-modes.md
 .ai-team/requirements/traceability.md
 .ai-team/planning/task-board.md
 docs/harness/bootstrap.md
 docs/harness/team-architecture.md
 docs/harness/validation.md
+docs/harness/quality-gates.md
 docs/harness/delivery.md
 docs/harness/evolution-log.md
 ```
@@ -207,6 +210,8 @@ Final delivery must include:
 - changed files or modules,
 - tests/checks run and results,
 - independent QA findings,
+- failure-mode coverage or exemption reason,
+- quality-gate result, reviewed commit/revision, and reviewer context,
 - GitHub/Linear/Notion/Figma/Slack links or fallback local artifacts used,
 - known gaps or residual risks,
 - explicit note that deployment is not included.

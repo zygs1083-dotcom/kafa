@@ -16,11 +16,12 @@ The `project-harness` skill should:
 4. clarify requirements,
 5. ask for baseline confirmation when needed,
 6. initialize `.ai-team/` and `docs/harness/`,
-7. generate the project team architecture,
-8. dispatch implementation and review work,
-9. verify delivery,
-10. prepare code delivery evidence,
-11. run a retrospective.
+7. create acceptance criteria and failure-mode IDs for risky behavior,
+8. generate the project team architecture,
+9. dispatch implementation and review work,
+10. record validation and an independent quality gate,
+11. prepare code delivery evidence,
+12. run a retrospective.
 
 It should decide which collaboration tools are useful from context. Local harness files are the fallback. It should stop at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are outside this harness.
 
@@ -42,7 +43,7 @@ $project-runtime
 
 ```text
 $requirement-baseline
-帮我把这个需求问清楚，形成可验收的需求基线。
+帮我把这个需求问清楚，形成可验收的需求基线，并列出关键失败模式。
 ```
 
 ```text
@@ -57,5 +58,5 @@ $independent-quality-gate
 
 ```text
 $delivery-readiness
-整理本次代码交付证据，包括验收映射、变更文件、测试结果、QA 结论和遗留风险。
+整理本次代码交付证据，包括验收映射、失败模式覆盖、变更文件、测试结果、质量门结论和遗留风险。
 ```
