@@ -2,15 +2,19 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Event",
   "type": "object",
-  "required": ["id", "schema_version", "timestamp", "type", "source", "target", "payload"],
+  "required": ["id", "schema_version", "type", "source", "target", "payload_json", "created_at"],
   "properties": {
+    "sequence": { "type": "integer" },
     "id": { "type": "string" },
-    "schema_version": { "type": "string" },
-    "timestamp": { "type": "string" },
+    "schema_version": { "type": "integer" },
     "type": { "type": "string" },
     "source": { "type": "string" },
     "target": { "type": "string" },
-    "payload": { "type": "object" }
+    "correlation_id": { "type": "string" },
+    "causation_id": { "type": "string" },
+    "idempotency_key": { "type": "string" },
+    "payload_json": { "type": "string" },
+    "created_at": { "type": "string" }
   },
   "additionalProperties": false
 }

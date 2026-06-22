@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +13,11 @@ from pathlib import Path
 
 STATE_PATH = Path(".ai-team/control/project-state.yaml")
 EVENT_PATH = Path(".ai-team/runtime/events.jsonl")
+HARNESS_GIT_PREFIXES = (
+    ".ai-team/",
+    ".codex/agents/",
+    "docs/harness/",
+)
 
 
 def now_iso() -> str:
@@ -123,7 +129,34 @@ def git_dirty(root: Path) -> bool | None:
         )
     except (OSError, subprocess.CalledProcessError):
         return None
-    return bool(result.stdout.strip())
+    for line in result.stdout.splitlines():
+        relpath = line[3:] if len(line) > 3 else ""
+        if relpath and not relpath.startswith(HARNESS_GIT_PREFIXES):
+            return True
+    return False
+
+
+def git_source_tree_hash(root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    digest = hashlib.sha256()
+    for relpath in sorted(path for path in result.stdout.splitlines() if path and not path.startswith(HARNESS_GIT_PREFIXES)):
+        path = root / relpath
+        if not path.exists() or not path.is_file():
+            continue
+        digest.update(relpath.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def append_table_row(root: Path, relpath: str, row: list[str], header: str) -> None:

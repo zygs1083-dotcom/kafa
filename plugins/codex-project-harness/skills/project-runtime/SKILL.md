@@ -32,14 +32,14 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair` |
-| Migrate state | `harness.py --root . migrate --from-version 2 --to-version 3` |
+| Migrate state | `harness.py --root . migrate --from-version 4 --to-version 5` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Add acceptance criterion | `harness.py --root . acceptance add` |
 | Add failure mode | `harness.py --root . failure-mode add` |
 | Add task | `harness.py --root . task add` |
 | Find next task | `harness.py --root . task next` |
 | Claim / release task | `harness.py --root . task claim`, `harness.py --root . task release` |
-| Start / complete task | `harness.py --root . task start`, `harness.py --root . task complete` |
+| Start / submit / review / accept task | `harness.py --root . task start`, `harness.py --root . task submit`, `harness.py --root . task review`, `harness.py --root . task accept` |
 | Record decision | `harness.py --root . decision record` |
 | Record QA / validation | `harness.py --root . validation record` |
 | Record quality gate | `harness.py --root . gate record` |
@@ -97,9 +97,13 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . task add \
 Update task state as implementation progresses:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1 --agent developer
-python3 plugins/codex-project-harness/scripts/harness.py --root . task complete T1 \
+python3 plugins/codex-project-harness/scripts/harness.py --root . task claim T1 --agent developer --expected-revision 1
+python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1 --agent developer --lease-token "<token>" --expected-revision 2
+python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 --agent developer --lease-token "<token>" --expected-revision 3 \
   --evidence "npm test -- profile-crud passed"
+python3 plugins/codex-project-harness/scripts/harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4
+python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 --agent qa-reviewer --lease-token "<review-token>" --expected-revision 5 \
+  --evidence "independent QA accepted"
 ```
 
 ## Evidence Protocol
@@ -110,6 +114,7 @@ Record validation before delivery readiness:
 python3 plugins/codex-project-harness/scripts/harness.py --root . validation record \
   --surface "API contract" \
   --acceptance AC1 \
+  --failure-mode FM1 \
   --commands "npm test -- profile-crud" \
   --findings "CRUD contract passed" \
   --result pass

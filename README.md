@@ -260,17 +260,19 @@ harness.py --root . init
 harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
-harness.py --root . migrate --from-version 2 --to-version 3
+harness.py --root . migrate --from-version 4 --to-version 5
 harness.py --root . phase project_bootstrap
 harness.py --root . acceptance add --id AC1 --criterion "Example acceptance"
 harness.py --root . failure-mode add --id FM1 --feature "Example" --scenario "Risk" --trigger "Bad input" --expected "Safe handling" --acceptance AC1
 harness.py --root . task add --id T1 --task "Implement example" --acceptance AC1 --failure-mode FM1
 harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
-harness.py --root . task start T1 --agent developer
-harness.py --root . task complete T1 --evidence "tests passed"
+harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2
+harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 3 --evidence "tests passed"
+harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4
+harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 5 --evidence "review passed"
 harness.py --root . decision record --decision "Selected local runtime" --reason "SQLite is the source of truth"
-harness.py --root . validation record --surface "Example" --findings "passed" --result pass
+harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass
 harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command"
 harness.py --root . delivery record --scope "Example delivery" --validation "tests passed" --quality-gate "independent_qa pass"
 harness.py --root . adapter record --tool github --mode read-only --artifact Tasks --external-id issue-1 --idempotency-key codex-project-harness:project:task:T1

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -19,6 +21,15 @@ def run_script(root: Path, script: str, *args: str, check: bool = True) -> subpr
         capture_output=True,
         check=check,
     )
+
+
+def task_revision(root: Path, task_id: str) -> int:
+    with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+        return int(conn.execute("select revision from tasks where id = ?", (task_id,)).fetchone()[0])
+
+
+def token_from_stdout(stdout: str) -> str:
+    return stdout.split("token=", 1)[1].strip()
 
 
 class HarnessRuntimeValidationTest(unittest.TestCase):
@@ -39,13 +50,17 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--acceptance",
             "AC1",
         )
-        run_script(root, "harness.py", "task", "start", "T1", "--agent", "developer")
-        run_script(root, "harness.py", "task", "complete", "T1", "--evidence", "example evidence")
+        claim = run_script(root, "harness.py", "task", "claim", "T1", "--agent", "developer", "--expected-revision", str(task_revision(root, "T1")))
+        producer_token = token_from_stdout(claim.stdout)
+        run_script(root, "harness.py", "task", "start", "T1", "--agent", "developer", "--lease-token", producer_token, "--expected-revision", str(task_revision(root, "T1")))
+        run_script(root, "harness.py", "task", "submit", "T1", "--agent", "developer", "--lease-token", producer_token, "--expected-revision", str(task_revision(root, "T1")), "--evidence", "example evidence")
+        review = run_script(root, "harness.py", "task", "review", "T1", "--agent", "qa-reviewer", "--expected-revision", str(task_revision(root, "T1")))
+        reviewer_token = token_from_stdout(review.stdout)
+        run_script(root, "harness.py", "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", str(task_revision(root, "T1")), "--evidence", "reviewed")
         return temp
 
-    def add_pass_validation(self, root: Path) -> None:
-        run_script(
-            root,
+    def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
+        command = [
             "record_validation.py",
             "--surface",
             "Example behavior",
@@ -57,6 +72,12 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "passed",
             "--result",
             "pass",
+        ]
+        if failure_mode:
+            command.extend(["--failure-mode", "FM1"])
+        run_script(
+            root,
+            *command,
         )
 
     def add_failure_mode(self, root: Path, status: str = "covered") -> None:
@@ -101,8 +122,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_delivery_passes_with_closed_failure_mode_and_passing_gate(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_pass_validation(root)
             self.add_failure_mode(root, status="covered")
+            self.add_pass_validation(root)
             self.add_quality_gate(root, result="pass")
 
             result = self.validate(root)
@@ -113,8 +134,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_empty_quality_gate_table_is_not_a_gate(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_pass_validation(root)
             self.add_failure_mode(root, status="covered")
+            self.add_pass_validation(root)
 
             result = self.validate(root)
 
@@ -124,8 +145,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_failed_quality_gate_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_pass_validation(root)
             self.add_failure_mode(root, status="covered")
+            self.add_pass_validation(root)
             self.add_quality_gate(root, result="fail")
 
             result = self.validate(root)
@@ -136,6 +157,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_failed_validation_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
+            self.add_failure_mode(root, status="covered")
             run_script(
                 root,
                 "record_validation.py",
@@ -149,8 +171,9 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
                 "failed",
                 "--result",
                 "fail",
+                "--failure-mode",
+                "FM1",
             )
-            self.add_failure_mode(root, status="covered")
             self.add_quality_gate(root, result="pass")
 
             result = self.validate(root)
@@ -161,14 +184,14 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_open_critical_failure_mode_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_pass_validation(root)
             self.add_failure_mode(root, status="identified")
+            self.add_pass_validation(root, failure_mode=False)
             self.add_quality_gate(root, result="pass")
 
             result = self.validate(root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("critical failure mode is not closed", result.stdout)
+        self.assertIn("critical failure mode is not covered", result.stdout)
 
     def test_project_runtime_cli_locates_plugin_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

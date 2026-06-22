@@ -9,7 +9,7 @@
     "owner": { "type": "string" },
     "status": {
       "type": "string",
-      "enum": ["ready", "claimed", "in_progress", "blocked", "accepted", "failed", "cancelled", "skipped"]
+      "enum": ["ready", "claimed", "in_progress", "submitted", "review", "blocked", "accepted", "failed", "cancelled", "skipped"]
     },
     "acceptance_ids": { "type": "array", "items": { "type": "string" } },
     "failure_mode_ids": { "type": "array", "items": { "type": "string" } },

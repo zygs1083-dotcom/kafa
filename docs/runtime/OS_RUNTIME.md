@@ -25,7 +25,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . init
 python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 2 --to-version 3
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 4 --to-version 5
 ```
 
 When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:
@@ -97,7 +97,7 @@ evidence
 Supported task lifecycle:
 
 ```text
-ready -> claimed -> in_progress -> accepted
+ready -> claimed -> in_progress -> submitted -> review -> accepted
 ready -> blocked
 in_progress -> blocked
 ready/in_progress -> failed
@@ -109,8 +109,10 @@ Key commands:
 harness.py --root . task add --id T1 --task "Implement API" --acceptance AC1
 harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
-harness.py --root . task start T1 --agent developer
-harness.py --root . task complete T1 --evidence "tests passed"
+harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2
+harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 3 --evidence "tests passed"
+harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4
+harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 5 --evidence "review passed"
 harness.py --root . task block T1 --reason "waiting for schema decision"
 harness.py --root . task release T1 --agent developer
 ```
@@ -123,6 +125,7 @@ Scheduler rules:
 - `task next` returns only ready tasks whose dependencies are accepted.
 - `task claim` requires expected revision and creates a lease.
 - `task claim` and `task start` fail when dependencies are not accepted.
+- Producers submit work; reviewers accept it. `task complete` is retained as a compatibility alias for submit and does not accept work.
 - stale claims fail with a revision mismatch.
 
 ## Agent Registry
@@ -174,7 +177,9 @@ harness.py --root . failure-mode add \
   --acceptance AC1
 ```
 
-High and critical failure modes must be `covered` or formally `accepted` before delivery readiness can pass.
+High and critical failure modes must be covered by passing validation or formally accepted before delivery readiness can pass.
+
+For high and critical risks, `covered` is not a self-attested flag. Delivery readiness requires at least one passing validation explicitly linked with `--failure-mode FMx`, unless the risk is accepted or exempted with accepted-by, acceptance-reason, and expires-at.
 
 Accepted risks can record:
 
@@ -189,10 +194,10 @@ Quality gates are fail-closed. Delivery readiness requires:
 - latest gate result is `pass`
 - no blocking findings
 - validation records are `pass`
-- high/critical failure modes are closed
+- high/critical failure modes are covered by passing validation or formally accepted
 - active tasks are accepted
-- Git worktree is clean when Git exists
-- gate commit matches current HEAD when Git exists
+- Git worktree is clean outside harness runtime files when Git exists
+- gate source tree hash matches current code outside harness runtime files when Git exists
 
 `same-context-degraded` is blocked for high/critical risk delivery.
 

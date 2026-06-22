@@ -17,25 +17,27 @@ def main() -> int:
     parser.add_argument("--findings", required=True)
     parser.add_argument("--result", choices=["pass", "fail", "blocked", "partial"], required=True)
     parser.add_argument("--risk", default="")
+    parser.add_argument("--failure-mode", action="append", default=[])
     args = parser.parse_args()
-    return run_harness(
-        [
-            "validation",
-            "record",
-            "--surface",
-            args.surface,
-            "--acceptance",
-            args.acceptance,
-            "--commands",
-            args.commands,
-            "--findings",
-            args.findings,
-            "--result",
-            args.result,
-            "--risk",
-            args.risk,
-        ]
-    )
+    command = [
+        "validation",
+        "record",
+        "--surface",
+        args.surface,
+        "--acceptance",
+        args.acceptance,
+        "--commands",
+        args.commands,
+        "--findings",
+        args.findings,
+        "--result",
+        args.result,
+        "--risk",
+        args.risk,
+    ]
+    for failure_mode in args.failure_mode:
+        command.extend(["--failure-mode", failure_mode])
+    return run_harness(command)
 
 
 if __name__ == "__main__":

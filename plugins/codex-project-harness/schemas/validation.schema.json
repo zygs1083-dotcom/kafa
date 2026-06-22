@@ -8,6 +8,7 @@
     "surface": { "type": "string" },
     "acceptance_id": { "type": "string" },
     "commands": { "type": "string" },
+    "failure_mode_ids": { "type": "array", "items": { "type": "string" } },
     "findings": { "type": "string" },
     "result": { "type": "string", "enum": ["pass", "fail", "blocked", "partial"] },
     "residual_risk": { "type": "string" },

@@ -27,18 +27,17 @@ def main() -> int:
             unsupported.append("--" + name.replace("_", "-"))
     if unsupported:
         print(
-            "ERROR: update_task.py only updates status and dependencies; use harness.py task add/complete/block for "
+            "ERROR: update_task.py only updates non-terminal status and dependencies; use harness.py task submit/review/accept/block for "
             + ", ".join(unsupported),
             file=sys.stderr,
         )
         return 2
     if args.status == "accepted":
-        if not args.evidence:
-            print("ERROR: accepted tasks require --evidence and must use task complete", file=sys.stderr)
-            return 2
-        return run_harness(["task", "complete", args.id, "--evidence", args.evidence])
+        print("ERROR: accepted tasks must use harness.py task review followed by task accept", file=sys.stderr)
+        return 2
     if args.status == "blocked":
-        return run_harness(["task", "block", args.id, "--reason", args.evidence or "blocked"])
+        print("ERROR: blocked tasks must use harness.py task block with lease token and expected revision", file=sys.stderr)
+        return 2
     command = ["task", "update", args.id]
     if args.status:
         command.extend(["--status", args.status])

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from harness_db import (
     HarnessError,
+    accept_task,
     add_acceptance,
     add_failure_mode,
     add_task,
@@ -28,9 +29,11 @@ from harness_db import (
     repair,
     start_task,
     status_lines,
+    submit_task,
     transition_phase,
     update_task,
     validate_runtime,
+    review_task,
 )
 
 
@@ -48,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("repair")
 
     migrate_parser = sub.add_parser("migrate")
-    migrate_parser.add_argument("--from-version", type=int, required=True)
+    migrate_parser.add_argument("--from-version", required=True)
     migrate_parser.add_argument("--to-version", type=int, required=True)
 
     phase = sub.add_parser("phase")
@@ -109,18 +112,47 @@ def build_parser() -> argparse.ArgumentParser:
     task_start = task_sub.add_parser("start")
     task_start.add_argument("id")
     task_start.add_argument("--agent", required=True)
+    task_start.add_argument("--lease-token", required=True)
+    task_start.add_argument("--expected-revision", type=int, required=True)
+
+    task_submit = task_sub.add_parser("submit")
+    task_submit.add_argument("id")
+    task_submit.add_argument("--agent", required=True)
+    task_submit.add_argument("--lease-token", required=True)
+    task_submit.add_argument("--expected-revision", type=int, required=True)
+    task_submit.add_argument("--evidence", required=True)
 
     task_complete = task_sub.add_parser("complete")
     task_complete.add_argument("id")
+    task_complete.add_argument("--agent", required=True)
+    task_complete.add_argument("--lease-token", required=True)
+    task_complete.add_argument("--expected-revision", type=int, required=True)
     task_complete.add_argument("--evidence", required=True)
+
+    task_review = task_sub.add_parser("review")
+    task_review.add_argument("id")
+    task_review.add_argument("--agent", required=True)
+    task_review.add_argument("--expected-revision", type=int, required=True)
+
+    task_accept = task_sub.add_parser("accept")
+    task_accept.add_argument("id")
+    task_accept.add_argument("--agent", required=True)
+    task_accept.add_argument("--lease-token", required=True)
+    task_accept.add_argument("--expected-revision", type=int, required=True)
+    task_accept.add_argument("--evidence", required=True)
 
     task_block = task_sub.add_parser("block")
     task_block.add_argument("id")
+    task_block.add_argument("--agent", required=True)
+    task_block.add_argument("--lease-token", required=True)
+    task_block.add_argument("--expected-revision", type=int, required=True)
     task_block.add_argument("--reason", required=True)
 
     task_release = task_sub.add_parser("release")
     task_release.add_argument("id")
     task_release.add_argument("--agent", required=True)
+    task_release.add_argument("--lease-token", required=True)
+    task_release.add_argument("--expected-revision", type=int, required=True)
 
     validation = sub.add_parser("validation")
     validation_sub = validation.add_subparsers(dest="validation_command", required=True)
@@ -131,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--findings", required=True)
     validation_record.add_argument("--result", required=True, choices=["pass", "fail", "blocked", "partial"])
     validation_record.add_argument("--risk", default="")
+    validation_record.add_argument("--failure-mode", action="append", default=[])
 
     decision = sub.add_parser("decision")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
@@ -168,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_sub = adapter.add_subparsers(dest="adapter_command", required=True)
     adapter_record = adapter_sub.add_parser("record")
     adapter_record.add_argument("--tool", required=True)
-    adapter_record.add_argument("--mode", required=True)
+    adapter_record.add_argument("--mode", required=True, choices=["read-only", "draft-write", "write-confirm", "write-auto", "disabled"])
     adapter_record.add_argument("--artifact", required=True)
     adapter_record.add_argument("--external-id", default="")
     adapter_record.add_argument("--external-link", default="")
@@ -265,19 +298,28 @@ def main() -> int:
             token = claim_task(root, args.id, args.agent, args.expected_revision)
             print(f"OK: claimed {args.id} token={token}")
         elif args.command == "task" and args.task_command == "start":
-            start_task(root, args.id, args.agent)
+            start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
             print(f"OK: task started {args.id}")
+        elif args.command == "task" and args.task_command == "submit":
+            submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            print(f"OK: task submitted {args.id}")
         elif args.command == "task" and args.task_command == "complete":
-            complete_task(root, args.id, args.evidence)
-            print(f"OK: task completed {args.id}")
+            complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            print(f"OK: task submitted {args.id}")
+        elif args.command == "task" and args.task_command == "review":
+            token = review_task(root, args.id, args.agent, args.expected_revision)
+            print(f"OK: task review started {args.id} token={token}")
+        elif args.command == "task" and args.task_command == "accept":
+            accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            print(f"OK: task accepted {args.id}")
         elif args.command == "task" and args.task_command == "block":
-            block_task(root, args.id, args.reason)
+            block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
             print(f"OK: task blocked {args.id}")
         elif args.command == "task" and args.task_command == "release":
-            release_task(root, args.id, args.agent)
+            release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
             print(f"OK: task released {args.id}")
         elif args.command == "validation" and args.validation_command == "record":
-            record_validation(root, args.surface, args.findings, args.result, acceptance=args.acceptance, commands=args.commands, risk=args.risk)
+            record_validation(root, args.surface, args.findings, args.result, acceptance=args.acceptance, commands=args.commands, risk=args.risk, failure_modes=", ".join(args.failure_mode))
             print("OK: validation recorded")
         elif args.command == "decision" and args.decision_command == "record":
             record_decision(root, args.decision, args.reason)
