@@ -257,6 +257,7 @@ python3 <project-runtime-skill-dir>/scripts/harness.py --root . task add --id T1
 ```bash
 harness.py --root . init
 harness.py --root . doctor
+harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . migrate --from-version 1 --to-version 2
 harness.py --root . phase project_bootstrap

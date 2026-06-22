@@ -29,6 +29,7 @@ from harness_db import (
     status_lines,
     transition_phase,
     update_task,
+    validate_runtime,
 )
 
 
@@ -41,7 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--dry-run", action="store_true")
     sub.add_parser("status")
     sub.add_parser("doctor")
-    sub.add_parser("validate")
+    validate_parser = sub.add_parser("validate")
+    validate_parser.add_argument("--delivery", action="store_true")
     sub.add_parser("repair")
 
     migrate_parser = sub.add_parser("migrate")
@@ -193,7 +195,7 @@ def main() -> int:
                 return 1
             print("OK: harness doctor passed")
         elif args.command == "validate":
-            issues = doctor(root)
+            issues = validate_runtime(root, delivery=args.delivery)
             if issues:
                 for issue in issues:
                     print(f"ERROR: {issue}")

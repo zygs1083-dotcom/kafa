@@ -353,6 +353,10 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
             raise HarnessError(f"unknown phase: {phase}")
         if phase != current and phase not in PHASE_TRANSITIONS[current]:
             raise HarnessError(f"illegal phase transition: {current} -> {phase}")
+        if phase == "delivery_readiness":
+            issues = validate_delivery(conn, root)
+            if issues:
+                raise HarnessError("delivery readiness blocked: " + "; ".join(issues))
         updates: dict[str, str] = {"phase": phase}
         if status:
             updates["status"] = status
@@ -548,6 +552,29 @@ def ready_tasks(root: Path) -> list[str]:
         return ready
 
 
+def dependency_blockers(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    return [
+        f"{row['depends_on']}={row['status']}"
+        for row in conn.execute(
+            """
+            select d.depends_on, t.status from task_dependencies d
+            join tasks t on t.id = d.depends_on
+            where d.task_id = ? and t.status != 'accepted'
+            order by d.depends_on
+            """,
+            (task_id,),
+        )
+    ]
+
+
+def require_task_runnable(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    if row["status"] not in {"ready", "claimed"}:
+        raise HarnessError(f"task status is not runnable: {row['id']} status={row['status']}")
+    blockers = dependency_blockers(conn, row["id"])
+    if blockers:
+        raise HarnessError(f"task dependencies are not accepted: {row['id']} blockers={', '.join(blockers)}")
+
+
 def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> str:
     with transaction(root) as conn:
         row = require_task(conn, task_id)
@@ -555,6 +582,9 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
             raise HarnessError(f"revision mismatch: expected {expected_revision}, actual {row['revision']}")
         if row["lease_agent"]:
             raise HarnessError(f"task already leased by {row['lease_agent']}")
+        if row["status"] != "ready":
+            raise HarnessError(f"task status is not ready: {task_id} status={row['status']}")
+        require_task_runnable(conn, row)
         token = str(uuid.uuid4())
         conn.execute(
             """
@@ -594,6 +624,7 @@ def start_task(root: Path, task_id: str, agent: str) -> None:
         row = require_task(conn, task_id)
         if row["lease_agent"] and row["lease_agent"] != agent:
             raise HarnessError(f"task leased by {row['lease_agent']}")
+        require_task_runnable(conn, row)
         conn.execute(
             "update tasks set status = 'in_progress', owner = ?, revision = revision + 1, updated_at = ? where id = ?",
             (agent, now_iso(), task_id),
@@ -773,6 +804,68 @@ def doctor(root: Path) -> list[str]:
         ]:
             if not (root / relpath).exists():
                 issues.append(f"missing view: {relpath}")
+    return issues
+
+
+def validate_delivery(conn: sqlite3.Connection, root: Path) -> list[str]:
+    issues: list[str] = []
+    active_tasks = conn.execute(
+        "select id, status from tasks where status not in ('accepted', 'cancelled', 'skipped') order by id"
+    ).fetchall()
+    for task in active_tasks:
+        issues.append(f"task is not accepted: {task['id']} status={task['status']}")
+
+    validations = conn.execute("select surface, result from validations order by created_at, id").fetchall()
+    if not validations:
+        issues.append("delivery requires validation evidence")
+    for validation in validations:
+        if validation["result"] != "pass":
+            issues.append(f"validation is not pass: {validation['surface']}={validation['result']}")
+
+    open_failure_modes = conn.execute(
+        """
+        select id, risk, status from failure_modes
+        where risk in ('high', 'critical') and status not in ('covered', 'accepted')
+        order by id
+        """
+    ).fetchall()
+    for failure_mode in open_failure_modes:
+        issues.append(
+            f"{failure_mode['risk']} failure mode is not closed: {failure_mode['id']} status={failure_mode['status']}"
+        )
+
+    latest_gate = conn.execute("select * from quality_gates order by created_at desc, id desc limit 1").fetchone()
+    if not latest_gate:
+        issues.append("delivery requires a quality gate record")
+    else:
+        if latest_gate["result"] != "pass":
+            issues.append(f"latest quality gate is not pass: {latest_gate['gate']}={latest_gate['result']}")
+        if latest_gate["blocking_findings"]:
+            issues.append(f"latest quality gate has blocking findings: {latest_gate['blocking_findings']}")
+        high_risk_present = conn.execute(
+            "select 1 from failure_modes where risk in ('high', 'critical') limit 1"
+        ).fetchone()
+        if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
+            issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")
+        current_sha = git_head_sha(root)
+        if current_sha:
+            if git_dirty(root):
+                issues.append("git worktree is dirty after quality gate")
+            if latest_gate["reviewed_commit"] != current_sha:
+                issues.append(
+                    f"latest quality gate commit does not match current HEAD: gate={latest_gate['reviewed_commit']} head={current_sha}"
+                )
+    return issues
+
+
+def validate_runtime(root: Path, *, delivery: bool = False) -> list[str]:
+    issues = doctor(root)
+    if issues:
+        return issues
+    with connect(root) as conn:
+        project = project_row(conn)
+        if delivery or project["phase"] in {"delivery_readiness", "retrospective"}:
+            issues.extend(validate_delivery(conn, root))
     return issues
 
 

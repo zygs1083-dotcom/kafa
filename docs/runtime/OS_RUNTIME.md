@@ -23,6 +23,7 @@ Use:
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . init
 python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
+python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 1 --to-version 2
 ```
@@ -121,6 +122,7 @@ Scheduler rules:
 - Dependency cycles are rejected.
 - `task next` returns only ready tasks whose dependencies are accepted.
 - `task claim` requires expected revision and creates a lease.
+- `task claim` and `task start` fail when dependencies are not accepted.
 - stale claims fail with a revision mismatch.
 
 ## Agent Registry
@@ -193,6 +195,14 @@ Quality gates are fail-closed. Delivery readiness requires:
 - gate commit matches current HEAD when Git exists
 
 `same-context-degraded` is blocked for high/critical risk delivery.
+
+Use the explicit delivery gate before handoff:
+
+```bash
+harness.py --root . validate --delivery
+```
+
+Moving the project into `delivery_readiness` calls the same delivery gate and fails when the gate is not satisfied.
 
 Use:
 
