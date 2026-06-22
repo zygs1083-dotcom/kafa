@@ -1,7 +1,25 @@
 # Fresh Skill Eval Prompts
 
-These prompts define future fresh-session evaluations for Codex Project Harness.
-They are not executed automatically by the local runtime smoke script yet.
+These prompts define fresh-session evaluations for Codex Project Harness.
+`plugins/codex-project-harness/scripts/run_skill_eval.py` executes the local
+fixture by default and can run a host-provided command when `CODEX_EVAL_CMD` is
+set.
+
+## Local Fixture Acceptance
+
+The local fixture lives at `docs/runtime/skill-eval-transcript-fixture.txt`.
+The harness validates that a transcript includes these flow markers:
+
+- bootstrap/init
+- requirement baseline
+- scope confirmation
+- baseline freeze
+- requirement to acceptance link
+- task creation and lifecycle
+- validation with linked test/evidence
+- quality gate
+- delivery readiness
+- delivery record
 
 ## Requirement To Delivery
 
@@ -16,12 +34,16 @@ delivery.
 
 Expected evidence:
 
+- `harness.py --root . init`
+- `harness.py --root . scope confirm`
+- `harness.py --root . baseline freeze`
 - `harness.py --root . requirement add`
 - `harness.py --root . requirement link`
 - `harness.py --root . task add`
 - `harness.py --root . validation record`
 - `harness.py --root . gate record`
-- `harness.py --root . validate --delivery`
+- `harness.py --root . phase delivery_readiness`
+- `harness.py --root . delivery record`
 
 ## Traceability Failure
 

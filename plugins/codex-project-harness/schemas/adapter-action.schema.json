@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "tool", "mode", "artifact", "action", "payload_json", "status", "idempotency_key", "created_at", "updated_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "tool": { "type": "string" },
+    "mode": { "type": "string", "enum": ["read-only", "draft-write", "write-confirm", "write-auto", "disabled"] },
+    "artifact": { "type": "string" },
+    "action": { "type": "string" },
+    "payload_json": { "type": "string" },
+    "status": { "type": "string", "enum": ["planned", "draft", "confirmed", "completed", "blocked"] },
+    "confirmation": { "type": "string" },
+    "external_id": { "type": "string" },
+    "external_link": { "type": "string" },
+    "idempotency_key": { "type": "string" },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  }
+}

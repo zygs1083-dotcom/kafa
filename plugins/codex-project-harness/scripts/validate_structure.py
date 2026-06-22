@@ -48,6 +48,7 @@ REQUIRED_SCRIPTS = [
     "harness.py",
     "run_runtime_smoke.py",
     "run_forward_eval.py",
+    "run_skill_eval.py",
 ]
 
 REQUIRED_SCHEMAS = [
@@ -65,7 +66,12 @@ REQUIRED_SCHEMAS = [
     "invalidation.schema.json",
     "delivery.schema.json",
     "adapter.schema.json",
+    "adapter-action.schema.json",
     "agent.schema.json",
+    "baseline.schema.json",
+    "dispatch-run.schema.json",
+    "dispatch-assignment.schema.json",
+    "runtime-snapshot.schema.json",
 ]
 
 

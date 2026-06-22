@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["run_id", "task_id", "agent_id", "capability", "status", "evidence", "updated_at"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "capability": { "type": "string" },
+    "status": { "type": "string", "enum": ["planned", "claimed", "completed", "stale"] },
+    "evidence": { "type": "string" },
+    "claimed_at": { "type": ["string", "null"] },
+    "updated_at": { "type": "string" }
+  }
+}

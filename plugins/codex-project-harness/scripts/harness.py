@@ -10,15 +10,33 @@ from pathlib import Path
 from harness_db import (
     HarnessError,
     accept_task,
+    adapter_plan,
+    adapter_reconcile,
+    adapter_transition,
+    add_agent_capability,
     add_acceptance,
     add_failure_mode,
+    add_requirement,
     add_task,
+    baseline_diff,
+    baseline_validate,
     block_task,
     claim_task,
     complete_task,
+    confirm_scope,
+    create_checkpoint,
+    dispatch_claim_next,
+    dispatch_plan,
+    dispatch_recover_stale,
+    dispatch_status,
     doctor,
+    export_checkpoint,
+    export_events,
+    freeze_baseline,
+    import_checkpoint,
     init_runtime,
     link_requirement_acceptance,
+    list_checkpoints,
     migrate,
     ready_tasks,
     record_adapter,
@@ -29,7 +47,7 @@ from harness_db import (
     record_gate,
     record_test,
     record_validation,
-    add_requirement,
+    replay_events,
     heartbeat_task,
     recover_stale_leases,
     release_task,
@@ -37,10 +55,12 @@ from harness_db import (
     start_task,
     status_lines,
     submit_task,
+    sweep_expired_risks,
     trace_show,
     trace_validate,
     transition_phase,
     update_task,
+    validate_events,
     validate_runtime,
     review_task,
 )
@@ -69,6 +89,23 @@ def build_parser() -> argparse.ArgumentParser:
     phase.add_argument("phase")
     phase.add_argument("--status")
     phase.add_argument("--owner")
+
+    scope = sub.add_parser("scope")
+    scope_sub = scope.add_subparsers(dest="scope_command", required=True)
+    scope_confirm = scope_sub.add_parser("confirm")
+    scope_confirm.add_argument("--by", required=True)
+    scope_confirm.add_argument("--summary", required=True)
+
+    baseline = sub.add_parser("baseline")
+    baseline_sub = baseline.add_subparsers(dest="baseline_command", required=True)
+    baseline_freeze = baseline_sub.add_parser("freeze")
+    baseline_freeze.add_argument("--id", required=True)
+    baseline_freeze.add_argument("--summary", required=True)
+    baseline_freeze.add_argument("--by", default="")
+    baseline_diff_parser = baseline_sub.add_parser("diff")
+    baseline_diff_parser.add_argument("--from", dest="from_id", required=True)
+    baseline_diff_parser.add_argument("--to", default="current")
+    baseline_sub.add_parser("validate")
 
     acceptance = sub.add_parser("acceptance")
     acceptance_sub = acceptance.add_subparsers(dest="acceptance_command", required=True)
@@ -203,6 +240,8 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--result", required=True, choices=["pass", "fail", "blocked", "partial"])
     validation_record.add_argument("--risk", default="")
     validation_record.add_argument("--failure-mode", action="append", default=[])
+    validation_record.add_argument("--test", action="append", default=[])
+    validation_record.add_argument("--evidence", action="append", default=[])
 
     decision = sub.add_parser("decision")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
@@ -248,6 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate_record.add_argument("--evidence", default="")
     gate_record.add_argument("--blocking-findings", default="")
     gate_record.add_argument("--residual-risk", default="")
+    gate_record.add_argument("--finding", action="append", default=[])
 
     delivery = sub.add_parser("delivery")
     delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
@@ -276,6 +316,65 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_record.add_argument("--evidence", default="")
     adapter_record.add_argument("--fallback", default="")
     adapter_record.add_argument("--confirmation-needed", default="no")
+    adapter_plan_parser = adapter_sub.add_parser("plan")
+    adapter_plan_parser.add_argument("--tool", required=True)
+    adapter_plan_parser.add_argument("--mode", required=True, choices=["read-only", "draft-write", "write-confirm", "write-auto", "disabled"])
+    adapter_plan_parser.add_argument("--artifact", required=True)
+    adapter_plan_parser.add_argument("--action", required=True)
+    adapter_plan_parser.add_argument("--payload-json", default="{}")
+    adapter_plan_parser.add_argument("--idempotency-key", default="")
+    adapter_draft = adapter_sub.add_parser("draft")
+    adapter_draft.add_argument("--id", required=True)
+    adapter_confirm = adapter_sub.add_parser("confirm")
+    adapter_confirm.add_argument("--id", required=True)
+    adapter_confirm.add_argument("--confirmation", default="confirmed")
+    adapter_complete = adapter_sub.add_parser("complete")
+    adapter_complete.add_argument("--id", required=True)
+    adapter_complete.add_argument("--external-id", default="")
+    adapter_complete.add_argument("--external-link", default="")
+    adapter_sub.add_parser("reconcile")
+
+    risk = sub.add_parser("risk")
+    risk_sub = risk.add_subparsers(dest="risk_command", required=True)
+    risk_sub.add_parser("sweep-expired")
+
+    checkpoint = sub.add_parser("checkpoint")
+    checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_create = checkpoint_sub.add_parser("create")
+    checkpoint_create.add_argument("--label", required=True)
+    checkpoint_sub.add_parser("list")
+    checkpoint_export = checkpoint_sub.add_parser("export")
+    checkpoint_export.add_argument("--out", required=True)
+    checkpoint_import = checkpoint_sub.add_parser("import")
+    checkpoint_import.add_argument("--file", required=True)
+    checkpoint_import.add_argument("--dry-run", action="store_true")
+    checkpoint_import.add_argument("--apply", action="store_true")
+
+    event = sub.add_parser("event")
+    event_sub = event.add_subparsers(dest="event_command", required=True)
+    event_export = event_sub.add_parser("export")
+    event_export.add_argument("--out", required=True)
+    event_sub.add_parser("validate")
+    event_replay = event_sub.add_parser("replay")
+    event_replay.add_argument("--to", type=int, required=True)
+    event_replay.add_argument("--out", required=True)
+
+    agent = sub.add_parser("agent")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_capability = agent_sub.add_parser("capability")
+    agent_capability_sub = agent_capability.add_subparsers(dest="agent_capability_command", required=True)
+    agent_capability_add = agent_capability_sub.add_parser("add")
+    agent_capability_add.add_argument("--agent", required=True)
+    agent_capability_add.add_argument("--capability", required=True)
+
+    dispatch = sub.add_parser("dispatch")
+    dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
+    dispatch_plan_parser = dispatch_sub.add_parser("plan")
+    dispatch_plan_parser.add_argument("--scope", required=True)
+    dispatch_claim = dispatch_sub.add_parser("claim-next")
+    dispatch_claim.add_argument("--agent", required=True)
+    dispatch_sub.add_parser("recover-stale")
+    dispatch_sub.add_parser("status")
 
     return parser
 
@@ -328,6 +427,21 @@ def main() -> int:
         elif args.command == "phase":
             transition_phase(root, args.phase, status=args.status, owner=args.owner)
             print(f"OK: phase={args.phase}")
+        elif args.command == "scope" and args.scope_command == "confirm":
+            confirm_scope(root, args.by, args.summary)
+            print(f"OK: scope confirmed by {args.by}")
+        elif args.command == "baseline" and args.baseline_command == "freeze":
+            freeze_baseline(root, args.id, args.summary, by=args.by)
+            print(f"OK: baseline frozen {args.id}")
+        elif args.command == "baseline" and args.baseline_command == "diff":
+            print("\n".join(baseline_diff(root, args.from_id, args.to)))
+        elif args.command == "baseline" and args.baseline_command == "validate":
+            issues = baseline_validate(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: baseline is current")
         elif args.command == "acceptance" and args.acceptance_command == "add":
             add_acceptance(root, args.id, args.criterion, args.priority, args.tool_link)
             print(f"OK: acceptance added {args.id}")
@@ -419,7 +533,18 @@ def main() -> int:
             release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
             print(f"OK: task released {args.id}")
         elif args.command == "validation" and args.validation_command == "record":
-            record_validation(root, args.surface, args.findings, args.result, acceptance=args.acceptance, commands=args.commands, risk=args.risk, failure_modes=", ".join(args.failure_mode))
+            record_validation(
+                root,
+                args.surface,
+                args.findings,
+                args.result,
+                acceptance=args.acceptance,
+                commands=args.commands,
+                risk=args.risk,
+                failure_modes=", ".join(args.failure_mode),
+                tests=", ".join(args.test),
+                evidence=", ".join(args.evidence),
+            )
             print("OK: validation recorded")
         elif args.command == "decision" and args.decision_command == "record":
             record_decision(root, args.decision, args.reason)
@@ -443,6 +568,7 @@ def main() -> int:
                 evidence=args.evidence,
                 blocking_findings=args.blocking_findings,
                 residual_risk=args.residual_risk,
+                findings=", ".join(args.finding),
             )
             print(f"OK: quality gate recorded {args.gate}={args.result}")
         elif args.command == "delivery" and args.delivery_command == "record":
@@ -475,6 +601,70 @@ def main() -> int:
                 confirmation_needed=args.confirmation_needed,
             )
             print(f"OK: adapter recorded {args.tool}")
+        elif args.command == "adapter" and args.adapter_command == "plan":
+            action_id = adapter_plan(root, args.tool, args.mode, args.artifact, args.action, payload_json=args.payload_json, idempotency_key=args.idempotency_key)
+            print(f"OK: adapter action planned {action_id}")
+        elif args.command == "adapter" and args.adapter_command == "draft":
+            adapter_transition(root, args.id, "draft")
+            print(f"OK: adapter action draft {args.id}")
+        elif args.command == "adapter" and args.adapter_command == "confirm":
+            adapter_transition(root, args.id, "confirmed", confirmation=args.confirmation)
+            print(f"OK: adapter action confirmed {args.id}")
+        elif args.command == "adapter" and args.adapter_command == "complete":
+            adapter_transition(root, args.id, "completed", external_id=args.external_id, external_link=args.external_link)
+            print(f"OK: adapter action completed {args.id}")
+        elif args.command == "adapter" and args.adapter_command == "reconcile":
+            issues = adapter_reconcile(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: adapters reconciled")
+        elif args.command == "risk" and args.risk_command == "sweep-expired":
+            count = sweep_expired_risks(root)
+            print(f"OK: swept {count} expired risk acceptance(s)")
+        elif args.command == "checkpoint" and args.checkpoint_command == "create":
+            checkpoint_id = create_checkpoint(root, args.label)
+            print(f"OK: checkpoint created {checkpoint_id}")
+        elif args.command == "checkpoint" and args.checkpoint_command == "list":
+            print("\n".join(list_checkpoints(root)))
+        elif args.command == "checkpoint" and args.checkpoint_command == "export":
+            export_checkpoint(root, Path(args.out))
+            print(f"OK: checkpoint exported {args.out}")
+        elif args.command == "checkpoint" and args.checkpoint_command == "import":
+            issues = import_checkpoint(root, Path(args.file), apply=args.apply)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1 if args.apply else 0
+            print("OK: checkpoint import applied" if args.apply else "OK: checkpoint import dry-run passed")
+        elif args.command == "event" and args.event_command == "export":
+            export_events(root, Path(args.out))
+            print(f"OK: events exported {args.out}")
+        elif args.command == "event" and args.event_command == "validate":
+            issues = validate_events(root)
+            if issues:
+                for issue in issues:
+                    print(f"ERROR: {issue}")
+                return 1
+            print("OK: events are replay-compatible")
+        elif args.command == "event" and args.event_command == "replay":
+            replay_events(root, args.to, Path(args.out))
+            print(f"OK: events replayed to {args.out}")
+        elif args.command == "agent" and args.agent_command == "capability" and args.agent_capability_command == "add":
+            add_agent_capability(root, args.agent, args.capability)
+            print(f"OK: agent capability added {args.agent}:{args.capability}")
+        elif args.command == "dispatch" and args.dispatch_command == "plan":
+            run_id = dispatch_plan(root, args.scope)
+            print(f"OK: dispatch planned {run_id}")
+        elif args.command == "dispatch" and args.dispatch_command == "claim-next":
+            task_id = dispatch_claim_next(root, args.agent)
+            print(f"OK: dispatch claimed {task_id}")
+        elif args.command == "dispatch" and args.dispatch_command == "recover-stale":
+            count = dispatch_recover_stale(root)
+            print(f"OK: dispatch recovered {count} stale assignment(s)")
+        elif args.command == "dispatch" and args.dispatch_command == "status":
+            print("\n".join(dispatch_status(root)))
         else:
             parser.error("unknown command")
     except HarnessError as exc:

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "scope", "status", "created_at", "updated_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "scope": { "type": "string" },
+    "status": { "type": "string", "enum": ["planned", "claimed", "completed", "stale"] },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  }
+}

@@ -47,6 +47,8 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(run(root, "phase", "confirmation"))
         commands.append(run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "high", "--acceptance", "AC1"))
         commands.append(run(root, "task", "add", "--id", "T1", "--task", "Implement task creation", "--acceptance", "AC1", "--failure-mode", "FM1"))
+        commands.append(run(root, "scope", "confirm", "--by", "project-manager", "--summary", "Task creation scope confirmed"))
+        commands.append(run(root, "baseline", "freeze", "--id", "B1", "--summary", "Task creation baseline"))
         commands.append(run(root, "phase", "planning"))
         commands.append(run(root, "phase", "implementation"))
         claim = run(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", task_revision(root, "T1"))
@@ -59,8 +61,11 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(review)
         reviewer_token = token(review.stdout) if review.returncode == 0 else ""
         commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass", "--failure-mode", "FM1"))
+        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed"))
+        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", "unit test", "--result", "pass", "--evidence", "EV1"))
+        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1"))
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
+        commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
         ok = all(command.returncode == 0 for command in commands)
         files = [

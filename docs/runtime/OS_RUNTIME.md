@@ -1,4 +1,4 @@
-# Codex OS Runtime Layer v2.5
+# Codex OS Runtime Layer v2.6
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
@@ -26,7 +26,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 7
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 8
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 ```
 
@@ -146,7 +146,19 @@ Initialization installs agent templates into:
 
 The runtime records agent rows with role, template path, status, session ID, tool permissions, and current task lease.
 
-The runtime does not create user-visible Codex threads by itself. It provides the local registry and lease mechanism that agent-capable clients can use.
+The runtime does not create user-visible Codex threads by itself. It provides the local registry, lease mechanism, and local dispatch protocol that agent-capable clients can use.
+
+Local dispatcher commands:
+
+```bash
+harness.py --root . agent capability add --agent developer --capability frontend
+harness.py --root . dispatch plan --scope "Build profile UI and API"
+harness.py --root . dispatch claim-next --agent developer
+harness.py --root . dispatch recover-stale
+harness.py --root . dispatch status
+```
+
+Dispatcher records are local and verifiable. If the Codex host exposes true subagents, the skill should use the host mechanism and write back dispatch evidence. Otherwise it records the plan and work ownership locally.
 
 ## Event Log
 
@@ -166,7 +178,20 @@ payload_json
 created_at
 ```
 
-This provides a replayable ordered audit trail inside `.ai-team/state/harness.db`.
+Events include entity type, entity id, before/after snapshots for key state changes, actor or agent when available, command context, revision/status movement, and correlation id.
+
+Replay starts from an explicit checkpoint snapshot and then applies newer event `after` snapshots. Older events are kept as audit history and are not falsely treated as replay-complete without a checkpoint.
+
+```bash
+harness.py --root . checkpoint create --label before-delivery
+harness.py --root . checkpoint list
+harness.py --root . checkpoint export --out checkpoint.json
+harness.py --root . checkpoint import --file checkpoint.json --dry-run
+harness.py --root . checkpoint import --file checkpoint.json --apply
+harness.py --root . event export --out events.jsonl
+harness.py --root . event validate
+harness.py --root . event replay --to 42 --out replay.db
+```
 
 Legacy JSONL events may still exist for older scripts, but the SQLite events table is the runtime event log.
 
@@ -199,7 +224,11 @@ Accepted risks can record:
 - accepted project revision
 - expiration date
 
-Accepted risks expire. Expired accepted/exempt high and critical risks block delivery readiness.
+Accepted risks expire. Expired accepted/exempt high and critical risks block delivery readiness, and can be explicitly swept back to open identified risks:
+
+```bash
+harness.py --root . risk sweep-expired
+```
 
 ## Requirements, Evidence, And Findings
 
@@ -213,7 +242,14 @@ harness.py --root . requirement add \
   --priority must
 ```
 
-Confirmation, team architecture, and planning require at least one requirement baseline record and at least one acceptance criterion.
+Confirmation and team architecture require at least one requirement baseline record and at least one acceptance criterion. Planning also requires confirmed scope and a current frozen baseline.
+
+```bash
+harness.py --root . scope confirm --by project-manager --summary "User confirmed API-only scope"
+harness.py --root . baseline freeze --id B1 --summary "Confirmed API-only baseline"
+harness.py --root . baseline diff --from B1 --to current
+harness.py --root . baseline validate
+```
 
 Traceability links requirements to acceptance criteria:
 
@@ -223,7 +259,7 @@ harness.py --root . trace show --requirement R1
 harness.py --root . trace validate
 ```
 
-When a requirement baseline exists, delivery readiness requires a complete requirement -> acceptance -> task -> passing validation chain.
+When a requirement baseline exists, delivery readiness requires a current frozen baseline and a complete requirement -> acceptance -> task -> passing validation chain.
 
 Evidence, test records, and findings are also structured:
 
@@ -234,6 +270,20 @@ harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity m
 ```
 
 Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, and `project_revision`. Delivery readiness fails if a passing validation was recorded against an older code snapshot.
+
+Each active acceptance must have passing validation linked to at least one passing test or evidence item:
+
+```bash
+harness.py --root . validation record \
+  --surface "Profile CRUD" \
+  --acceptance AC1 \
+  --failure-mode FM1 \
+  --commands "npm test" \
+  --findings "passed" \
+  --result pass \
+  --test TEST1 \
+  --evidence EV1
+```
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 
@@ -267,7 +317,8 @@ harness.py --root . gate record \
   --reviewer-context fresh \
   --result pass \
   --commands "npm test" \
-  --evidence "QA reviewed acceptance and failure modes"
+  --evidence "QA reviewed acceptance and failure modes" \
+  --finding F1
 ```
 
 ## Adapter Records
@@ -293,11 +344,23 @@ write-confirm
 write-auto
 ```
 
-External tools remain adapters. Local SQLite state is still sufficient for code delivery.
+Adapter actions model external work before and after the Codex host or connector performs it:
+
+```bash
+harness.py --root . adapter plan --tool github --mode write-confirm --artifact "Issue R1" --action "create issue"
+harness.py --root . adapter draft --id <action-id>
+harness.py --root . adapter confirm --id <action-id>
+harness.py --root . adapter complete --id <action-id> --external-id GH-1 --external-link https://example.invalid/GH-1
+harness.py --root . adapter reconcile
+```
+
+External tools remain adapters. Local SQLite state is still sufficient for code delivery. The runtime does not import GitHub/Linear/Notion/Figma/Slack SDKs or perform direct external writes.
 
 ## Delivery
 
 Delivery records store scope, acceptance mapping, changed files, validation, QA, failure-mode coverage, quality gate, data/config notes, collaboration links, known gaps, and handoff notes.
+
+`delivery record` only writes in `delivery_readiness` or `retrospective`.
 
 Use:
 
@@ -317,6 +380,8 @@ Runtime behavior is covered by:
 
 ```bash
 python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
+python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
+python3 plugins/codex-project-harness/scripts/run_skill_eval.py
 ```
 
 GitHub Actions runs structure checks, JSON checks, Python compilation, and runtime tests on push and pull request.

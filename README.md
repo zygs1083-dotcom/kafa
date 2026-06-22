@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v0.5.0-beta.1**，架构代际定位为 **Code Delivery Architecture v2**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v0.6.0-beta.1**，架构代际定位为 **Code Delivery Architecture v2**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v0.5.0-beta.1
+git show v0.6.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -281,9 +281,13 @@ harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 7
-harness.py --root . migrate --from-version markdown-v1 --to-version 7 --dry-run
+harness.py --root . migrate --from-version 6 --to-version 8
+harness.py --root . migrate --from-version markdown-v1 --to-version 8 --dry-run
 harness.py --root . phase project_bootstrap
+harness.py --root . scope confirm --by project-manager --summary "Scope confirmed"
+harness.py --root . baseline freeze --id B1 --summary "Confirmed baseline"
+harness.py --root . baseline diff --from B1
+harness.py --root . baseline validate
 harness.py --root . requirement add --id R1 --kind functional --body "Example requirement"
 harness.py --root . acceptance add --id AC1 --criterion "Example acceptance"
 harness.py --root . requirement link --requirement R1 --acceptance AC1
@@ -303,8 +307,15 @@ harness.py --root . decision record --decision "Selected local runtime" --reason
 harness.py --root . evidence record --id EV1 --kind command --summary "pytest passed" --uri "local://pytest"
 harness.py --root . test record --id TEST1 --surface "Example" --command "pytest" --result pass --evidence EV1
 harness.py --root . finding record --id F1 --surface "Example" --severity medium --status open --summary "Follow-up needed"
-harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass
-harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command"
+harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass --test TEST1 --evidence EV1
+harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command" --finding F1
+harness.py --root . checkpoint create --label before-delivery
+harness.py --root . checkpoint export --out checkpoint.json
+harness.py --root . event validate
+harness.py --root . dispatch plan --scope "Example scope"
+harness.py --root . adapter plan --tool github --mode write-confirm --artifact Tasks --action "create issue"
+harness.py --root . adapter confirm --id <action-id>
+harness.py --root . risk sweep-expired
 harness.py --root . delivery record --scope "Example delivery" --validation "tests passed" --quality-gate "independent_qa pass"
 harness.py --root . adapter record --tool github --mode read-only --artifact Tasks --external-id issue-1 --idempotency-key codex-project-harness:project:task:T1
 ```
@@ -480,6 +491,7 @@ python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/d
 python3 -m py_compile plugins/codex-project-harness/scripts/*.py
 python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
+python3 plugins/codex-project-harness/scripts/run_skill_eval.py
 git diff --check
 ```
 
@@ -491,7 +503,7 @@ git diff --check
 .github/workflows/validate.yml
 ```
 
-它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译、运行时回归测试和 runtime smoke。
+它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译、运行时回归测试、runtime smoke 和本地 skill eval fixture。
 
 ## 版本状态
 

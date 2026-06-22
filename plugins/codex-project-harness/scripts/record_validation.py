@@ -18,6 +18,8 @@ def main() -> int:
     parser.add_argument("--result", choices=["pass", "fail", "blocked", "partial"], required=True)
     parser.add_argument("--risk", default="")
     parser.add_argument("--failure-mode", action="append", default=[])
+    parser.add_argument("--test", action="append", default=[])
+    parser.add_argument("--evidence", action="append", default=[])
     args = parser.parse_args()
     command = [
         "validation",
@@ -37,6 +39,10 @@ def main() -> int:
     ]
     for failure_mode in args.failure_mode:
         command.extend(["--failure-mode", failure_mode])
+    for test in args.test:
+        command.extend(["--test", test])
+    for evidence in args.evidence:
+        command.extend(["--evidence", evidence])
     return run_harness(command)
 
 

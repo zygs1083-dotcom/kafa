@@ -4,6 +4,31 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v0.6.0-beta.1 - 2026-06-22
+
+### Added
+
+- Scope confirmation and frozen requirement baselines with `scope confirm`, `baseline freeze`, `baseline diff`, and `baseline validate`.
+- Delivery records now require `delivery_readiness` or `retrospective`, and delivery readiness requires a current frozen baseline.
+- Validation quality links through `validation_tests`, `validation_evidence`, and `quality_gate_findings`.
+- Checkpoint export/import, event export/validate/replay, and replay-compatible runtime snapshots.
+- Local dispatcher capability matching, dispatch runs, assignments, stale recovery, and status reporting.
+- Adapter action lifecycle commands: `adapter plan`, `adapter draft`, `adapter confirm`, `adapter complete`, and `adapter reconcile`.
+- `risk sweep-expired` for turning expired accepted/exempt risks back into open identified risks.
+- Executable fresh skill eval fixture harness via `run_skill_eval.py`.
+
+### Changed
+
+- Runtime schema version is now `8`; runtime implementation version is now `2.6.0`.
+- Delivery validation requires each active acceptance to have passing validation linked to a passing test or evidence.
+- High/critical failure-mode coverage must come from passing validation plus linked test/evidence on the current code snapshot.
+
+### Boundaries
+
+- This release still stops at verified code delivery.
+- Real GitHub/Linear/Notion/Figma/Slack writes remain adapter/action contracts executed by the Codex host or connector, then reconciled locally.
+- Real Codex sub-session creation remains host-provided; the repository implements local dispatch protocol, fixtures, CLI, and evidence.
+
 ## v0.5.0-beta.1 - 2026-06-22
 
 ### Added

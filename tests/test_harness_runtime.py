@@ -60,6 +60,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         return temp
 
     def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
+        run_script(root, "harness.py", "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "example evidence")
+        run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", "example test", "--result", "pass", "--evidence", "EV1")
         command = [
             "record_validation.py",
             "--surface",
@@ -72,6 +74,10 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "passed",
             "--result",
             "pass",
+            "--test",
+            "TEST1",
+            "--evidence",
+            "EV1",
         ]
         if failure_mode:
             command.extend(["--failure-mode", "FM1"])
