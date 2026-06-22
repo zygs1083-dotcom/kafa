@@ -20,6 +20,8 @@ REQUIRED_MARKERS = [
     "harness.py --root . baseline freeze",
     "harness.py --root . requirement link",
     "harness.py --root . task add",
+    "--stdout-sha256",
+    "--artifact-path",
     "harness.py --root . validation record",
     "harness.py --root . gate record",
     "harness.py --root . phase delivery_readiness",

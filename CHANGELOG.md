@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v0.8.0-beta.1 - 2026-06-22
+
+### Added
+
+- Trusted command evidence fields for evidence and validation records: command, exit code, stdout SHA-256, artifact path, and source tree hash.
+- LocalExecutor and `dispatch run` for executing local commands, writing stdout artifacts, and recording command evidence.
+- Pre-commit invariant enforcement inside runtime write transactions so failed invariants roll back state changes.
+- Single-source runtime enum imports for task statuses, failure-mode statuses, and adapter modes.
+
+### Changed
+
+- Runtime schema version is now `10`; runtime implementation version is now `3.1.0`.
+- Delivery gates now require passing validations to be backed by trusted command evidence with exit code `0` and a current source tree hash.
+- Event replay is no longer a public CLI promise; checkpoint export/import remains the supported snapshot restore path.
+
+### Boundaries
+
+- This release still stops at verified code delivery.
+- LocalExecutor is a local single-machine executor, not an OS-level sandbox or distributed worker.
+- External tools remain adapter contracts; no real GitHub/Linear/Notion/Figma/Slack writes are performed by the runtime.
+
 ## v0.7.0-beta.1 - 2026-06-22
 
 ### Added

@@ -32,6 +32,7 @@ from core.api import (
     dispatch_claim_next,
     dispatch_plan,
     dispatch_recover_stale,
+    dispatch_run,
     dispatch_status,
     doctor,
     export_checkpoint,
@@ -53,7 +54,6 @@ from core.api import (
     record_gate,
     record_test,
     record_validation,
-    replay_events,
     projection_rebuild,
     heartbeat_task,
     recover_stale_leases,
@@ -249,6 +249,10 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--failure-mode", action="append", default=[])
     validation_record.add_argument("--test", action="append", default=[])
     validation_record.add_argument("--evidence", action="append", default=[])
+    validation_record.add_argument("--command", dest="validation_command_text", default="")
+    validation_record.add_argument("--exit-code", type=int)
+    validation_record.add_argument("--stdout-sha256", default="")
+    validation_record.add_argument("--artifact-path", default="")
 
     decision = sub.add_parser("decision")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
@@ -264,6 +268,10 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_record.add_argument("--summary", required=True)
     evidence_record.add_argument("--uri", default="")
     evidence_record.add_argument("--hash", default="")
+    evidence_record.add_argument("--command", dest="evidence_command_text", default="")
+    evidence_record.add_argument("--exit-code", type=int)
+    evidence_record.add_argument("--stdout-sha256", default="")
+    evidence_record.add_argument("--artifact-path", default="")
 
     test = sub.add_parser("test")
     test_sub = test.add_subparsers(dest="test_command", required=True)
@@ -362,9 +370,6 @@ def build_parser() -> argparse.ArgumentParser:
     event_export = event_sub.add_parser("export")
     event_export.add_argument("--out", required=True)
     event_sub.add_parser("validate")
-    event_replay = event_sub.add_parser("replay")
-    event_replay.add_argument("--to", type=int, required=True)
-    event_replay.add_argument("--out", required=True)
 
     agent = sub.add_parser("agent")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
@@ -380,6 +385,10 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_plan_parser.add_argument("--scope", required=True)
     dispatch_claim = dispatch_sub.add_parser("claim-next")
     dispatch_claim.add_argument("--agent", required=True)
+    dispatch_run = dispatch_sub.add_parser("run")
+    dispatch_run.add_argument("--agent", required=True)
+    dispatch_run.add_argument("--command", dest="dispatch_command_text", required=True)
+    dispatch_run.add_argument("--timeout", type=int, default=120)
     dispatch_sub.add_parser("recover-stale")
     dispatch_sub.add_parser("status")
 
@@ -563,13 +572,28 @@ def main() -> int:
                 failure_modes=", ".join(args.failure_mode),
                 tests=", ".join(args.test),
                 evidence=", ".join(args.evidence),
+                command=args.validation_command_text,
+                exit_code=args.exit_code,
+                stdout_sha256=args.stdout_sha256,
+                artifact_path=args.artifact_path,
             )
             print("OK: validation recorded")
         elif args.command == "decision" and args.decision_command == "record":
             record_decision(root, args.decision, args.reason)
             print("OK: decision recorded")
         elif args.command == "evidence" and args.evidence_command == "record":
-            record_evidence(root, args.id, args.kind, args.summary, uri=args.uri, artifact_hash=args.hash)
+            record_evidence(
+                root,
+                args.id,
+                args.kind,
+                args.summary,
+                uri=args.uri,
+                artifact_hash=args.hash,
+                command=args.evidence_command_text,
+                exit_code=args.exit_code,
+                stdout_sha256=args.stdout_sha256,
+                artifact_path=args.artifact_path,
+            )
             print(f"OK: evidence recorded {args.id}")
         elif args.command == "test" and args.test_command == "record":
             record_test(root, args.id, args.surface, args.test_command_text, args.result, evidence_id=args.evidence)
@@ -666,10 +690,7 @@ def main() -> int:
                 for issue in issues:
                     print(f"ERROR: {issue}")
                 return 1
-            print("OK: events are replay-compatible")
-        elif args.command == "event" and args.event_command == "replay":
-            replay_events(root, args.to, Path(args.out))
-            print(f"OK: events replayed to {args.out}")
+            print("OK: events are audit-compatible")
         elif args.command == "agent" and args.agent_command == "capability" and args.agent_capability_command == "add":
             add_agent_capability(root, args.agent, args.capability)
             print(f"OK: agent capability added {args.agent}:{args.capability}")
@@ -679,6 +700,9 @@ def main() -> int:
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")
+        elif args.command == "dispatch" and args.dispatch_command == "run":
+            evidence_id = dispatch_run(root, args.agent, args.dispatch_command_text, timeout=args.timeout)
+            print(f"OK: dispatch command evidence {evidence_id}")
         elif args.command == "dispatch" and args.dispatch_command == "recover-stale":
             count = dispatch_recover_stale(root)
             print(f"OK: dispatch recovered {count} stale assignment(s)")

@@ -36,6 +36,7 @@ REQUIRED_CORE = [
     "lock_manager.py",
     "schema_guard.py",
     "event_bus.py",
+    "executor.py",
     "invariant_checker.py",
     "projections.py",
 ]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 import tempfile
@@ -34,6 +35,13 @@ def token(stdout: str) -> str:
     return stdout.split("token=", 1)[1].strip()
 
 
+def trusted_artifact(root: Path, suffix: str, content: str = "ok\n") -> tuple[str, str]:
+    artifact = root / ".ai-team" / "runtime" / "smoke" / f"stdout-{suffix}.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(content, encoding="utf-8")
+    return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def scenario_full_project() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -61,9 +69,11 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(review)
         reviewer_token = token(review.stdout) if review.returncode == 0 else ""
         commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
-        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed"))
+        evidence_artifact, evidence_sha = trusted_artifact(root, "evidence")
+        validation_artifact, validation_sha = trusted_artifact(root, "validation")
+        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed", "--command", "python3 -c 'print(\"ok\")'", "--exit-code", "0", "--stdout-sha256", evidence_sha, "--artifact-path", evidence_artifact))
         commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", "unit test", "--result", "pass", "--evidence", "EV1"))
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1"))
+        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1", "--command", "python3 -c 'print(\"ok\")'", "--exit-code", "0", "--stdout-sha256", validation_sha, "--artifact-path", validation_artifact))
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
         commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))

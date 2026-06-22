@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v0.7.0-beta.1**，架构代际定位为 **Codex Harness Kernel v3.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v0.8.0-beta.1**，架构代际定位为 **Codex Harness Kernel v3.1**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v0.7.0-beta.1
+git show v0.8.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -124,7 +124,9 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 这是 SQLite 数据库，保存 project、requirements、acceptance、failure modes、tasks、validations、evidence、tests、findings、invalidations、quality gates、deliveries、adapter mappings、agents、migrations 和 events。SQLite 使用事务、WAL、外键、唯一约束和 task revision/lease/heartbeat 来支持多会话和多 agent 协作。
 
-从 v0.7 开始，运行时引入 **Kernel v3.0** 一致性内核。CLI 和 legacy wrappers 会经过 `core.api`，写入路径统一经过 schema guard、调度/锁/门禁、事务、event bus、invariant checker 和 projections。SQLite 状态表仍是主事实源；event bus 用于审计、校验、dispatch 和从 checkpoint replay，不把系统切换成事件主源。
+从 v0.7 开始，运行时引入 **Kernel v3** 一致性内核。CLI 和 legacy wrappers 会经过 `core.api`，写入路径统一经过 schema guard、调度/锁/门禁、事务、event bus、invariant checker 和 projections。SQLite 状态表仍是主事实源；event bus 用于审计和校验，可信恢复路径是 checkpoint snapshot export/import。
+
+从 v0.8 开始，交付门禁只接受可信命令证据：validation 或其关联 evidence 必须包含真实命令、退出码 `0`、stdout SHA-256、artifact path，以及当前 source tree hash。
 
 Markdown 文件是面向人的派生视图。
 
@@ -283,8 +285,8 @@ harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 9
-harness.py --root . migrate --from-version markdown-v1 --to-version 9 --dry-run
+harness.py --root . migrate --from-version 6 --to-version 10
+harness.py --root . migrate --from-version markdown-v1 --to-version 10 --dry-run
 harness.py --root . invariant validate
 harness.py --root . projection rebuild
 harness.py --root . kernel doctor
@@ -309,15 +311,16 @@ harness.py --root . task submit T1 --agent developer --lease-token <token> --exp
 harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
 harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --evidence "review passed"
 harness.py --root . decision record --decision "Selected local runtime" --reason "SQLite is the source of truth"
-harness.py --root . evidence record --id EV1 --kind command --summary "pytest passed" --uri "local://pytest"
+harness.py --root . evidence record --id EV1 --kind command --summary "pytest passed" --command "pytest" --exit-code 0 --stdout-sha256 <sha256> --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
 harness.py --root . test record --id TEST1 --surface "Example" --command "pytest" --result pass --evidence EV1
 harness.py --root . finding record --id F1 --surface "Example" --severity medium --status open --summary "Follow-up needed"
-harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass --test TEST1 --evidence EV1
+harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass --test TEST1 --evidence EV1 --command "pytest" --exit-code 0 --stdout-sha256 <sha256> --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
 harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command" --finding F1
 harness.py --root . checkpoint create --label before-delivery
 harness.py --root . checkpoint export --out checkpoint.json
 harness.py --root . event validate
 harness.py --root . dispatch plan --scope "Example scope"
+harness.py --root . dispatch run --agent developer --command "pytest"
 harness.py --root . adapter plan --tool github --mode write-confirm --artifact Tasks --action "create issue"
 harness.py --root . adapter confirm --id <action-id>
 harness.py --root . risk sweep-expired
@@ -514,12 +517,12 @@ git diff --check
 
 ## 版本状态
 
-当前 README 描述的是 v0.7 beta / Kernel v3.0 插件格式：
+当前 README 描述的是 v0.8 beta / Kernel v3.1 插件格式：
 
 - `plugin.json` 使用官方风格 `interface` 元数据。
 - `skills` 使用插件目录引用。
 - 每个 skill 包含 `agents/openai.yaml`。
-- 本地运行时包含 requirement、failure-mode、evidence、test、finding、invalidation、quality-gate 等机器可读 schema，并通过 core schema guard、gate engine、event bus、invariant checker 和 projection 层统一执行。
+- 本地运行时包含 requirement、failure-mode、evidence、test、finding、invalidation、quality-gate 等机器可读 schema，并通过 core schema guard、gate engine、event bus、invariant checker、executor 和 projection 层统一执行。
 - 项目目标固定为 verified code delivery，不包含 deployment。
 
 ## License

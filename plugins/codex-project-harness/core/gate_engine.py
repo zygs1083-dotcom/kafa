@@ -8,6 +8,73 @@ from pathlib import Path
 from harness_lib import git_dirty, git_head_sha, git_source_tree_hash
 
 
+def _value(row: sqlite3.Row, field: str) -> object:
+    return row[field] if field in row.keys() else None
+
+
+def _artifact_is_available(root: Path, artifact_path: str) -> bool:
+    if not artifact_path:
+        return False
+    candidate = (root / artifact_path).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return False
+    return candidate.exists() and candidate.is_file()
+
+
+def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, *, label: str) -> list[str]:
+    command = str(_value(row, "command") or "")
+    exit_code = _value(row, "exit_code")
+    stdout_sha256 = str(_value(row, "stdout_sha256") or "")
+    artifact_path = str(_value(row, "artifact_path") or "")
+    source_tree_hash = str(_value(row, "source_tree_hash") or "")
+    issues: list[str] = []
+    if not command:
+        issues.append(f"{label} missing command")
+    if exit_code is None:
+        issues.append(f"{label} missing exit_code")
+    elif int(exit_code) != 0:
+        issues.append(f"{label} exit_code={exit_code}")
+    if not stdout_sha256:
+        issues.append(f"{label} missing stdout_sha256")
+    if not artifact_path:
+        issues.append(f"{label} missing artifact_path")
+    elif not _artifact_is_available(root, artifact_path):
+        issues.append(f"{label} artifact unavailable: {artifact_path}")
+    if current_source_hash and source_tree_hash != current_source_hash:
+        issues.append(f"{label} source_tree_hash mismatch: evidence={source_tree_hash} current={current_source_hash}")
+    return issues
+
+
+def validation_trusted_command_issues(
+    conn: sqlite3.Connection,
+    validation: sqlite3.Row,
+    root: Path,
+    current_source_hash: str,
+) -> list[str]:
+    candidates: list[tuple[str, sqlite3.Row]] = [("validation", validation)]
+    candidates.extend(
+        ("evidence", row)
+        for row in conn.execute(
+            """
+            select e.* from validation_evidence ve
+            join evidence e on e.id = ve.evidence_id
+            where ve.validation_id = ?
+            order by e.created_at, e.id
+            """,
+            (validation["id"],),
+        )
+    )
+    all_issues: list[str] = []
+    for label, row in candidates:
+        issues = _command_row_issues(root, row, current_source_hash, label=label)
+        if not issues:
+            return []
+        all_issues.extend(issues)
+    return all_issues or ["missing trusted command evidence"]
+
+
 def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[str]:
     from harness_db import baseline_issues, is_expired, traceability_issues, validation_has_test_or_evidence
 
@@ -59,6 +126,13 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             issues.append(f"acceptance has no passing validation: {acceptance['id']}")
         elif not validation_has_test_or_evidence(conn, validation["id"]):
             issues.append(f"acceptance validation lacks linked passing test or evidence: {acceptance['id']}")
+        else:
+            validation_row = conn.execute("select * from validations where id = ?", (validation["id"],)).fetchone()
+            trusted_issues = validation_trusted_command_issues(conn, validation_row, root, current_source_hash)
+            if trusted_issues:
+                issues.append(
+                    f"acceptance validation lacks trusted command evidence: {acceptance['id']} ({'; '.join(trusted_issues)})"
+                )
 
     risky_failure_modes = conn.execute(
         """
@@ -83,7 +157,11 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             """,
             (failure_mode["id"],),
         ).fetchall()
-        covered_with_evidence = any(validation_has_test_or_evidence(conn, row["id"]) for row in covered)
+        covered_with_evidence = any(
+            validation_has_test_or_evidence(conn, row["id"])
+            and not validation_trusted_command_issues(conn, row, root, current_source_hash)
+            for row in covered
+        )
         if not covered_with_evidence:
             issues.append(
                 f"{failure_mode['risk']} failure mode is not covered by passing validation with linked test/evidence: {failure_mode['id']} status={failure_mode['status']}"

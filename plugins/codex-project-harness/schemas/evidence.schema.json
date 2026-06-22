@@ -9,6 +9,11 @@
     "summary": { "type": "string" },
     "uri": { "type": "string" },
     "hash": { "type": "string" },
+    "command": { "type": "string" },
+    "exit_code": { "type": ["integer", "null"] },
+    "stdout_sha256": { "type": "string" },
+    "artifact_path": { "type": "string" },
+    "source_tree_hash": { "type": "string" },
     "created_at": { "type": "string" }
   },
   "additionalProperties": true

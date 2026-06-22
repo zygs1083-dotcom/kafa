@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sqlite3
 import tempfile
@@ -32,6 +33,13 @@ def token_from_stdout(stdout: str) -> str:
     return stdout.split("token=", 1)[1].strip()
 
 
+def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "ok\n") -> tuple[str, str]:
+    artifact = root / ".ai-team" / "runtime" / "test-artifacts" / f"stdout-{suffix}.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(content, encoding="utf-8")
+    return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 class HarnessRuntimeValidationTest(unittest.TestCase):
     def make_project(self) -> tempfile.TemporaryDirectory[str]:
         temp = tempfile.TemporaryDirectory()
@@ -60,7 +68,28 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         return temp
 
     def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
-        run_script(root, "harness.py", "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "example evidence")
+        artifact_path, stdout_sha = trusted_artifact(root, "evidence")
+        validation_artifact, validation_sha = trusted_artifact(root, "validation")
+        run_script(
+            root,
+            "harness.py",
+            "evidence",
+            "record",
+            "--id",
+            "EV1",
+            "--kind",
+            "command",
+            "--summary",
+            "example evidence",
+            "--command",
+            "python3 -c 'print(\"ok\")'",
+            "--exit-code",
+            "0",
+            "--stdout-sha256",
+            stdout_sha,
+            "--artifact-path",
+            artifact_path,
+        )
         run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", "example test", "--result", "pass", "--evidence", "EV1")
         command = [
             "record_validation.py",
@@ -78,6 +107,14 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "TEST1",
             "--evidence",
             "EV1",
+            "--command",
+            "python3 -c 'print(\"ok\")'",
+            "--exit-code",
+            "0",
+            "--stdout-sha256",
+            validation_sha,
+            "--artifact-path",
+            validation_artifact,
         ]
         if failure_mode:
             command.extend(["--failure-mode", "FM1"])

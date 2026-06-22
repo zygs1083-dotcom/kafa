@@ -20,12 +20,12 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso
+from core.schema_guard import ADAPTER_MODES, FAILURE_MODE_STATUSES, TASK_STATUSES
 
 
-SCHEMA_VERSION = 9
-RUNTIME_VERSION = "3.0.0"
+SCHEMA_VERSION = 10
+RUNTIME_VERSION = "3.1.0"
 DB_PATH = Path(".ai-team/state/harness.db")
-ADAPTER_MODES = {"read-only", "draft-write", "write-confirm", "write-auto", "disabled"}
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -61,22 +61,8 @@ PHASE_TRANSITIONS = {
     "archived": set(),
 }
 
-TASK_STATUSES = {
-    "ready",
-    "claimed",
-    "in_progress",
-    "submitted",
-    "review",
-    "blocked",
-    "accepted",
-    "failed",
-    "cancelled",
-    "skipped",
-}
-
-FAILURE_MODE_STATUSES = {"identified", "accepted", "exempt"}
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
-DISPATCH_STATUSES = {"planned", "claimed", "completed", "stale"}
+DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale"}
 
 SNAPSHOT_TABLES = [
     "project",
@@ -142,12 +128,25 @@ def connection(root: Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def transaction_invariant_issues(conn: sqlite3.Connection, root: Path) -> list[str]:
+    exists = conn.execute("select 1 from sqlite_master where type='table' and name = 'project'").fetchone()
+    if not exists:
+        return []
+    from core.invariant_checker import check_runtime_invariants
+
+    return check_runtime_invariants(conn, root)
+
+
 @contextmanager
-def transaction(root: Path) -> Iterator[sqlite3.Connection]:
+def transaction(root: Path, *, validate_invariants: bool = True) -> Iterator[sqlite3.Connection]:
     conn = connect(root)
     try:
         conn.execute("begin immediate")
         yield conn
+        if validate_invariants:
+            issues = transaction_invariant_issues(conn, root)
+            if issues:
+                raise HarnessError("; ".join(issues))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -264,6 +263,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             surface text not null,
             acceptance_id text not null default '',
             commands text not null default '',
+            command text not null default '',
+            exit_code integer,
+            stdout_sha256 text not null default '',
+            artifact_path text not null default '',
             findings text not null,
             result text not null,
             residual_risk text not null default '',
@@ -337,6 +340,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             summary text not null,
             uri text not null default '',
             hash text not null default '',
+            command text not null default '',
+            exit_code integer,
+            stdout_sha256 text not null default '',
+            artifact_path text not null default '',
+            source_tree_hash text not null default '',
             created_at text not null
         );
         create table if not exists tests (
@@ -477,6 +485,15 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "source_tree_hash", "text not null default ''")
     ensure_column(conn, "validations", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "validations", "project_revision", "integer not null default 0")
+    ensure_column(conn, "validations", "command", "text not null default ''")
+    ensure_column(conn, "validations", "exit_code", "integer")
+    ensure_column(conn, "validations", "stdout_sha256", "text not null default ''")
+    ensure_column(conn, "validations", "artifact_path", "text not null default ''")
+    ensure_column(conn, "evidence", "command", "text not null default ''")
+    ensure_column(conn, "evidence", "exit_code", "integer")
+    ensure_column(conn, "evidence", "stdout_sha256", "text not null default ''")
+    ensure_column(conn, "evidence", "artifact_path", "text not null default ''")
+    ensure_column(conn, "evidence", "source_tree_hash", "text not null default ''")
 
 
 def ensure_runtime_gitignore(root: Path) -> None:
@@ -755,6 +772,17 @@ def guard_schema(callable_name: str, *args: object) -> None:
         raise HarnessError(str(exc)) from exc
 
 
+def normalize_artifact_path(root: Path, artifact_path: str) -> str:
+    if not artifact_path:
+        return ""
+    candidate = Path(artifact_path)
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        return resolved.relative_to(root.resolve()).as_posix()
+    except ValueError as exc:
+        raise HarnessError(f"artifact path must be inside project root: {artifact_path}") from exc
+
+
 def bump_project(conn: sqlite3.Connection, **updates: str) -> None:
     project = conn.execute("select revision from project where id = 1").fetchone()
     revision = int(project["revision"]) + 1
@@ -830,7 +858,7 @@ def init_runtime(root: Path) -> None:
     if not db_file(root).exists() and has_legacy_markdown_data(root):
         migrate_markdown_v1(root)
         return
-    with transaction(root) as conn:
+    with transaction(root, validate_invariants=False) as conn:
         create_schema(conn)
         initialize_project(conn)
         emit_event(conn, "runtime_initialized", payload())
@@ -964,7 +992,7 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
         return report
 
     backup_runtime(root, "markdown-v1")
-    with transaction(root) as conn:
+    with transaction(root, validate_invariants=False) as conn:
         create_schema(conn)
         initialize_project(conn)
         for cells in acceptance_rows:
@@ -1929,26 +1957,48 @@ def record_decision(root: Path, decision: str, reason: str) -> None:
     render_all(root)
 
 
-def record_validation(root: Path, surface: str, findings: str, result: str, *, acceptance: str = "", commands: str = "", risk: str = "", failure_modes: str = "", tests: str = "", evidence: str = "") -> None:
+def record_validation(
+    root: Path,
+    surface: str,
+    findings: str,
+    result: str,
+    *,
+    acceptance: str = "",
+    commands: str = "",
+    risk: str = "",
+    failure_modes: str = "",
+    tests: str = "",
+    evidence: str = "",
+    command: str = "",
+    exit_code: int | None = None,
+    stdout_sha256: str = "",
+    artifact_path: str = "",
+) -> None:
     guard_schema("validate_validation", surface, findings, result)
     current_sha = git_head_sha(root) or "no-git"
     source_hash = git_source_tree_hash(root) or ""
     tracked_diff_hash = git_tracked_diff_hash(root) or ""
+    artifact_path = normalize_artifact_path(root, artifact_path)
     with transaction(root) as conn:
         validation_id = str(uuid.uuid4())
         project_revision = int(project_row(conn)["revision"])
         conn.execute(
             """
             insert into validations
-            (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
-             source_tree_hash, tracked_diff_hash, project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
+             findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
+             project_revision, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 validation_id,
                 surface,
                 acceptance,
                 commands,
+                command,
+                exit_code,
+                stdout_sha256,
+                artifact_path,
                 findings,
                 result,
                 risk,
@@ -1992,16 +2042,33 @@ def record_validation(root: Path, surface: str, findings: str, result: str, *, a
     render_all(root)
 
 
-def record_evidence(root: Path, evidence_id: str, kind: str, summary: str, *, uri: str = "", artifact_hash: str = "") -> None:
+def record_evidence(
+    root: Path,
+    evidence_id: str,
+    kind: str,
+    summary: str,
+    *,
+    uri: str = "",
+    artifact_hash: str = "",
+    command: str = "",
+    exit_code: int | None = None,
+    stdout_sha256: str = "",
+    artifact_path: str = "",
+) -> None:
+    artifact_path = normalize_artifact_path(root, artifact_path)
+    source_hash = git_source_tree_hash(root) or ""
     with transaction(root) as conn:
         conn.execute(
             """
-            insert into evidence (id, kind, summary, uri, hash, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into evidence
+            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, summary=excluded.summary, uri=excluded.uri,
-              hash=excluded.hash, created_at=excluded.created_at
+              hash=excluded.hash, command=excluded.command, exit_code=excluded.exit_code,
+              stdout_sha256=excluded.stdout_sha256, artifact_path=excluded.artifact_path,
+              source_tree_hash=excluded.source_tree_hash, created_at=excluded.created_at
             """,
-            (evidence_id, kind, summary, uri, artifact_hash, now_iso()),
+            (evidence_id, kind, summary, uri, artifact_hash, command, exit_code, stdout_sha256, artifact_path, source_hash, now_iso()),
         )
         emit_event(conn, "evidence_recorded", payload(id=evidence_id, kind=kind))
     render_all(root)
@@ -2436,6 +2503,74 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
         return assignment["task_id"]
 
 
+def dispatch_run(root: Path, agent: str, command: str, *, timeout: int = 120) -> str:
+    from core.executor import LocalExecutor
+
+    with connection(root) as conn:
+        active = conn.execute(
+            "select * from dispatch_assignments where agent_id = ? and status = 'claimed' order by claimed_at, task_id limit 1",
+            (agent,),
+        ).fetchone()
+    if not active:
+        dispatch_claim_next(root, agent)
+    with connection(root) as conn:
+        assignment = conn.execute(
+            "select * from dispatch_assignments where agent_id = ? and status = 'claimed' order by claimed_at, task_id limit 1",
+            (agent,),
+        ).fetchone()
+    if not assignment:
+        raise HarnessError(f"no claimed dispatch assignment for agent: {agent}")
+
+    result = LocalExecutor(root).run(command, timeout=timeout)
+    evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
+    source_hash = git_source_tree_hash(root) or ""
+    status = "completed" if result.exit_code == 0 else "failed"
+    with transaction(root) as conn:
+        conn.execute(
+            """
+            insert into evidence
+            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash, created_at)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id,
+                f"dispatch {assignment['task_id']} command exit {result.exit_code}",
+                f"local://{result.artifact_path}",
+                result.stdout_sha256,
+                result.command,
+                result.exit_code,
+                result.stdout_sha256,
+                result.artifact_path,
+                source_hash,
+                now_iso(),
+            ),
+        )
+        conn.execute(
+            """
+            update dispatch_assignments
+            set status = ?, evidence = ?, updated_at = ?
+            where run_id = ? and task_id = ?
+            """,
+            (status, evidence_id, now_iso(), assignment["run_id"], assignment["task_id"]),
+        )
+        conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), assignment["run_id"]))
+        emit_event(
+            conn,
+            "dispatch_command_executed",
+            payload(
+                run_id=assignment["run_id"],
+                task_id=assignment["task_id"],
+                agent=agent,
+                evidence_id=evidence_id,
+                exit_code=result.exit_code,
+                timed_out=result.timed_out,
+            ),
+        )
+    if result.exit_code != 0:
+        raise HarnessError(f"dispatch command failed: {assignment['task_id']} exit_code={result.exit_code} evidence={evidence_id}")
+    return evidence_id
+
+
 def dispatch_recover_stale(root: Path) -> int:
     recovered = 0
     with transaction(root) as conn:
@@ -2485,7 +2620,7 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
         }
     backup_runtime(root, "migrate")
     from_version_int = int(from_version)
-    with transaction(root) as conn:
+    with transaction(root, validate_invariants=False) as conn:
         create_schema(conn)
         initialize_project(conn)
         conn.execute(

@@ -167,7 +167,7 @@ def render_validation(root: Path) -> None:
     with runtime.connection(root) as conn:
         rows = conn.execute("select * from validations order by created_at, id").fetchall()
         failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
-    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Command | Exit Code | Stdout SHA256 | Artifact | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(
         markdown_row(
             [
@@ -180,6 +180,10 @@ def render_validation(root: Path) -> None:
                 row["project_revision"],
                 "",
                 row["commands"],
+                row["command"] if "command" in row.keys() else "",
+                row["exit_code"] if "exit_code" in row.keys() else "",
+                row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
+                row["artifact_path"] if "artifact_path" in row.keys() else "",
                 row["findings"],
                 row["result"],
                 row["residual_risk"],
@@ -195,8 +199,25 @@ def render_evidence(root: Path) -> None:
     with runtime.connection(root) as conn:
         evidence_rows = conn.execute("select * from evidence order by created_at, id").fetchall()
         test_rows = conn.execute("select * from tests order by created_at, id").fetchall()
-    lines = ["# Evidence", "", "## Evidence Records", "", "| ID | Kind | Summary | URI | Hash | Created At |", "| --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["id"], row["kind"], row["summary"], row["uri"], row["hash"], row["created_at"]]) for row in evidence_rows)
+    lines = ["# Evidence", "", "## Evidence Records", "", "| ID | Kind | Summary | URI | Hash | Command | Exit Code | Stdout SHA256 | Artifact | Source Hash | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(
+        markdown_row(
+            [
+                row["id"],
+                row["kind"],
+                row["summary"],
+                row["uri"],
+                row["hash"],
+                row["command"] if "command" in row.keys() else "",
+                row["exit_code"] if "exit_code" in row.keys() else "",
+                row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
+                row["artifact_path"] if "artifact_path" in row.keys() else "",
+                row["source_tree_hash"] if "source_tree_hash" in row.keys() else "",
+                row["created_at"],
+            ]
+        )
+        for row in evidence_rows
+    )
     lines.extend(["", "## Test Records", "", "| ID | Surface | Command | Result | Evidence | Created At |", "| --- | --- | --- | --- | --- | --- |"])
     lines.extend(markdown_row([row["id"], row["surface"], row["command"], row["result"], row["evidence_id"], row["created_at"]]) for row in test_rows)
     write_view(root, "docs/harness/evidence.md", "\n".join(lines))

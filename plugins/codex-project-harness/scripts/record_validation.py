@@ -20,6 +20,10 @@ def main() -> int:
     parser.add_argument("--failure-mode", action="append", default=[])
     parser.add_argument("--test", action="append", default=[])
     parser.add_argument("--evidence", action="append", default=[])
+    parser.add_argument("--command", default="")
+    parser.add_argument("--exit-code", type=int)
+    parser.add_argument("--stdout-sha256", default="")
+    parser.add_argument("--artifact-path", default="")
     args = parser.parse_args()
     command = [
         "validation",
@@ -37,6 +41,14 @@ def main() -> int:
         "--risk",
         args.risk,
     ]
+    if args.command:
+        command.extend(["--command", args.command])
+    if args.exit_code is not None:
+        command.extend(["--exit-code", str(args.exit_code)])
+    if args.stdout_sha256:
+        command.extend(["--stdout-sha256", args.stdout_sha256])
+    if args.artifact_path:
+        command.extend(["--artifact-path", args.artifact_path])
     for failure_mode in args.failure_mode:
         command.extend(["--failure-mode", failure_mode])
     for test in args.test:

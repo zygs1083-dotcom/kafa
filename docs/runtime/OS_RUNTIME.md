@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.0
+# Codex OS Runtime Layer v3.1
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.0 is an architecture generation for runtime consistency. The repository release remains a beta release, while the runtime implementation version is `3.0.0` and the database schema version is `9`.
+Kernel v3.1 is an architecture generation for runtime consistency and trusted command evidence. The repository release remains a beta release, while the runtime implementation version is `3.1.0` and the database schema version is `10`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.0
+## Kernel v3.1
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -27,11 +27,12 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `lock_manager.py` owns task revision and lease validation.
 - `gate_engine.py` owns delivery readiness and delivery record barriers.
 - `schema_guard.py` performs pre-write entity validation and reuses row-level schema checks.
-- `event_bus.py` emits, stores, validates, dispatches, and replays checkpoint-era events.
+- `event_bus.py` emits, stores, validates, and dispatches audit events.
+- `executor.py` runs local commands and writes trusted command evidence artifacts.
 - `invariant_checker.py` verifies constraints that must not be bypassed by manual DB edits.
 - `projections.py` is the only Markdown projection writer.
 
-SQLite state tables remain the primary runtime fact source. Events are audit and replay support, not the primary source of truth.
+SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
 
 ## Unified CLI
 
@@ -43,7 +44,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 9
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 10
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -67,7 +68,7 @@ python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
 
 `harness doctor` checks required state, generated views, runtime Git hygiene, and DB rows against the machine-readable schema contracts.
 
-`harness kernel doctor` runs the regular doctor plus Kernel v3.0 invariant checks through the core API.
+`harness kernel doctor` runs the regular doctor plus Kernel v3 invariant checks through the core API.
 
 `harness invariant validate` runs the invariant checker directly.
 
@@ -180,6 +181,7 @@ Local dispatcher commands:
 harness.py --root . agent capability add --agent developer --capability frontend
 harness.py --root . dispatch plan --scope "Build profile UI and API"
 harness.py --root . dispatch claim-next --agent developer
+harness.py --root . dispatch run --agent developer --command "pytest"
 harness.py --root . dispatch recover-stale
 harness.py --root . dispatch status
 ```
@@ -206,7 +208,7 @@ created_at
 
 Events include entity type, entity id, before/after snapshots for key state changes, actor or agent when available, command context, revision/status movement, and correlation id.
 
-Replay starts from an explicit checkpoint snapshot and then applies newer event `after` snapshots. Older events are kept as audit history and are not falsely treated as replay-complete without a checkpoint.
+Checkpoint export/import is the supported restore path. Events remain audit records and are validated for completeness, but the public runtime does not expose event replay as a recovery guarantee.
 
 ```bash
 harness.py --root . checkpoint create --label before-delivery
@@ -216,7 +218,6 @@ harness.py --root . checkpoint import --file checkpoint.json --dry-run
 harness.py --root . checkpoint import --file checkpoint.json --apply
 harness.py --root . event export --out events.jsonl
 harness.py --root . event validate
-harness.py --root . event replay --to 42 --out replay.db
 ```
 
 Legacy JSONL events may still exist for older scripts, but the SQLite events table is the runtime event log.
@@ -290,12 +291,19 @@ When a requirement baseline exists, delivery readiness requires a current frozen
 Evidence, test records, and findings are also structured:
 
 ```bash
-harness.py --root . evidence record --id EV1 --kind command --summary "npm test passed" --uri "local://npm-test"
+harness.py --root . evidence record \
+  --id EV1 \
+  --kind command \
+  --summary "npm test passed" \
+  --command "npm test" \
+  --exit-code 0 \
+  --stdout-sha256 <sha256> \
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
 harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence EV1
 harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity medium --status open --summary "Needs follow-up"
 ```
 
-Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, and `project_revision`. Delivery readiness fails if a passing validation was recorded against an older code snapshot.
+Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, `project_revision`, command, exit code, stdout hash, and artifact path. Delivery readiness fails if a passing validation was recorded against an older code snapshot or lacks trusted command evidence.
 
 Each active acceptance must have passing validation linked to at least one passing test or evidence item:
 
@@ -308,7 +316,11 @@ harness.py --root . validation record \
   --findings "passed" \
   --result pass \
   --test TEST1 \
-  --evidence EV1
+  --evidence EV1 \
+  --command "npm test" \
+  --exit-code 0 \
+  --stdout-sha256 <sha256> \
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
 ```
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
