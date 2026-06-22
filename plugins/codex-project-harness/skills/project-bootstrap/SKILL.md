@@ -18,14 +18,15 @@ Bootstrap owns local setup, capability discovery, tool mapping, and safe recomme
 3. Inspect branch, remote, and dirty worktree state when git exists.
 4. Recommend a feature branch for non-trivial work.
 5. Initialize or repair `.ai-team/` and `docs/harness/` with `scripts/init_project_harness.py` when appropriate.
-6. Detect whether project instructions such as `AGENTS.md` exist.
-7. Identify available or requested collaboration systems:
+6. Use `project-runtime` to update phase to `project_bootstrap` and record bootstrap decisions.
+7. Detect whether project instructions such as `AGENTS.md` exist.
+8. Identify available or requested collaboration systems:
    - GitHub for repository, branches, issues, PRs, checks, and code review.
    - Linear for project, issue, milestone, and implementation status.
    - Notion for PRD, decision log, architecture notes, and delivery records.
    - Figma for design context, prototypes, components, and visual acceptance.
    - Slack for status updates, review requests, and delivery notifications.
-8. Decide the source of truth for each artifact. Default to local harness files when an external tool is unavailable or not useful for the current project.
+9. Decide the source of truth for each artifact. Default to local harness files when an external tool is unavailable or not useful for the current project.
 
 ## Autonomy Policy
 
@@ -62,6 +63,15 @@ Please confirm before I proceed.
 ```
 
 Read-only inspection can proceed when the relevant connector is available and the user request implies that tool context matters.
+
+## Runtime Updates
+
+After bootstrap, update local control files:
+
+```bash
+python3 plugins/codex-project-harness/scripts/update_phase.py project_bootstrap --status active --owner bootstrap-coordinator
+python3 plugins/codex-project-harness/scripts/record_decision.py --decision "Selected project tooling" --reason "Workspace and collaboration context inspected"
+```
 
 ## Tool Mapping
 

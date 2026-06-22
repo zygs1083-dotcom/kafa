@@ -11,6 +11,7 @@ from pathlib import Path
 REQUIRED_SKILLS = [
     "project-harness",
     "project-bootstrap",
+    "project-runtime",
     "requirement-baseline",
     "team-architecture",
     "minimal-safe-change",
@@ -24,6 +25,22 @@ REQUIRED_SKILLS = [
 
 REQUIRED_REFERENCES = [
     "collaboration-tools.md",
+    "tool-adapters.md",
+]
+
+REQUIRED_SCRIPTS = [
+    "init_project_harness.py",
+    "validate_structure.py",
+    "harness_lib.py",
+    "harness_status.py",
+    "update_phase.py",
+    "add_acceptance.py",
+    "add_task.py",
+    "update_task.py",
+    "record_decision.py",
+    "record_validation.py",
+    "record_delivery.py",
+    "validate_harness_state.py",
 ]
 
 
@@ -65,6 +82,11 @@ def main() -> int:
         ref_path = root / "references" / ref
         if not ref_path.exists():
             errors.append(f"missing reference file: {ref_path}")
+
+    for script in REQUIRED_SCRIPTS:
+        script_path = root / "scripts" / script
+        if not script_path.exists():
+            errors.append(f"missing runtime script: {script_path}")
 
     stale_paths = [
         root / "skills" / "release-readiness" / "SKILL.md",

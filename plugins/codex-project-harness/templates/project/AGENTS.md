@@ -7,6 +7,7 @@ This project uses Codex Project Harness.
 - Keep changes scoped to the current task.
 - Preserve user changes and inspect before editing.
 - Maintain `.ai-team/` control files for substantial work.
+- Use project runtime scripts to update phase, task, validation, decision, and delivery records.
 - Let Codex decide whether GitHub, Linear, Notion, Figma, or Slack is useful from context; use local harness files as fallback.
 - Ask before high-impact external actions such as Slack messages, public/shared artifact creation, permission or secret changes, paid resources, destructive edits, or production-related changes.
 - Separate producer and reviewer roles.

@@ -33,6 +33,7 @@ For broad changes, split QA into short-lived subagents by risk surface. Examples
 - QA-D: security, permissions, secrets exposure, dependency risk.
 
 Each subagent must return evidence: files inspected, commands run, findings, and residual risk.
+Record each material QA result with `scripts/record_validation.py`.
 
 Use this output shape for each QA subagent:
 
@@ -57,3 +58,5 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 Lead with findings ordered by severity. If no issues are found, say that clearly and mention remaining test gaps or residual risk.
 
 Include GitHub/Linear/Notion/Figma/Slack links or local fallback artifacts used during review.
+
+Before passing delivery readiness, run `scripts/validate_harness_state.py` and report any warnings or errors.

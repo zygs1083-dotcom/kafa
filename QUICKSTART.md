@@ -12,14 +12,15 @@ The `project-harness` skill should:
 
 1. inspect the workspace,
 2. bootstrap git, harness files, and useful GitHub/Linear/Notion/Figma/Slack mappings,
-3. clarify requirements,
-4. ask for baseline confirmation when needed,
-5. initialize `.ai-team/` and `docs/harness/`,
-6. generate the project team architecture,
-7. dispatch implementation and review work,
-8. verify delivery,
-9. prepare code delivery evidence,
-10. run a retrospective.
+3. update runtime phase and task state through `project-runtime`,
+4. clarify requirements,
+5. ask for baseline confirmation when needed,
+6. initialize `.ai-team/` and `docs/harness/`,
+7. generate the project team architecture,
+8. dispatch implementation and review work,
+9. verify delivery,
+10. prepare code delivery evidence,
+11. run a retrospective.
 
 It should decide which collaboration tools are useful from context. Local harness files are the fallback. It should stop at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are outside this harness.
 
@@ -32,6 +33,11 @@ Use smaller skills when you do not need the whole project operating system:
 ```text
 $project-bootstrap
 检查并初始化当前项目的 git、.ai-team、docs/harness，以及需要使用的 GitHub/Linear/Notion/Figma/Slack 映射。
+```
+
+```text
+$project-runtime
+更新项目阶段、任务、决策、QA 和交付记录，并校验本地 harness 状态。
 ```
 
 ```text

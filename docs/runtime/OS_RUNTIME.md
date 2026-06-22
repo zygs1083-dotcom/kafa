@@ -88,6 +88,8 @@ created -> bootstrapped -> planned -> in_progress -> testing -> review -> delive
 - State transitions must be explicit
 - No implicit state changes allowed
 - Every state change must be logged
+- Use `scripts/update_phase.py` for phase changes
+- Use `scripts/add_acceptance.py` and `scripts/add_task.py` to keep requirements and work items linked
 
 ---
 
@@ -127,6 +129,7 @@ Event = {
 - All state transitions emit events
 - Events are immutable
 - Events are the only communication mechanism between agents
+- Runtime scripts append events to `.ai-team/runtime/events.jsonl`
 
 ---
 
@@ -136,6 +139,7 @@ This runtime layer extends the existing system:
 
 - project-harness -> becomes entry point into runtime
 - project-bootstrap -> checks workspace and collaboration control plane
+- project-runtime -> updates phase, tasks, decisions, validation, delivery, and local runtime events
 - team-architecture -> maps agents to scheduler assignments
 - skills -> become executable behaviors triggered by events
 
@@ -149,6 +153,8 @@ User Request
 project-harness
   ↓
 project-bootstrap
+  ↓
+project-runtime
   ↓
 Task Scheduler
   ↓

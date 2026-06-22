@@ -1,6 +1,6 @@
 # Codex Project Harness (Code Delivery Architecture v2)
 
-Codex Project Harness is a Codex-native project operating system that orchestrates verified code delivery using structured workflows, dynamic team generation, collaboration-tool mapping, and skill-based execution.
+Codex Project Harness is a Codex-native project operating system that orchestrates verified code delivery using executable local runtime state, structured workflows, dynamic team generation, collaboration-tool mapping, and skill-based execution.
 
 This version introduces a **3-layer execution model** and a **Failure Mode Engineering system** for delivering code with clear requirements, tests, independent QA, and handoff evidence.
 
@@ -38,14 +38,15 @@ It can use Git/GitHub, Linear, Notion, Figma, and Slack during delivery when use
 
 1. Project Manager receives idea
 2. Runs project bootstrap: workspace, git, harness files, and useful collaboration tools
-3. Performs requirement baseline and clarification
-4. Generates or selects team architecture
-5. Creates domain sessions (Product / Dev / QA etc.)
-6. Domain sessions break work into subagents
-7. Subagents execute isolated tasks
-8. QA and validation run independently
-9. Results are aggregated by Project Manager
-10. Delivery readiness + code handoff
+3. Updates executable runtime state and task records
+4. Performs requirement baseline and clarification
+5. Generates or selects team architecture
+6. Creates domain sessions (Product / Dev / QA etc.)
+7. Domain sessions break work into subagents
+8. Subagents execute isolated tasks
+9. QA and validation run independently
+10. Results are aggregated by Project Manager
+11. Delivery readiness + code handoff
 
 ---
 
@@ -103,6 +104,7 @@ Subagents must now include:
 This upgrade is fully compatible with existing skills:
 - project-harness
 - project-bootstrap
+- project-runtime
 - team-architecture
 - minimal-safe-change
 - test-first-delivery
@@ -110,7 +112,7 @@ This upgrade is fully compatible with existing skills:
 - delivery-readiness
 - independent-quality-gate
 
-See `examples/full-project-flow.md` for a complete request-to-delivery walkthrough.
+See `examples/full-project-flow.md` for a complete request-to-delivery walkthrough and `examples/forward-tests.md` for fresh-session validation prompts.
 
 ---
 

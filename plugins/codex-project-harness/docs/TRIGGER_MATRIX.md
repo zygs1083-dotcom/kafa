@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | 我要开发/创建/搭建一个项目 | `project-harness` | Code delivery orchestration |
 | 初始化项目/检查协作工具/配置 GitHub Linear Notion Figma Slack | `project-bootstrap` | Workspace, git, harness, and collaboration tool mapping |
+| 更新阶段/任务/QA/交付记录/检查本地状态 | `project-runtime` | Executable local control plane |
 | 帮我把需求问清楚 | `requirement-baseline` | Use before implementation |
 | 设计 Agent 小队/项目团队 | `team-architecture` | Creates role and skill plan |
 | 最小改动/不要重构 | `minimal-safe-change` | Keep diff narrow but complete |

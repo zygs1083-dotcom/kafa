@@ -19,6 +19,8 @@ Check whether the project operating system still matches reality.
 - acceptance criteria and traceability
 - GitHub/Linear/Notion/Figma/Slack mappings when present
 - recent code changes and tests
+- `scripts/harness_status.py`
+- `scripts/validate_harness_state.py`
 
 ## Detect
 

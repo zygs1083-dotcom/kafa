@@ -1,6 +1,6 @@
 ---
 name: "project-harness"
-description: "Use when the user wants to develop, create, build, implement, or fully deliver code for a software/data/automation project with Codex, including Chinese requests like 我要开发, 帮我做一个, 实现一个功能, 搭建一个系统, 从0到代码交付. Orchestrates project bootstrap, git/workspace checks, Codex-selected GitHub/Linear/Notion/Figma/Slack collaboration mapping, requirement clarification, confirmed scope, team architecture, implementation, tests, independent QA, and code delivery handoff. This skill stops at delivery of verified code and does not perform deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation."
+description: "Use when the user wants to develop, create, build, implement, or fully deliver code for a software/data/automation project with Codex, including Chinese requests like 我要开发, 帮我做一个, 实现一个功能, 搭建一个系统, 从0到代码交付. Orchestrates executable project runtime updates, project bootstrap, git/workspace checks, Codex-selected GitHub/Linear/Notion/Figma/Slack collaboration mapping, requirement clarification, confirmed scope, team architecture, implementation, tests, independent QA, and code delivery handoff. This skill stops at delivery of verified code and does not perform deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation."
 ---
 
 # Project Harness
@@ -27,6 +27,7 @@ The harness owns:
 
 - requirement baseline and acceptance criteria,
 - project bootstrap, git/workspace checks, and collaboration tool mapping,
+- executable runtime state, tasks, validation records, and delivery records,
 - implementation plan and task routing,
 - code changes and local/project tests,
 - independent QA and integration coherence review,
@@ -52,6 +53,7 @@ intake -> project_bootstrap -> requirement_baseline -> confirmation -> team_arch
 Rules:
 
 - Run `project_bootstrap` before requirement baselining for new projects, substantial features, or any request that mentions GitHub, Linear, Notion, Figma, Slack, issues, PRs, design, or team coordination.
+- Use `project-runtime` scripts whenever a phase, task, decision, validation record, or delivery record changes.
 - Do not enter `implementation` before a requirement baseline exists unless the request is a narrow, already-clear change.
 - Ask for confirmation before freezing the baseline when scope, data model, user workflow, or acceptance criteria are ambiguous.
 - Skip `team_architecture` only for small changes where one producer and one review pass are enough.
@@ -93,17 +95,20 @@ Use this baseline confirmation shape before implementation on broad work:
 
 1. Inspect the workspace and current repository state.
 2. Run `project-bootstrap` when the work is new, substantial, or tool-coordinated.
-3. Clarify only missing information that materially changes scope, risk, or acceptance.
-4. Build a requirement baseline with acceptance criteria and non-goals.
-5. Ask for confirmation before treating the baseline as execution scope when the project is ambiguous or high impact.
-6. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
-7. Use `team-architecture` logic to choose the smallest effective agent team.
-8. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
-9. Keep producer and reviewer roles separate.
-10. Use a maximum of two producer-reviewer retry loops before escalating.
-11. Run integration coherence QA before declaring completion.
-12. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
-13. Finish with a concise delivery report and update the evolution log when useful.
+3. Use `project-runtime` to update the current phase and local control plane.
+4. Clarify only missing information that materially changes scope, risk, or acceptance.
+5. Build a requirement baseline with acceptance criteria and non-goals.
+6. Ask for confirmation before treating the baseline as execution scope when the project is ambiguous or high impact.
+7. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
+8. Use `team-architecture` logic to choose the smallest effective agent team.
+9. Add tasks through `project-runtime` with owners, acceptance mapping, tool mapping, dependencies, and evidence fields.
+10. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
+11. Keep producer and reviewer roles separate.
+12. Use a maximum of two producer-reviewer retry loops before escalating.
+13. Run integration coherence QA before declaring completion.
+14. Record QA and delivery evidence through `project-runtime`.
+15. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
+16. Finish with a concise delivery report and update the evolution log when useful.
 
 ## Skill Routing
 
@@ -112,6 +117,7 @@ Route work through the smallest useful path:
 | Situation | Skill |
 | --- | --- |
 | New/substantial project, repo setup, branch setup, GitHub/Linear/Notion/Figma/Slack coordination | `project-bootstrap` |
+| Phase/task/decision/validation/delivery state changes | `project-runtime` |
 | Broad or vague new project / feature | `requirement-baseline` first |
 | Agent roles or parallel work are useful | `team-architecture` |
 | Small focused patch | `minimal-safe-change` |
@@ -125,6 +131,7 @@ Route work through the smallest useful path:
 ## Collaboration Tools
 
 Use `references/collaboration-tools.md` when the project uses or requests GitHub, Linear, Notion, Figma, Slack, issues, PRs, design files, or status notifications.
+Use `references/tool-adapters.md` when deciding whether and how to sync local harness records to GitHub, Linear, Notion, Figma, or Slack.
 
 Default source-of-truth policy:
 
@@ -157,6 +164,7 @@ Create or maintain these when the project is substantial:
 .ai-team/control/decision-log.md
 .ai-team/requirements/requirements.md
 .ai-team/requirements/acceptance.md
+.ai-team/requirements/traceability.md
 .ai-team/planning/task-board.md
 docs/harness/bootstrap.md
 docs/harness/team-architecture.md
@@ -202,3 +210,10 @@ Final delivery must include:
 - GitHub/Linear/Notion/Figma/Slack links or fallback local artifacts used,
 - known gaps or residual risks,
 - explicit note that deployment is not included.
+
+Before final delivery, run:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness_status.py
+python3 plugins/codex-project-harness/scripts/validate_harness_state.py
+```

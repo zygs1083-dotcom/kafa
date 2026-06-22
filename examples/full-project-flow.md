@@ -113,6 +113,12 @@ Task Board:
 - T7 Delivery readiness | Tool link: local or GitHub PR/Notion handoff
 ```
 
+Codex should record these tasks through `project-runtime`, for example:
+
+```bash
+python3 plugins/codex-project-harness/scripts/add_task.py --id T1 --task "Data model and local storage" --owner architect --acceptance AC1
+```
+
 ## 6. Implementation
 
 Implementation should follow local project conventions and keep changes scoped.
@@ -131,6 +137,8 @@ Risks:
 Next:
 ```
 
+Codex should update task status with `scripts/update_task.py` as work progresses.
+
 ## 7. Independent QA
 
 For broad changes, split QA into short-lived subagents:
@@ -143,6 +151,7 @@ QA-D: permission/security review when relevant
 ```
 
 Each QA subagent must return findings, evidence, and residual risk.
+Codex should record material QA results with `scripts/record_validation.py`.
 
 ## 8. Delivery Readiness
 
@@ -162,6 +171,13 @@ Final output should package the code delivery:
 ## Handoff Notes
 ## Out Of Scope
 - Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation.
+```
+
+Before final handoff, Codex should run:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness_status.py
+python3 plugins/codex-project-harness/scripts/validate_harness_state.py
 ```
 
 ## 9. Retrospective
