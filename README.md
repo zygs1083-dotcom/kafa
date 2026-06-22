@@ -1,67 +1,108 @@
-# Codex Project Harness
+# Codex Project Harness (Extended Architecture v2)
 
-Codex Project Harness is a Codex-native project team operating system. It turns large software requests into a controlled workflow with requirement baselines, generated agent teams, reusable skills, quality gates, release readiness checks, and retrospectives.
+Codex Project Harness is a Codex-native project operating system that orchestrates end-to-end software delivery using structured workflows, dynamic team generation, and skill-based execution.
 
-The design borrows the useful ideas from harness-style agent systems, but keeps the implementation aligned with Codex:
+This version introduces a **3-layer execution model** and a **Failure Mode Engineering system** inspired by agent workflow research and production systems.
 
-- Codex Skills instead of a single oversized methodology document
-- Codex subagents and `.codex/agents/` instead of Claude-specific agent paths
-- Project control files under `.ai-team/`
-- Progressive disclosure through `references/`
-- Small reusable skills only when they have independent trigger value
+---
 
-## Skills
+# Core Architecture Upgrade
 
-| Skill | Purpose |
-| --- | --- |
-| `project-harness` | Start and orchestrate a full project from idea to delivery |
-| `requirement-baseline` | Clarify, freeze, and trace requirements |
-| `team-architecture` | Generate the right agent team and project-specific skills |
-| `minimal-safe-change` | Make the smallest complete change with verification |
-| `test-first-delivery` | Deliver with tests, contracts, and regression checks |
-| `bug-fix-loop` | Reproduce, diagnose, fix, and prevent a bug from returning |
-| `independent-quality-gate` | Run independent QA, review, and integration coherence checks |
-| `release-readiness` | Prepare deployment, migration, rollback, and monitoring evidence |
-| `harness-audit` | Audit drift in agents, skills, rules, and control files |
-| `project-retrospective` | Convert project evidence into reusable process improvements |
+## 1. Three-Layer Execution Model
 
-## Repository Layout
+### Layer 0 — Project Manager (Single Source of Truth)
+- Entry point for all projects
+- Responsible for requirement clarification and orchestration
+- Maintains global state and decisions
+- Assigns work to domain sessions
 
-```text
-plugins/codex-project-harness/
-├── .codex-plugin/plugin.json
-├── skills/
-├── docs/
-├── scripts/
-└── templates/
+### Layer 1 — Domain Sessions (Role-Based Contexts)
+- Product / Dev / QA / Security / Ops sessions
+- Each session owns a domain of reasoning
+- No direct execution of unrelated domains
+- Produces structured outputs and task breakdowns
+
+### Layer 2 — Subagents (Task Execution Units)
+- Fine-grained execution agents
+- Each handles a single task or subtask
+- Stateless, short-lived execution
+- Must return verifiable artifacts
+
+---
+
+## 2. Execution Flow
+
+1. Project Manager receives idea
+2. Performs requirement baseline and clarification
+3. Generates or selects team architecture
+4. Creates domain sessions (Product / Dev / QA etc.)
+5. Domain sessions break work into subagents
+6. Subagents execute isolated tasks
+7. QA and validation run independently
+8. Results are aggregated by Project Manager
+9. Release readiness + deployment approval
+
+---
+
+## 3. Failure Mode Engineering (NEW)
+
+Every feature must explicitly model:
+
+- Normal path (happy flow)
+- Edge cases
+- Invalid input scenarios
+- Concurrency issues
+- Partial failure states
+- Recovery strategies
+- Rollback plan
+
+### Required Output Artifact
+Each feature must generate:
+
+```
+Failure Mode Matrix
+- Scenario
+- Trigger
+- Expected system behavior
+- Recovery strategy
+- Data safety guarantee
+- Test coverage mapping
 ```
 
-## Quick Start
+---
 
-Install the plugin or copy `plugins/codex-project-harness/skills/*` into a Codex skills directory. Then start a project with natural language:
+## 4. Subagent Requirements Upgrade
 
-```text
-我要开发一个跨境电商商品主数据系统，请从需求到上线完整推进。
-```
+Subagents must now include:
 
-For explicit invocation:
+- Explicit failure assumptions
+- Retry behavior
+- Idempotency guarantees
+- Rollback awareness
+- Test linkage
 
-```text
-$project-harness
-```
+---
 
-Use smaller skills directly when the task is narrow:
+## 5. Design Principles
 
-```text
-$minimal-safe-change
-请用最小改动修复这个筛选条件 bug，并补回归测试。
-```
+- No single agent owns full lifecycle decisions
+- Separation of reasoning (domain sessions) and execution (subagents)
+- Failure is first-class, not optional
+- All flows must be reversible or recoverable
 
-## Safety Defaults
+---
 
-- Requirement baseline before execution when scope is unclear
-- Human approval before production deployment or irreversible operations
-- Producer and reviewer are separated
-- Maximum producer-reviewer retry count is 2 before escalation
-- No default creation of excessive agents
-- No automatic secret writes or paid-resource creation
+## 6. Compatibility
+
+This upgrade is fully compatible with existing skills:
+- project-harness
+- team-architecture
+- minimal-safe-change
+- test-first-delivery
+- bug-fix-loop
+- release-readiness
+- independent-quality-gate
+
+---
+
+# End of Extension
