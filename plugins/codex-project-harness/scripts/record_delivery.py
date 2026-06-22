@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Write a delivery readiness record to docs/harness/delivery.md."""
+"""Compatibility wrapper for `harness.py delivery record`."""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from harness_lib import append_event, append_markdown, now_iso
+from harness_wrapper import run_harness
 
 
 def main() -> int:
@@ -23,51 +22,34 @@ def main() -> int:
     parser.add_argument("--known-gaps", default="")
     parser.add_argument("--handoff", default="")
     args = parser.parse_args()
-
-    content = f"""
-## Delivery Record {now_iso()}
-
-### Scope
-{args.scope}
-
-### Acceptance Mapping
-{args.acceptance}
-
-### Changed Files
-{args.changed_files}
-
-### Validation
-{args.validation}
-
-### Independent QA
-{args.qa}
-
-### Collaboration Links
-{args.collaboration_links}
-
-### Failure Mode Coverage
-{args.failure_mode_coverage}
-
-### Quality Gate
-{args.quality_gate}
-
-### Data / Config Notes
-{args.data_config_notes}
-
-### Known Gaps
-{args.known_gaps}
-
-### Handoff Notes
-{args.handoff}
-
-### Out Of Scope
-Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation.
-"""
-    root = Path.cwd()
-    append_markdown(root, "docs/harness/delivery.md", content)
-    append_event(root, "delivery_recorded", {"scope": args.scope})
-    print("OK: delivery recorded")
-    return 0
+    return run_harness(
+        [
+            "delivery",
+            "record",
+            "--scope",
+            args.scope,
+            "--acceptance",
+            args.acceptance,
+            "--changed-files",
+            args.changed_files,
+            "--validation",
+            args.validation,
+            "--qa",
+            args.qa,
+            "--collaboration-links",
+            args.collaboration_links,
+            "--failure-mode-coverage",
+            args.failure_mode_coverage,
+            "--quality-gate",
+            args.quality_gate,
+            "--data-config-notes",
+            args.data_config_notes,
+            "--known-gaps",
+            args.known_gaps,
+            "--handoff",
+            args.handoff,
+        ]
+    )
 
 
 if __name__ == "__main__":

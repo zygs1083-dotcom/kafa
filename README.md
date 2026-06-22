@@ -148,13 +148,13 @@ docs/harness/
   evolution-log.md
 ```
 
-运行时事件会写入：
+运行时状态和事件的事实源是：
 
 ```text
-.ai-team/runtime/events.jsonl
+.ai-team/state/harness.db
 ```
 
-该目录默认应被目标项目 `.gitignore` 忽略，因为它是过程事件流，不一定适合作为长期文档入仓。
+其中 `events` 表保存可审计事件流；`.ai-team/` 和 `docs/harness/` 下的 Markdown 文件由运行时渲染生成，适合阅读和交付，但不作为唯一事实源。
 
 ## 插件目录结构
 
@@ -181,6 +181,7 @@ plugins/codex-project-harness/
   scripts/
     harness.py
     harness_db.py
+    harness_wrapper.py
     init_project_harness.py
     validate_structure.py
     harness_status.py
@@ -259,7 +260,7 @@ harness.py --root . init
 harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
-harness.py --root . migrate --from-version 1 --to-version 2
+harness.py --root . migrate --from-version 2 --to-version 3
 harness.py --root . phase project_bootstrap
 harness.py --root . acceptance add --id AC1 --criterion "Example acceptance"
 harness.py --root . failure-mode add --id FM1 --feature "Example" --scenario "Risk" --trigger "Bad input" --expected "Safe handling" --acceptance AC1
@@ -268,99 +269,30 @@ harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
 harness.py --root . task start T1 --agent developer
 harness.py --root . task complete T1 --evidence "tests passed"
+harness.py --root . decision record --decision "Selected local runtime" --reason "SQLite is the source of truth"
 harness.py --root . validation record --surface "Example" --findings "passed" --result pass
 harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command"
+harness.py --root . delivery record --scope "Example delivery" --validation "tests passed" --quality-gate "independent_qa pass"
 harness.py --root . adapter record --tool github --mode read-only --artifact Tasks --external-id issue-1 --idempotency-key codex-project-harness:project:task:T1
 ```
 
-初始化本地控制面：
+兼容脚本仍然保留给旧流程和已有文档使用，例如 `init_project_harness.py`、`add_task.py`、`record_validation.py`、`validate_harness_state.py`。它们现在只是统一 CLI 的薄包装，不再直接写 Markdown/JSONL 事实文件。SQLite 是唯一运行时事实源，Markdown 文件是渲染视图。
 
-```bash
-python3 plugins/codex-project-harness/scripts/init_project_harness.py
-```
+旧脚本到统一 CLI 的对应关系：
 
-查看当前状态：
-
-```bash
-python3 plugins/codex-project-harness/scripts/harness_status.py
-```
-
-更新阶段：
-
-```bash
-python3 plugins/codex-project-harness/scripts/update_phase.py planning --status active --owner project-manager
-```
-
-添加验收标准：
-
-```bash
-python3 plugins/codex-project-harness/scripts/add_acceptance.py \
-  --id AC1 \
-  --criterion "User can create and edit a profile"
-```
-
-添加失败模式：
-
-```bash
-python3 plugins/codex-project-harness/scripts/add_failure_mode.py \
-  --id FM1 \
-  --feature "Profile CRUD" \
-  --scenario "Duplicate submit" \
-  --trigger "same request submitted twice" \
-  --expected "only one profile is created" \
-  --risk high \
-  --test-mapping AC1
-```
-
-添加任务：
-
-```bash
-python3 plugins/codex-project-harness/scripts/add_task.py \
-  --id T1 \
-  --task "Implement profile CRUD" \
-  --owner developer \
-  --acceptance AC1 \
-  --failure-mode FM1
-```
-
-记录验证证据：
-
-```bash
-python3 plugins/codex-project-harness/scripts/record_validation.py \
-  --surface "Profile API" \
-  --acceptance AC1 \
-  --commands "npm test -- profile" \
-  --findings "CRUD behavior passed" \
-  --result pass
-```
-
-记录质量门：
-
-```bash
-python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
-  --reviewer-context fresh \
-  --result pass \
-  --commands "npm test" \
-  --evidence "Acceptance and failure modes reviewed"
-```
-
-记录交付：
-
-```bash
-python3 plugins/codex-project-harness/scripts/record_delivery.py \
-  --scope "Profile CRUD" \
-  --acceptance "AC1" \
-  --validation "Tests passed" \
-  --qa "Quality gate passed" \
-  --failure-mode-coverage "FM1 covered by duplicate-submit test" \
-  --quality-gate "independent_qa pass"
-```
-
-校验目标项目的 harness 状态：
-
-```bash
-python3 plugins/codex-project-harness/scripts/validate_harness_state.py
-```
+| Legacy script | Canonical CLI |
+| --- | --- |
+| `harness_status.py` | `harness.py --root . status` |
+| `update_phase.py` | `harness.py --root . phase ...` |
+| `add_acceptance.py` | `harness.py --root . acceptance add ...` |
+| `add_failure_mode.py` | `harness.py --root . failure-mode add ...` |
+| `add_task.py` | `harness.py --root . task add ...` |
+| `update_task.py` | `harness.py --root . task update/start/complete/block ...` |
+| `record_decision.py` | `harness.py --root . decision record ...` |
+| `record_validation.py` | `harness.py --root . validation record ...` |
+| `record_quality_gate.py` | `harness.py --root . gate record ...` |
+| `record_delivery.py` | `harness.py --root . delivery record ...` |
+| `validate_harness_state.py` | `harness.py --root . validate --delivery` |
 
 校验本插件结构：
 

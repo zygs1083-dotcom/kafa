@@ -40,7 +40,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 2)
+            self.assertEqual(project[0], 3)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
 
@@ -95,16 +95,64 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "init")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "task", "add", "--id", "T1", "--task", "First", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T2", "--task", "Second", "--acceptance", "AC1")
 
             claim = run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", "1")
+            second_claim = run_harness(root, "task", "claim", "T2", "--agent", "developer", "--expected-revision", "1", check=False)
             stale = run_harness(root, "task", "claim", "T1", "--agent", "qa-reviewer", "--expected-revision", "1", check=False)
             run_harness(root, "task", "release", "T1", "--agent", "developer")
             fresh = run_harness(root, "task", "claim", "T1", "--agent", "qa-reviewer", "--expected-revision", "3")
 
             self.assertIn("claimed", claim.stdout)
+            self.assertNotEqual(second_claim.returncode, 0)
+            self.assertIn("agent already leased", second_claim.stdout)
             self.assertNotEqual(stale.returncode, 0)
             self.assertIn("revision mismatch", stale.stdout)
             self.assertIn("claimed", fresh.stdout)
+
+    def test_task_acceptance_requires_complete_flow_and_releases_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            add_accepted = run_harness(root, "task", "add", "--id", "T0", "--task", "Shortcut", "--acceptance", "AC1", "--status", "accepted", check=False)
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Real flow", "--acceptance", "AC1")
+            update_accepted = run_harness(root, "task", "update", "T1", "--status", "accepted", check=False)
+            complete_early = run_harness(root, "task", "complete", "T1", "--evidence", "done", check=False)
+            run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", "1")
+            run_harness(root, "task", "complete", "T1", "--evidence", "done")
+
+            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+                task = conn.execute("select status, lease_agent from tasks where id = 'T1'").fetchone()
+                agent = conn.execute("select status, lease_task_id from agents where id = 'developer'").fetchone()
+
+            self.assertNotEqual(add_accepted.returncode, 0)
+            self.assertIn("new tasks cannot be created as accepted", add_accepted.stdout)
+            self.assertNotEqual(update_accepted.returncode, 0)
+            self.assertIn("task acceptance must use task complete", update_accepted.stdout)
+            self.assertNotEqual(complete_early.returncode, 0)
+            self.assertIn("task status is not completable", complete_early.stdout)
+            self.assertEqual(task, ("accepted", None))
+            self.assertEqual(agent, ("available", ""))
+
+    def test_task_start_creates_agent_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "First", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T2", "--task", "Second", "--acceptance", "AC1")
+
+            run_harness(root, "task", "start", "T1", "--agent", "developer")
+            second_start = run_harness(root, "task", "start", "T2", "--agent", "developer", check=False)
+            run_harness(root, "task", "complete", "T1", "--evidence", "done")
+
+            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+                agent = conn.execute("select status, lease_task_id from agents where id = 'developer'").fetchone()
+
+            self.assertNotEqual(second_start.returncode, 0)
+            self.assertIn("agent already leased", second_start.stdout)
+            self.assertEqual(agent, ("available", ""))
 
     def test_doctor_repair_migrate_and_adapter_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -199,6 +247,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "critical", "--acceptance", "AC1")
             run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1", "--failure-mode", "FM1")
+            run_harness(root, "task", "start", "T1", "--agent", "developer")
             run_harness(root, "task", "complete", "T1", "--evidence", "done")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "test", "--findings", "failed", "--result", "fail")
             run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "fail", "--commands", "test", "--evidence", "review")
@@ -212,6 +261,37 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertIn("latest quality gate is not pass", validate.stdout)
             self.assertNotEqual(transition.returncode, 0)
             self.assertIn("delivery readiness blocked", transition.stdout)
+
+    def test_legacy_decision_wrapper_writes_sqlite_and_rendered_view(self) -> None:
+        legacy_init = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "init_project_harness.py"
+        legacy_decision = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "record_decision.py"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["python3", str(legacy_init)], cwd=root, text=True, capture_output=True, check=True)
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(legacy_decision),
+                    "--decision",
+                    'Use SQLite "runtime"',
+                    "--reason",
+                    "Avoid split-brain markdown writes",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+                decision = conn.execute("select decision, reason from decisions").fetchone()
+                event_payload = conn.execute("select payload_json from events where type = 'decision_recorded'").fetchone()[0]
+            rendered = (root / ".ai-team/control/decision-log.md").read_text(encoding="utf-8")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(decision, ('Use SQLite "runtime"', "Avoid split-brain markdown writes"))
+            self.assertIn('\\"runtime\\"', event_payload)
+            self.assertIn('Use SQLite "runtime"', rendered)
 
 
 if __name__ == "__main__":

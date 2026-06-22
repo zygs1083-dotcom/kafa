@@ -133,11 +133,11 @@ Task Board:
 - T7 Delivery readiness | Tool link: local or GitHub PR/Notion handoff
 ```
 
-Codex should record these tasks through `project-runtime`, for example:
+Codex should record these tasks through the unified `project-runtime` CLI, for example:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/add_failure_mode.py --id FM1 --feature "Relative profile CRUD" --scenario "Duplicate submit" --trigger "same form submitted twice" --expected "only one record is created" --risk high --test-mapping AC1
-python3 plugins/codex-project-harness/scripts/add_task.py --id T1 --task "Data model and local storage" --owner architect --acceptance AC1 --failure-mode FM1
+python3 plugins/codex-project-harness/scripts/harness.py --root . failure-mode add --id FM1 --feature "Relative profile CRUD" --scenario "Duplicate submit" --trigger "same form submitted twice" --expected "only one record is created" --risk high --acceptance AC1
+python3 plugins/codex-project-harness/scripts/harness.py --root . task add --id T1 --task "Data model and local storage" --owner architect --acceptance AC1 --failure-mode FM1
 ```
 
 ## 6. Implementation
@@ -158,7 +158,7 @@ Risks:
 Next:
 ```
 
-Codex should update task status with `scripts/update_task.py` as work progresses.
+Codex should update task state with `scripts/harness.py --root . task ...` as work progresses.
 
 ## 7. Independent QA
 
@@ -172,12 +172,12 @@ QA-D: permission/security review when relevant
 ```
 
 Each QA subagent must return findings, evidence, and residual risk.
-Codex should record material QA results with `scripts/record_validation.py` and the final gate with `scripts/record_quality_gate.py`.
+Codex should record material QA results with `scripts/harness.py --root . validation record ...` and the final gate with `scripts/harness.py --root . gate record ...`.
 
 The quality gate must include the reviewed commit or revision and reviewer context:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/record_quality_gate.py \
+python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
   --reviewer-context fresh \
   --result pass \
   --commands "npm test" \
@@ -209,8 +209,8 @@ Final output should package the code delivery:
 Before final handoff, Codex should run:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness_status.py
-python3 plugins/codex-project-harness/scripts/validate_harness_state.py
+python3 plugins/codex-project-harness/scripts/harness.py --root . status
+python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 ```
 
 ## 9. Retrospective

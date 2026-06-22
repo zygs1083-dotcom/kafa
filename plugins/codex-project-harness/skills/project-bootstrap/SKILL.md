@@ -18,7 +18,7 @@ Bootstrap owns local setup, capability discovery, tool mapping, and safe recomme
 3. Inspect branch, remote, and dirty worktree state when git exists.
 4. Recommend a feature branch for non-trivial work.
 5. Initialize or repair `.ai-team/` and `docs/harness/` with `scripts/init_project_harness.py` when appropriate.
-6. Use `project-runtime` to update phase to `project_bootstrap` and record bootstrap decisions.
+6. Use `project-runtime` unified CLI to update phase to `project_bootstrap` and record bootstrap decisions.
 7. Detect whether project instructions such as `AGENTS.md` exist.
 8. Identify available or requested collaboration systems:
    - GitHub for repository, branches, issues, PRs, checks, and code review.
@@ -71,8 +71,8 @@ Read-only inspection can proceed when the relevant connector is available and th
 After bootstrap, update local control files:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/update_phase.py project_bootstrap --status active --owner bootstrap-coordinator
-python3 plugins/codex-project-harness/scripts/record_decision.py --decision "Selected project tooling" --reason "Workspace and collaboration context inspected"
+python3 plugins/codex-project-harness/scripts/harness.py --root . phase project_bootstrap --status active --owner bootstrap-coordinator
+python3 plugins/codex-project-harness/scripts/harness.py --root . decision record --decision "Selected project tooling" --reason "Workspace and collaboration context inspected"
 ```
 
 ## Tool Mapping

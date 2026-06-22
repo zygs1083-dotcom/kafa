@@ -26,7 +26,6 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         run_script(root, "init_project_harness.py")
-        run_script(root, "update_phase.py", "delivery_readiness", "--status", "active", "--owner", "delivery")
         run_script(root, "add_acceptance.py", "--id", "AC1", "--criterion", "Example acceptance")
         run_script(
             root,
@@ -37,15 +36,11 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "Example task",
             "--owner",
             "developer",
-            "--status",
-            "accepted",
             "--acceptance",
             "AC1",
-            "--failure-mode",
-            "FM1",
-            "--evidence",
-            "example evidence",
         )
+        run_script(root, "harness.py", "task", "start", "T1", "--agent", "developer")
+        run_script(root, "harness.py", "task", "complete", "T1", "--evidence", "example evidence")
         return temp
 
     def add_pass_validation(self, root: Path) -> None:
@@ -161,7 +156,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             result = self.validate(root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("delivery validation is not pass", result.stdout)
+        self.assertIn("validation is not pass", result.stdout)
 
     def test_open_critical_failure_mode_blocks_delivery(self) -> None:
         with self.make_project() as temp:

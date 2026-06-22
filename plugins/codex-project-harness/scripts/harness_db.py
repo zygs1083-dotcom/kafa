@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import uuid
@@ -14,8 +15,8 @@ from typing import Iterator
 from harness_lib import ensure_parent, git_dirty, git_head_sha, markdown_row, now_iso, write_state
 
 
-SCHEMA_VERSION = 2
-RUNTIME_VERSION = "2.1.0"
+SCHEMA_VERSION = 3
+RUNTIME_VERSION = "2.2.0"
 DB_PATH = Path(".ai-team/state/harness.db")
 
 PHASES = [
@@ -203,6 +204,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             handoff text not null default '',
             created_at text not null
         );
+        create table if not exists decisions (
+            id text primary key,
+            decision text not null,
+            reason text not null,
+            created_at text not null
+        );
         create table if not exists adapters (
             id text primary key,
             tool text not null,
@@ -296,6 +303,10 @@ def emit_event(
     )
 
 
+def payload(**values: object) -> str:
+    return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def bump_project(conn: sqlite3.Connection, **updates: str) -> None:
     project = conn.execute("select revision from project where id = 1").fetchone()
     revision = int(project["revision"]) + 1
@@ -312,7 +323,7 @@ def init_runtime(root: Path) -> None:
     with transaction(root) as conn:
         create_schema(conn)
         initialize_project(conn)
-        emit_event(conn, "runtime_initialized", "{}")
+        emit_event(conn, "runtime_initialized", payload())
     render_all(root)
     install_agents(root)
 
@@ -335,7 +346,7 @@ def install_agents(root: Path) -> None:
                 """,
                 (role, role, str(target), now_iso()),
             )
-        emit_event(conn, "agents_installed", "{}")
+        emit_event(conn, "agents_installed", payload())
 
 
 def project_row(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -363,7 +374,7 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
         if owner:
             updates["current_owner"] = owner
         bump_project(conn, **updates)
-        emit_event(conn, "phase_updated", f'{{"from":"{current}","to":"{phase}"}}')
+        emit_event(conn, "phase_updated", payload(**{"from": current, "to": phase}))
     render_all(root)
 
 
@@ -378,7 +389,7 @@ def add_acceptance(root: Path, acceptance_id: str, criterion: str, priority: str
             """,
             (acceptance_id, criterion, priority, tool_link),
         )
-        emit_event(conn, "acceptance_added", f'{{"id":"{acceptance_id}"}}')
+        emit_event(conn, "acceptance_added", payload(id=acceptance_id))
     render_all(root)
 
 
@@ -432,7 +443,7 @@ def add_failure_mode(
                 "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
                 (fm_id, acceptance),
             )
-        emit_event(conn, "failure_mode_added", f'{{"id":"{fm_id}","risk":"{risk}"}}')
+        emit_event(conn, "failure_mode_added", payload(id=fm_id, risk=risk))
     render_all(root)
 
 
@@ -484,6 +495,8 @@ def add_task(
     with transaction(root) as conn:
         if status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
+        if status == "accepted":
+            raise HarnessError("new tasks cannot be created as accepted; use task complete with evidence")
         if conn.execute("select id from tasks where id = ?", (task_id,)).fetchone():
             raise HarnessError(f"duplicate task id: {task_id}")
         conn.execute(
@@ -507,7 +520,7 @@ def add_task(
             require_task(conn, dep)
             assert_no_dependency_cycle(conn, task_id, dep)
             conn.execute("insert into task_dependencies (task_id, depends_on) values (?, ?)", (task_id, dep))
-        emit_event(conn, "task_created", f'{{"id":"{task_id}"}}')
+        emit_event(conn, "task_created", payload(id=task_id))
     render_all(root)
 
 
@@ -516,6 +529,8 @@ def update_task(root: Path, task_id: str, *, depends_on: str | None = None, stat
         row = require_task(conn, task_id)
         if status and status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
+        if status == "accepted":
+            raise HarnessError("task acceptance must use task complete with evidence")
         if depends_on is not None:
             conn.execute("delete from task_dependencies where task_id = ?", (task_id,))
             for dep in parse_ids(depends_on):
@@ -529,7 +544,7 @@ def update_task(root: Path, task_id: str, *, depends_on: str | None = None, stat
             )
         else:
             conn.execute("update tasks set revision = revision + 1, updated_at = ? where id = ?", (now_iso(), task_id))
-        emit_event(conn, "task_updated", f'{{"id":"{row["id"]}"}}')
+        emit_event(conn, "task_updated", payload(id=row["id"]))
     render_all(root)
 
 
@@ -580,6 +595,9 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
         row = require_task(conn, task_id)
         if int(row["revision"]) != expected_revision:
             raise HarnessError(f"revision mismatch: expected {expected_revision}, actual {row['revision']}")
+        active_lease = conn.execute("select lease_task_id from agents where id = ?", (agent,)).fetchone()
+        if active_lease and active_lease["lease_task_id"] and active_lease["lease_task_id"] != task_id:
+            raise HarnessError(f"agent already leased to {active_lease['lease_task_id']}")
         if row["lease_agent"]:
             raise HarnessError(f"task already leased by {row['lease_agent']}")
         if row["status"] != "ready":
@@ -600,7 +618,7 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
             """,
             (task_id, now_iso(), agent),
         )
-        emit_event(conn, "task_claimed", f'{{"id":"{task_id}","agent":"{agent}"}}')
+        emit_event(conn, "task_claimed", payload(id=task_id, agent=agent))
     render_all(root)
     return token
 
@@ -615,27 +633,43 @@ def release_task(root: Path, task_id: str, agent: str) -> None:
             (now_iso(), task_id),
         )
         conn.execute("update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?", (now_iso(), agent))
-        emit_event(conn, "task_released", f'{{"id":"{task_id}","agent":"{agent}"}}')
+        emit_event(conn, "task_released", payload(id=task_id, agent=agent))
     render_all(root)
 
 
 def start_task(root: Path, task_id: str, agent: str) -> None:
     with transaction(root) as conn:
         row = require_task(conn, task_id)
+        active_lease = conn.execute("select lease_task_id from agents where id = ?", (agent,)).fetchone()
+        if active_lease and active_lease["lease_task_id"] and active_lease["lease_task_id"] != task_id:
+            raise HarnessError(f"agent already leased to {active_lease['lease_task_id']}")
         if row["lease_agent"] and row["lease_agent"] != agent:
             raise HarnessError(f"task leased by {row['lease_agent']}")
         require_task_runnable(conn, row)
+        token = row["lease_token"] or str(uuid.uuid4())
         conn.execute(
-            "update tasks set status = 'in_progress', owner = ?, revision = revision + 1, updated_at = ? where id = ?",
-            (agent, now_iso(), task_id),
+            """
+            update tasks set status = 'in_progress', owner = ?, lease_agent = ?, lease_token = ?,
+              revision = revision + 1, updated_at = ? where id = ?
+            """,
+            (agent, agent, token, now_iso(), task_id),
         )
-        emit_event(conn, "task_started", f'{{"id":"{task_id}","agent":"{agent}"}}')
+        conn.execute(
+            """
+            update agents set lease_task_id = ?, status = 'leased', updated_at = ?
+            where id = ?
+            """,
+            (task_id, now_iso(), agent),
+        )
+        emit_event(conn, "task_started", payload(id=task_id, agent=agent))
     render_all(root)
 
 
 def complete_task(root: Path, task_id: str, evidence: str) -> None:
     with transaction(root) as conn:
-        require_task(conn, task_id)
+        row = require_task(conn, task_id)
+        if row["status"] not in {"claimed", "in_progress"}:
+            raise HarnessError(f"task status is not completable: {task_id} status={row['status']}")
         conn.execute(
             """
             update tasks set status = 'accepted', evidence = ?, lease_agent = null, lease_token = null,
@@ -643,7 +677,12 @@ def complete_task(root: Path, task_id: str, evidence: str) -> None:
             """,
             (evidence, now_iso(), task_id),
         )
-        emit_event(conn, "task_completed", f'{{"id":"{task_id}"}}')
+        if row["lease_agent"]:
+            conn.execute(
+                "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
+                (now_iso(), row["lease_agent"]),
+            )
+        emit_event(conn, "task_completed", payload(id=task_id))
     render_all(root)
 
 
@@ -654,7 +693,17 @@ def block_task(root: Path, task_id: str, reason: str) -> None:
             "update tasks set status = 'blocked', evidence = ?, revision = revision + 1, updated_at = ? where id = ?",
             (reason, now_iso(), task_id),
         )
-        emit_event(conn, "task_blocked", f'{{"id":"{task_id}"}}')
+        emit_event(conn, "task_blocked", payload(id=task_id))
+    render_all(root)
+
+
+def record_decision(root: Path, decision: str, reason: str) -> None:
+    with transaction(root) as conn:
+        conn.execute(
+            "insert into decisions (id, decision, reason, created_at) values (?, ?, ?, ?)",
+            (str(uuid.uuid4()), decision, reason, now_iso()),
+        )
+        emit_event(conn, "decision_recorded", payload(decision=decision, reason=reason))
     render_all(root)
 
 
@@ -667,7 +716,7 @@ def record_validation(root: Path, surface: str, findings: str, result: str, *, a
             """,
             (str(uuid.uuid4()), surface, acceptance, commands, findings, result, risk, now_iso()),
         )
-        emit_event(conn, "validation_recorded", f'{{"surface":"{surface}","result":"{result}"}}')
+        emit_event(conn, "validation_recorded", payload(surface=surface, result=result))
     render_all(root)
 
 
@@ -696,7 +745,7 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
                 now_iso(),
             ),
         )
-        emit_event(conn, "quality_gate_recorded", f'{{"gate":"{gate}","result":"{result}"}}')
+        emit_event(conn, "quality_gate_recorded", payload(gate=gate, result=result))
     render_all(root)
 
 
@@ -739,7 +788,7 @@ def record_delivery(
                 now_iso(),
             ),
         )
-        emit_event(conn, "delivery_recorded", f'{{"scope":"{scope}"}}')
+        emit_event(conn, "delivery_recorded", payload(scope=scope))
     render_all(root)
 
 
@@ -768,7 +817,7 @@ def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id:
                 now_iso(),
             ),
         )
-        emit_event(conn, "adapter_recorded", f'{{"tool":"{tool}","mode":"{mode}"}}', idempotency_key=idempotency_key)
+        emit_event(conn, "adapter_recorded", payload(tool=tool, mode=mode), idempotency_key=idempotency_key)
     render_tooling_map(root)
 
 
@@ -781,7 +830,7 @@ def migrate(root: Path, from_version: int, to_version: int) -> None:
             (from_version, to_version, now_iso()),
         )
         conn.execute("update project set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ? where id = 1", (to_version, RUNTIME_VERSION, now_iso()))
-        emit_event(conn, "migration_applied", f'{{"from":{from_version},"to":{to_version}}}')
+        emit_event(conn, "migration_applied", payload(**{"from": from_version, "to": to_version}))
     render_all(root)
 
 
@@ -904,6 +953,7 @@ def render_all(root: Path) -> None:
     render_validation(root)
     render_gates(root)
     render_deliveries(root)
+    render_decisions(root)
     render_tooling_map(root)
 
 
@@ -1071,6 +1121,14 @@ def render_deliveries(root: Path) -> None:
             ]
         )
     write_view(root, "docs/harness/delivery.md", "\n".join(lines))
+
+
+def render_decisions(root: Path) -> None:
+    with connect(root) as conn:
+        rows = conn.execute("select * from decisions order by created_at, id").fetchall()
+    lines = ["# Decision Log", "", "| Date | Decision | Reason |", "| --- | --- | --- |"]
+    lines.extend(markdown_row([row["created_at"], row["decision"], row["reason"]]) for row in rows)
+    write_view(root, ".ai-team/control/decision-log.md", "\n".join(lines))
 
 
 def render_tooling_map(root: Path) -> None:

@@ -32,6 +32,7 @@ REQUIRED_SCRIPTS = [
     "init_project_harness.py",
     "validate_structure.py",
     "harness_lib.py",
+    "harness_wrapper.py",
     "harness_status.py",
     "update_phase.py",
     "add_acceptance.py",

@@ -20,6 +20,7 @@ from harness_db import (
     migrate,
     ready_tasks,
     record_adapter,
+    record_decision,
     record_delivery,
     record_gate,
     record_validation,
@@ -130,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--findings", required=True)
     validation_record.add_argument("--result", required=True, choices=["pass", "fail", "blocked", "partial"])
     validation_record.add_argument("--risk", default="")
+
+    decision = sub.add_parser("decision")
+    decision_sub = decision.add_subparsers(dest="decision_command", required=True)
+    decision_record = decision_sub.add_parser("record")
+    decision_record.add_argument("--decision", required=True)
+    decision_record.add_argument("--reason", required=True)
 
     gate = sub.add_parser("gate")
     gate_sub = gate.add_subparsers(dest="gate_command", required=True)
@@ -272,6 +279,9 @@ def main() -> int:
         elif args.command == "validation" and args.validation_command == "record":
             record_validation(root, args.surface, args.findings, args.result, acceptance=args.acceptance, commands=args.commands, risk=args.risk)
             print("OK: validation recorded")
+        elif args.command == "decision" and args.decision_command == "record":
+            record_decision(root, args.decision, args.reason)
+            print("OK: decision recorded")
         elif args.command == "gate" and args.gate_command == "record":
             record_gate(
                 root,

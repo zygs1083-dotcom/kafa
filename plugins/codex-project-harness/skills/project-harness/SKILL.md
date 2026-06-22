@@ -219,6 +219,6 @@ Final delivery must include:
 Before final delivery, run:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness_status.py
-python3 plugins/codex-project-harness/scripts/validate_harness_state.py
+python3 plugins/codex-project-harness/scripts/harness.py --root . status
+python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 ```

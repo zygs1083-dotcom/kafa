@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Update a task row in the harness task board."""
+"""Compatibility wrapper for `harness.py task update`."""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import sys
 
-from harness_lib import append_event, replace_task_row
+from harness_wrapper import run_harness
 
 
 def main() -> int:
@@ -21,24 +21,30 @@ def main() -> int:
     parser.add_argument("--tool-link")
     parser.add_argument("--evidence")
     args = parser.parse_args()
-
-    updates = {
-        "task": args.task,
-        "owner": args.owner,
-        "status": args.status,
-        "acceptance": args.acceptance,
-        "failure_modes": args.failure_modes,
-        "depends_on": args.depends_on,
-        "tool_link": args.tool_link,
-        "evidence": args.evidence,
-    }
-    root = Path.cwd()
-    if not replace_task_row(root, args.id, updates):
-        print(f"ERROR: task not found: {args.id}")
-        return 1
-    append_event(root, "task_updated", {"id": args.id, **{k: v for k, v in updates.items() if v}})
-    print(f"OK: task updated {args.id}")
-    return 0
+    unsupported = []
+    for name in ["task", "owner", "acceptance", "failure_modes", "tool_link"]:
+        if getattr(args, name):
+            unsupported.append("--" + name.replace("_", "-"))
+    if unsupported:
+        print(
+            "ERROR: update_task.py only updates status and dependencies; use harness.py task add/complete/block for "
+            + ", ".join(unsupported),
+            file=sys.stderr,
+        )
+        return 2
+    if args.status == "accepted":
+        if not args.evidence:
+            print("ERROR: accepted tasks require --evidence and must use task complete", file=sys.stderr)
+            return 2
+        return run_harness(["task", "complete", args.id, "--evidence", args.evidence])
+    if args.status == "blocked":
+        return run_harness(["task", "block", args.id, "--reason", args.evidence or "blocked"])
+    command = ["task", "update", args.id]
+    if args.status:
+        command.extend(["--status", args.status])
+    if args.depends_on is not None:
+        command.extend(["--depends-on", args.depends_on])
+    return run_harness(command)
 
 
 if __name__ == "__main__":

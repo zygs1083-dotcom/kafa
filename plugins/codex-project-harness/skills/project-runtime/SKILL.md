@@ -17,7 +17,7 @@ Prefer the self-contained CLI in this skill when the plugin is installed outside
 
 ```bash
 python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
-python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate
+python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate --delivery
 ```
 
 The CLI locates the installed plugin scripts from the skill directory and runs them with the target project root as `cwd`.
@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair` |
-| Migrate state | `harness.py --root . migrate --from-version 1 --to-version 2` |
+| Migrate state | `harness.py --root . migrate --from-version 2 --to-version 3` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Add acceptance criterion | `harness.py --root . acceptance add` |
 | Add failure mode | `harness.py --root . failure-mode add` |
@@ -40,10 +40,12 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Find next task | `harness.py --root . task next` |
 | Claim / release task | `harness.py --root . task claim`, `harness.py --root . task release` |
 | Start / complete task | `harness.py --root . task start`, `harness.py --root . task complete` |
+| Record decision | `harness.py --root . decision record` |
 | Record QA / validation | `harness.py --root . validation record` |
 | Record quality gate | `harness.py --root . gate record` |
+| Record delivery | `harness.py --root . delivery record` |
 | Record adapter link | `harness.py --root . adapter record` |
-| Validate local harness state | `harness.py --root . validate` |
+| Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
 
 ## Phase Protocol
 
@@ -95,6 +97,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . task add \
 Update task state as implementation progresses:
 
 ```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1 --agent developer
 python3 plugins/codex-project-harness/scripts/harness.py --root . task complete T1 \
   --evidence "npm test -- profile-crud passed"
 ```
@@ -124,6 +127,17 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
 Record delivery when QA has acceptable evidence:
 
 ```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . delivery record \
+  --scope "Profile CRUD" \
+  --acceptance "AC1" \
+  --validation "npm test -- profile-crud passed" \
+  --qa "independent_qa pass" \
+  --quality-gate "latest gate pass"
+```
+
+Record external tool links when they are useful:
+
+```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . adapter record \
   --tool github \
   --mode read-only \
@@ -141,7 +155,7 @@ Use `references/tool-adapters.md` when deciding whether to sync GitHub, Linear, 
 Before claiming delivery readiness:
 
 1. Run `harness.py --root . status`.
-2. Run `harness.py --root . validate`.
+2. Run `harness.py --root . validate --delivery`.
 3. Confirm validation evidence exists.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
 5. Confirm high/critical failure modes are covered or explicitly accepted.

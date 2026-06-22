@@ -25,7 +25,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . init
 python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 1 --to-version 2
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 2 --to-version 3
 ```
 
 When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:

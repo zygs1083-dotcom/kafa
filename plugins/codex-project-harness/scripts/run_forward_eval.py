@@ -33,6 +33,7 @@ def scenario_full_project() -> dict[str, object]:
             run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"),
             run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "high", "--status", "covered", "--acceptance", "AC1"),
             run(root, "task", "add", "--id", "T1", "--task", "Implement task creation", "--acceptance", "AC1", "--failure-mode", "FM1"),
+            run(root, "task", "start", "T1", "--agent", "developer"),
             run(root, "task", "complete", "T1", "--evidence", "unit test passed"),
             run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass"),
             run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"),

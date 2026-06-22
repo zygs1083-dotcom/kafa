@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""Append a failure mode to the harness failure-mode matrix."""
+"""Compatibility wrapper for `harness.py failure-mode add`."""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from harness_lib import append_event, append_table_row
-
-
-HEADER = """# Failure Modes
-
-| ID | Feature | Scenario | Trigger | Expected Behavior | Recovery | Data Safety | Risk | Test Mapping | Status |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"""
+from harness_wrapper import run_harness
 
 
 def main() -> int:
@@ -28,28 +21,31 @@ def main() -> int:
     parser.add_argument("--test-mapping", default="")
     parser.add_argument("--status", choices=["identified", "covered", "accepted", "exempt"], default="identified")
     args = parser.parse_args()
-
-    root = Path.cwd()
-    append_table_row(
-        root,
-        ".ai-team/requirements/failure-modes.md",
-        [
-            args.id,
-            args.feature,
-            args.scenario,
-            args.trigger,
-            args.expected,
-            args.recovery,
-            args.data_safety,
-            args.risk,
-            args.test_mapping,
-            args.status,
-        ],
-        HEADER,
-    )
-    append_event(root, "failure_mode_added", {"id": args.id, "feature": args.feature, "risk": args.risk})
-    print(f"OK: failure mode added {args.id}")
-    return 0
+    command = [
+        "failure-mode",
+        "add",
+        "--id",
+        args.id,
+        "--feature",
+        args.feature,
+        "--scenario",
+        args.scenario,
+        "--trigger",
+        args.trigger,
+        "--expected",
+        args.expected,
+        "--risk",
+        args.risk,
+        "--status",
+        args.status,
+        "--recovery",
+        args.recovery,
+        "--data-safety",
+        args.data_safety,
+    ]
+    if args.test_mapping:
+        command.extend(["--acceptance", args.test_mapping])
+    return run_harness(command)
 
 
 if __name__ == "__main__":
