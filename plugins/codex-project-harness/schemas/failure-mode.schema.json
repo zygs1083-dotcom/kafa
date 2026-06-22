@@ -13,7 +13,13 @@
     "data_safety": { "type": "string" },
     "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
     "test_mapping": { "type": "string" },
-    "status": { "type": "string", "enum": ["identified", "covered", "accepted", "exempt"] }
+    "status": { "type": "string", "enum": ["identified", "covered", "accepted", "exempt"] },
+    "accepted_by": { "type": ["string", "null"] },
+    "acceptance_reason": { "type": ["string", "null"] },
+    "acceptance_scope": { "type": "string" },
+    "accepted_revision": { "type": ["integer", "null"] },
+    "expires_at": { "type": ["string", "null"] },
+    "revision": { "type": "integer" }
   },
   "additionalProperties": true
 }

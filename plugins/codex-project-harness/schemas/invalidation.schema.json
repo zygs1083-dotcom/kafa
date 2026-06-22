@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Invalidation",
+  "type": "object",
+  "required": ["id", "source_type", "source_id", "target_type", "target_id", "reason", "created_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "source_type": { "type": "string", "enum": ["requirement", "acceptance", "failure_mode"] },
+    "source_id": { "type": "string" },
+    "target_type": { "type": "string", "enum": ["task", "validation", "quality_gate"] },
+    "target_id": { "type": "string" },
+    "reason": { "type": "string" },
+    "resolved_at": { "type": ["string", "null"] },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

@@ -17,8 +17,9 @@ Turn an idea into an executable requirement baseline.
 6. Ask only high-leverage questions; continue with stated assumptions when safe.
 7. Freeze a baseline before implementation when scope is broad.
 8. Assign stable IDs for requirements and acceptance criteria when implementation will proceed.
-9. Identify failure modes for risky work and record them with `scripts/add_failure_mode.py`.
-10. Map the baseline to useful collaboration tools when context supports it:
+9. Record baseline rows with `scripts/harness.py --root . requirement add ...` and `scripts/harness.py --root . acceptance add ...`.
+10. Identify failure modes for risky work and record them with `scripts/harness.py --root . failure-mode add ...`.
+11. Map the baseline to useful collaboration tools when context supports it:
    - Notion for PRD and decision records.
    - Linear or GitHub issues for scope, tasks, and acceptance checklists.
    - Figma for design inputs, prototypes, component constraints, and visual acceptance.
@@ -39,7 +40,7 @@ Codex should decide whether external tools are useful. Use local harness files a
 
 ## Failure Mode Policy
 
-Create Failure Mode IDs such as `FM1`, `FM2` when the work touches data writes, external APIs, permissions, concurrency, retry behavior, message processing, migrations, billing, or irreversible behavior. Pure copy/style changes may be exempt, but record the exemption reason in risks or assumptions.
+Create Failure Mode IDs such as `FM1`, `FM2` when the work touches data writes, external APIs, permissions, concurrency, retry behavior, message processing, migrations, billing, or irreversible behavior. Pure copy/style changes may be exempt, but record the exemption reason in risks or assumptions. Accepted or exempt high/critical risks require accepted-by, acceptance-reason, acceptance-scope, and expires-at.
 
 ## Confirmation Gate
 

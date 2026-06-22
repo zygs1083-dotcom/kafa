@@ -20,6 +20,10 @@ def main() -> int:
     parser.add_argument("--risk", choices=["low", "medium", "high", "critical"], default="medium")
     parser.add_argument("--test-mapping", default="")
     parser.add_argument("--status", choices=["identified", "covered", "accepted", "exempt"], default="identified")
+    parser.add_argument("--accepted-by", default="")
+    parser.add_argument("--acceptance-reason", default="")
+    parser.add_argument("--acceptance-scope", default="")
+    parser.add_argument("--expires-at", default="")
     args = parser.parse_args()
     command = [
         "failure-mode",
@@ -43,6 +47,14 @@ def main() -> int:
         "--data-safety",
         args.data_safety,
     ]
+    for flag, value in [
+        ("--accepted-by", args.accepted_by),
+        ("--acceptance-reason", args.acceptance_reason),
+        ("--acceptance-scope", args.acceptance_scope),
+        ("--expires-at", args.expires_at),
+    ]:
+        if value:
+            command.extend([flag, value])
     if args.test_mapping:
         command.extend(["--acceptance", args.test_mapping])
     return run_harness(command)

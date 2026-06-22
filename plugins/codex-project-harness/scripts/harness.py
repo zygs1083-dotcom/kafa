@@ -23,8 +23,14 @@ from harness_db import (
     record_adapter,
     record_decision,
     record_delivery,
+    record_evidence,
+    record_finding,
     record_gate,
+    record_test,
     record_validation,
+    add_requirement,
+    heartbeat_task,
+    recover_stale_leases,
     release_task,
     repair,
     start_task,
@@ -67,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_add.add_argument("--priority", default="")
     acceptance_add.add_argument("--tool-link", default="")
 
+    requirement = sub.add_parser("requirement")
+    requirement_sub = requirement.add_subparsers(dest="requirement_command", required=True)
+    requirement_add = requirement_sub.add_parser("add")
+    requirement_add.add_argument("--id", required=True)
+    requirement_add.add_argument("--kind", required=True, choices=["goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"])
+    requirement_add.add_argument("--body", required=True)
+    requirement_add.add_argument("--priority", default="")
+    requirement_add.add_argument("--status", default="active")
+    requirement_add.add_argument("--tool-link", default="")
+
     fm = sub.add_parser("failure-mode")
     fm_sub = fm.add_subparsers(dest="failure_mode_command", required=True)
     fm_add = fm_sub.add_parser("add")
@@ -82,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     fm_add.add_argument("--data-safety", default="")
     fm_add.add_argument("--accepted-by", default="")
     fm_add.add_argument("--acceptance-reason", default="")
+    fm_add.add_argument("--acceptance-scope", default="")
     fm_add.add_argument("--expires-at", default="")
 
     task = sub.add_parser("task")
@@ -108,6 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_claim.add_argument("id")
     task_claim.add_argument("--agent", required=True)
     task_claim.add_argument("--expected-revision", type=int, required=True)
+
+    task_heartbeat = task_sub.add_parser("heartbeat")
+    task_heartbeat.add_argument("id")
+    task_heartbeat.add_argument("--agent", required=True)
+    task_heartbeat.add_argument("--lease-token", required=True)
+    task_heartbeat.add_argument("--expected-revision", type=int, required=True)
+
+    task_sub.add_parser("recover-stale")
 
     task_start = task_sub.add_parser("start")
     task_start.add_argument("id")
@@ -170,6 +195,34 @@ def build_parser() -> argparse.ArgumentParser:
     decision_record = decision_sub.add_parser("record")
     decision_record.add_argument("--decision", required=True)
     decision_record.add_argument("--reason", required=True)
+
+    evidence = sub.add_parser("evidence")
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_record = evidence_sub.add_parser("record")
+    evidence_record.add_argument("--id", required=True)
+    evidence_record.add_argument("--kind", required=True)
+    evidence_record.add_argument("--summary", required=True)
+    evidence_record.add_argument("--uri", default="")
+    evidence_record.add_argument("--hash", default="")
+
+    test = sub.add_parser("test")
+    test_sub = test.add_subparsers(dest="test_command", required=True)
+    test_record = test_sub.add_parser("record")
+    test_record.add_argument("--id", required=True)
+    test_record.add_argument("--surface", required=True)
+    test_record.add_argument("--command", dest="test_command_text", default="")
+    test_record.add_argument("--result", required=True, choices=["pass", "fail", "blocked", "partial"])
+    test_record.add_argument("--evidence", default="")
+
+    finding = sub.add_parser("finding")
+    finding_sub = finding.add_subparsers(dest="finding_command", required=True)
+    finding_record = finding_sub.add_parser("record")
+    finding_record.add_argument("--id", required=True)
+    finding_record.add_argument("--surface", required=True)
+    finding_record.add_argument("--severity", required=True, choices=["low", "medium", "high", "critical"])
+    finding_record.add_argument("--status", required=True, choices=["open", "resolved", "accepted", "false-positive"])
+    finding_record.add_argument("--summary", required=True)
+    finding_record.add_argument("--evidence", default="")
 
     gate = sub.add_parser("gate")
     gate_sub = gate.add_subparsers(dest="gate_command", required=True)
@@ -253,6 +306,9 @@ def main() -> int:
         elif args.command == "acceptance" and args.acceptance_command == "add":
             add_acceptance(root, args.id, args.criterion, args.priority, args.tool_link)
             print(f"OK: acceptance added {args.id}")
+        elif args.command == "requirement" and args.requirement_command == "add":
+            add_requirement(root, args.id, args.kind, args.body, priority=args.priority, status=args.status, tool_link=args.tool_link)
+            print(f"OK: requirement added {args.id}")
         elif args.command == "failure-mode" and args.failure_mode_command == "add":
             add_failure_mode(
                 root,
@@ -268,6 +324,7 @@ def main() -> int:
                 data_safety=args.data_safety,
                 accepted_by=args.accepted_by,
                 acceptance_reason=args.acceptance_reason,
+                acceptance_scope=args.acceptance_scope,
                 expires_at=args.expires_at,
             )
             print(f"OK: failure mode added {args.id}")
@@ -297,6 +354,12 @@ def main() -> int:
         elif args.command == "task" and args.task_command == "claim":
             token = claim_task(root, args.id, args.agent, args.expected_revision)
             print(f"OK: claimed {args.id} token={token}")
+        elif args.command == "task" and args.task_command == "heartbeat":
+            heartbeat_task(root, args.id, args.agent, args.lease_token, args.expected_revision)
+            print(f"OK: heartbeat {args.id}")
+        elif args.command == "task" and args.task_command == "recover-stale":
+            recovered = recover_stale_leases(root)
+            print(f"OK: recovered {recovered} stale lease(s)")
         elif args.command == "task" and args.task_command == "start":
             start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
             print(f"OK: task started {args.id}")
@@ -324,6 +387,15 @@ def main() -> int:
         elif args.command == "decision" and args.decision_command == "record":
             record_decision(root, args.decision, args.reason)
             print("OK: decision recorded")
+        elif args.command == "evidence" and args.evidence_command == "record":
+            record_evidence(root, args.id, args.kind, args.summary, uri=args.uri, artifact_hash=args.hash)
+            print(f"OK: evidence recorded {args.id}")
+        elif args.command == "test" and args.test_command == "record":
+            record_test(root, args.id, args.surface, args.test_command_text, args.result, evidence_id=args.evidence)
+            print(f"OK: test recorded {args.id}")
+        elif args.command == "finding" and args.finding_command == "record":
+            record_finding(root, args.id, args.surface, args.severity, args.status, args.summary, evidence_id=args.evidence)
+            print(f"OK: finding recorded {args.id}")
         elif args.command == "gate" and args.gate_command == "record":
             record_gate(
                 root,

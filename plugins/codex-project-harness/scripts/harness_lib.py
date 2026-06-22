@@ -121,7 +121,7 @@ def git_head_sha(root: Path) -> str | None:
 def git_dirty(root: Path) -> bool | None:
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--untracked-files=all"],
             cwd=root,
             check=True,
             capture_output=True,
@@ -157,6 +157,56 @@ def git_source_tree_hash(root: Path) -> str | None:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def git_base_commit(root: Path) -> str | None:
+    head = git_head_sha(root)
+    if not head:
+        return None
+    try:
+        upstream = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        result = subprocess.run(
+            ["git", "merge-base", "HEAD", upstream],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or head
+    except (OSError, subprocess.CalledProcessError):
+        return head
+
+
+def git_tracked_diff_hash(root: Path) -> str | None:
+    if not git_head_sha(root):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--binary",
+                "HEAD",
+                "--",
+                ".",
+                ":(exclude).ai-team/**",
+                ":(exclude).codex/agents/**",
+                ":(exclude)docs/harness/**",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
 
 
 def append_table_row(root: Path, relpath: str, row: list[str], header: str) -> None:

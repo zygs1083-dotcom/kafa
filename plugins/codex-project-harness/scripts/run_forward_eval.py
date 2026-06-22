@@ -41,6 +41,7 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(run(root, "init"))
         commands.append(run(root, "phase", "project_bootstrap"))
         commands.append(run(root, "phase", "requirement_baseline"))
+        commands.append(run(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "User can create a task", "--priority", "must"))
         commands.append(run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"))
         commands.append(run(root, "phase", "confirmation"))
         commands.append(run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "high", "--status", "covered", "--acceptance", "AC1"))

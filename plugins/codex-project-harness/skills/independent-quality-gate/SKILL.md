@@ -36,7 +36,9 @@ For broad changes, split QA into short-lived subagents by risk surface. Examples
 - QA-D: security, permissions, secrets exposure, dependency risk.
 
 Each subagent must return evidence: files inspected, commands run, findings, and residual risk.
+Record material command/test proof with `scripts/harness.py --root . evidence record ...` and `scripts/harness.py --root . test record ...`.
 Record each material QA result with `scripts/harness.py --root . validation record ...`.
+Record unresolved issues with `scripts/harness.py --root . finding record ...`.
 Record the gate decision with `scripts/harness.py --root . gate record ...`, including the reviewed commit or revision.
 
 Use this output shape for each QA subagent:
@@ -64,6 +66,7 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 - Medium findings require explicit residual-risk acceptance.
 - Same-context review can pass only with `reviewer_context: same-context-degraded` and clear residual-risk notes.
 - Code changes after QA require a new gate record for the new commit or revision.
+- Requirement, acceptance, or failure-mode changes invalidate dependent validation and gate records until fresh evidence is recorded.
 
 ## Output
 

@@ -6,7 +6,7 @@
   "properties": {
     "id": { "type": "string" },
     "tool": { "type": "string" },
-    "mode": { "type": "string", "enum": ["off", "read-only", "draft-write", "write-confirm", "write-auto"] },
+    "mode": { "type": "string", "enum": ["disabled", "read-only", "draft-write", "write-confirm", "write-auto"] },
     "artifact": { "type": "string" },
     "external_id": { "type": "string" },
     "external_link": { "type": "string" },

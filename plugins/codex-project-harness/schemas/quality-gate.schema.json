@@ -8,6 +8,10 @@
     "reviewed_commit": { "type": "string" },
     "evidence_commit": { "type": "string" },
     "diff_hash": { "type": "string" },
+    "base_commit": { "type": "string" },
+    "head_commit": { "type": "string" },
+    "tracked_diff_hash": { "type": "string" },
+    "project_revision": { "type": "integer" },
     "reviewer_context": {
       "type": "string",
       "enum": ["fresh", "same-context-degraded", "external"]

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Evidence",
+  "type": "object",
+  "required": ["id", "kind", "summary", "created_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "kind": { "type": "string" },
+    "summary": { "type": "string" },
+    "uri": { "type": "string" },
+    "hash": { "type": "string" },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

@@ -18,6 +18,8 @@
     "evidence": { "type": "string" },
     "lease_agent": { "type": ["string", "null"] },
     "lease_token": { "type": ["string", "null"] },
+    "lease_heartbeat_at": { "type": ["string", "null"] },
+    "lease_expires_at": { "type": ["string", "null"] },
     "retry_count": { "type": "integer" },
     "retry_budget": { "type": "integer" },
     "revision": { "type": "integer" }

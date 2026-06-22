@@ -29,7 +29,7 @@ Use the least powerful mode that completes the delivery work:
 
 | Mode | Meaning | Typical Use |
 | --- | --- | --- |
-| `off` | Do not use the tool | Tool unavailable, irrelevant, or too risky |
+| `disabled` | Do not use the tool | Tool unavailable, irrelevant, or too risky |
 | `read-only` | Read context only | PR, issue, design, docs, or channel context |
 | `draft-write` | Create local draft text for a future external write | Slack post, Notion note, PR body, issue body |
 | `write-confirm` | Write only after explicit user confirmation | Shared pages, issues, Slack messages, Figma edits |

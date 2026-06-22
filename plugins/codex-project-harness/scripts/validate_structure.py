@@ -51,12 +51,17 @@ REQUIRED_SCRIPTS = [
 
 REQUIRED_SCHEMAS = [
     "project-state.schema.json",
+    "requirement.schema.json",
     "acceptance.schema.json",
     "task.schema.json",
     "event.schema.json",
     "quality-gate.schema.json",
     "failure-mode.schema.json",
     "validation.schema.json",
+    "evidence.schema.json",
+    "test.schema.json",
+    "finding.schema.json",
+    "invalidation.schema.json",
     "delivery.schema.json",
     "adapter.schema.json",
     "agent.schema.json",

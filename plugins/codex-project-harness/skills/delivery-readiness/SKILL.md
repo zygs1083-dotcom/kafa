@@ -21,8 +21,8 @@ Prepare evidence for verified code delivery.
 10. Summarize Linear issue status, Notion delivery notes, Figma design status, and Slack handoff status when useful.
 11. List known gaps, skipped checks, and follow-up tasks.
 12. State clearly that deployment and production release are outside this handoff.
-13. Record delivery evidence with `scripts/harness.py --root . delivery record ...`.
-14. Run `scripts/harness.py --root . validate --delivery` before claiming the handoff is ready.
+13. Run `scripts/harness.py --root . validate --delivery`; do not claim handoff readiness while it reports errors.
+14. Record delivery evidence with `scripts/harness.py --root . delivery record ...`.
 
 ## Output
 

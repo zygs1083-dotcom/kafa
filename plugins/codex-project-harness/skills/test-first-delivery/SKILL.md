@@ -17,7 +17,7 @@ Prefer evidence before implementation confidence.
 6. Implement the smallest code needed to pass.
 7. Add edge-case and regression checks proportional to risk.
 8. Run relevant tests and inspect failures.
-9. Record test evidence in local validation docs and external trackers when useful.
+9. Record test evidence with `scripts/harness.py --root . evidence record ...`, `test record ...`, and `validation record ...`; mirror to external trackers when useful.
 10. Ensure the final test proves behavior, not just existence.
 
 ## Test Exception Rule
@@ -38,6 +38,7 @@ Report:
 - command run,
 - result,
 - behavior covered,
+- evidence ID and validation record,
 - GitHub/Linear/Notion/Figma links or local fallback artifact,
 - failure modes covered or exemption reason,
 - known gaps.

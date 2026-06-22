@@ -1,4 +1,4 @@
-# Codex OS Runtime Layer v2.1
+# Codex OS Runtime Layer v2.4
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
@@ -25,7 +25,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . init
 python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 4 --to-version 5
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 5 --to-version 6
 ```
 
 When the plugin is installed outside the target project, use the proxy CLI inside the `project-runtime` skill:
@@ -88,6 +88,8 @@ failure_mode_ids
 dependencies
 lease_agent
 lease_token
+lease_heartbeat_at
+lease_expires_at
 retry_count
 retry_budget
 revision
@@ -110,11 +112,13 @@ harness.py --root . task add --id T1 --task "Implement API" --acceptance AC1
 harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
 harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2
-harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 3 --evidence "tests passed"
-harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4
-harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 5 --evidence "review passed"
+harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3
+harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --evidence "tests passed"
+harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
+harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --evidence "review passed"
 harness.py --root . task block T1 --reason "waiting for schema decision"
 harness.py --root . task release T1 --agent developer
+harness.py --root . task recover-stale
 ```
 
 Scheduler rules:
@@ -124,6 +128,8 @@ Scheduler rules:
 - Dependency cycles are rejected.
 - `task next` returns only ready tasks whose dependencies are accepted.
 - `task claim` requires expected revision and creates a lease.
+- `task heartbeat` extends a valid lease and advances task revision.
+- expired leases fail closed until `task recover-stale` clears them.
 - `task claim` and `task start` fail when dependencies are not accepted.
 - Producers submit work; reviewers accept it. `task complete` is retained as a compatibility alias for submit and does not accept work.
 - stale claims fail with a revision mismatch.
@@ -179,13 +185,41 @@ harness.py --root . failure-mode add \
 
 High and critical failure modes must be covered by passing validation or formally accepted before delivery readiness can pass.
 
-For high and critical risks, `covered` is not a self-attested flag. Delivery readiness requires at least one passing validation explicitly linked with `--failure-mode FMx`, unless the risk is accepted or exempted with accepted-by, acceptance-reason, and expires-at.
+For high and critical risks, `covered` is not a self-attested flag. Delivery readiness requires at least one passing validation explicitly linked with `--failure-mode FMx`, unless the risk is accepted or exempted with accepted-by, acceptance-reason, acceptance-scope, accepted-revision, and expires-at.
 
 Accepted risks can record:
 
 - accepted by
 - acceptance reason
+- acceptance scope
+- accepted project revision
 - expiration date
+
+Accepted risks expire. Expired accepted/exempt high and critical risks block delivery readiness.
+
+## Requirements, Evidence, And Findings
+
+Requirement baselines are structured records, not prose-only notes:
+
+```bash
+harness.py --root . requirement add \
+  --id R1 \
+  --kind functional \
+  --body "User can create a profile" \
+  --priority must
+```
+
+Confirmation, team architecture, and planning require at least one requirement baseline record and at least one acceptance criterion.
+
+Evidence, test records, and findings are also structured:
+
+```bash
+harness.py --root . evidence record --id EV1 --kind command --summary "npm test passed" --uri "local://npm-test"
+harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence EV1
+harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity medium --status open --summary "Needs follow-up"
+```
+
+When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 
 ## Quality Gates
 
@@ -194,6 +228,7 @@ Quality gates are fail-closed. Delivery readiness requires:
 - latest gate result is `pass`
 - no blocking findings
 - validation records are `pass`
+- no unresolved invalidations remain
 - high/critical failure modes are covered by passing validation or formally accepted
 - active tasks are accepted
 - Git worktree is clean outside harness runtime files when Git exists
@@ -235,7 +270,7 @@ harness.py --root . adapter record \
 Supported modes:
 
 ```text
-off
+disabled
 read-only
 draft-write
 write-confirm

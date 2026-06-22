@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Requirement",
+  "type": "object",
+  "required": ["id", "kind", "body", "status", "revision", "updated_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "kind": {
+      "type": "string",
+      "enum": ["goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"]
+    },
+    "body": { "type": "string" },
+    "priority": { "type": "string" },
+    "status": { "type": "string" },
+    "tool_link": { "type": "string" },
+    "revision": { "type": "integer" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}
