@@ -21,6 +21,7 @@ def render_all(root: Path) -> None:
     render_acceptance(root)
     render_failure_modes(root)
     render_tasks(root)
+    render_test_targets(root)
     render_validation(root)
     render_evidence(root)
     render_findings(root)
@@ -162,12 +163,24 @@ def grouped(conn: sqlite3.Connection, table: str, key: str, value: str) -> dict[
     }
 
 
+def render_test_targets(root: Path) -> None:
+    runtime = _runtime()
+    with runtime.connection(root) as conn:
+        targets = conn.execute("select * from test_targets order by id").fetchall()
+        prefixes = conn.execute("select prefix, reason from executor_allowlist order by prefix").fetchall()
+    lines = ["# Test Targets", "", "## Registered Targets", "", "| ID | Kind | Command Template | Description |", "| --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["id"], row["kind"], row["command_template"], row["description"]]) for row in targets)
+    lines.extend(["", "## Executor Allow Prefixes", "", "| Prefix | Reason |", "| --- | --- |"])
+    lines.extend(markdown_row([row["prefix"], row["reason"]]) for row in prefixes)
+    write_view(root, ".ai-team/control/test-targets.md", "\n".join(lines))
+
+
 def render_validation(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
         rows = conn.execute("select * from validations order by created_at, id").fetchall()
         failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
-    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Command | Exit Code | Stdout SHA256 | Artifact | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Command | Target | Executed Count | Count Source | Exit Code | Stdout SHA256 | Artifact | Policy | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(
         markdown_row(
             [
@@ -181,9 +194,13 @@ def render_validation(root: Path) -> None:
                 "",
                 row["commands"],
                 row["command"] if "command" in row.keys() else "",
+                row["target_id"] if "target_id" in row.keys() else "",
+                row["executed_count"] if "executed_count" in row.keys() else "",
+                row["executed_count_source"] if "executed_count_source" in row.keys() else "",
                 row["exit_code"] if "exit_code" in row.keys() else "",
                 row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
                 row["artifact_path"] if "artifact_path" in row.keys() else "",
+                row["policy_status"] if "policy_status" in row.keys() else "",
                 row["findings"],
                 row["result"],
                 row["residual_risk"],
@@ -199,7 +216,7 @@ def render_evidence(root: Path) -> None:
     with runtime.connection(root) as conn:
         evidence_rows = conn.execute("select * from evidence order by created_at, id").fetchall()
         test_rows = conn.execute("select * from tests order by created_at, id").fetchall()
-    lines = ["# Evidence", "", "## Evidence Records", "", "| ID | Kind | Summary | URI | Hash | Command | Exit Code | Stdout SHA256 | Artifact | Source Hash | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["# Evidence", "", "## Evidence Records", "", "| ID | Kind | Summary | URI | Hash | Command | Target | Executed Count | Count Source | Exit Code | Stdout SHA256 | Artifact | Source Hash | Policy | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(
         markdown_row(
             [
@@ -209,10 +226,14 @@ def render_evidence(root: Path) -> None:
                 row["uri"],
                 row["hash"],
                 row["command"] if "command" in row.keys() else "",
+                row["target_id"] if "target_id" in row.keys() else "",
+                row["executed_count"] if "executed_count" in row.keys() else "",
+                row["executed_count_source"] if "executed_count_source" in row.keys() else "",
                 row["exit_code"] if "exit_code" in row.keys() else "",
                 row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
                 row["artifact_path"] if "artifact_path" in row.keys() else "",
                 row["source_tree_hash"] if "source_tree_hash" in row.keys() else "",
+                row["policy_status"] if "policy_status" in row.keys() else "",
                 row["created_at"],
             ]
         )

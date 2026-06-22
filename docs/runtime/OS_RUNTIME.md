@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.1
+# Codex OS Runtime Layer v3.2
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.1 is an architecture generation for runtime consistency and trusted command evidence. The repository release remains a beta release, while the runtime implementation version is `3.1.0` and the database schema version is `10`.
+Kernel v3.2 is an architecture generation for runtime consistency, semantic evidence, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.2.0` and the database schema version is `11`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.1
+## Kernel v3.2
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -28,8 +28,8 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `gate_engine.py` owns delivery readiness and delivery record barriers.
 - `schema_guard.py` performs pre-write entity validation and reuses row-level schema checks.
 - `event_bus.py` emits, stores, validates, and dispatches audit events.
-- `executor.py` runs local commands and writes trusted command evidence artifacts.
-- `invariant_checker.py` verifies constraints that must not be bypassed by manual DB edits.
+- `executor.py` runs local commands through target/prefix policy and writes trusted command evidence artifacts.
+- `invariant_checker.py` verifies constraints that must not be bypassed by manual DB edits, using directed checks in write transactions and full checks for doctor/audit.
 - `projections.py` is the only Markdown projection writer.
 
 SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
@@ -44,7 +44,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 10
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 11
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -74,7 +74,7 @@ python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
 
 `harness projection rebuild` regenerates all Markdown views from SQLite through the core projection module.
 
-`harness repair` recreates missing runtime state and views without deleting existing project files. Use `harness repair --dry-run` to see the planned repair actions without writing state.
+`harness repair` recreates missing runtime state and views without deleting existing project files. Use `harness repair --dry-run` to see the planned repair actions without writing state. Targeted invariant repair requires explicit confirmation, for example `harness repair --clear-invariant expired-lease --confirm expired-lease`.
 
 `harness migrate` records schema migrations and updates runtime metadata. Markdown v1 migration supports `--dry-run` and writes `docs/harness/migration-report.md` on real migration.
 
@@ -291,6 +291,7 @@ When a requirement baseline exists, delivery readiness requires a current frozen
 Evidence, test records, and findings are also structured:
 
 ```bash
+harness.py --root . test-target add --id NPM_TEST --kind unit --command-template "npm test"
 harness.py --root . evidence record \
   --id EV1 \
   --kind command \
@@ -298,12 +299,14 @@ harness.py --root . evidence record \
   --command "npm test" \
   --exit-code 0 \
   --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --target NPM_TEST \
+  --executed-count 12
 harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence EV1
 harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity medium --status open --summary "Needs follow-up"
 ```
 
-Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, `project_revision`, command, exit code, stdout hash, and artifact path. Delivery readiness fails if a passing validation was recorded against an older code snapshot or lacks trusted command evidence.
+Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, `project_revision`, command, target, executed count, exit code, stdout hash, artifact path, and executor policy fields. Delivery readiness fails if a passing validation was recorded against an older code snapshot, lacks a registered target, does not match the target command template, or has `executed_count=0`.
 
 Each active acceptance must have passing validation linked to at least one passing test or evidence item:
 
@@ -320,8 +323,19 @@ harness.py --root . validation record \
   --command "npm test" \
   --exit-code 0 \
   --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --target NPM_TEST \
+  --executed-count 12
 ```
+
+`dispatch run` uses LocalExecutor policy before starting a process:
+
+```bash
+harness.py --root . executor allow-prefix add --prefix "npm test" --reason "project test runner"
+harness.py --root . dispatch run --agent developer --target NPM_TEST --command "npm test" --no-network
+```
+
+`--no-network` records intent and sets `NO_NETWORK=1` in the minimized execution environment. It is not an OS-level network sandbox.
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 

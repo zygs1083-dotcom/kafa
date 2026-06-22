@@ -75,6 +75,7 @@ REQUIRED_SCHEMAS = [
     "validation.schema.json",
     "evidence.schema.json",
     "test.schema.json",
+    "test-target.schema.json",
     "finding.schema.json",
     "invalidation.schema.json",
     "delivery.schema.json",

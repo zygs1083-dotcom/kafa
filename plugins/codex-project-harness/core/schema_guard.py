@@ -28,6 +28,9 @@ GATE_CONTEXTS = {"fresh", "same-context-degraded", "external"}
 ADAPTER_MODES = {"read-only", "draft-write", "write-confirm", "write-auto", "disabled"}
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 REQUIREMENT_KINDS = {"goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"}
+TEST_TARGET_KINDS = {"unit", "integration", "lint", "build"}
+POLICY_STATUSES = {"allowed", "rejected", "manual", ""}
+EXECUTED_COUNT_SOURCES = {"", "parsed", "manual", "policy"}
 
 
 def require_text(label: str, value: str) -> None:
@@ -90,3 +93,9 @@ def validate_adapter_action(tool: str, mode: str, artifact: str, action: str, pa
         json.loads(payload_json)
     except json.JSONDecodeError as exc:
         raise SchemaGuardError(f"adapter action payload must be valid JSON: {exc.msg}") from exc
+
+
+def validate_test_target(target_id: str, kind: str, command_template: str) -> None:
+    require_text("test target id", target_id)
+    require_choice("test target kind", kind, TEST_TARGET_KINDS)
+    require_text("test target command template", command_template)

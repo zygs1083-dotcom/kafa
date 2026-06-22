@@ -4,6 +4,29 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v0.9.0-beta.1 - 2026-06-22
+
+### Added
+
+- Test target registry with `test-target add/list`, projected to `.ai-team/control/test-targets.md`.
+- Executor allow-prefix management and LocalExecutor command policy evidence.
+- `executed_count`, target, policy, allow-unlisted, and no-network fields for evidence and validation records.
+- Directed invariant checks for write transactions, with full invariant validation retained for doctor and `invariant validate`.
+- Targeted `repair --clear-invariant <code> --confirm <code>` for expired leases and producer self-acceptance.
+
+### Changed
+
+- Runtime schema version is now `11`; runtime implementation version is now `3.2.0`.
+- Delivery gates now require passing validations to reference a registered test target, match that target command, and prove `executed_count > 0`.
+- LocalExecutor rejects unlisted commands by default, records rejected evidence without running the process, and marks `--no-network` as an audit/environment hint.
+- Runtime smoke now includes a 5000-entity directed-invariant benchmark.
+
+### Boundaries
+
+- This release still stops at verified code delivery.
+- `--no-network` is not an OS-level network sandbox.
+- External tools remain adapter contracts; no real GitHub/Linear/Notion/Figma/Slack writes are performed by the runtime.
+
 ## v0.8.0-beta.1 - 2026-06-22
 
 ### Added

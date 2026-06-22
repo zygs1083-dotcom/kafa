@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 10`, `harness.py --root . migrate --from-version markdown-v1 --to-version 10 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 11`, `harness.py --root . migrate --from-version markdown-v1 --to-version 11 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -48,13 +48,14 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Start / submit / review / accept task | `harness.py --root . task start`, `harness.py --root . task submit`, `harness.py --root . task review`, `harness.py --root . task accept` |
 | Record decision | `harness.py --root . decision record` |
 | Record evidence / tests / findings | `harness.py --root . evidence record`, `harness.py --root . test record`, `harness.py --root . finding record` |
+| Register test target | `harness.py --root . test-target add --id UNIT --kind unit --command-template "pytest"`, `harness.py --root . test-target list` |
 | Record QA / validation | `harness.py --root . validation record --test TEST1 --evidence EV1` |
 | Record quality gate | `harness.py --root . gate record --finding F1` |
 | Record delivery | `harness.py --root . delivery record` |
 | Record adapter link | `harness.py --root . adapter record` |
 | Plan adapter action | `harness.py --root . adapter plan`, `harness.py --root . adapter draft`, `harness.py --root . adapter confirm`, `harness.py --root . adapter complete`, `harness.py --root . adapter reconcile` |
 | Checkpoint / audit events | `harness.py --root . checkpoint create`, `harness.py --root . checkpoint export`, `harness.py --root . checkpoint import`, `harness.py --root . event validate` |
-| Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . dispatch run --agent developer --command "pytest"`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
+| Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . executor allow-prefix add --prefix "pytest" --reason "test runner"`, `harness.py --root . dispatch run --agent developer --target UNIT --command "pytest"`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
 | Sweep expired accepted risk | `harness.py --root . risk sweep-expired` |
 | Kernel diagnostics / projections | `harness.py --root . kernel doctor`, `harness.py --root . invariant validate`, `harness.py --root . projection rebuild` |
 | Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
@@ -134,6 +135,11 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1
 Record validation before delivery readiness:
 
 ```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . test-target add \
+  --id PROFILE_CRUD_TEST \
+  --kind unit \
+  --command-template "npm test -- profile-crud"
+
 python3 plugins/codex-project-harness/scripts/harness.py --root . evidence record \
   --id EV1 \
   --kind command \
@@ -142,7 +148,9 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . evidence recor
   --command "npm test -- profile-crud" \
   --exit-code 0 \
   --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --target PROFILE_CRUD_TEST \
+  --executed-count 12
 
 python3 plugins/codex-project-harness/scripts/harness.py --root . test record \
   --id TEST1 \
@@ -163,7 +171,9 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . validation rec
   --command "npm test -- profile-crud" \
   --exit-code 0 \
   --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt
+  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --target PROFILE_CRUD_TEST \
+  --executed-count 12
 ```
 
 Record the independent quality gate before handoff:
@@ -207,7 +217,7 @@ Before claiming delivery readiness:
 
 1. Run `harness.py --root . status`.
 2. Run `harness.py --root . validate --delivery`.
-3. Confirm validation evidence has trusted command fields and `exit_code=0`.
+3. Confirm validation evidence has a registered target, matching command, `executed_count>0`, and `exit_code=0`.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
 5. Confirm high/critical failure modes are covered by passing validation or explicitly accepted.
 6. Confirm delivery record includes local or external collaboration links.

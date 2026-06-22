@@ -14,6 +14,13 @@
     "stdout_sha256": { "type": "string" },
     "artifact_path": { "type": "string" },
     "source_tree_hash": { "type": "string" },
+    "target_id": { "type": "string" },
+    "executed_count": { "type": "integer" },
+    "executed_count_source": { "type": "string", "enum": ["", "parsed", "manual", "policy"] },
+    "allow_unlisted": { "type": "integer" },
+    "no_network": { "type": "integer" },
+    "policy_status": { "type": "string", "enum": ["", "allowed", "rejected", "manual"] },
+    "policy_reason": { "type": "string" },
     "created_at": { "type": "string" }
   },
   "additionalProperties": true

@@ -12,6 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts"
 RUNTIME_CLI = REPO_ROOT / "plugins" / "codex-project-harness" / "skills" / "project-runtime" / "scripts" / "harness.py"
+DEFAULT_TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
 
 
 def run_script(root: Path, script: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -68,6 +69,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         return temp
 
     def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
+        run_script(root, "harness.py", "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", DEFAULT_TEST_COMMAND)
         artifact_path, stdout_sha = trusted_artifact(root, "evidence")
         validation_artifact, validation_sha = trusted_artifact(root, "validation")
         run_script(
@@ -82,15 +84,19 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--summary",
             "example evidence",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            DEFAULT_TEST_COMMAND,
             "--exit-code",
             "0",
             "--stdout-sha256",
             stdout_sha,
             "--artifact-path",
             artifact_path,
+            "--target",
+            "TARGET1",
+            "--executed-count",
+            "1",
         )
-        run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", "example test", "--result", "pass", "--evidence", "EV1")
+        run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
         command = [
             "record_validation.py",
             "--surface",
@@ -98,7 +104,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--acceptance",
             "AC1",
             "--commands",
-            "example test",
+            DEFAULT_TEST_COMMAND,
             "--findings",
             "passed",
             "--result",
@@ -108,13 +114,17 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--evidence",
             "EV1",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            DEFAULT_TEST_COMMAND,
             "--exit-code",
             "0",
             "--stdout-sha256",
             validation_sha,
             "--artifact-path",
             validation_artifact,
+            "--target",
+            "TARGET1",
+            "--executed-count",
+            "1",
         ]
         if failure_mode:
             command.extend(["--failure-mode", "FM1"])

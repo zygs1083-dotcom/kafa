@@ -27,6 +27,7 @@
       0,
       0,
       0,
+      0,
       0
     ]
   },
@@ -38,5 +39,12 @@
       0,
       0
     ]
+  },
+  {
+    "name": "directed_invariant_benchmark",
+    "pass": true,
+    "full_seconds": 0.010288,
+    "directed_seconds": 0.000267,
+    "ratio": 38.5
   }
 ]

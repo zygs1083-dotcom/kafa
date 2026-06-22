@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
+DEFAULT_TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
@@ -98,9 +99,27 @@ def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "ok\n") ->
     return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def register_test_target(root: Path, target_id: str = "TARGET1", *, command: str = DEFAULT_TEST_COMMAND, kind: str = "unit") -> None:
+    run_harness(
+        root,
+        "test-target",
+        "add",
+        "--id",
+        target_id,
+        "--kind",
+        kind,
+        "--command-template",
+        command,
+        "--description",
+        f"{target_id} command target",
+    )
+
+
 def record_evidence_and_test(root: Path, suffix: str = "1") -> tuple[str, str]:
     evidence_id = f"EV{suffix}"
     test_id = f"TEST{suffix}"
+    target_id = f"TARGET{suffix}"
+    register_test_target(root, target_id)
     artifact_path, stdout_sha = trusted_artifact(root, suffix)
     run_harness(
         root,
@@ -113,20 +132,25 @@ def record_evidence_and_test(root: Path, suffix: str = "1") -> tuple[str, str]:
         "--summary",
         f"test evidence {suffix}",
         "--command",
-        "python3 -c 'print(\"ok\")'",
+        DEFAULT_TEST_COMMAND,
         "--exit-code",
         "0",
         "--stdout-sha256",
         stdout_sha,
         "--artifact-path",
         artifact_path,
+        "--target",
+        target_id,
+        "--executed-count",
+        "1",
     )
-    run_harness(root, "test", "record", "--id", test_id, "--surface", "Example", "--command", "test", "--result", "pass", "--evidence", evidence_id)
+    run_harness(root, "test", "record", "--id", test_id, "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", evidence_id)
     return evidence_id, test_id
 
 
 def record_pass_validation(root: Path, *, acceptance: str = "AC1", failure_mode: str | None = None, suffix: str = "1") -> None:
     evidence_id, test_id = record_evidence_and_test(root, suffix)
+    target_id = f"TARGET{suffix}"
     artifact_path, stdout_sha = trusted_artifact(root, f"validation-{suffix}")
     command = [
         "validation",
@@ -136,7 +160,7 @@ def record_pass_validation(root: Path, *, acceptance: str = "AC1", failure_mode:
         "--acceptance",
         acceptance,
         "--commands",
-        "test",
+        DEFAULT_TEST_COMMAND,
         "--findings",
         "passed",
         "--result",
@@ -146,13 +170,17 @@ def record_pass_validation(root: Path, *, acceptance: str = "AC1", failure_mode:
         "--evidence",
         evidence_id,
         "--command",
-        "python3 -c 'print(\"ok\")'",
+        DEFAULT_TEST_COMMAND,
         "--exit-code",
         "0",
         "--stdout-sha256",
         stdout_sha,
         "--artifact-path",
         artifact_path,
+        "--target",
+        target_id,
+        "--executed-count",
+        "1",
     ]
     if failure_mode:
         command.extend(["--failure-mode", failure_mode])
@@ -193,9 +221,10 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 10)
+            self.assertEqual(project[0], 11)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
+            self.assertIn("test_targets", tables)
 
     def test_legacy_init_also_creates_sqlite_state(self) -> None:
         legacy_init = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "init_project_harness.py"
@@ -391,7 +420,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "10")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "11")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -730,7 +759,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "10", "--dry-run")
+            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "11", "--dry-run")
             repair_plan = run_harness(root, "repair", "--dry-run")
 
             self.assertEqual(migrate.returncode, 0, migrate.stdout + migrate.stderr)
@@ -826,6 +855,23 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertEqual(finding_row, ("medium", "open"))
             self.assertIn("pytest passed", rendered)
 
+    def test_test_target_registry_is_structured_and_projected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+
+            added = run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", "python3 -m unittest", "--description", "Unit suite")
+            listed = run_harness(root, "test-target", "list")
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                target = conn.execute("select id, kind, command_template, description from test_targets where id = 'UNIT'").fetchone()
+            rendered = (root / ".ai-team/control/test-targets.md").read_text(encoding="utf-8")
+
+            self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+            self.assertIn("UNIT", listed.stdout)
+            self.assertEqual(target, ("UNIT", "unit", "python3 -m unittest", "Unit suite"))
+            self.assertIn("python3 -m unittest", rendered)
+
     def test_quality_gate_records_code_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -887,7 +933,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "10")
+            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "11")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 acceptance = conn.execute("select criterion from acceptance where id = 'AC1'").fetchone()[0]
@@ -1111,6 +1157,52 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertNotEqual(validate.returncode, 0)
             self.assertIn("exit_code=2", validate.stdout)
 
+    def test_delivery_requires_validation_command_to_match_registered_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
+            claim_start_submit(root, "T1")
+            review_accept(root, "T1")
+            confirm_and_freeze(root)
+            register_test_target(root, "TARGET1", command="python3 -c 'print(\"1 passed\")'")
+            artifact_path, stdout_sha = trusted_artifact(root, "target-mismatch", content="1 passed\n")
+            run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "mismatch", "--command", "python3 -c 'print(\"wrong\")'", "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
+            run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", "python3 -c 'print(\"wrong\")'", "--result", "pass", "--evidence", "EV1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "wrong", "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", "python3 -c 'print(\"wrong\")'", "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("command does not match target", validate.stdout)
+
+    def test_delivery_rejects_zero_executed_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
+            claim_start_submit(root, "T1")
+            review_accept(root, "T1")
+            confirm_and_freeze(root)
+            register_test_target(root, "TARGET1")
+            artifact_path, stdout_sha = trusted_artifact(root, "zero-count", content="0 passed\n")
+            run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "zero count", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "0")
+            run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "0")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("executed_count=0", validate.stdout)
+
     def test_quality_gate_can_link_findings(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1175,24 +1267,44 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "task", "add", "--id", "T1", "--task", "Run success", "--owner", "developer", "--acceptance", "AC1")
             run_harness(root, "task", "add", "--id", "T2", "--task", "Run fail", "--owner", "developer", "--acceptance", "AC1")
+            run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", "python3 -c 'print(\"2 passed\")'")
             run_harness(root, "dispatch", "plan", "--scope", "Executor")
 
-            success = run_harness(root, "dispatch", "run", "--agent", "developer", "--command", "python3 -c 'print(123)'", check=False)
-            failure = run_harness(root, "dispatch", "run", "--agent", "developer", "--command", "python3 -c 'import sys; sys.exit(3)'", check=False)
+            rejected = run_harness(root, "dispatch", "run", "--agent", "developer", "--command", "python3 -c 'print(123)'", "--no-network", check=False)
+            success = run_harness(root, "dispatch", "run", "--agent", "developer", "--target", "UNIT", "--command", "python3 -c 'print(\"2 passed\")'", "--no-network", check=False)
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 evidence = conn.execute(
-                    "select command, exit_code, stdout_sha256, artifact_path from evidence where kind = 'command' order by created_at"
+                    """
+                    select command, exit_code, stdout_sha256, artifact_path, target_id, executed_count,
+                           no_network, policy_status
+                    from evidence where kind = 'command' order by created_at
+                    """
                 ).fetchall()
                 statuses = conn.execute("select task_id, status from dispatch_assignments order by task_id").fetchall()
 
+            self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
             self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
-            self.assertEqual(failure.returncode, 1, failure.stdout + failure.stderr)
-            self.assertEqual(evidence[0][1], 0)
+            self.assertEqual(evidence[0][1], 126)
             self.assertEqual(len(evidence[0][2]), 64)
             self.assertTrue((root / evidence[0][3]).exists())
-            self.assertEqual(evidence[1][1], 3)
-            self.assertEqual(statuses, [("T1", "completed"), ("T2", "failed")])
+            self.assertEqual(evidence[0][5], 0)
+            self.assertEqual(evidence[0][6], 1)
+            self.assertEqual(evidence[0][7], "rejected")
+            self.assertEqual(evidence[1][1], 0)
+            self.assertEqual(evidence[1][4], "UNIT")
+            self.assertEqual(evidence[1][5], 2)
+            self.assertEqual(evidence[1][6], 1)
+            self.assertEqual(evidence[1][7], "allowed")
+            self.assertEqual(statuses, [("T1", "failed"), ("T2", "completed")])
+
+    def test_executor_parses_executed_count_from_common_test_outputs(self) -> None:
+        from core.executor import parse_executed_count
+
+        self.assertEqual(parse_executed_count("3 passed, 1 skipped in 0.12s"), 3)
+        self.assertEqual(parse_executed_count("Ran 4 tests in 0.001s\n\nOK"), 4)
+        self.assertEqual(parse_executed_count("Tests:       5 passed, 5 total"), 5)
+        self.assertEqual(parse_executed_count("0 passing (4ms)"), 0)
 
     def test_adapter_action_lifecycle_and_reconcile(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1316,6 +1428,68 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertIn("accepted task has no evidence", invariant.stdout)
             self.assertIn("accepted task has no accept actor/event", invariant.stdout)
 
+    def test_repair_clear_invariant_requires_confirm_and_repairs_expired_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Lease", "--acceptance", "AC1")
+            claim = run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", "1")
+            token = token_from_stdout(claim.stdout)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update tasks set lease_token = ?, lease_expires_at = '2000-01-01T00:00:00+00:00' where id = 'T1'", (token,))
+                conn.commit()
+
+            plan = run_harness(root, "repair", "--clear-invariant", "expired-lease", check=False)
+            repaired = run_harness(root, "repair", "--clear-invariant", "expired-lease", "--confirm", "expired-lease")
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                task = conn.execute("select lease_agent, lease_token, lease_expires_at from tasks where id = 'T1'").fetchone()
+                agent = conn.execute("select status, lease_task_id from agents where id = 'developer'").fetchone()
+
+            self.assertNotEqual(plan.returncode, 0)
+            self.assertIn("repair requires --confirm expired-lease", plan.stdout)
+            self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+            self.assertEqual(task, (None, None, None))
+            self.assertEqual(agent, ("available", ""))
+
+    def test_repair_clear_invariant_repairs_producer_self_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Self accepted", "--owner", "developer", "--acceptance", "AC1")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update tasks set status = 'accepted', evidence = 'manual', accepted_by = 'developer' where id = 'T1'")
+                conn.commit()
+
+            repaired = run_harness(root, "repair", "--clear-invariant", "producer-self-accepted", "--confirm", "producer-self-accepted")
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                task = conn.execute("select status, accepted_by, evidence from tasks where id = 'T1'").fetchone()
+
+            self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+            self.assertEqual(task, ("review", "", "manual"))
+
+    def test_directed_invariant_scope_checks_touched_entity_closure(self) -> None:
+        from core.invariant_checker import check_runtime_invariants
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Self accepted", "--owner", "developer", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T2", "--task", "Unrelated", "--owner", "developer", "--acceptance", "AC1")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("update tasks set status = 'accepted', evidence = 'manual', accepted_by = 'developer' where id = 'T1'")
+                conn.commit()
+                issues = check_runtime_invariants(conn, root, scope=[("task", "T1")])
+
+            messages = [str(issue) for issue in issues]
+            self.assertTrue(any("producer accepted own task T1" in message for message in messages))
+            self.assertFalse(any("T2" in message for message in messages))
+
     def test_event_validate_requires_replay_snapshots_after_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1326,7 +1500,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     """
                     insert into events
                     (id, schema_version, type, source, target, payload_json, created_at)
-                    values ('bad-replay-event', 10, 'task_tampered', 'test', 'task:T1',
+                    values ('bad-replay-event', 11, 'task_tampered', 'test', 'task:T1',
                             '{"entity_type":"task","entity_id":"T1","command":"tamper"}', 'now')
                     """
                 )

@@ -7,14 +7,22 @@ import json
 import hashlib
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import time
 from contextlib import closing
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+PLUGIN_ROOT = ROOT / "plugins" / "codex-project-harness"
+SCRIPTS_ROOT = PLUGIN_ROOT / "scripts"
+for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 HARNESS = ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
 RESULT_PATH = ROOT / "docs" / "runtime" / "runtime-smoke-results.json"
+TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
 
 
 def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -35,7 +43,7 @@ def token(stdout: str) -> str:
     return stdout.split("token=", 1)[1].strip()
 
 
-def trusted_artifact(root: Path, suffix: str, content: str = "ok\n") -> tuple[str, str]:
+def trusted_artifact(root: Path, suffix: str, content: str = "1 passed\n") -> tuple[str, str]:
     artifact = root / ".ai-team" / "runtime" / "smoke" / f"stdout-{suffix}.txt"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text(content, encoding="utf-8")
@@ -69,11 +77,12 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(review)
         reviewer_token = token(review.stdout) if review.returncode == 0 else ""
         commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
+        commands.append(run(root, "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", TEST_COMMAND, "--description", "Smoke unit target"))
         evidence_artifact, evidence_sha = trusted_artifact(root, "evidence")
         validation_artifact, validation_sha = trusted_artifact(root, "validation")
-        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed", "--command", "python3 -c 'print(\"ok\")'", "--exit-code", "0", "--stdout-sha256", evidence_sha, "--artifact-path", evidence_artifact))
-        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", "unit test", "--result", "pass", "--evidence", "EV1"))
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", "unit test", "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1", "--command", "python3 -c 'print(\"ok\")'", "--exit-code", "0", "--stdout-sha256", validation_sha, "--artifact-path", validation_artifact))
+        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed", "--command", TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", evidence_sha, "--artifact-path", evidence_artifact, "--target", "TARGET1", "--executed-count", "1"))
+        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", "EV1"))
+        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1", "--command", TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", validation_sha, "--artifact-path", validation_artifact, "--target", "TARGET1", "--executed-count", "1"))
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
         commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
@@ -101,8 +110,46 @@ def scenario_tool_mapping() -> dict[str, object]:
         return {"name": "tool_mapping_runtime", "pass": ok, "commands": [command.returncode for command in commands]}
 
 
+def scenario_directed_invariant_benchmark() -> dict[str, object]:
+    from core.invariant_checker import check_runtime_invariants
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        init = run(root, "init")
+        with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+            conn.row_factory = sqlite3.Row
+            now = "2026-01-01T00:00:00+00:00"
+            conn.executemany(
+                "insert into tasks (id, task, owner, status, updated_at) values (?, ?, 'developer', 'ready', ?)",
+                [(f"B{i}", f"Benchmark {i}", now) for i in range(5000)],
+            )
+            conn.executemany(
+                """
+                insert into events (id, schema_version, type, source, target, payload_json, created_at)
+                values (?, 11, 'benchmark_event', 'smoke', 'project', '{}', ?)
+                """,
+                [(f"bench-event-{i}", now) for i in range(5000)],
+            )
+            conn.commit()
+            start = time.perf_counter()
+            full_issues = check_runtime_invariants(conn, root)
+            full_seconds = time.perf_counter() - start
+            start = time.perf_counter()
+            directed_issues = check_runtime_invariants(conn, root, scope=[("task", "B1")], full=False)
+            directed_seconds = time.perf_counter() - start
+        ratio = full_seconds / max(directed_seconds, 0.000001)
+        ok = init.returncode == 0 and not full_issues and not directed_issues and ratio >= 10
+        return {
+            "name": "directed_invariant_benchmark",
+            "pass": ok,
+            "full_seconds": round(full_seconds, 6),
+            "directed_seconds": round(directed_seconds, 6),
+            "ratio": round(ratio, 2),
+        }
+
+
 def main() -> int:
-    results = [scenario_full_project(), scenario_tool_mapping()]
+    results = [scenario_full_project(), scenario_tool_mapping(), scenario_directed_invariant_benchmark()]
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULT_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     failed = [result for result in results if not result["pass"]]

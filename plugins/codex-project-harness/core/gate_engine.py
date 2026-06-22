@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from harness_lib import git_dirty, git_head_sha, git_source_tree_hash
+from .executor import command_matches_template
 
 
 def _value(row: sqlite3.Row, field: str) -> object:
@@ -29,6 +30,9 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
     stdout_sha256 = str(_value(row, "stdout_sha256") or "")
     artifact_path = str(_value(row, "artifact_path") or "")
     source_tree_hash = str(_value(row, "source_tree_hash") or "")
+    target_id = str(_value(row, "target_id") or "")
+    executed_count = int(_value(row, "executed_count") or 0)
+    policy_status = str(_value(row, "policy_status") or "")
     issues: list[str] = []
     if not command:
         issues.append(f"{label} missing command")
@@ -44,6 +48,12 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
         issues.append(f"{label} artifact unavailable: {artifact_path}")
     if current_source_hash and source_tree_hash != current_source_hash:
         issues.append(f"{label} source_tree_hash mismatch: evidence={source_tree_hash} current={current_source_hash}")
+    if not target_id:
+        issues.append(f"{label} missing target")
+    if executed_count <= 0:
+        issues.append(f"{label} executed_count={executed_count}")
+    if policy_status == "rejected":
+        issues.append(f"{label} command policy rejected")
     return issues
 
 
@@ -53,26 +63,16 @@ def validation_trusted_command_issues(
     root: Path,
     current_source_hash: str,
 ) -> list[str]:
-    candidates: list[tuple[str, sqlite3.Row]] = [("validation", validation)]
-    candidates.extend(
-        ("evidence", row)
-        for row in conn.execute(
-            """
-            select e.* from validation_evidence ve
-            join evidence e on e.id = ve.evidence_id
-            where ve.validation_id = ?
-            order by e.created_at, e.id
-            """,
-            (validation["id"],),
-        )
-    )
-    all_issues: list[str] = []
-    for label, row in candidates:
-        issues = _command_row_issues(root, row, current_source_hash, label=label)
-        if not issues:
-            return []
-        all_issues.extend(issues)
-    return all_issues or ["missing trusted command evidence"]
+    issues = _command_row_issues(root, validation, current_source_hash, label="validation")
+    target_id = str(_value(validation, "target_id") or "")
+    command = str(_value(validation, "command") or "")
+    if target_id:
+        target = conn.execute("select command_template from test_targets where id = ?", (target_id,)).fetchone()
+        if not target:
+            issues.append(f"validation unknown target: {target_id}")
+        elif command and not command_matches_template(command, target["command_template"]):
+            issues.append(f"validation command does not match target {target_id}")
+    return issues
 
 
 def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[str]:
@@ -150,7 +150,7 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             continue
         covered = conn.execute(
             """
-            select v.id from validation_failure_modes vfm
+            select v.* from validation_failure_modes vfm
             join validations v on v.id = vfm.validation_id
             where vfm.failure_mode_id = ? and v.result = 'pass'
             order by v.created_at desc, v.id desc

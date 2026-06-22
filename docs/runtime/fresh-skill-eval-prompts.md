@@ -16,7 +16,8 @@ The harness validates that a transcript includes these flow markers:
 - baseline freeze
 - requirement to acceptance link
 - task creation and lifecycle
-- validation with linked test/evidence and trusted command fields
+- registered test target
+- validation with linked test/evidence, trusted command fields, target, and executed count
 - quality gate
 - delivery readiness
 - delivery record
@@ -40,9 +41,12 @@ Expected evidence:
 - `harness.py --root . requirement add`
 - `harness.py --root . requirement link`
 - `harness.py --root . task add`
+- `harness.py --root . test-target add`
 - `harness.py --root . evidence record`
 - `--stdout-sha256`
 - `--artifact-path`
+- `--target`
+- `--executed-count`
 - `harness.py --root . validation record`
 - `harness.py --root . gate record`
 - `harness.py --root . phase delivery_readiness`

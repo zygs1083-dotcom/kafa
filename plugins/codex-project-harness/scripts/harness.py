@@ -22,6 +22,8 @@ from core.api import (
     add_failure_mode,
     add_requirement,
     add_task,
+    add_executor_prefix,
+    add_test_target,
     baseline_diff,
     baseline_validate,
     block_task,
@@ -44,6 +46,8 @@ from core.api import (
     kernel_doctor,
     link_requirement_acceptance,
     list_checkpoints,
+    list_executor_prefixes,
+    list_test_targets,
     migrate,
     ready_tasks,
     record_adapter,
@@ -86,6 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--delivery", action="store_true")
     repair_parser = sub.add_parser("repair")
     repair_parser.add_argument("--dry-run", action="store_true")
+    repair_parser.add_argument("--clear-invariant", default="")
+    repair_parser.add_argument("--confirm", default="")
 
     migrate_parser = sub.add_parser("migrate")
     migrate_parser.add_argument("--from-version", required=True)
@@ -253,6 +259,19 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--exit-code", type=int)
     validation_record.add_argument("--stdout-sha256", default="")
     validation_record.add_argument("--artifact-path", default="")
+    validation_record.add_argument("--target", default="")
+    validation_record.add_argument("--executed-count", type=int)
+    validation_record.add_argument("--allow-unlisted", action="store_true")
+    validation_record.add_argument("--no-network", action="store_true")
+
+    test_target = sub.add_parser("test-target")
+    test_target_sub = test_target.add_subparsers(dest="test_target_command", required=True)
+    test_target_add = test_target_sub.add_parser("add")
+    test_target_add.add_argument("--id", required=True)
+    test_target_add.add_argument("--kind", required=True, choices=["unit", "integration", "lint", "build"])
+    test_target_add.add_argument("--command-template", required=True)
+    test_target_add.add_argument("--description", default="")
+    test_target_sub.add_parser("list")
 
     decision = sub.add_parser("decision")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
@@ -272,6 +291,10 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_record.add_argument("--exit-code", type=int)
     evidence_record.add_argument("--stdout-sha256", default="")
     evidence_record.add_argument("--artifact-path", default="")
+    evidence_record.add_argument("--target", default="")
+    evidence_record.add_argument("--executed-count", type=int)
+    evidence_record.add_argument("--allow-unlisted", action="store_true")
+    evidence_record.add_argument("--no-network", action="store_true")
 
     test = sub.add_parser("test")
     test_sub = test.add_subparsers(dest="test_command", required=True)
@@ -387,10 +410,23 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_claim.add_argument("--agent", required=True)
     dispatch_run = dispatch_sub.add_parser("run")
     dispatch_run.add_argument("--agent", required=True)
+    dispatch_run.add_argument("--target", default="")
     dispatch_run.add_argument("--command", dest="dispatch_command_text", required=True)
     dispatch_run.add_argument("--timeout", type=int, default=120)
+    dispatch_run.add_argument("--allow-unlisted", action="store_true")
+    dispatch_run.add_argument("--no-network", action="store_true")
+    dispatch_run.add_argument("--executed-count", type=int)
     dispatch_sub.add_parser("recover-stale")
     dispatch_sub.add_parser("status")
+
+    executor = sub.add_parser("executor")
+    executor_sub = executor.add_subparsers(dest="executor_command", required=True)
+    executor_allow = executor_sub.add_parser("allow-prefix")
+    executor_allow_sub = executor_allow.add_subparsers(dest="executor_allow_command", required=True)
+    executor_allow_add = executor_allow_sub.add_parser("add")
+    executor_allow_add.add_argument("--prefix", required=True)
+    executor_allow_add.add_argument("--reason", required=True)
+    executor_allow_sub.add_parser("list")
 
     invariant = sub.add_parser("invariant")
     invariant_sub = invariant.add_subparsers(dest="invariant_command", required=True)
@@ -436,12 +472,16 @@ def main() -> int:
                 return 1
             print("OK: harness state is valid")
         elif args.command == "repair":
-            plan = repair(root, dry_run=args.dry_run)
+            plan = repair(root, dry_run=args.dry_run, clear_invariant=args.clear_invariant, confirm=args.confirm)
             if args.dry_run:
                 print("DRY-RUN: repair plan")
                 for item in plan:
                     print(f"- {item}")
                 return 0
+            if plan:
+                for item in plan:
+                    print(f"ERROR: {item}")
+                return 1
             print("OK: repair complete")
         elif args.command == "migrate":
             report = migrate(root, args.from_version, args.to_version, dry_run=args.dry_run)
@@ -576,8 +616,17 @@ def main() -> int:
                 exit_code=args.exit_code,
                 stdout_sha256=args.stdout_sha256,
                 artifact_path=args.artifact_path,
+                target_id=args.target,
+                executed_count=args.executed_count,
+                allow_unlisted=args.allow_unlisted,
+                no_network=args.no_network,
             )
             print("OK: validation recorded")
+        elif args.command == "test-target" and args.test_target_command == "add":
+            add_test_target(root, args.id, args.kind, args.command_template, args.description)
+            print(f"OK: test target recorded {args.id}")
+        elif args.command == "test-target" and args.test_target_command == "list":
+            print("\n".join(list_test_targets(root)))
         elif args.command == "decision" and args.decision_command == "record":
             record_decision(root, args.decision, args.reason)
             print("OK: decision recorded")
@@ -593,6 +642,10 @@ def main() -> int:
                 exit_code=args.exit_code,
                 stdout_sha256=args.stdout_sha256,
                 artifact_path=args.artifact_path,
+                target_id=args.target,
+                executed_count=args.executed_count,
+                allow_unlisted=args.allow_unlisted,
+                no_network=args.no_network,
             )
             print(f"OK: evidence recorded {args.id}")
         elif args.command == "test" and args.test_command == "record":
@@ -701,13 +754,27 @@ def main() -> int:
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")
         elif args.command == "dispatch" and args.dispatch_command == "run":
-            evidence_id = dispatch_run(root, args.agent, args.dispatch_command_text, timeout=args.timeout)
+            evidence_id = dispatch_run(
+                root,
+                args.agent,
+                args.dispatch_command_text,
+                timeout=args.timeout,
+                target_id=args.target,
+                allow_unlisted=args.allow_unlisted,
+                no_network=args.no_network,
+                executed_count=args.executed_count,
+            )
             print(f"OK: dispatch command evidence {evidence_id}")
         elif args.command == "dispatch" and args.dispatch_command == "recover-stale":
             count = dispatch_recover_stale(root)
             print(f"OK: dispatch recovered {count} stale assignment(s)")
         elif args.command == "dispatch" and args.dispatch_command == "status":
             print("\n".join(dispatch_status(root)))
+        elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "add":
+            add_executor_prefix(root, args.prefix, args.reason)
+            print(f"OK: executor prefix allowed {args.prefix}")
+        elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "list":
+            print("\n".join(list_executor_prefixes(root)))
         elif args.command == "invariant" and args.invariant_command == "validate":
             issues = invariant_validate(root)
             if issues:

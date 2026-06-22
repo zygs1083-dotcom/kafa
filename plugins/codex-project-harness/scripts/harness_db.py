@@ -20,11 +20,11 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso
-from core.schema_guard import ADAPTER_MODES, FAILURE_MODE_STATUSES, TASK_STATUSES
+from core.schema_guard import ADAPTER_MODES, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
 
 
-SCHEMA_VERSION = 10
-RUNTIME_VERSION = "3.1.0"
+SCHEMA_VERSION = 11
+RUNTIME_VERSION = "3.2.0"
 DB_PATH = Path(".ai-team/state/harness.db")
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -63,6 +63,19 @@ PHASE_TRANSITIONS = {
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale"}
+DEFAULT_EXECUTOR_PREFIXES = [
+    "python3 -m unittest",
+    "python3 -m pytest",
+    "pytest",
+    "npm test",
+    "pnpm test",
+    "yarn test",
+    "make test",
+    "make lint",
+    "go test",
+    "cargo test",
+    "dotnet test",
+]
 
 SNAPSHOT_TABLES = [
     "project",
@@ -79,6 +92,7 @@ SNAPSHOT_TABLES = [
     "validation_failure_modes",
     "validation_tests",
     "validation_evidence",
+    "test_targets",
     "quality_gates",
     "quality_gate_findings",
     "deliveries",
@@ -92,6 +106,7 @@ SNAPSHOT_TABLES = [
     "invalidations",
     "agents",
     "agent_capabilities",
+    "executor_allowlist",
     "dispatch_runs",
     "dispatch_assignments",
     "runtime_snapshots",
@@ -128,7 +143,16 @@ def connection(root: Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def transaction_invariant_issues(conn: sqlite3.Connection, root: Path) -> list[str]:
+def transaction_invariant_issues(conn: sqlite3.Connection, root: Path, touched: list[tuple[str, str]] | None = None) -> list[object]:
+    exists = conn.execute("select 1 from sqlite_master where type='table' and name = 'project'").fetchone()
+    if not exists:
+        return []
+    from core.invariant_checker import check_runtime_invariants
+
+    return check_runtime_invariants(conn, root, scope=touched or [], full=False)
+
+
+def full_invariant_issues(conn: sqlite3.Connection, root: Path) -> list[object]:
     exists = conn.execute("select 1 from sqlite_master where type='table' and name = 'project'").fetchone()
     if not exists:
         return []
@@ -137,16 +161,22 @@ def transaction_invariant_issues(conn: sqlite3.Connection, root: Path) -> list[s
     return check_runtime_invariants(conn, root)
 
 
+def require_full_invariants(conn: sqlite3.Connection, root: Path, label: str) -> None:
+    issues = full_invariant_issues(conn, root)
+    if issues:
+        raise HarnessError(f"{label} invariant failed: " + "; ".join(str(issue) for issue in issues))
+
+
 @contextmanager
-def transaction(root: Path, *, validate_invariants: bool = True) -> Iterator[sqlite3.Connection]:
+def transaction(root: Path, *, validate_invariants: bool = True, touched: list[tuple[str, str]] | None = None) -> Iterator[sqlite3.Connection]:
     conn = connect(root)
     try:
         conn.execute("begin immediate")
         yield conn
         if validate_invariants:
-            issues = transaction_invariant_issues(conn, root)
+            issues = transaction_invariant_issues(conn, root, touched)
             if issues:
-                raise HarnessError("; ".join(issues))
+                raise HarnessError("; ".join(str(issue) for issue in issues))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -267,6 +297,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
             exit_code integer,
             stdout_sha256 text not null default '',
             artifact_path text not null default '',
+            target_id text not null default '',
+            executed_count integer not null default 0,
+            executed_count_source text not null default '',
+            allow_unlisted integer not null default 0,
+            no_network integer not null default 0,
+            policy_status text not null default '',
+            policy_reason text not null default '',
             findings text not null,
             result text not null,
             residual_risk text not null default '',
@@ -290,6 +327,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
             validation_id text not null references validations(id) on delete cascade,
             evidence_id text not null references evidence(id) on delete cascade,
             primary key (validation_id, evidence_id)
+        );
+        create table if not exists test_targets (
+            id text primary key,
+            kind text not null,
+            command_template text not null,
+            description text not null default '',
+            created_at text not null,
+            updated_at text not null
         );
         create table if not exists quality_gates (
             id text primary key,
@@ -345,6 +390,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
             stdout_sha256 text not null default '',
             artifact_path text not null default '',
             source_tree_hash text not null default '',
+            target_id text not null default '',
+            executed_count integer not null default 0,
+            executed_count_source text not null default '',
+            allow_unlisted integer not null default 0,
+            no_network integer not null default 0,
+            policy_status text not null default '',
+            policy_reason text not null default '',
             created_at text not null
         );
         create table if not exists tests (
@@ -425,6 +477,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             capability text not null,
             primary key (agent_id, capability)
         );
+        create table if not exists executor_allowlist (
+            id text primary key,
+            prefix text not null unique,
+            reason text not null,
+            created_at text not null
+        );
         create table if not exists dispatch_runs (
             id text primary key,
             scope text not null,
@@ -489,11 +547,26 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "exit_code", "integer")
     ensure_column(conn, "validations", "stdout_sha256", "text not null default ''")
     ensure_column(conn, "validations", "artifact_path", "text not null default ''")
+    ensure_column(conn, "validations", "target_id", "text not null default ''")
+    ensure_column(conn, "validations", "executed_count", "integer not null default 0")
+    ensure_column(conn, "validations", "executed_count_source", "text not null default ''")
+    ensure_column(conn, "validations", "allow_unlisted", "integer not null default 0")
+    ensure_column(conn, "validations", "no_network", "integer not null default 0")
+    ensure_column(conn, "validations", "policy_status", "text not null default ''")
+    ensure_column(conn, "validations", "policy_reason", "text not null default ''")
     ensure_column(conn, "evidence", "command", "text not null default ''")
     ensure_column(conn, "evidence", "exit_code", "integer")
     ensure_column(conn, "evidence", "stdout_sha256", "text not null default ''")
     ensure_column(conn, "evidence", "artifact_path", "text not null default ''")
     ensure_column(conn, "evidence", "source_tree_hash", "text not null default ''")
+    ensure_column(conn, "evidence", "target_id", "text not null default ''")
+    ensure_column(conn, "evidence", "executed_count", "integer not null default 0")
+    ensure_column(conn, "evidence", "executed_count_source", "text not null default ''")
+    ensure_column(conn, "evidence", "allow_unlisted", "integer not null default 0")
+    ensure_column(conn, "evidence", "no_network", "integer not null default 0")
+    ensure_column(conn, "evidence", "policy_status", "text not null default ''")
+    ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
+    ensure_default_executor_allowlist(conn)
 
 
 def ensure_runtime_gitignore(root: Path) -> None:
@@ -549,6 +622,18 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
     columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
     if column not in columns:
         conn.execute(f"alter table {table} add column {column} {ddl}")
+
+
+def ensure_default_executor_allowlist(conn: sqlite3.Connection) -> None:
+    for prefix in DEFAULT_EXECUTOR_PREFIXES:
+        conn.execute(
+            """
+            insert into executor_allowlist (id, prefix, reason, created_at)
+            values (?, ?, ?, ?)
+            on conflict(prefix) do nothing
+            """,
+            (f"default-{hashlib.sha256(prefix.encode('utf-8')).hexdigest()[:12]}", prefix, "default safe test prefix", now_iso()),
+        )
 
 
 def initialize_project(conn: sqlite3.Connection) -> None:
@@ -783,6 +868,29 @@ def normalize_artifact_path(root: Path, artifact_path: str) -> str:
         raise HarnessError(f"artifact path must be inside project root: {artifact_path}") from exc
 
 
+def bool_int(value: bool) -> int:
+    return 1 if value else 0
+
+
+def normalize_manual_execution_fields(executed_count: int | None, command: str) -> tuple[int, str, str, str]:
+    if executed_count is None:
+        return 0, "", "manual" if command else "", "recorded without executor"
+    return int(executed_count), "manual", "manual", "recorded via CLI"
+
+
+def test_target_command(conn: sqlite3.Connection, target_id: str) -> str:
+    if not target_id:
+        return ""
+    row = conn.execute("select command_template from test_targets where id = ?", (target_id,)).fetchone()
+    if not row:
+        raise HarnessError(f"missing test target: {target_id}")
+    return row["command_template"]
+
+
+def executor_prefixes(conn: sqlite3.Connection) -> list[str]:
+    return [row["prefix"] for row in conn.execute("select prefix from executor_allowlist order by prefix")]
+
+
 def bump_project(conn: sqlite3.Connection, **updates: str) -> None:
     project = conn.execute("select revision from project where id = 1").fetchone()
     revision = int(project["revision"]) + 1
@@ -862,6 +970,7 @@ def init_runtime(root: Path) -> None:
         create_schema(conn)
         initialize_project(conn)
         emit_event(conn, "runtime_initialized", payload())
+        require_full_invariants(conn, root, "init")
     render_all(root)
     install_agents(root)
 
@@ -887,6 +996,30 @@ def backup_runtime(root: Path, reason: str) -> Path:
         else:
             shutil.copy2(source, target)
     return backup_dir
+
+
+def restore_runtime_backup(root: Path, backup_dir: Path) -> None:
+    for relpath in [
+        ".ai-team/state",
+        ".ai-team/control",
+        ".ai-team/requirements",
+        ".ai-team/planning",
+        "docs/harness",
+    ]:
+        source = backup_dir / relpath
+        target = root / relpath
+        if not source.exists():
+            continue
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        ensure_parent(target)
+        if source.is_dir():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, target)
 
 
 def has_legacy_markdown_data(root: Path) -> bool:
@@ -991,184 +1124,189 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     if dry_run:
         return report
 
-    backup_runtime(root, "markdown-v1")
-    with transaction(root, validate_invariants=False) as conn:
-        create_schema(conn)
-        initialize_project(conn)
-        for cells in acceptance_rows:
-            if len(cells) < 2:
-                report_count(report, "skipped", "acceptance")
-                continue
-            conn.execute(
-                """
-                insert into acceptance (id, criterion, priority, tool_link, status)
-                values (?, ?, ?, ?, ?)
-                on conflict(id) do nothing
-                """,
-                (cells[0], cells[1], cells[2] if len(cells) > 2 else "", cells[3] if len(cells) > 3 else "", cells[4] if len(cells) > 4 else "active"),
-            )
-        for cells in requirement_rows:
-            if len(cells) < 3:
-                report_count(report, "skipped", "requirement")
-                continue
-            conn.execute(
-                """
-                insert into requirements (id, kind, body, priority, status, tool_link, revision, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(id) do nothing
-                """,
-                (
-                    cells[0],
-                    cells[1],
-                    cells[2],
-                    cells[3] if len(cells) > 3 else "",
-                    cells[4] if len(cells) > 4 else "active",
-                    cells[5] if len(cells) > 5 else "",
-                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 1,
-                    now_iso(),
-                ),
-            )
-        for cells in failure_mode_rows:
-            if len(cells) < 8:
-                report_count(report, "skipped", "failure_mode")
-                continue
-            conn.execute(
-                """
-                insert into failure_modes
-                (id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(id) do nothing
-                """,
-                (
-                    cells[0],
-                    cells[1],
-                    cells[2],
-                    cells[3],
-                    cells[4],
-                    cells[5] if len(cells) > 5 else "",
-                    cells[6] if len(cells) > 6 else "",
-                    cells[7] if len(cells) > 7 else "medium",
-                    normalize_failure_mode_status(cells[9] if len(cells) > 9 else "identified"),
-                ),
-            )
-            if len(cells) > 8:
-                for acceptance_id in parse_ids(cells[8]):
+    backup_dir = backup_runtime(root, "markdown-v1")
+    try:
+        with transaction(root, validate_invariants=False) as conn:
+            create_schema(conn)
+            initialize_project(conn)
+            for cells in acceptance_rows:
+                if len(cells) < 2:
+                    report_count(report, "skipped", "acceptance")
+                    continue
+                conn.execute(
+                    """
+                    insert into acceptance (id, criterion, priority, tool_link, status)
+                    values (?, ?, ?, ?, ?)
+                    on conflict(id) do nothing
+                    """,
+                    (cells[0], cells[1], cells[2] if len(cells) > 2 else "", cells[3] if len(cells) > 3 else "", cells[4] if len(cells) > 4 else "active"),
+                )
+            for cells in requirement_rows:
+                if len(cells) < 3:
+                    report_count(report, "skipped", "requirement")
+                    continue
+                conn.execute(
+                    """
+                    insert into requirements (id, kind, body, priority, status, tool_link, revision, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(id) do nothing
+                    """,
+                    (
+                        cells[0],
+                        cells[1],
+                        cells[2],
+                        cells[3] if len(cells) > 3 else "",
+                        cells[4] if len(cells) > 4 else "active",
+                        cells[5] if len(cells) > 5 else "",
+                        int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 1,
+                        now_iso(),
+                    ),
+                )
+            for cells in failure_mode_rows:
+                if len(cells) < 8:
+                    report_count(report, "skipped", "failure_mode")
+                    continue
+                conn.execute(
+                    """
+                    insert into failure_modes
+                    (id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(id) do nothing
+                    """,
+                    (
+                        cells[0],
+                        cells[1],
+                        cells[2],
+                        cells[3],
+                        cells[4],
+                        cells[5] if len(cells) > 5 else "",
+                        cells[6] if len(cells) > 6 else "",
+                        cells[7] if len(cells) > 7 else "medium",
+                        normalize_failure_mode_status(cells[9] if len(cells) > 9 else "identified"),
+                    ),
+                )
+                if len(cells) > 8:
+                    for acceptance_id in parse_ids(cells[8]):
+                        if conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+                            conn.execute(
+                                "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
+                                (cells[0], acceptance_id),
+                            )
+            for cells in task_rows:
+                if len(cells) < 4:
+                    report_count(report, "skipped", "task")
+                    continue
+                status = cells[3] if cells[3] in TASK_STATUSES else "ready"
+                conn.execute(
+                    """
+                    insert into tasks (id, task, owner, status, tool_link, evidence, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    on conflict(id) do nothing
+                    """,
+                    (
+                        cells[0],
+                        cells[1],
+                        cells[2] if len(cells) > 2 else "unassigned",
+                        status,
+                        cells[7] if len(cells) > 7 else "",
+                        cells[8] if len(cells) > 8 else "",
+                        now_iso(),
+                    ),
+                )
+                for acceptance_id in parse_ids(cells[4] if len(cells) > 4 else ""):
                     if conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+                        conn.execute("insert or ignore into task_acceptance (task_id, acceptance_id) values (?, ?)", (cells[0], acceptance_id))
+                for fm_id in parse_ids(cells[5] if len(cells) > 5 else ""):
+                    if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
+                        conn.execute("insert or ignore into task_failure_modes (task_id, failure_mode_id) values (?, ?)", (cells[0], fm_id))
+            for cells in validation_rows:
+                if len(cells) < 10:
+                    report_count(report, "skipped", "validation")
+                    continue
+                validation_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    insert into validations
+                    (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
+                     source_tree_hash, tracked_diff_hash, project_revision, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        validation_id,
+                        cells[0],
+                        cells[1] if len(cells) > 1 else "",
+                        cells[8] if len(cells) > 8 else "",
+                        cells[9] if len(cells) > 9 else "",
+                        cells[10] if len(cells) > 10 else "partial",
+                        cells[11] if len(cells) > 11 else "",
+                        cells[3] if len(cells) > 3 else "",
+                        cells[4] if len(cells) > 4 else "",
+                        cells[5] if len(cells) > 5 else "",
+                        int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
+                        now_iso(),
+                    ),
+                )
+                for fm_id in parse_ids(cells[2] if len(cells) > 2 else ""):
+                    if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
                         conn.execute(
-                            "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
-                            (cells[0], acceptance_id),
+                            "insert or ignore into validation_failure_modes (validation_id, failure_mode_id) values (?, ?)",
+                            (validation_id, fm_id),
                         )
-        for cells in task_rows:
-            if len(cells) < 4:
-                report_count(report, "skipped", "task")
-                continue
-            status = cells[3] if cells[3] in TASK_STATUSES else "ready"
+            for cells in gate_rows:
+                if len(cells) < 9:
+                    report_count(report, "skipped", "quality_gate")
+                    continue
+                conn.execute(
+                    """
+                    insert into quality_gates
+                    (id, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
+                     project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        cells[0],
+                        cells[1],
+                        cells[1],
+                        cells[4] if len(cells) > 4 else "",
+                        cells[2] if len(cells) > 2 else "",
+                        cells[3] if len(cells) > 3 else "",
+                        cells[5] if len(cells) > 5 else "",
+                        int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
+                        cells[7] if len(cells) > 7 else "external",
+                        cells[8] if len(cells) > 8 else "blocked",
+                        cells[9] if len(cells) > 9 else "",
+                        cells[10] if len(cells) > 10 else "",
+                        cells[11] if len(cells) > 11 else "",
+                        cells[12] if len(cells) > 12 else "",
+                        now_iso(),
+                    ),
+                )
+            for cells in decision_rows:
+                if len(cells) < 3:
+                    report_count(report, "skipped", "decision")
+                    continue
+                conn.execute(
+                    "insert into decisions (id, decision, reason, created_at) values (?, ?, ?, ?)",
+                    (str(uuid.uuid4()), cells[1], cells[2], cells[0] or now_iso()),
+                )
+            if delivery_text.strip():
+                conn.execute(
+                    """
+                    insert into deliveries (id, scope, handoff, created_at)
+                    values (?, ?, ?, ?)
+                    """,
+                    (str(uuid.uuid4()), "Imported markdown-v1 delivery history", delivery_text.strip(), now_iso()),
+                )
             conn.execute(
-                """
-                insert into tasks (id, task, owner, status, tool_link, evidence, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
-                on conflict(id) do nothing
-                """,
-                (
-                    cells[0],
-                    cells[1],
-                    cells[2] if len(cells) > 2 else "unassigned",
-                    status,
-                    cells[7] if len(cells) > 7 else "",
-                    cells[8] if len(cells) > 8 else "",
-                    now_iso(),
-                ),
+                "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
+                (1, SCHEMA_VERSION, now_iso()),
             )
-            for acceptance_id in parse_ids(cells[4] if len(cells) > 4 else ""):
-                if conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
-                    conn.execute("insert or ignore into task_acceptance (task_id, acceptance_id) values (?, ?)", (cells[0], acceptance_id))
-            for fm_id in parse_ids(cells[5] if len(cells) > 5 else ""):
-                if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
-                    conn.execute("insert or ignore into task_failure_modes (task_id, failure_mode_id) values (?, ?)", (cells[0], fm_id))
-        for cells in validation_rows:
-            if len(cells) < 10:
-                report_count(report, "skipped", "validation")
-                continue
-            validation_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                insert into validations
-                (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
-                 source_tree_hash, tracked_diff_hash, project_revision, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    validation_id,
-                    cells[0],
-                    cells[1] if len(cells) > 1 else "",
-                    cells[8] if len(cells) > 8 else "",
-                    cells[9] if len(cells) > 9 else "",
-                    cells[10] if len(cells) > 10 else "partial",
-                    cells[11] if len(cells) > 11 else "",
-                    cells[3] if len(cells) > 3 else "",
-                    cells[4] if len(cells) > 4 else "",
-                    cells[5] if len(cells) > 5 else "",
-                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
-                    now_iso(),
-                ),
-            )
-            for fm_id in parse_ids(cells[2] if len(cells) > 2 else ""):
-                if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
-                    conn.execute(
-                        "insert or ignore into validation_failure_modes (validation_id, failure_mode_id) values (?, ?)",
-                        (validation_id, fm_id),
-                    )
-        for cells in gate_rows:
-            if len(cells) < 9:
-                report_count(report, "skipped", "quality_gate")
-                continue
-            conn.execute(
-                """
-                insert into quality_gates
-                (id, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
-                 project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    cells[0],
-                    cells[1],
-                    cells[1],
-                    cells[4] if len(cells) > 4 else "",
-                    cells[2] if len(cells) > 2 else "",
-                    cells[3] if len(cells) > 3 else "",
-                    cells[5] if len(cells) > 5 else "",
-                    int(cells[6]) if len(cells) > 6 and cells[6].isdigit() else 0,
-                    cells[7] if len(cells) > 7 else "external",
-                    cells[8] if len(cells) > 8 else "blocked",
-                    cells[9] if len(cells) > 9 else "",
-                    cells[10] if len(cells) > 10 else "",
-                    cells[11] if len(cells) > 11 else "",
-                    cells[12] if len(cells) > 12 else "",
-                    now_iso(),
-                ),
-            )
-        for cells in decision_rows:
-            if len(cells) < 3:
-                report_count(report, "skipped", "decision")
-                continue
-            conn.execute(
-                "insert into decisions (id, decision, reason, created_at) values (?, ?, ?, ?)",
-                (str(uuid.uuid4()), cells[1], cells[2], cells[0] or now_iso()),
-            )
-        if delivery_text.strip():
-            conn.execute(
-                """
-                insert into deliveries (id, scope, handoff, created_at)
-                values (?, ?, ?, ?)
-                """,
-                (str(uuid.uuid4()), "Imported markdown-v1 delivery history", delivery_text.strip(), now_iso()),
-            )
-        conn.execute(
-            "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
-            (1, SCHEMA_VERSION, now_iso()),
-        )
-        emit_event(conn, "markdown_v1_migrated", payload(to=SCHEMA_VERSION))
+            emit_event(conn, "markdown_v1_migrated", payload(to=SCHEMA_VERSION))
+            require_full_invariants(conn, root, "migration")
+    except Exception:
+        restore_runtime_backup(root, backup_dir)
+        raise
     render_all(root)
     write_migration_report(root, report)
     install_agents(root)
@@ -1204,7 +1342,7 @@ def project_row(conn: sqlite3.Connection) -> sqlite3.Row:
 
 
 def transition_phase(root: Path, phase: str, *, status: str | None = None, owner: str | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("project", "1")]) as conn:
         row = project_row(conn)
         current = row["phase"]
         if phase not in PHASES:
@@ -1266,7 +1404,7 @@ def phase_prerequisite_issues(conn: sqlite3.Connection, phase: str) -> list[str]
 
 
 def confirm_scope(root: Path, by: str, summary: str) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("project", "1")]) as conn:
         before = project_row(conn)
         bump_project(conn, scope_status="confirmed", current_owner=by, status="scope-confirmed")
         after = project_row(conn)
@@ -1285,7 +1423,7 @@ def confirm_scope(root: Path, by: str, summary: str) -> None:
 
 
 def freeze_baseline(root: Path, baseline_id: str, summary: str, *, by: str = "") -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("baseline", baseline_id)]) as conn:
         snapshot = baseline_snapshot(conn)
         digest = stable_digest(snapshot)
         conn.execute(
@@ -1334,7 +1472,7 @@ def baseline_diff(root: Path, from_id: str, to: str = "current") -> list[str]:
 
 def add_requirement(root: Path, requirement_id: str, kind: str, body: str, priority: str = "", status: str = "active", tool_link: str = "") -> None:
     guard_schema("validate_requirement", requirement_id, kind, body, status)
-    with transaction(root) as conn:
+    with transaction(root, touched=[("requirement", requirement_id)]) as conn:
         existing = conn.execute("select * from requirements where id = ?", (requirement_id,)).fetchone()
         conn.execute(
             """
@@ -1363,7 +1501,7 @@ def add_requirement(root: Path, requirement_id: str, kind: str, body: str, prior
 
 def add_acceptance(root: Path, acceptance_id: str, criterion: str, priority: str = "", tool_link: str = "") -> None:
     guard_schema("validate_acceptance", acceptance_id, criterion)
-    with transaction(root) as conn:
+    with transaction(root, touched=[("acceptance", acceptance_id)]) as conn:
         existing = conn.execute("select * from acceptance where id = ?", (acceptance_id,)).fetchone()
         conn.execute(
             """
@@ -1408,7 +1546,7 @@ def add_failure_mode(
     expires_at: str = "",
 ) -> None:
     guard_schema("validate_failure_mode", fm_id, risk, status)
-    with transaction(root) as conn:
+    with transaction(root, touched=[("failure_mode", fm_id)]) as conn:
         existing = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
         accepted_revision = None
         if status not in FAILURE_MODE_STATUSES:
@@ -1486,7 +1624,7 @@ def require_requirement(conn: sqlite3.Connection, requirement_id: str) -> None:
 
 
 def link_requirement_acceptance(root: Path, requirement_id: str, acceptance_id: str) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("requirement", requirement_id), ("acceptance", acceptance_id)]) as conn:
         require_requirement(conn, requirement_id)
         require_acceptance(conn, acceptance_id)
         before = trace_snapshot(conn, requirement_id)
@@ -1557,7 +1695,7 @@ def add_task(
     tool_link: str = "",
 ) -> None:
     guard_schema("validate_task", task_id, task, status)
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         if status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
         if status == "accepted":
@@ -1600,7 +1738,7 @@ def add_task(
 
 
 def update_task(root: Path, task_id: str, *, depends_on: str | None = None, status: str | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         if status and status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
@@ -1652,7 +1790,7 @@ def require_task_runnable(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 
 
 def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> str:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_revision(row, expected_revision)
         active_lease = require_agent(conn, agent)
@@ -1694,7 +1832,7 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
 
 
 def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expected_revision: int) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1719,7 +1857,7 @@ def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expec
 
 def recover_stale_leases(root: Path) -> int:
     recovered = 0
-    with transaction(root) as conn:
+    with transaction(root, touched=[]) as conn:
         rows = conn.execute(
             """
             select id, status, lease_agent from tasks
@@ -1750,7 +1888,7 @@ def recover_stale_leases(root: Path) -> int:
 
 
 def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1778,7 +1916,7 @@ def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | Non
 
 
 def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1807,7 +1945,7 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
 
 
 def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1845,7 +1983,7 @@ def complete_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_
 
 
 def review_task(root: Path, task_id: str, agent: str, expected_revision: int) -> str:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         active_lease = require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1883,7 +2021,7 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int) ->
 
 
 def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1917,7 +2055,7 @@ def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
 
 
 def block_task(root: Path, task_id: str, reason: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    with transaction(root) as conn:
+    with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
@@ -1957,6 +2095,52 @@ def record_decision(root: Path, decision: str, reason: str) -> None:
     render_all(root)
 
 
+def add_test_target(root: Path, target_id: str, kind: str, command_template: str, description: str = "") -> None:
+    guard_schema("validate_test_target", target_id, kind, command_template)
+    with transaction(root, touched=[("test_target", target_id)]) as conn:
+        conn.execute(
+            """
+            insert into test_targets (id, kind, command_template, description, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(id) do update set kind=excluded.kind, command_template=excluded.command_template,
+              description=excluded.description, updated_at=excluded.updated_at
+            """,
+            (target_id, kind, command_template, description, now_iso(), now_iso()),
+        )
+        emit_event(conn, "test_target_recorded", payload(id=target_id, kind=kind))
+    render_all(root)
+
+
+def list_test_targets(root: Path) -> list[str]:
+    with connection(root) as conn:
+        rows = conn.execute("select id, kind, command_template, description from test_targets order by id").fetchall()
+    return [markdown_row([row["id"], row["kind"], row["command_template"], row["description"]]) for row in rows]
+
+
+def add_executor_prefix(root: Path, prefix: str, reason: str) -> None:
+    if not prefix.strip():
+        raise HarnessError("executor allow prefix is required")
+    if not reason.strip():
+        raise HarnessError("executor allow prefix reason is required")
+    with transaction(root, touched=[("executor_allowlist", prefix)]) as conn:
+        conn.execute(
+            """
+            insert into executor_allowlist (id, prefix, reason, created_at)
+            values (?, ?, ?, ?)
+            on conflict(prefix) do update set reason=excluded.reason
+            """,
+            (f"user-{hashlib.sha256(prefix.encode('utf-8')).hexdigest()[:12]}", prefix, reason, now_iso()),
+        )
+        emit_event(conn, "executor_prefix_allowed", payload(prefix=prefix, reason=reason))
+    render_all(root)
+
+
+def list_executor_prefixes(root: Path) -> list[str]:
+    with connection(root) as conn:
+        rows = conn.execute("select prefix, reason from executor_allowlist order by prefix").fetchall()
+    return [markdown_row([row["prefix"], row["reason"]]) for row in rows]
+
+
 def record_validation(
     root: Path,
     surface: str,
@@ -1973,22 +2157,30 @@ def record_validation(
     exit_code: int | None = None,
     stdout_sha256: str = "",
     artifact_path: str = "",
+    target_id: str = "",
+    executed_count: int | None = None,
+    allow_unlisted: bool = False,
+    no_network: bool = False,
 ) -> None:
     guard_schema("validate_validation", surface, findings, result)
     current_sha = git_head_sha(root) or "no-git"
     source_hash = git_source_tree_hash(root) or ""
     tracked_diff_hash = git_tracked_diff_hash(root) or ""
     artifact_path = normalize_artifact_path(root, artifact_path)
-    with transaction(root) as conn:
+    executed_count_value, executed_count_source, policy_status, policy_reason = normalize_manual_execution_fields(executed_count, command)
+    with transaction(root, touched=[("validation", "")]) as conn:
+        if target_id:
+            test_target_command(conn, target_id)
         validation_id = str(uuid.uuid4())
         project_revision = int(project_row(conn)["revision"])
         conn.execute(
             """
             insert into validations
             (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
-             findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
+             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
+             policy_reason, findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
              project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 validation_id,
@@ -1999,6 +2191,13 @@ def record_validation(
                 exit_code,
                 stdout_sha256,
                 artifact_path,
+                target_id,
+                executed_count_value,
+                executed_count_source,
+                bool_int(allow_unlisted),
+                bool_int(no_network),
+                policy_status,
+                policy_reason,
                 findings,
                 result,
                 risk,
@@ -2054,21 +2253,53 @@ def record_evidence(
     exit_code: int | None = None,
     stdout_sha256: str = "",
     artifact_path: str = "",
+    target_id: str = "",
+    executed_count: int | None = None,
+    allow_unlisted: bool = False,
+    no_network: bool = False,
 ) -> None:
     artifact_path = normalize_artifact_path(root, artifact_path)
     source_hash = git_source_tree_hash(root) or ""
-    with transaction(root) as conn:
+    executed_count_value, executed_count_source, policy_status, policy_reason = normalize_manual_execution_fields(executed_count, command)
+    with transaction(root, touched=[("evidence", evidence_id)]) as conn:
+        if target_id:
+            test_target_command(conn, target_id)
         conn.execute(
             """
             insert into evidence
-            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, summary=excluded.summary, uri=excluded.uri,
               hash=excluded.hash, command=excluded.command, exit_code=excluded.exit_code,
               stdout_sha256=excluded.stdout_sha256, artifact_path=excluded.artifact_path,
-              source_tree_hash=excluded.source_tree_hash, created_at=excluded.created_at
+              source_tree_hash=excluded.source_tree_hash, target_id=excluded.target_id,
+              executed_count=excluded.executed_count, executed_count_source=excluded.executed_count_source,
+              allow_unlisted=excluded.allow_unlisted, no_network=excluded.no_network,
+              policy_status=excluded.policy_status, policy_reason=excluded.policy_reason,
+              created_at=excluded.created_at
             """,
-            (evidence_id, kind, summary, uri, artifact_hash, command, exit_code, stdout_sha256, artifact_path, source_hash, now_iso()),
+            (
+                evidence_id,
+                kind,
+                summary,
+                uri,
+                artifact_hash,
+                command,
+                exit_code,
+                stdout_sha256,
+                artifact_path,
+                source_hash,
+                target_id,
+                executed_count_value,
+                executed_count_source,
+                bool_int(allow_unlisted),
+                bool_int(no_network),
+                policy_status,
+                policy_reason,
+                now_iso(),
+            ),
         )
         emit_event(conn, "evidence_recorded", payload(id=evidence_id, kind=kind))
     render_all(root)
@@ -2503,7 +2734,17 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
         return assignment["task_id"]
 
 
-def dispatch_run(root: Path, agent: str, command: str, *, timeout: int = 120) -> str:
+def dispatch_run(
+    root: Path,
+    agent: str,
+    command: str,
+    *,
+    timeout: int = 120,
+    target_id: str = "",
+    allow_unlisted: bool = False,
+    no_network: bool = False,
+    executed_count: int | None = None,
+) -> str:
     from core.executor import LocalExecutor
 
     with connection(root) as conn:
@@ -2521,16 +2762,31 @@ def dispatch_run(root: Path, agent: str, command: str, *, timeout: int = 120) ->
     if not assignment:
         raise HarnessError(f"no claimed dispatch assignment for agent: {agent}")
 
-    result = LocalExecutor(root).run(command, timeout=timeout)
+    with connection(root) as conn:
+        target_command = test_target_command(conn, target_id) if target_id else ""
+        prefixes = executor_prefixes(conn)
+
+    result = LocalExecutor(root).run(
+        command,
+        timeout=timeout,
+        target_id=target_id,
+        target_command_template=target_command,
+        allowed_prefixes=prefixes,
+        allow_unlisted=allow_unlisted,
+        no_network=no_network,
+        executed_count=executed_count,
+    )
     evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
     source_hash = git_source_tree_hash(root) or ""
     status = "completed" if result.exit_code == 0 else "failed"
-    with transaction(root) as conn:
+    with transaction(root, touched=[("dispatch_assignment", assignment["task_id"]), ("evidence", evidence_id)]) as conn:
         conn.execute(
             """
             insert into evidence
-            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash, created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             created_at)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 evidence_id,
@@ -2542,6 +2798,13 @@ def dispatch_run(root: Path, agent: str, command: str, *, timeout: int = 120) ->
                 result.stdout_sha256,
                 result.artifact_path,
                 source_hash,
+                result.target_id,
+                result.executed_count,
+                result.executed_count_source,
+                bool_int(result.allow_unlisted),
+                bool_int(result.no_network),
+                result.policy_status,
+                result.policy_reason,
                 now_iso(),
             ),
         )
@@ -2618,17 +2881,22 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
             "skipped": {},
             "unrecognized": [],
         }
-    backup_runtime(root, "migrate")
+    backup_dir = backup_runtime(root, "migrate")
     from_version_int = int(from_version)
-    with transaction(root, validate_invariants=False) as conn:
-        create_schema(conn)
-        initialize_project(conn)
-        conn.execute(
-            "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
-            (from_version_int, to_version, now_iso()),
-        )
-        conn.execute("update project set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ? where id = 1", (to_version, RUNTIME_VERSION, now_iso()))
-        emit_event(conn, "migration_applied", payload(**{"from": from_version_int, "to": to_version}))
+    try:
+        with transaction(root, validate_invariants=False) as conn:
+            create_schema(conn)
+            initialize_project(conn)
+            conn.execute(
+                "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
+                (from_version_int, to_version, now_iso()),
+            )
+            conn.execute("update project set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ? where id = 1", (to_version, RUNTIME_VERSION, now_iso()))
+            emit_event(conn, "migration_applied", payload(**{"from": from_version_int, "to": to_version}))
+            require_full_invariants(conn, root, "migration")
+    except Exception:
+        restore_runtime_backup(root, backup_dir)
+        raise
     render_all(root)
     return None
 
@@ -2685,9 +2953,12 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("adapter_actions", "status", ADAPTER_ACTION_STATUSES, "adapter action status"),
         ("agents", "status", {"available", "leased", "disabled"}, "agent status"),
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
+        ("dispatch_assignments", "status", DISPATCH_STATUSES, "dispatch assignment status"),
+        ("test_targets", "kind", TEST_TARGET_KINDS, "test target kind"),
     ]
     for table, column, allowed, label in enum_checks:
-        for row in conn.execute(f"select id, {column} as value from {table} where {column} not in ({','.join('?' for _ in allowed)})", tuple(allowed)):
+        id_column = "task_id" if table == "dispatch_assignments" else "id"
+        for row in conn.execute(f"select {id_column} as id, {column} as value from {table} where {column} not in ({','.join('?' for _ in allowed)})", tuple(allowed)):
             issues.append(f"invalid {label}: {table}.{row['id']}={row['value']}")
     for row in conn.execute("select id, payload_json from events"):
         try:
@@ -2786,6 +3057,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("failure-mode.schema.json", "failure_modes", [row_snapshot(row) or {} for row in conn.execute("select * from failure_modes")]),
         ("task.schema.json", "tasks", tasks),
         ("validation.schema.json", "validations", validations),
+        ("test-target.schema.json", "test_targets", [row_snapshot(row) or {} for row in conn.execute("select * from test_targets")]),
         ("quality-gate.schema.json", "quality_gates", [row_snapshot(row) or {} for row in conn.execute("select * from quality_gates")]),
         ("delivery.schema.json", "deliveries", [row_snapshot(row) or {} for row in conn.execute("select * from deliveries")]),
         ("evidence.schema.json", "evidence", [row_snapshot(row) or {} for row in conn.execute("select * from evidence")]),
@@ -2952,7 +3224,52 @@ def status_lines(root: Path) -> list[str]:
     ]
 
 
-def repair(root: Path, *, dry_run: bool = False) -> list[str]:
+def repair(root: Path, *, dry_run: bool = False, clear_invariant: str = "", confirm: str = "") -> list[str]:
+    if clear_invariant:
+        supported = {"expired-lease", "producer-self-accepted"}
+        plan = [f"clear invariant: {clear_invariant}"]
+        if clear_invariant not in supported:
+            return [f"unsupported invariant repair code: {clear_invariant}"]
+        if dry_run:
+            return [f"repair action: {item}" for item in plan]
+        if confirm != clear_invariant:
+            return [f"repair requires --confirm {clear_invariant}", *[f"repair action: {item}" for item in plan]]
+        backup_runtime(root, f"repair-{clear_invariant}")
+        with transaction(root, validate_invariants=False) as conn:
+            if clear_invariant == "expired-lease":
+                rows = conn.execute(
+                    """
+                    select id, lease_agent from tasks
+                    where lease_expires_at is not null and lease_expires_at <= ? and lease_agent is not null
+                    order by id
+                    """,
+                    (now_iso(),),
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        """
+                        update tasks set lease_agent = null, lease_token = null, lease_heartbeat_at = null,
+                          lease_expires_at = null, revision = revision + 1, updated_at = ? where id = ?
+                        """,
+                        (now_iso(), row["id"]),
+                    )
+                    if row["lease_agent"]:
+                        conn.execute(
+                            "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
+                            (now_iso(), row["lease_agent"]),
+                        )
+            elif clear_invariant == "producer-self-accepted":
+                conn.execute(
+                    """
+                    update tasks
+                    set status = 'review', accepted_by = '', revision = revision + 1, updated_at = ?
+                    where status = 'accepted' and accepted_by != '' and accepted_by = owner
+                    """,
+                    (now_iso(),),
+                )
+            emit_event(conn, "invariant_repaired", payload(code=clear_invariant))
+        render_all(root)
+        return []
     if dry_run:
         issues = doctor(root)
         plan = [

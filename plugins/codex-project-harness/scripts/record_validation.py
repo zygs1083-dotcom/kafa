@@ -24,6 +24,10 @@ def main() -> int:
     parser.add_argument("--exit-code", type=int)
     parser.add_argument("--stdout-sha256", default="")
     parser.add_argument("--artifact-path", default="")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--executed-count", type=int)
+    parser.add_argument("--allow-unlisted", action="store_true")
+    parser.add_argument("--no-network", action="store_true")
     args = parser.parse_args()
     command = [
         "validation",
@@ -49,6 +53,14 @@ def main() -> int:
         command.extend(["--stdout-sha256", args.stdout_sha256])
     if args.artifact_path:
         command.extend(["--artifact-path", args.artifact_path])
+    if args.target:
+        command.extend(["--target", args.target])
+    if args.executed_count is not None:
+        command.extend(["--executed-count", str(args.executed_count)])
+    if args.allow_unlisted:
+        command.append("--allow-unlisted")
+    if args.no_network:
+        command.append("--no-network")
     for failure_mode in args.failure_mode:
         command.extend(["--failure-mode", failure_mode])
     for test in args.test:
