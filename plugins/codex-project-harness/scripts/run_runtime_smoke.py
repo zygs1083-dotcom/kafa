@@ -91,7 +91,13 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(evidence)
         evidence_id = evidence.stdout.strip().rsplit(" ", 1)[-1] if evidence.returncode == 0 else "EV1"
         commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", evidence_id))
-        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector", "--verification-token", "smoke-token")
+        key_file = root / ".ai-team/runtime/connector.key"
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text("smoke-connector-key\n", encoding="utf-8")
+        key_path_file = root / ".ai-team/control/connector-key-path.txt"
+        key_path_file.parent.mkdir(parents=True, exist_ok=True)
+        key_path_file.write_text(".ai-team/runtime/connector.key\n", encoding="utf-8")
+        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector")
         commands.append(session)
         session_id = session.stdout.strip().rsplit(" ", 1)[-1] if session.returncode == 0 else "smoke-session-1:smoke-verifier"
         commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", session_id, "--code-identity", "git"))

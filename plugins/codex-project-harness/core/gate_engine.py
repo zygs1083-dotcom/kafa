@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 
 from harness_lib import content_source_tree_hash, git_dirty, git_head_sha, git_source_tree_hash
+from .connector_trust import ci_payload, external_session_payload, verify_connector_record
 from .executor import command_matches_template
 
 
@@ -76,7 +77,7 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
     return issues
 
 
-def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha: str | None, *, require_external: bool) -> list[str]:
+def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, root: Path, current_sha: str | None, *, require_external: bool) -> list[str]:
     trust_anchor = str(_value(row, "trust_anchor") or "local-only")
     trust_anchor_id = str(_value(row, "trust_anchor_id") or "")
     issues: list[str] = []
@@ -94,12 +95,23 @@ def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha
                     issues.append(f"external-session verification is not verified: {verification['conclusion']}")
                 if require_external and verification["origin"] != "connector":
                     issues.append(f"external-session verification origin is not connector: {verification['origin']}")
-                if require_external and not verification["verification_token"]:
-                    issues.append("external-session verification requires connector verification_token")
                 if not current_sha:
                     issues.append("external-session verification requires git HEAD")
                 elif verification["commit_sha"] != current_sha:
                     issues.append(f"external-session verification sha mismatch: session={verification['commit_sha']} current={current_sha}")
+                if require_external and verification["origin"] == "connector":
+                    ok, reason = verify_connector_record(
+                        root,
+                        verification["verification_token"],
+                        external_session_payload(
+                            verification["session_id"],
+                            verification["verifier"],
+                            verification["commit_sha"],
+                            verification["conclusion"],
+                        ),
+                    )
+                    if not ok:
+                        issues.append(f"external-session connector HMAC invalid: {reason}")
     if trust_anchor == "ci":
         if not trust_anchor_id:
             issues.append("ci trust anchor requires trust_anchor_id")
@@ -112,12 +124,18 @@ def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha
                     issues.append(f"ci verification is not success: {ci['conclusion']}")
                 if require_external and ci["origin"] != "connector":
                     issues.append(f"ci verification origin is not connector: {ci['origin']}")
-                if require_external and not ci["verification_token"]:
-                    issues.append("ci verification requires connector verification_token")
                 if not current_sha:
                     issues.append("ci verification requires git HEAD")
                 elif ci["commit_sha"] != current_sha:
                     issues.append(f"ci verification sha mismatch: ci={ci['commit_sha']} current={current_sha}")
+                if require_external and ci["origin"] == "connector":
+                    ok, reason = verify_connector_record(
+                        root,
+                        ci["verification_token"],
+                        ci_payload(ci["provider"], ci["run_id"], ci["commit_sha"], ci["conclusion"]),
+                    )
+                    if not ok:
+                        issues.append(f"ci connector HMAC invalid: {reason}")
     return issues
 
 
@@ -140,7 +158,7 @@ def validation_trusted_command_issues(
             issues.append(f"validation command does not match target {target_id}")
         elif int(target["gateable"] or 0) != 1:
             issues.append(f"validation target is not gateable: {target_id} {target['gate_block_reason']}")
-    issues.extend(_trust_anchor_issues(conn, validation, current_sha, require_external=require_external_anchor))
+    issues.extend(_trust_anchor_issues(conn, validation, root, current_sha, require_external=require_external_anchor))
     return issues
 
 

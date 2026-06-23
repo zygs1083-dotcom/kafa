@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.0.1-beta.1**，架构代际定位为 **Codex Harness Kernel v3.3.1**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.0.2-beta.1**，架构代际定位为 **Codex Harness Kernel v3.3.2**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v1.0.1-beta.1
+git show v1.0.2-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -128,7 +128,15 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 从 v1.0 开始，交付门禁只接受执行器真实运行并解析出的语义可信证据：passing validation 必须引用 gateable test target，命令必须匹配目标模板，退出码必须为 `0`，`executed_count_source` 必须为 `parsed`，`executed_count` 必须大于 `0`，并保留 stdout SHA-256、artifact path、当前 source tree hash 和 trust anchor。旧自由文本或手填命令证据仍可审计记录，但不具备交付资格。
 
-从 v1.0.1 开始，门禁进一步 fail-closed：无 git 项目不会静默跳过代码身份校验，必须显式记录 `--code-identity content-hash`；用于交付的证据必须有非空且当前有效的 source hash；stdout artifact 会在门禁阶段重算 SHA-256；`ci` 与 `external-session` 高信任锚必须来自 connector-origin 契约和 verification token，manual-origin 记录只作为审计事实。
+从 v1.0.1 开始，门禁进一步 fail-closed：无 git 项目不会静默跳过代码身份校验，必须显式记录 `--code-identity content-hash`；用于交付的证据必须有非空且当前有效的 source hash；stdout artifact 会在门禁阶段重算 SHA-256；`ci` 与 `external-session` 高信任锚必须来自 connector-origin 契约，manual-origin 记录只作为审计事实。
+
+从 v1.0.2 开始，connector-origin 不再只看 `verification_token` 是否非空，而是要求宿主保管的 HMAC key 参与校验。运行时从 `HARNESS_CONNECTOR_KEY` 或 `.ai-team/control/connector-key-path.txt` 指向的文件加载 key，并用该 key 计算 CI / external-session verification token。没有 key、token 不匹配、commit SHA 或 conclusion 被篡改时，该记录在门禁中降级为 manual/local-only 等价，不能覆盖 high/critical failure mode。key 本身不得写入 DB、事件、Markdown 或 Git；推荐放在已忽略的 `.ai-team/runtime/connector.key`。
+
+信任等级按强度分为三档：
+
+- `local-only`：本地模型会话执行证据，可覆盖 low/medium 风险。
+- `human-confirmed`：人工确认记录，可覆盖 low/medium 风险，但不能冒充外部执行。
+- `connector(HMAC)`：宿主/connector 用模型会话拿不到的 key 生成或验证 HMAC，可覆盖 high/critical 风险。
 
 Markdown 文件是面向人的派生视图。
 
@@ -287,8 +295,8 @@ harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 13
-harness.py --root . migrate --from-version markdown-v1 --to-version 13 --dry-run
+harness.py --root . migrate --from-version 6 --to-version 14
+harness.py --root . migrate --from-version markdown-v1 --to-version 14 --dry-run
 harness.py --root . invariant validate
 harness.py --root . projection rebuild
 harness.py --root . kernel doctor

@@ -20,12 +20,19 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
+from core.connector_trust import (
+    ConnectorTrustError,
+    ci_payload,
+    configured_key_path,
+    external_session_payload,
+    prepare_connector_record,
+)
 from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXTERNAL_SESSION_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 13
-RUNTIME_VERSION = "3.3.1"
+SCHEMA_VERSION = 14
+RUNTIME_VERSION = "3.3.2"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -509,6 +516,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             commit_sha text not null,
             origin text not null default 'manual',
             verification_token text not null default '',
+            token_status text not null default 'unchecked',
+            token_reason text not null default '',
             external_link text not null default '',
             created_at text not null,
             unique(provider, run_id)
@@ -521,6 +530,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             commit_sha text not null,
             origin text not null default 'manual',
             verification_token text not null default '',
+            token_status text not null default 'unchecked',
+            token_reason text not null default '',
             external_link text not null default '',
             created_at text not null,
             unique(session_id, verifier)
@@ -633,6 +644,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
     ensure_column(conn, "ci_verifications", "origin", "text not null default 'manual'")
     ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
+    ensure_column(conn, "ci_verifications", "token_status", "text not null default 'unchecked'")
+    ensure_column(conn, "ci_verifications", "token_reason", "text not null default ''")
+    ensure_column(conn, "external_session_verifications", "origin", "text not null default 'manual'")
+    ensure_column(conn, "external_session_verifications", "verification_token", "text not null default ''")
+    ensure_column(conn, "external_session_verifications", "token_status", "text not null default 'unchecked'")
+    ensure_column(conn, "external_session_verifications", "token_reason", "text not null default ''")
     ensure_default_executor_allowlist(conn)
 
 
@@ -682,6 +699,28 @@ def gitignore_runtime_issues(root: Path) -> list[str]:
             + " ".join(tracked)
             + ")"
         )
+    key_path = configured_key_path(root)
+    if key_path is not None:
+        try:
+            rel_key_path = key_path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            rel_key_path = ""
+        if rel_key_path:
+            try:
+                tracked_key = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", rel_key_path],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                tracked_key = None
+            if tracked_key is not None:
+                issues.append(
+                    f"connector key file is tracked by git: {rel_key_path} "
+                    f"(fix with: git rm --cached {rel_key_path})"
+                )
     return issues
 
 
@@ -2712,19 +2751,43 @@ def record_ci_verification(
     verification_token: str = "",
 ) -> str:
     guard_schema("validate_ci_verification", provider, run_id, conclusion, commit_sha, origin)
+    try:
+        stored_origin, stored_token, token_status, token_reason = prepare_connector_record(
+            root,
+            origin,
+            verification_token,
+            ci_payload(provider, run_id, commit_sha, conclusion),
+        )
+    except ConnectorTrustError as exc:
+        raise HarnessError(str(exc)) from exc
     verification_id = f"{provider}:{run_id}"
     with transaction(root, touched=[("ci_verification", verification_id)]) as conn:
         conn.execute(
             """
-            insert into ci_verifications (id, provider, run_id, conclusion, commit_sha, origin, verification_token, external_link, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into ci_verifications
+            (id, provider, run_id, conclusion, commit_sha, origin, verification_token, token_status, token_reason, external_link, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(provider, run_id) do update set conclusion=excluded.conclusion,
               commit_sha=excluded.commit_sha, origin=excluded.origin, verification_token=excluded.verification_token,
+              token_status=excluded.token_status, token_reason=excluded.token_reason,
               external_link=excluded.external_link, created_at=excluded.created_at
             """,
-            (verification_id, provider, run_id, conclusion, commit_sha, origin, verification_token, external_link, now_iso()),
+            (verification_id, provider, run_id, conclusion, commit_sha, stored_origin, stored_token, token_status, token_reason, external_link, now_iso()),
         )
-        emit_event(conn, "ci_verification_recorded", payload(id=verification_id, provider=provider, run_id=run_id, conclusion=conclusion, commit_sha=commit_sha, origin=origin))
+        emit_event(
+            conn,
+            "ci_verification_recorded",
+            payload(
+                id=verification_id,
+                provider=provider,
+                run_id=run_id,
+                conclusion=conclusion,
+                commit_sha=commit_sha,
+                origin=stored_origin,
+                token_status=token_status,
+                token_reason=token_reason,
+            ),
+        )
     render_tooling_map(root)
     return verification_id
 
@@ -2741,23 +2804,42 @@ def record_external_session_verification(
     verification_token: str = "",
 ) -> str:
     guard_schema("validate_external_session_verification", session_id, verifier, conclusion, commit_sha, origin)
+    try:
+        stored_origin, stored_token, token_status, token_reason = prepare_connector_record(
+            root,
+            origin,
+            verification_token,
+            external_session_payload(session_id, verifier, commit_sha, conclusion),
+        )
+    except ConnectorTrustError as exc:
+        raise HarnessError(str(exc)) from exc
     verification_id = f"{session_id}:{verifier}"
     with transaction(root, touched=[("external_session_verification", verification_id)]) as conn:
         conn.execute(
             """
             insert into external_session_verifications
-            (id, session_id, verifier, conclusion, commit_sha, origin, verification_token, external_link, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, session_id, verifier, conclusion, commit_sha, origin, verification_token, token_status, token_reason, external_link, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(session_id, verifier) do update set conclusion=excluded.conclusion,
               commit_sha=excluded.commit_sha, origin=excluded.origin, verification_token=excluded.verification_token,
+              token_status=excluded.token_status, token_reason=excluded.token_reason,
               external_link=excluded.external_link, created_at=excluded.created_at
             """,
-            (verification_id, session_id, verifier, conclusion, commit_sha, origin, verification_token, external_link, now_iso()),
+            (verification_id, session_id, verifier, conclusion, commit_sha, stored_origin, stored_token, token_status, token_reason, external_link, now_iso()),
         )
         emit_event(
             conn,
             "external_session_verification_recorded",
-            payload(id=verification_id, session_id=session_id, verifier=verifier, conclusion=conclusion, commit_sha=commit_sha, origin=origin),
+            payload(
+                id=verification_id,
+                session_id=session_id,
+                verifier=verifier,
+                conclusion=conclusion,
+                commit_sha=commit_sha,
+                origin=stored_origin,
+                token_status=token_status,
+                token_reason=token_reason,
+            ),
         )
     render_tooling_map(root)
     return verification_id

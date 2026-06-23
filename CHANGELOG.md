@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.0.2-beta.1 - 2026-06-23
+
+### Fixed
+
+- Connector-origin CI and external-session anchors now require HMAC verification instead of trusting any non-empty `verification_token`.
+- Without `HARNESS_CONNECTOR_KEY` or a configured connector key file, connector-origin writes are downgraded to manual audit records and cannot cover high/critical failure modes.
+- Delivery gates recompute connector HMAC tokens from the verification payload, so tampered commit SHA or conclusion fields fail closed.
+- `harness doctor` reports an error when the configured connector key file is tracked by Git.
+
+### Changed
+
+- Runtime schema version is now `14`; runtime implementation version is now `3.3.2`.
+- CI and external-session verification rows include `token_status` and `token_reason` audit fields.
+- Documentation now defines trust as `local-only < human-confirmed < connector(HMAC)` and states that connector key material must be controlled outside the model session.
+
+### Boundaries
+
+- The key itself is never written to SQLite, event payloads, Markdown projections, or Git by the runtime.
+- This release still stops at verified code delivery and performs no deployment, real external writes, or connector-side polling.
+
 ## v1.0.1-beta.1 - 2026-06-23
 
 ### Fixed

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness External Session Verification",
   "type": "object",
-  "required": ["id", "session_id", "verifier", "conclusion", "commit_sha", "origin", "created_at"],
+  "required": ["id", "session_id", "verifier", "conclusion", "commit_sha", "origin", "token_status", "token_reason", "created_at"],
   "properties": {
     "id": { "type": "string" },
     "session_id": { "type": "string" },
@@ -11,6 +11,8 @@
     "commit_sha": { "type": "string" },
     "origin": { "type": "string", "enum": ["manual", "connector"] },
     "verification_token": { "type": "string" },
+    "token_status": { "type": "string" },
+    "token_reason": { "type": "string" },
     "external_link": { "type": "string" },
     "created_at": { "type": "string" }
   },

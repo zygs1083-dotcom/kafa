@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.3.1
+# Codex OS Runtime Layer v3.3.2
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.3.1 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.3.1` and the database schema version is `13`.
+Kernel v3.3.2 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.3.2` and the database schema version is `14`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.3.1
+## Kernel v3.3.2
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -44,7 +44,15 @@ harness.py --root . dispatch run --agent developer --target UNIT --command "pyte
 
 The gate rejects empty source hashes, stale source hashes, missing artifacts, empty artifacts, and artifact bytes whose SHA-256 does not match the stored `stdout_sha256`.
 
-High and critical failure-mode coverage requires a real external trust anchor. `adapter ci-verify` and `adapter external-session-verify` records with `origin=manual` are audit-only for high-risk gates. Connector-origin records must include a verification token and match the current commit SHA.
+High and critical failure-mode coverage requires a real external trust anchor. `adapter ci-verify` and `adapter external-session-verify` records with `origin=manual` are audit-only for high-risk gates. Connector-origin records must pass HMAC verification against a connector key controlled by the host or connector boundary and must match the current commit SHA.
+
+The trust ladder is:
+
+- `local-only`: local executor evidence from the current model session; eligible for low/medium risk.
+- `human-confirmed`: explicit human confirmation; eligible for low/medium risk.
+- `connector(HMAC)`: CI or external-session verification whose token is HMAC-SHA256 over the verification payload using `HARNESS_CONNECTOR_KEY` or the file referenced by `.ai-team/control/connector-key-path.txt`; required for high/critical risk unless the risk is formally accepted/exempt.
+
+Recommended connector key placement is `.ai-team/runtime/connector.key`, referenced by `.ai-team/control/connector-key-path.txt`. The key itself must not be written to SQLite, event payloads, Markdown projections, or Git. `harness doctor` reports an error if the configured key file is tracked by Git.
 
 ## Unified CLI
 
@@ -56,7 +64,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 13
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 14
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -341,8 +349,9 @@ harness.py --root . dispatch run --agent developer --command "custom check" --al
 Trust anchors define what risk level evidence can satisfy:
 
 - `local-only` and `human-confirmed` can satisfy low/medium delivery evidence.
-- `external-session` and `ci` can satisfy high/critical failure-mode coverage.
-- `ci` must reference a local `adapter ci-verify` record whose conclusion is `success` and whose commit SHA matches current HEAD.
+- `external-session` and `ci` can satisfy high/critical failure-mode coverage only when their verification row is connector-origin and HMAC-valid.
+- `ci` must reference a local `adapter ci-verify` record whose conclusion is `success`, whose commit SHA matches current HEAD, and whose connector token validates with the host-controlled key.
+- `external-session` must reference a local `adapter external-session-verify` record whose conclusion is `verified`, whose commit SHA matches current HEAD, and whose connector token validates with the host-controlled key.
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 
@@ -354,7 +363,7 @@ Quality gates are fail-closed. Delivery readiness requires:
 - no blocking findings
 - validation records are `pass`
 - no unresolved invalidations remain
-- high/critical failure modes are covered by passing validation with `ci` or `external-session` trust anchor, or formally accepted
+- high/critical failure modes are covered by passing validation with HMAC-valid connector `ci` or `external-session` trust anchor, or formally accepted
 - active tasks are accepted
 - Git worktree is clean outside harness runtime files when Git exists
 - gate source tree hash matches current code outside harness runtime files when Git exists

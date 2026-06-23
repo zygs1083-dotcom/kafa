@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 13`, `harness.py --root . migrate --from-version markdown-v1 --to-version 13 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 14`, `harness.py --root . migrate --from-version markdown-v1 --to-version 14 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -151,8 +151,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . adapter extern
   --verifier <independent-session> \
   --conclusion verified \
   --commit-sha <current-commit-sha> \
-  --origin connector \
-  --verification-token <connector-token>
+  --origin connector
 
 python3 plugins/codex-project-harness/scripts/harness.py --root . test record \
   --id TEST1 \
@@ -175,7 +174,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . validation rec
   --trust-anchor-id <session-id>:<independent-session>
 ```
 
-For no-git projects, use `--code-identity content-hash` explicitly. For git projects, prefer the default git identity. Manual `ci` or `external-session` records are audit-only for high/critical risks; high-trust gates require connector-origin verification records with a token and current commit SHA.
+For no-git projects, use `--code-identity content-hash` explicitly. For git projects, prefer the default git identity. Manual `ci` or `external-session` records are audit-only for high/critical risks; high-trust gates require connector-origin verification records whose token validates with the host-controlled HMAC key and current commit SHA. The key must come from `HARNESS_CONNECTOR_KEY` or `.ai-team/control/connector-key-path.txt`; it must not be written to DB, events, Markdown, or Git.
 
 Record the independent quality gate before handoff:
 
@@ -220,6 +219,6 @@ Before claiming delivery readiness:
 2. Run `harness.py --root . validate --delivery`.
 3. Confirm validation evidence has a gateable registered target, matching command, `executed_count_source=parsed`, `executed_count>0`, and `exit_code=0`.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
-5. Confirm high/critical failure modes are covered by `ci` or `external-session` trust anchor, or explicitly accepted.
+5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor, or explicitly accepted.
 6. Confirm delivery record includes local or external collaboration links.
 7. State any warnings or residual risk.
