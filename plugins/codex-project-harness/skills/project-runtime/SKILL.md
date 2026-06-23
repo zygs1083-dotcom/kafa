@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 21`, `harness.py --root . migrate --from-version markdown-v1 --to-version 21 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 22`, `harness.py --root . migrate --from-version markdown-v1 --to-version 22 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -155,9 +155,13 @@ Session attestation proves an independent context/session identity, not reasonin
 
 For isolated local agent execution, explicitly use `dispatch run --runner local-process --claim-file <path> ...`; then run `dispatch integrate --run-id <id>` to merge agent branches through a staging integration branch and rerun delivery validation. LocalProcessRunner is not an OS sandbox or a real Codex sub-session.
 
+For controller-side sandbox verification, explicitly use `dispatch verify-attempt --runner container [--container-image <image>]`. The runtime uses Docker/Podman with no network and a read-only code mount, records `sandbox_executions`, and links sandbox metadata to evidence and validations. If Docker/Podman is unavailable, container verification fails closed with `sandbox-unavailable`; do not treat that as local verification.
+
 For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>`. Import records raw worker reports only; run `dispatch verify-attempt --run-id <run-id> --task <task-id>` for each reported task before `dispatch integrate --run-id <run-id>`.
 
 When an AgentProvider is available, use `dispatch provider start --run-id <run-id> --provider <provider>`, then `dispatch provider collect --run-id <run-id>` or `dispatch provider reconcile --run-id <run-id>` to manage the session lifecycle. Provider output remains a raw report; never treat it as delivery evidence until `dispatch verify-attempt` reruns the linked target and records controller evidence. The repository does not call Codex APIs or create user-visible Codex sessions by itself; real providers are host-supplied.
+
+`dispatch integrate` only merges active agent branches that have a verified task attempt, whose current branch head/tree still match that verified attempt, and whose changed files remain within active file claims. Unverified branches, branch drift, and file-claim violations are high findings and fail closed before merge.
 
 ## Evidence Protocol
 
@@ -249,5 +253,6 @@ Before claiming delivery readiness:
 3. Confirm validation evidence has a gateable registered target, matching command, `executed_count_source=parsed`, `executed_count>0`, and `exit_code=0`.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
 5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor and connector(HMAC) reviewer session attestation, or explicitly accepted.
-6. Confirm delivery record includes local or external collaboration links.
-7. State any warnings or residual risk.
+6. Confirm any claimed no-network sandbox evidence has `sandbox_status=available`; otherwise describe it as local/manual verification, not sandbox execution.
+7. Confirm delivery record includes local or external collaboration links.
+8. State any warnings or residual risk.

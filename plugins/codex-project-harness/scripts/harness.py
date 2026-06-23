@@ -548,6 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_verify.add_argument("--run-id", required=True)
     dispatch_verify.add_argument("--task", required=True)
     dispatch_verify.add_argument("--runner", default="local", choices=["local", "container"])
+    dispatch_verify.add_argument("--container-image", default="")
     add_request_id(dispatch_verify)
     dispatch_claim = dispatch_sub.add_parser("claim-next")
     dispatch_claim.add_argument("--agent", required=True)
@@ -1015,7 +1016,7 @@ def main() -> int:
             result_path = Path(args.result)
             mutate("dispatch.import-csv", lambda: f"OK: dispatch csv imported {dispatch_import_csv(root, args.run_id, result_path if result_path.is_absolute() else root / result_path)}")
         elif args.command == "dispatch" and args.dispatch_command == "verify-attempt":
-            mutate("dispatch.verify-attempt", lambda: f"OK: dispatch attempt verified {dispatch_verify_attempt(root, args.run_id, args.task, runner=args.runner)}")
+            mutate("dispatch.verify-attempt", lambda: f"OK: dispatch attempt verified {dispatch_verify_attempt(root, args.run_id, args.task, runner=args.runner, container_image=args.container_image)}")
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "run_id", "target_branch", "status", "started_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "target_branch": { "type": "string" },
+    "integration_worktree": { "type": "string" },
+    "base_ref": { "type": "string" },
+    "merged_branches": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": [
+        "running",
+        "integrated",
+        "integration_conflict",
+        "verification_failed",
+        "integration_unverified_branch",
+        "integration_branch_drift",
+        "file_claim_violation"
+      ]
+    },
+    "validation_result": { "type": "string" },
+    "finding_id": { "type": "string" },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": "string" }
+  }
+}
