@@ -4,6 +4,23 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.3.0-beta.1 - 2026-06-23
+
+### Added
+
+- Native Codex agent installation through `agents install`, using `.codex/agents/*.toml` templates with schema validation and no silent overwrite.
+- Codex fan-out export through `dispatch export-csv`, generating `input.csv`, `instruction.md`, `output_schema.json`, and `spawn_config.json` for `spawn_agents_on_csv`.
+- Codex fan-out import through `dispatch import-csv`, consuming native output CSV rows and recording trusted command evidence only when parsed evidence, branch, target, artifact hash, source hash, and task fence checks pass.
+
+### Changed
+
+- Runtime schema version is now `18`; runtime implementation version is now `3.6.0`.
+- Codex fan-out remains optional; unavailable native subagents fall back to v1.2 `dispatch run --runner null|local-process`.
+
+### Boundaries
+
+- Harness does not call Codex APIs or spawn sessions. It prepares native inputs, consumes native outputs, and keeps P0/P1 consistency and delivery gates intact.
+
 ## v1.2.0-beta.1 - 2026-06-23
 
 ### Added

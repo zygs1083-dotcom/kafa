@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 17`, `harness.py --root . migrate --from-version markdown-v1 --to-version 17 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 18`, `harness.py --root . migrate --from-version markdown-v1 --to-version 18 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -135,6 +135,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1
 Use stable `--request-id` values when an automation may retry a mutating command. Reusing the same id with the same arguments returns the first stdout; reusing it with different arguments fails with `idempotency-conflict`. Admin commands `init`, `migrate`, `repair`, and `checkpoint create/import` do not support `--request-id`.
 
 For isolated local agent execution, explicitly use `dispatch run --runner local-process --claim-file <path> ...`; then run `dispatch integrate --run-id <id>` to merge agent branches through a staging integration branch and rerun delivery validation. LocalProcessRunner is not an OS sandbox or a real Codex sub-session.
+
+For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>` and `dispatch integrate --run-id <run-id>`.
 
 ## Evidence Protocol
 

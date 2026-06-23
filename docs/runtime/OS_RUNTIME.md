@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.5.0
+# Codex OS Runtime Layer v3.6.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.5.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, and isolated agent dispatch. The repository release remains a beta release, while the runtime implementation version is `3.5.0` and the database schema version is `17`.
+Kernel v3.6.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, and native Codex subagent exchange files. The repository release remains a beta release, while the runtime implementation version is `3.6.0` and the database schema version is `18`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.5.0
+## Kernel v3.6.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -52,6 +52,19 @@ Most mutating CLI commands accept `--request-id`. The runtime writes a `command_
 
 LocalProcessRunner is not an OS sandbox and does not create real Codex sub-sessions. Unattended use still requires host or container isolation.
 
+## Native Codex Fan-Out
+
+Harness maps to Codex native primitives instead of inventing a session protocol. `agents install` writes validated `.codex/agents/*.toml` files from the plugin templates. `dispatch export-csv <run-id>` writes native `spawn_agents_on_csv` inputs: `input.csv`, `instruction.md`, `output_schema.json`, and `spawn_config.json`. The host or user then runs Codex fan-out externally. `dispatch import-csv <run-id> --result <output.csv>` consumes native output rows and only records evidence when parsed command evidence, artifact hash, target, branch, source hash, and task fence checks pass. Finish with `dispatch integrate --run-id <run-id>` to merge branches through the v1.2 integration gate.
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . agents install
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch plan --scope "Feature slice"
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch export-csv <run-id>
+# Host/user invokes Codex spawn_agents_on_csv using .ai-team/runtime/codex-fanout/<run-id>/spawn_config.json.
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch import-csv <run-id> --result .ai-team/runtime/codex-fanout/<run-id>/output.csv
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
+```
+
 ## Fail-Closed Evidence Identity
 
 Delivery gates require a current code identity. Git projects use the committed HEAD plus tracked source-tree hash. No-git projects must explicitly opt into content-hash evidence when recording executor output:
@@ -82,7 +95,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 17
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 18
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
