@@ -35,6 +35,8 @@ from core.api import (
     dispatch_file_claim_add,
     dispatch_file_claim_list,
     dispatch_file_claim_release,
+    dispatch_export_csv,
+    dispatch_import_csv,
     dispatch_integrate,
     dispatch_plan,
     dispatch_recover_stale,
@@ -47,6 +49,7 @@ from core.api import (
     import_checkpoint,
     invariant_validate,
     init_runtime,
+    install_agents,
     kernel_doctor,
     link_requirement_acceptance,
     list_checkpoints,
@@ -481,11 +484,28 @@ def build_parser() -> argparse.ArgumentParser:
     agent_capability_add.add_argument("--capability", required=True)
     add_request_id(agent_capability_add)
 
+    agents = sub.add_parser("agents")
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+    agents_install = agents_sub.add_parser("install")
+    agents_install.add_argument("--dir", default=".codex/agents")
+    agents_install.add_argument("--force", action="store_true")
+    add_request_id(agents_install)
+
     dispatch = sub.add_parser("dispatch")
     dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
     dispatch_plan_parser = dispatch_sub.add_parser("plan")
     dispatch_plan_parser.add_argument("--scope", required=True)
     add_request_id(dispatch_plan_parser)
+    dispatch_export = dispatch_sub.add_parser("export-csv")
+    dispatch_export.add_argument("run_id")
+    dispatch_export.add_argument("--out-dir", default="")
+    dispatch_export.add_argument("--max-concurrency", type=int, default=6)
+    dispatch_export.add_argument("--max-runtime-seconds", type=int, default=1800)
+    add_request_id(dispatch_export)
+    dispatch_import = dispatch_sub.add_parser("import-csv")
+    dispatch_import.add_argument("run_id")
+    dispatch_import.add_argument("--result", required=True)
+    add_request_id(dispatch_import)
     dispatch_claim = dispatch_sub.add_parser("claim-next")
     dispatch_claim.add_argument("--agent", required=True)
     dispatch_run = dispatch_sub.add_parser("run")
@@ -896,8 +916,16 @@ def main() -> int:
             print("OK: events are audit-compatible")
         elif args.command == "agent" and args.agent_command == "capability" and args.agent_capability_command == "add":
             mutate("agent.capability.add", lambda: (add_agent_capability(root, args.agent, args.capability), f"OK: agent capability added {args.agent}:{args.capability}")[1])
+        elif args.command == "agents" and args.agents_command == "install":
+            mutate("agents.install", lambda: f"OK: agents installed {install_agents(root, target_dir=args.dir, force=args.force, strict_no_overwrite=True)}")
         elif args.command == "dispatch" and args.dispatch_command == "plan":
             mutate("dispatch.plan", lambda: f"OK: dispatch planned {dispatch_plan(root, args.scope)}")
+        elif args.command == "dispatch" and args.dispatch_command == "export-csv":
+            out_dir = Path(args.out_dir) if args.out_dir else None
+            mutate("dispatch.export-csv", lambda: f"OK: dispatch csv exported {dispatch_export_csv(root, args.run_id, out_dir=(root / out_dir if out_dir and not out_dir.is_absolute() else out_dir), max_concurrency=args.max_concurrency, max_runtime_seconds=args.max_runtime_seconds)}")
+        elif args.command == "dispatch" and args.dispatch_command == "import-csv":
+            result_path = Path(args.result)
+            mutate("dispatch.import-csv", lambda: f"OK: dispatch csv imported {dispatch_import_csv(root, args.run_id, result_path if result_path.is_absolute() else root / result_path)}")
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")

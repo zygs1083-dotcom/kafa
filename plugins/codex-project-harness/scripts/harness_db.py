@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import contextvars
+import csv
 import hashlib
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tomllib
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -33,8 +35,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 17
-RUNTIME_VERSION = "3.5.0"
+SCHEMA_VERSION = 18
+RUNTIME_VERSION = "3.6.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -72,6 +74,41 @@ PHASE_TRANSITIONS = {
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
+CODEX_FANOUT_INPUT_FIELDS = [
+    "item_id",
+    "task",
+    "acceptance",
+    "failure_modes",
+    "target_id",
+    "command_template",
+    "branch_name",
+    "fence",
+    "agent_id",
+]
+CODEX_FANOUT_OUTPUT_FIELDS = [
+    "command",
+    "exit_code",
+    "stdout_sha256",
+    "artifact_path",
+    "executed_count",
+    "executed_count_source",
+    "source_tree_hash",
+    "branch_name",
+    "status",
+    "target_id",
+]
+CODEX_FANOUT_RESULT_COLUMNS = ["job_id", "item_id", "status", "last_error", "result_json"]
+CODEX_AGENT_REQUIRED_FIELDS = {"name", "description", "developer_instructions"}
+CODEX_AGENT_ALLOWED_FIELDS = {
+    "name",
+    "description",
+    "developer_instructions",
+    "model",
+    "model_reasoning_effort",
+    "sandbox_mode",
+    "mcp_servers",
+    "skills",
+}
 DEFAULT_EXECUTOR_PREFIXES = [
     "python3 -m unittest",
     "python3 -B -m unittest",
@@ -144,6 +181,7 @@ SNAPSHOT_TABLES = [
     "dispatch_assignments",
     "dispatch_worktrees",
     "task_file_claims",
+    "codex_fanout_exports",
     "runtime_snapshots",
     "command_log",
     "migrations",
@@ -653,6 +691,19 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create unique index if not exists task_file_claims_active_path
             on task_file_claims(path) where status = 'active';
+        create table if not exists codex_fanout_exports (
+            id text primary key,
+            run_id text not null,
+            input_csv_path text not null,
+            instruction_path text not null,
+            output_schema_path text not null,
+            spawn_config_path text not null,
+            max_concurrency integer not null,
+            max_runtime_seconds integer not null,
+            status text not null,
+            created_at text not null,
+            imported_at text not null default ''
+        );
         create table if not exists runtime_snapshots (
             id text primary key,
             label text not null,
@@ -1538,16 +1589,38 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     return report
 
 
-def install_agents(root: Path) -> None:
+def validate_codex_agent_template(path: Path) -> dict[str, Any]:
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HarnessError(f"invalid agent template {path.name}: {exc}") from exc
+    missing = sorted(field for field in CODEX_AGENT_REQUIRED_FIELDS if not str(data.get(field, "")).strip())
+    if missing:
+        raise HarnessError(f"invalid agent template {path.name}: missing {', '.join(missing)}")
+    extra = sorted(set(data) - CODEX_AGENT_ALLOWED_FIELDS)
+    if extra:
+        raise HarnessError(f"invalid agent template {path.name}: unsupported fields {', '.join(extra)}")
+    expected_name = path.stem
+    if data["name"] != expected_name:
+        raise HarnessError(f"invalid agent template {path.name}: name must be {expected_name}")
+    return data
+
+
+def install_agents(root: Path, *, target_dir: str = ".codex/agents", force: bool = False, strict_no_overwrite: bool = False) -> int:
     template_dir = Path(__file__).resolve().parents[1] / "templates" / "agents"
-    agent_dir = root / ".codex" / "agents"
+    agent_dir = root / target_dir
     agent_dir.mkdir(parents=True, exist_ok=True)
+    installed = 0
     with transaction(root) as conn:
         for template in sorted(template_dir.glob("*.toml")):
-            target = agent_dir / template.name
-            if not target.exists():
+            data = validate_codex_agent_template(template)
+            target = agent_dir / f"{data['name']}.toml"
+            if target.exists() and strict_no_overwrite and not force:
+                raise HarnessError(f"agent already exists: {target.relative_to(root)}")
+            if force or not target.exists():
                 shutil.copyfile(template, target)
-            role = template.stem
+                installed += 1
+            role = data["name"]
             conn.execute(
                 """
                 insert into agents (id, role, template_path, status, updated_at)
@@ -1556,7 +1629,8 @@ def install_agents(root: Path) -> None:
                 """,
                 (role, role, str(target), now_iso()),
             )
-        emit_event(conn, "agents_installed", payload())
+        emit_event(conn, "agents_installed", payload(target_dir=target_dir, force=force, installed=installed))
+    return installed
 
 
 def project_row(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -3125,6 +3199,142 @@ def dispatch_plan(root: Path, scope: str) -> str:
     return run_id
 
 
+def default_codex_fanout_dir(root: Path, run_id: str) -> Path:
+    return root / ".ai-team" / "runtime" / "codex-fanout" / safe_branch_part(run_id)
+
+
+def codex_output_schema() -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "command": {"type": "string"},
+        "exit_code": {"type": "integer"},
+        "stdout_sha256": {"type": "string"},
+        "artifact_path": {"type": "string"},
+        "executed_count": {"type": "integer"},
+        "executed_count_source": {"type": "string", "enum": ["parsed"]},
+        "source_tree_hash": {"type": "string"},
+        "branch_name": {"type": "string"},
+        "status": {"type": "string", "enum": ["success", "failed"]},
+        "target_id": {"type": "string"},
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": CODEX_FANOUT_OUTPUT_FIELDS,
+        "properties": properties,
+        "additionalProperties": False,
+    }
+
+
+def dispatch_export_csv(
+    root: Path,
+    run_id: str,
+    *,
+    out_dir: Path | None = None,
+    max_concurrency: int = 6,
+    max_runtime_seconds: int = 1800,
+) -> Path:
+    if max_concurrency < 1 or max_concurrency > 6:
+        raise HarnessError("max concurrency must be between 1 and 6")
+    if max_runtime_seconds < 1 or max_runtime_seconds > 1800:
+        raise HarnessError("max runtime seconds must be between 1 and 1800")
+    output_dir = out_dir if out_dir else default_codex_fanout_dir(root, run_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_csv = output_dir / "input.csv"
+    instruction_path = output_dir / "instruction.md"
+    output_schema_path = output_dir / "output_schema.json"
+    spawn_config_path = output_dir / "spawn_config.json"
+
+    with connection(root) as conn:
+        assignments = conn.execute(
+            """
+            select da.run_id, da.task_id, da.agent_id, da.capability, da.status as assignment_status,
+                   t.task, t.owner, t.fence
+            from dispatch_assignments da
+            join tasks t on t.id = da.task_id
+            where da.run_id = ? and t.status = 'ready' and da.status in ('planned', 'claimed')
+            order by da.task_id
+            """,
+            (run_id,),
+        ).fetchall()
+        if not assignments:
+            raise HarnessError(f"no ready dispatch assignments for run: {run_id}")
+        target = conn.execute("select id, command_template from test_targets where gateable = 1 order by id limit 1").fetchone()
+        rows: list[dict[str, str]] = []
+        for assignment in assignments:
+            acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id").get(assignment["task_id"], "")
+            failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id").get(assignment["task_id"], "")
+            agent_id = assignment["agent_id"] or assignment["capability"] or assignment["owner"] or "developer"
+            branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(assignment['task_id'])}/{safe_branch_part(agent_id)}"
+            rows.append(
+                {
+                    "item_id": assignment["task_id"],
+                    "task": assignment["task"],
+                    "acceptance": acceptance,
+                    "failure_modes": failure_modes,
+                    "target_id": target["id"] if target else "",
+                    "command_template": target["command_template"] if target else "",
+                    "branch_name": branch_name,
+                    "fence": str(assignment["fence"]),
+                    "agent_id": agent_id,
+                }
+            )
+
+    with input_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CODEX_FANOUT_INPUT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    instruction = "\n".join(
+        [
+            "# Codex Harness Dispatch Worker",
+            "",
+            "You are the assigned Codex worker for task {item_id}.",
+            "Task: {task}",
+            "Acceptance: {acceptance}",
+            "Failure modes: {failure_modes}",
+            "Run the registered target `{target_id}` using `{command_template}` when available.",
+            "Work on branch `{branch_name}` and report exactly one result via report_agent_job_result.",
+            "Return JSON matching output_schema.json with parsed command evidence and status.",
+            "",
+        ]
+    )
+    instruction_path.write_text(instruction, encoding="utf-8")
+    output_schema_path.write_text(json.dumps(codex_output_schema(), indent=2, sort_keys=True), encoding="utf-8")
+    spawn_config = {
+        "csv_path": input_csv.as_posix(),
+        "instruction_template_path": instruction_path.as_posix(),
+        "id_column": "item_id",
+        "output_schema": output_schema_path.as_posix(),
+        "output_csv_path": (output_dir / "output.csv").as_posix(),
+        "max_concurrency": max_concurrency,
+        "max_runtime_seconds": max_runtime_seconds,
+        "max_depth": 1,
+        "sqlite_home": (root / ".ai-team" / "state").as_posix(),
+    }
+    spawn_config_path.write_text(json.dumps(spawn_config, indent=2, sort_keys=True), encoding="utf-8")
+    with transaction(root, touched=[("codex_fanout_export", run_id)]) as conn:
+        conn.execute(
+            """
+            insert into codex_fanout_exports
+            (id, run_id, input_csv_path, instruction_path, output_schema_path, spawn_config_path,
+             max_concurrency, max_runtime_seconds, status, created_at, imported_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, 'exported', ?, '')
+            """,
+            (
+                str(uuid.uuid4()),
+                run_id,
+                input_csv.relative_to(root).as_posix() if input_csv.is_relative_to(root) else input_csv.as_posix(),
+                instruction_path.relative_to(root).as_posix() if instruction_path.is_relative_to(root) else instruction_path.as_posix(),
+                output_schema_path.relative_to(root).as_posix() if output_schema_path.is_relative_to(root) else output_schema_path.as_posix(),
+                spawn_config_path.relative_to(root).as_posix() if spawn_config_path.is_relative_to(root) else spawn_config_path.as_posix(),
+                max_concurrency,
+                max_runtime_seconds,
+                now_iso(),
+            ),
+        )
+        emit_event(conn, "codex_fanout_exported", payload(run_id=run_id, input_csv=input_csv.as_posix(), count=len(rows)))
+    return output_dir
+
+
 def dispatch_claim_next(root: Path, agent: str) -> str:
     with transaction(root) as conn:
         require_agent(conn, agent)
@@ -3521,13 +3731,195 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
             conn.execute("update dispatch_runs set status = 'integrated', updated_at = ? where id = ?", (now_iso(), run_id))
             conn.execute("update dispatch_assignments set status = 'integrated', updated_at = ? where run_id = ?", (now_iso(), run_id))
             for row in rows:
-                worktree = root / row["worktree_path"]
-                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
+                if row["worktree_path"]:
+                    worktree = root / row["worktree_path"]
+                    subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
                 conn.execute("update dispatch_worktrees set status = 'cleaned', cleaned_at = ? where id = ?", (now_iso(), row["id"]))
             emit_event(conn, "dispatch_integrated", payload(run_id=run_id, target_branch=target))
         return target
     finally:
         subprocess.run(["git", "switch", current], cwd=root, text=True, capture_output=True, check=False)
+
+
+def resolve_runtime_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else root / path
+
+
+def read_csv_dicts(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def latest_fanout_export(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "select * from codex_fanout_exports where run_id = ? order by created_at desc limit 1",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        raise HarnessError(f"missing codex fanout export for run: {run_id}")
+    return row
+
+
+def codex_import_failure(conn: sqlite3.Connection, run_id: str, task_id: str, message: str) -> None:
+    record_integration_finding(conn, run_id, f"codex fanout import failed for {task_id}: {message}")
+    conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+    conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
+
+
+def codex_result_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any]) -> list[str]:
+    from core.executor import command_matches_template
+
+    issues: list[str] = []
+    for field in CODEX_FANOUT_OUTPUT_FIELDS:
+        if field not in result:
+            issues.append(f"missing result field: {field}")
+    if issues:
+        return issues
+    if result["status"] != "success":
+        issues.append(f"result status is not success: {result['status']}")
+    if int(result["exit_code"]) != 0:
+        issues.append(f"exit_code is not zero: {result['exit_code']}")
+    if result["executed_count_source"] != "parsed":
+        issues.append(f"executed_count_source is not parsed: {result['executed_count_source']}")
+    if int(result["executed_count"]) <= 0:
+        issues.append("executed_count must be > 0")
+    target = conn.execute("select * from test_targets where id = ?", (result["target_id"],)).fetchone()
+    if not target:
+        issues.append(f"missing test target: {result['target_id']}")
+    elif not int(target["gateable"]):
+        issues.append(f"test target is not gateable: {result['target_id']}")
+    elif not command_matches_template(result["command"], target["command_template"]):
+        issues.append(f"command does not match target: {result['target_id']}")
+    if expected.get("target_id") and result["target_id"] != expected["target_id"]:
+        issues.append(f"target differs from export: expected={expected['target_id']} actual={result['target_id']}")
+    if result["branch_name"] != expected["branch_name"]:
+        issues.append(f"branch differs from export: expected={expected['branch_name']} actual={result['branch_name']}")
+    artifact = resolve_runtime_path(root, str(result["artifact_path"]))
+    try:
+        normalized_artifact = normalize_artifact_path(root, str(artifact))
+    except HarnessError as exc:
+        issues.append(str(exc))
+        normalized_artifact = ""
+    if not artifact.exists() or not artifact.is_file():
+        issues.append(f"artifact is missing: {result['artifact_path']}")
+    elif normalized_artifact:
+        actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual_hash != result["stdout_sha256"]:
+            issues.append("stdout_sha256 does not match artifact bytes")
+    current_hash = source_tree_hash_for_mode(root, "auto")
+    if not current_hash:
+        issues.append("current source tree hash is unavailable")
+    elif result["source_tree_hash"] != current_hash:
+        issues.append(f"source_tree_hash does not match current code: result={result['source_tree_hash']} current={current_hash}")
+    branch = subprocess.run(["git", "rev-parse", "--verify", str(result["branch_name"])], cwd=root, text=True, capture_output=True, check=False)
+    if branch.returncode != 0:
+        issues.append(f"branch is missing: {result['branch_name']}")
+    task = conn.execute("select fence from tasks where id = ?", (expected["item_id"],)).fetchone()
+    if not task:
+        issues.append(f"task is missing: {expected['item_id']}")
+    elif int(task["fence"]) != int(expected["fence"]):
+        issues.append(f"fence-stale: {expected['item_id']} expected={expected['fence']} actual={task['fence']}")
+    return issues
+
+
+def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
+    with connection(root) as conn:
+        export = latest_fanout_export(conn, run_id)
+        input_csv = resolve_runtime_path(root, export["input_csv_path"])
+    expected_rows = {row["item_id"]: row for row in read_csv_dicts(input_csv)}
+    result_rows = read_csv_dicts(result_csv)
+    seen: set[str] = set()
+    imported = 0
+    failed = False
+    for row in result_rows:
+        for column in CODEX_FANOUT_RESULT_COLUMNS:
+            if column not in row:
+                raise HarnessError(f"result CSV missing column: {column}")
+        item_id = row["item_id"]
+        seen.add(item_id)
+        expected = expected_rows.get(item_id)
+        if not expected:
+            with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
+                codex_import_failure(conn, run_id, item_id or "unknown", "unexpected item_id")
+            failed = True
+            continue
+        if row["status"] != "success" or row["last_error"]:
+            with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
+                codex_import_failure(conn, run_id, item_id, row["last_error"] or f"worker status {row['status']}")
+            failed = True
+            continue
+        try:
+            result = json.loads(row["result_json"])
+        except json.JSONDecodeError as exc:
+            with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
+                codex_import_failure(conn, run_id, item_id, f"invalid result_json: {exc.msg}")
+            failed = True
+            continue
+        with connection(root) as conn:
+            issues = codex_result_issues(root, conn, expected, result)
+        if issues:
+            with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
+                codex_import_failure(conn, run_id, item_id, "; ".join(issues[:5]))
+            failed = True
+            continue
+        evidence_id = f"CODEX-{uuid.uuid4().hex[:12]}"
+        artifact_path = normalize_artifact_path(root, str(result["artifact_path"]))
+        with transaction(root, touched=[("dispatch_assignment", item_id), ("evidence", evidence_id)]) as conn:
+            conn.execute(
+                """
+                insert into evidence
+                (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+                 target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+                 sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id, created_at)
+                values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'allowed', 'codex fanout import',
+                        'none', '', '', 'local-only', '', ?)
+                """,
+                (
+                    evidence_id,
+                    f"codex fanout {item_id} command exit {result['exit_code']}",
+                    f"local://{artifact_path}",
+                    result["stdout_sha256"],
+                    result["command"],
+                    int(result["exit_code"]),
+                    result["stdout_sha256"],
+                    artifact_path,
+                    result["source_tree_hash"],
+                    result["target_id"],
+                    int(result["executed_count"]),
+                    result["executed_count_source"],
+                    now_iso(),
+                ),
+            )
+            conn.execute(
+                "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
+                (evidence_id, now_iso(), run_id, item_id),
+            )
+            conn.execute(
+                """
+                insert into dispatch_worktrees
+                (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
+                values (?, ?, ?, ?, ?, '', 'active', ?, '')
+                """,
+                (str(uuid.uuid4()), run_id, item_id, expected["agent_id"], result["branch_name"], now_iso()),
+            )
+            emit_event(conn, "codex_fanout_result_imported", payload(run_id=run_id, item_id=item_id, evidence_id=evidence_id))
+        imported += 1
+    missing = sorted(set(expected_rows) - seen)
+    for item_id in missing:
+        with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
+            codex_import_failure(conn, run_id, item_id, "worker did not report result")
+        failed = True
+    with transaction(root, touched=[("codex_fanout_export", run_id), ("dispatch_run", run_id)]) as conn:
+        conn.execute(
+            "update codex_fanout_exports set status = ?, imported_at = ? where run_id = ? and imported_at = ''",
+            ("verification_failed" if failed else "imported", now_iso(), run_id),
+        )
+        if not failed:
+            conn.execute("update dispatch_runs set status = 'completed', updated_at = ? where id = ?", (now_iso(), run_id))
+    if failed:
+        raise HarnessError(f"codex fanout import failed: {run_id}")
+    return f"imported {imported} result(s)"
 
 
 def dispatch_status(root: Path) -> list[str]:
@@ -3756,6 +4148,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("dispatch-assignment.schema.json", "dispatch_assignments", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_assignments")]),
         ("dispatch-worktree.schema.json", "dispatch_worktrees", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_worktrees")]),
         ("task-file-claim.schema.json", "task_file_claims", [row_snapshot(row) or {} for row in conn.execute("select * from task_file_claims")]),
+        ("codex-fanout-export.schema.json", "codex_fanout_exports", [row_snapshot(row) or {} for row in conn.execute("select * from codex_fanout_exports")]),
         ("runtime-snapshot.schema.json", "runtime_snapshots", [row_snapshot(row) or {} for row in conn.execute("select * from runtime_snapshots")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),
         ("event.schema.json", "events", [row_snapshot(row) or {} for row in conn.execute("select * from events")]),
