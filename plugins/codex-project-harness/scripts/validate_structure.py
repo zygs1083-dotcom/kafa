@@ -64,6 +64,7 @@ REQUIRED_SCRIPTS = [
     "run_runtime_smoke.py",
     "run_forward_eval.py",
     "run_skill_eval.py",
+    "run_agent_e2e_eval.py",
 ]
 
 REQUIRED_SCHEMAS = [

@@ -25,7 +25,7 @@ jobs:
           find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec python3 -m json.tool {} \; >/dev/null
 
       - name: Compile Python
-        run: python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_harness_runtime.py tests/test_harness_operating_system.py
+        run: python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
 
       - name: Run runtime tests
         run: python3 -m unittest discover -s tests -p 'test_*.py'
@@ -38,6 +38,9 @@ jobs:
 
       - name: Run skill eval fixture
         run: python3 plugins/codex-project-harness/scripts/run_skill_eval.py
+
+      - name: Run agent E2E eval fixture
+        run: python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
 
       - name: Run kernel diagnostic smoke
         run: |

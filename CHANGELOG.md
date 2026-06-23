@@ -4,6 +4,25 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.8.0-beta.1 - 2026-06-23
+
+### Added
+
+- Deterministic Agent E2E evaluation via `run_agent_e2e_eval.py --mode fixture`.
+- Five fixture scenarios covering parallel success, dependency blocking, same-file claim conflict, forged evidence blocking, and integration regression blocking.
+- Structured JSON eval metrics including scenario counts, false-pass count, forged evidence blocking count, retry count, merge-conflict count, intervention count, and duration.
+- Optional `--mode live-command` dogfood path using `CODEX_AGENT_EVAL_CMD`; unset live mode reports `live_skipped=true`.
+
+### Changed
+
+- Runtime implementation version is now `4.1.0`; runtime schema remains `22`.
+- GitHub Actions now runs Agent E2E fixture eval, and Python compilation covers all `tests/test_*.py`.
+- `run_skill_eval.py` is documented as a transcript marker check, not an Agent capability evaluation.
+
+### Fixed
+
+- Integration verification failure reporting now stringifies non-string invariant issues before recording findings and events.
+
 ## v1.7.0-beta.1 - 2026-06-23
 
 ### Added

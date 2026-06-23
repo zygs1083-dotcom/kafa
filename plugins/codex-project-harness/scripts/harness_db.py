@@ -38,7 +38,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 22
-RUNTIME_VERSION = "4.0.0"
+RUNTIME_VERSION = "4.1.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -4506,13 +4506,14 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
                 raise HarnessError(f"integration conflict: {row['task_id']}")
         issues = validate_runtime(integration_worktree, delivery=True)
         if issues:
-            summary = "; ".join(issues[:5])
+            issue_text = [str(issue) for issue in issues]
+            summary = "; ".join(issue_text[:5])
             with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
                 finding_id = record_integration_finding(conn, run_id, f"delivery validation failed after integration: {summary}")
                 finish_integration_attempt(conn, integration_attempt_id, "verification_failed", merged_branches=[r["branch_name"] for r in rows], validation_result=summary, finding_id=finding_id)
                 conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
-                emit_event(conn, "dispatch_integration_verification_failed", payload(run_id=run_id, issues=issues[:10]))
+                emit_event(conn, "dispatch_integration_verification_failed", payload(run_id=run_id, issues=issue_text[:10]))
             raise HarnessError(f"integration verification failed: {summary}")
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
             finish_integration_attempt(conn, integration_attempt_id, "integrated", merged_branches=[r["branch_name"] for r in rows], validation_result="pass")
