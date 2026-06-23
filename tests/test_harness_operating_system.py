@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
-DEFAULT_TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
+DEFAULT_TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
@@ -92,11 +92,21 @@ def review_accept(root: Path, task_id: str, *, agent: str = "qa-reviewer") -> No
     )
 
 
-def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "ok\n") -> tuple[str, str]:
+def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "1 passed\n") -> tuple[str, str]:
     artifact = root / ".ai-team" / "runtime" / "test-artifacts" / f"stdout-{suffix}.txt"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text(content, encoding="utf-8")
     return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def ensure_dummy_unittest(root: Path) -> None:
+    (root / "test_harness_dummy.py").write_text(
+        "import unittest\n\n"
+        "class HarnessDummyTest(unittest.TestCase):\n"
+        "    def test_dummy(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
 
 
 def register_test_target(root: Path, target_id: str = "TARGET1", *, command: str = DEFAULT_TEST_COMMAND, kind: str = "unit") -> None:
@@ -115,35 +125,19 @@ def register_test_target(root: Path, target_id: str = "TARGET1", *, command: str
     )
 
 
+def run_executor_evidence(root: Path, *, target_id: str = "TARGET1", command: str = DEFAULT_TEST_COMMAND) -> str:
+    ensure_dummy_unittest(root)
+    run_harness(root, "agent", "capability", "add", "--agent", "developer", "--capability", "developer")
+    run_harness(root, "dispatch", "plan", "--scope", f"Execute {target_id}")
+    result = run_harness(root, "dispatch", "run", "--agent", "developer", "--target", target_id, "--command", command)
+    return result.stdout.strip().rsplit(" ", 1)[-1]
+
+
 def record_evidence_and_test(root: Path, suffix: str = "1") -> tuple[str, str]:
-    evidence_id = f"EV{suffix}"
     test_id = f"TEST{suffix}"
     target_id = f"TARGET{suffix}"
     register_test_target(root, target_id)
-    artifact_path, stdout_sha = trusted_artifact(root, suffix)
-    run_harness(
-        root,
-        "evidence",
-        "record",
-        "--id",
-        evidence_id,
-        "--kind",
-        "command",
-        "--summary",
-        f"test evidence {suffix}",
-        "--command",
-        DEFAULT_TEST_COMMAND,
-        "--exit-code",
-        "0",
-        "--stdout-sha256",
-        stdout_sha,
-        "--artifact-path",
-        artifact_path,
-        "--target",
-        target_id,
-        "--executed-count",
-        "1",
-    )
+    evidence_id = run_executor_evidence(root, target_id=target_id)
     run_harness(root, "test", "record", "--id", test_id, "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", evidence_id)
     return evidence_id, test_id
 
@@ -151,7 +145,6 @@ def record_evidence_and_test(root: Path, suffix: str = "1") -> tuple[str, str]:
 def record_pass_validation(root: Path, *, acceptance: str = "AC1", failure_mode: str | None = None, suffix: str = "1") -> None:
     evidence_id, test_id = record_evidence_and_test(root, suffix)
     target_id = f"TARGET{suffix}"
-    artifact_path, stdout_sha = trusted_artifact(root, f"validation-{suffix}")
     command = [
         "validation",
         "record",
@@ -169,18 +162,8 @@ def record_pass_validation(root: Path, *, acceptance: str = "AC1", failure_mode:
         test_id,
         "--evidence",
         evidence_id,
-        "--command",
-        DEFAULT_TEST_COMMAND,
-        "--exit-code",
-        "0",
-        "--stdout-sha256",
-        stdout_sha,
-        "--artifact-path",
-        artifact_path,
         "--target",
         target_id,
-        "--executed-count",
-        "1",
     ]
     if failure_mode:
         command.extend(["--failure-mode", failure_mode])
@@ -202,6 +185,40 @@ def move_to_delivery_readiness(root: Path) -> None:
     run_harness(root, "phase", "delivery_readiness")
 
 
+def prepare_basic_delivery_project(root: Path, *, failure_mode_risk: str | None = None) -> None:
+    run_harness(root, "init")
+    run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
+    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+    run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
+    if failure_mode_risk:
+        run_harness(
+            root,
+            "failure-mode",
+            "add",
+            "--id",
+            "FM1",
+            "--feature",
+            "Example",
+            "--scenario",
+            "Risk",
+            "--trigger",
+            "bad input",
+            "--expected",
+            "safe output",
+            "--risk",
+            failure_mode_risk,
+            "--acceptance",
+            "AC1",
+        )
+    task_args = ["task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1"]
+    if failure_mode_risk:
+        task_args.extend(["--failure-mode", "FM1"])
+    run_harness(root, *task_args)
+    claim_start_submit(root, "T1")
+    review_accept(root, "T1")
+    confirm_and_freeze(root)
+
+
 class HarnessOperatingSystemTest(unittest.TestCase):
     def test_init_creates_sqlite_state_and_installs_agents(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -221,7 +238,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 11)
+            self.assertEqual(project[0], 12)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
             self.assertIn("test_targets", tables)
@@ -420,7 +437,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "11")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "12")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -570,7 +587,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Original acceptance")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
-            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "critical", "--acceptance", "AC1")
+            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "low", "--acceptance", "AC1")
             run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1", "--failure-mode", "FM1")
             claim_start_submit(root, "T1")
             review_accept(root, "T1")
@@ -694,7 +711,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 "AC1",
                 check=False,
             )
-            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "critical", "--acceptance", "AC1")
+            run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "bad input", "--expected", "safe", "--risk", "low", "--acceptance", "AC1")
             record_pass_validation(root, failure_mode="FM1")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
@@ -759,7 +776,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "11", "--dry-run")
+            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "12", "--dry-run")
             repair_plan = run_harness(root, "repair", "--dry-run")
 
             self.assertEqual(migrate.returncode, 0, migrate.stdout + migrate.stderr)
@@ -810,7 +827,8 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, text=True, capture_output=True, check=True)
             subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, text=True, capture_output=True, check=True)
             (root / "app.txt").write_text("v1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "app.txt"], cwd=root, text=True, capture_output=True, check=True)
+            ensure_dummy_unittest(root)
+            subprocess.run(["git", "add", "app.txt", "test_harness_dummy.py"], cwd=root, text=True, capture_output=True, check=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             run_harness(root, "init")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
@@ -879,7 +897,9 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, text=True, capture_output=True, check=True)
             subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, text=True, capture_output=True, check=True)
             (root / "app.txt").write_text("hello\n", encoding="utf-8")
+            ensure_dummy_unittest(root)
             subprocess.run(["git", "add", "app.txt"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "add", "test_harness_dummy.py"], cwd=root, text=True, capture_output=True, check=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             run_harness(root, "init")
 
@@ -933,7 +953,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "11")
+            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "12")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 acceptance = conn.execute("select criterion from acceptance where id = 'AC1'").fetchone()[0]
@@ -1202,6 +1222,103 @@ class HarnessOperatingSystemTest(unittest.TestCase):
 
             self.assertNotEqual(validate.returncode, 0)
             self.assertIn("executed_count=0", validate.stdout)
+
+    def test_delivery_rejects_manual_executed_count_for_passing_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_basic_delivery_project(root)
+            register_test_target(root, "TARGET1")
+            artifact_path, stdout_sha = trusted_artifact(root, "manual-count")
+            run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "manual", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
+            run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("executed_count_source=manual", validate.stdout)
+
+    def test_gate_rejects_non_gateable_test_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_basic_delivery_project(root)
+            add = run_harness(root, "test-target", "add", "--id", "ECHO", "--kind", "unit", "--command-template", "echo ok")
+            artifact_path, stdout_sha = trusted_artifact(root, "echo", content="1 passed\n")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                target = conn.execute("select gateable, gate_block_reason from test_targets where id = 'ECHO'").fetchone()
+                conn.execute(
+                    """
+                    insert into evidence
+                    (id, kind, summary, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+                     target_id, executed_count, executed_count_source, policy_status, created_at)
+                    values ('EV1', 'command', 'echo', 'echo ok', 0, ?, ?, ?, 'ECHO', 1, 'parsed', 'allowed', 'now')
+                    """,
+                    (stdout_sha, artifact_path, ""),
+                )
+                conn.commit()
+            run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", "echo ok", "--result", "pass", "--evidence", "EV1")
+            run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "echo ok", "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--target", "ECHO")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertEqual(add.returncode, 0, add.stdout + add.stderr)
+            self.assertEqual(target[0], 0)
+            self.assertIn("not a gateable test target", target[1])
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("target is not gateable", validate.stdout)
+
+    def test_high_risk_failure_mode_requires_external_or_ci_trust_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_basic_delivery_project(root, failure_mode_risk="high")
+            record_pass_validation(root, failure_mode="FM1")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery", check=False)
+
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("requires ci or external-session trust anchor", validate.stdout)
+
+    def test_ci_verify_anchor_can_cover_high_risk_failure_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, text=True, capture_output=True, check=True)
+            (root / "app.txt").write_text("hello\n", encoding="utf-8")
+            ensure_dummy_unittest(root)
+            subprocess.run(["git", "add", "app.txt", "test_harness_dummy.py"], cwd=root, text=True, capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            prepare_basic_delivery_project(root, failure_mode_risk="critical")
+            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-1", "--conclusion", "success", "--commit-sha", sha)
+            record_pass_validation(root, failure_mode="FM1")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
+                conn.commit()
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+
+            validate = run_harness(root, "validate", "--delivery")
+
+            self.assertEqual(validate.returncode, 0, validate.stdout + validate.stderr)
+
+    def test_dispatch_allow_unlisted_requires_reason_and_records_sandbox_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+
+            missing_reason = run_harness(root, "dispatch", "run", "--agent", "developer", "--command", "python3 -c 'print(\"1 passed\")'", "--allow-unlisted", check=False)
+            with_reason = run_harness(root, "dispatch", "run", "--agent", "developer", "--command", "python3 -c 'print(\"1 passed\")'", "--allow-unlisted", "--reason", "diagnostic", "--no-network")
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                row = conn.execute("select allow_unlisted, allow_unlisted_reason, sandbox_profile, sandbox_status from evidence where exit_code = 0 order by created_at desc limit 1").fetchone()
+
+            self.assertNotEqual(missing_reason.returncode, 0)
+            self.assertIn("--reason is required", missing_reason.stdout)
+            self.assertEqual(with_reason.returncode, 0, with_reason.stdout + with_reason.stderr)
+            self.assertEqual(row, (1, "diagnostic", "no-network", "unavailable"))
 
     def test_quality_gate_can_link_findings(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

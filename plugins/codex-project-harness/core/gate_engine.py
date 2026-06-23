@@ -32,6 +32,7 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
     source_tree_hash = str(_value(row, "source_tree_hash") or "")
     target_id = str(_value(row, "target_id") or "")
     executed_count = int(_value(row, "executed_count") or 0)
+    executed_count_source = str(_value(row, "executed_count_source") or "")
     policy_status = str(_value(row, "policy_status") or "")
     issues: list[str] = []
     if not command:
@@ -52,8 +53,35 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
         issues.append(f"{label} missing target")
     if executed_count <= 0:
         issues.append(f"{label} executed_count={executed_count}")
+    if executed_count_source != "parsed":
+        issues.append(f"{label} executed_count_source={executed_count_source or 'empty'}")
     if policy_status == "rejected":
         issues.append(f"{label} command policy rejected")
+    return issues
+
+
+def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha: str | None, *, require_external: bool) -> list[str]:
+    trust_anchor = str(_value(row, "trust_anchor") or "local-only")
+    trust_anchor_id = str(_value(row, "trust_anchor_id") or "")
+    issues: list[str] = []
+    if require_external and trust_anchor not in {"ci", "external-session"}:
+        issues.append(f"requires ci or external-session trust anchor: trust_anchor={trust_anchor}")
+    if trust_anchor == "external-session" and not trust_anchor_id:
+        issues.append("external-session trust anchor requires trust_anchor_id")
+    if trust_anchor == "ci":
+        if not trust_anchor_id:
+            issues.append("ci trust anchor requires trust_anchor_id")
+        else:
+            ci = conn.execute("select * from ci_verifications where id = ?", (trust_anchor_id,)).fetchone()
+            if not ci:
+                issues.append(f"missing ci verification: {trust_anchor_id}")
+            else:
+                if ci["conclusion"] != "success":
+                    issues.append(f"ci verification is not success: {ci['conclusion']}")
+                if not current_sha:
+                    issues.append("ci verification requires git HEAD")
+                elif ci["commit_sha"] != current_sha:
+                    issues.append(f"ci verification sha mismatch: ci={ci['commit_sha']} current={current_sha}")
     return issues
 
 
@@ -62,16 +90,21 @@ def validation_trusted_command_issues(
     validation: sqlite3.Row,
     root: Path,
     current_source_hash: str,
+    current_sha: str | None = None,
+    require_external_anchor: bool = False,
 ) -> list[str]:
     issues = _command_row_issues(root, validation, current_source_hash, label="validation")
     target_id = str(_value(validation, "target_id") or "")
     command = str(_value(validation, "command") or "")
     if target_id:
-        target = conn.execute("select command_template from test_targets where id = ?", (target_id,)).fetchone()
+        target = conn.execute("select command_template, gateable, gate_block_reason from test_targets where id = ?", (target_id,)).fetchone()
         if not target:
             issues.append(f"validation unknown target: {target_id}")
         elif command and not command_matches_template(command, target["command_template"]):
             issues.append(f"validation command does not match target {target_id}")
+        elif int(target["gateable"] or 0) != 1:
+            issues.append(f"validation target is not gateable: {target_id} {target['gate_block_reason']}")
+    issues.extend(_trust_anchor_issues(conn, validation, current_sha, require_external=require_external_anchor))
     return issues
 
 
@@ -128,7 +161,7 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             issues.append(f"acceptance validation lacks linked passing test or evidence: {acceptance['id']}")
         else:
             validation_row = conn.execute("select * from validations where id = ?", (validation["id"],)).fetchone()
-            trusted_issues = validation_trusted_command_issues(conn, validation_row, root, current_source_hash)
+            trusted_issues = validation_trusted_command_issues(conn, validation_row, root, current_source_hash, current_sha)
             if trusted_issues:
                 issues.append(
                     f"acceptance validation lacks trusted command evidence: {acceptance['id']} ({'; '.join(trusted_issues)})"
@@ -157,14 +190,22 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             """,
             (failure_mode["id"],),
         ).fetchall()
-        covered_with_evidence = any(
-            validation_has_test_or_evidence(conn, row["id"])
-            and not validation_trusted_command_issues(conn, row, root, current_source_hash)
-            for row in covered
-        )
+        coverage_issues: list[str] = []
+        covered_with_evidence = False
+        for row in covered:
+            if not validation_has_test_or_evidence(conn, row["id"]):
+                coverage_issues.append("validation lacks linked test/evidence")
+                continue
+            trusted_issues = validation_trusted_command_issues(conn, row, root, current_source_hash, current_sha, require_external_anchor=True)
+            if trusted_issues:
+                coverage_issues.extend(trusted_issues)
+                continue
+            covered_with_evidence = True
+            break
         if not covered_with_evidence:
+            suffix = f" ({'; '.join(coverage_issues)})" if coverage_issues else ""
             issues.append(
-                f"{failure_mode['risk']} failure mode is not covered by passing validation with linked test/evidence: {failure_mode['id']} status={failure_mode['status']}"
+                f"{failure_mode['risk']} failure mode is not covered by passing validation with linked test/evidence: {failure_mode['id']} status={failure_mode['status']}{suffix}"
             )
 
     latest_gate = conn.execute("select * from quality_gates order by created_at desc, id desc limit 1").fetchone()

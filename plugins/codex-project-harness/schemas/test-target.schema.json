@@ -8,6 +8,8 @@
     "kind": { "type": "string", "enum": ["unit", "integration", "lint", "build"] },
     "command_template": { "type": "string" },
     "description": { "type": "string" },
+    "gateable": { "type": "integer" },
+    "gate_block_reason": { "type": "string" },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }
   },

@@ -81,6 +81,7 @@ REQUIRED_SCHEMAS = [
     "delivery.schema.json",
     "adapter.schema.json",
     "adapter-action.schema.json",
+    "ci-verification.schema.json",
     "agent.schema.json",
     "baseline.schema.json",
     "dispatch-run.schema.json",

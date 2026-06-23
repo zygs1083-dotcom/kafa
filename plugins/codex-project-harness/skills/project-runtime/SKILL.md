@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 11`, `harness.py --root . migrate --from-version markdown-v1 --to-version 11 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 12`, `harness.py --root . migrate --from-version markdown-v1 --to-version 12 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -47,7 +47,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Recover stale leases | `harness.py --root . task recover-stale` |
 | Start / submit / review / accept task | `harness.py --root . task start`, `harness.py --root . task submit`, `harness.py --root . task review`, `harness.py --root . task accept` |
 | Record decision | `harness.py --root . decision record` |
-| Record evidence / tests / findings | `harness.py --root . evidence record`, `harness.py --root . test record`, `harness.py --root . finding record` |
+| Record evidence / tests / findings | `harness.py --root . dispatch run`, `harness.py --root . test record`, `harness.py --root . finding record` |
 | Register test target | `harness.py --root . test-target add --id UNIT --kind unit --command-template "pytest"`, `harness.py --root . test-target list` |
 | Record QA / validation | `harness.py --root . validation record --test TEST1 --evidence EV1` |
 | Record quality gate | `harness.py --root . gate record --finding F1` |
@@ -140,24 +140,17 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . test-target ad
   --kind unit \
   --command-template "npm test -- profile-crud"
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . evidence record \
-  --id EV1 \
-  --kind command \
-  --summary "npm test -- profile-crud passed" \
-  --uri "local://npm-test" \
-  --command "npm test -- profile-crud" \
-  --exit-code 0 \
-  --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch run \
+  --agent developer \
   --target PROFILE_CRUD_TEST \
-  --executed-count 12
+  --command "npm test -- profile-crud"
 
 python3 plugins/codex-project-harness/scripts/harness.py --root . test record \
   --id TEST1 \
   --surface "API contract" \
   --command "npm test -- profile-crud" \
   --result pass \
-  --evidence EV1
+  --evidence <executor-evidence-id>
 
 python3 plugins/codex-project-harness/scripts/harness.py --root . validation record \
   --surface "API contract" \
@@ -167,13 +160,10 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . validation rec
   --findings "CRUD contract passed" \
   --result pass \
   --test TEST1 \
-  --evidence EV1 \
-  --command "npm test -- profile-crud" \
-  --exit-code 0 \
-  --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --evidence <executor-evidence-id> \
   --target PROFILE_CRUD_TEST \
-  --executed-count 12
+  --trust-anchor external-session \
+  --trust-anchor-id <session-id>
 ```
 
 Record the independent quality gate before handoff:
@@ -217,8 +207,8 @@ Before claiming delivery readiness:
 
 1. Run `harness.py --root . status`.
 2. Run `harness.py --root . validate --delivery`.
-3. Confirm validation evidence has a registered target, matching command, `executed_count>0`, and `exit_code=0`.
+3. Confirm validation evidence has a gateable registered target, matching command, `executed_count_source=parsed`, `executed_count>0`, and `exit_code=0`.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
-5. Confirm high/critical failure modes are covered by passing validation or explicitly accepted.
+5. Confirm high/critical failure modes are covered by `ci` or `external-session` trust anchor, or explicitly accepted.
 6. Confirm delivery record includes local or external collaboration links.
 7. State any warnings or residual risk.

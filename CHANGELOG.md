@@ -4,6 +4,28 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.0.0-beta.1 - 2026-06-23
+
+### Added
+
+- Trust anchors for validation and evidence: `local-only`, `human-confirmed`, `external-session`, and `ci`.
+- `adapter ci-verify` for local CI verification contracts with provider, run id, conclusion, commit SHA, and link.
+- Test target gateability metadata so placeholder commands such as `echo` and `true` cannot satisfy delivery gates.
+- Sandbox profile audit fields and mandatory allow-unlisted reasons for local executor runs.
+
+### Changed
+
+- Runtime schema version is now `12`; runtime implementation version is now `3.3.0`.
+- Delivery gates now require passing validation command evidence to come from executor-parsed output, not manual count/hash fields.
+- High and critical failure-mode coverage now requires `ci` or `external-session` trust anchors unless the risk is formally accepted.
+- `--no-network` is now a compatibility alias for audited `sandbox_profile=no-network` and is recorded as unavailable in the local runtime.
+
+### Boundaries
+
+- This release still stops at verified code delivery.
+- The runtime records CI and external-session trust contracts locally; it does not fetch CI or create real external sessions.
+- External tools remain adapter contracts; no real GitHub/Linear/Notion/Figma/Slack writes are performed by the runtime.
+
 ## v0.9.0-beta.1 - 2026-06-22
 
 ### Added

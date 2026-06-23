@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -22,7 +21,7 @@ for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
         sys.path.insert(0, str(path))
 HARNESS = ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
 RESULT_PATH = ROOT / "docs" / "runtime" / "runtime-smoke-results.json"
-TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
+TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
 
 
 def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -43,16 +42,20 @@ def token(stdout: str) -> str:
     return stdout.split("token=", 1)[1].strip()
 
 
-def trusted_artifact(root: Path, suffix: str, content: str = "1 passed\n") -> tuple[str, str]:
-    artifact = root / ".ai-team" / "runtime" / "smoke" / f"stdout-{suffix}.txt"
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text(content, encoding="utf-8")
-    return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
+def ensure_dummy_unittest(root: Path) -> None:
+    (root / "test_harness_dummy.py").write_text(
+        "import unittest\n\n"
+        "class HarnessSmokeTest(unittest.TestCase):\n"
+        "    def test_smoke(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
 
 
 def scenario_full_project() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        ensure_dummy_unittest(root)
         commands = []
         commands.append(run(root, "init"))
         commands.append(run(root, "phase", "project_bootstrap"))
@@ -78,11 +81,11 @@ def scenario_full_project() -> dict[str, object]:
         reviewer_token = token(review.stdout) if review.returncode == 0 else ""
         commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
         commands.append(run(root, "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", TEST_COMMAND, "--description", "Smoke unit target"))
-        evidence_artifact, evidence_sha = trusted_artifact(root, "evidence")
-        validation_artifact, validation_sha = trusted_artifact(root, "validation")
-        commands.append(run(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "unit test passed", "--command", TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", evidence_sha, "--artifact-path", evidence_artifact, "--target", "TARGET1", "--executed-count", "1"))
-        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", "EV1"))
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", "EV1", "--command", TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", validation_sha, "--artifact-path", validation_artifact, "--target", "TARGET1", "--executed-count", "1"))
+        evidence = run(root, "dispatch", "run", "--agent", "developer", "--target", "TARGET1", "--command", TEST_COMMAND)
+        commands.append(evidence)
+        evidence_id = evidence.stdout.strip().rsplit(" ", 1)[-1] if evidence.returncode == 0 else "EV1"
+        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", evidence_id))
+        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", "smoke-session-1"))
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
         commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
@@ -126,7 +129,7 @@ def scenario_directed_invariant_benchmark() -> dict[str, object]:
             conn.executemany(
                 """
                 insert into events (id, schema_version, type, source, target, payload_json, created_at)
-                values (?, 11, 'benchmark_event', 'smoke', 'project', '{}', ?)
+                values (?, 12, 'benchmark_event', 'smoke', 'project', '{}', ?)
                 """,
                 [(f"bench-event-{i}", now) for i in range(5000)],
             )

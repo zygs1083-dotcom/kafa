@@ -28,6 +28,10 @@ def main() -> int:
     parser.add_argument("--executed-count", type=int)
     parser.add_argument("--allow-unlisted", action="store_true")
     parser.add_argument("--no-network", action="store_true")
+    parser.add_argument("--trust-anchor", default="local-only")
+    parser.add_argument("--trust-anchor-id", default="")
+    parser.add_argument("--sandbox-profile", default="none")
+    parser.add_argument("--reason", default="")
     args = parser.parse_args()
     command = [
         "validation",
@@ -61,6 +65,14 @@ def main() -> int:
         command.append("--allow-unlisted")
     if args.no_network:
         command.append("--no-network")
+    if args.trust_anchor:
+        command.extend(["--trust-anchor", args.trust_anchor])
+    if args.trust_anchor_id:
+        command.extend(["--trust-anchor-id", args.trust_anchor_id])
+    if args.sandbox_profile:
+        command.extend(["--sandbox-profile", args.sandbox_profile])
+    if args.reason:
+        command.extend(["--reason", args.reason])
     for failure_mode in args.failure_mode:
         command.extend(["--failure-mode", failure_mode])
     for test in args.test:

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness CI Verification",
+  "type": "object",
+  "required": ["id", "provider", "run_id", "conclusion", "commit_sha", "created_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "provider": { "type": "string" },
+    "run_id": { "type": "string" },
+    "conclusion": { "type": "string", "enum": ["success", "failure", "cancelled", "skipped"] },
+    "commit_sha": { "type": "string" },
+    "external_link": { "type": "string" },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

@@ -12,7 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts"
 RUNTIME_CLI = REPO_ROOT / "plugins" / "codex-project-harness" / "skills" / "project-runtime" / "scripts" / "harness.py"
-DEFAULT_TEST_COMMAND = "python3 -c 'print(\"1 passed\")'"
+DEFAULT_TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
 
 
 def run_script(root: Path, script: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -39,6 +39,16 @@ def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "ok\n") ->
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text(content, encoding="utf-8")
     return artifact.relative_to(root).as_posix(), hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def ensure_dummy_unittest(root: Path) -> None:
+    (root / "test_harness_dummy.py").write_text(
+        "import unittest\n\n"
+        "class HarnessDummyTest(unittest.TestCase):\n"
+        "    def test_dummy(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
 
 
 class HarnessRuntimeValidationTest(unittest.TestCase):
@@ -69,34 +79,22 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         return temp
 
     def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
+        ensure_dummy_unittest(root)
         run_script(root, "harness.py", "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", DEFAULT_TEST_COMMAND)
-        artifact_path, stdout_sha = trusted_artifact(root, "evidence")
-        validation_artifact, validation_sha = trusted_artifact(root, "validation")
-        run_script(
+        evidence_result = run_script(
             root,
             "harness.py",
-            "evidence",
-            "record",
-            "--id",
-            "EV1",
-            "--kind",
-            "command",
-            "--summary",
-            "example evidence",
-            "--command",
-            DEFAULT_TEST_COMMAND,
-            "--exit-code",
-            "0",
-            "--stdout-sha256",
-            stdout_sha,
-            "--artifact-path",
-            artifact_path,
+            "dispatch",
+            "run",
+            "--agent",
+            "developer",
             "--target",
             "TARGET1",
-            "--executed-count",
-            "1",
+            "--command",
+            DEFAULT_TEST_COMMAND,
         )
-        run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
+        evidence_id = evidence_result.stdout.strip().rsplit(" ", 1)[-1]
+        run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", evidence_id)
         command = [
             "record_validation.py",
             "--surface",
@@ -112,19 +110,9 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--test",
             "TEST1",
             "--evidence",
-            "EV1",
-            "--command",
-            DEFAULT_TEST_COMMAND,
-            "--exit-code",
-            "0",
-            "--stdout-sha256",
-            validation_sha,
-            "--artifact-path",
-            validation_artifact,
+            evidence_id,
             "--target",
             "TARGET1",
-            "--executed-count",
-            "1",
         ]
         if failure_mode:
             command.extend(["--failure-mode", "FM1"])
@@ -133,7 +121,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             *command,
         )
 
-    def add_failure_mode(self, root: Path, status: str = "identified") -> None:
+    def add_failure_mode(self, root: Path, status: str = "identified", risk: str = "low") -> None:
         run_script(
             root,
             "add_failure_mode.py",
@@ -148,7 +136,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "--expected",
             "safe failure",
             "--risk",
-            "critical",
+            risk,
             "--test-mapping",
             "AC1",
             "--status",
@@ -237,7 +225,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def test_open_critical_failure_mode_blocks_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
-            self.add_failure_mode(root, status="identified")
+            self.add_failure_mode(root, status="identified", risk="critical")
             self.add_pass_validation(root, failure_mode=False)
             self.add_quality_gate(root, result="pass")
 

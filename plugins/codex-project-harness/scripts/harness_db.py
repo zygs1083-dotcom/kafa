@@ -20,11 +20,11 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso
-from core.schema_guard import ADAPTER_MODES, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
+from core.schema_guard import ADAPTER_MODES, CI_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
 
 
-SCHEMA_VERSION = 11
-RUNTIME_VERSION = "3.2.0"
+SCHEMA_VERSION = 12
+RUNTIME_VERSION = "3.3.0"
 DB_PATH = Path(".ai-team/state/harness.db")
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -65,6 +65,7 @@ ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocke
 DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale"}
 DEFAULT_EXECUTOR_PREFIXES = [
     "python3 -m unittest",
+    "python3 -B -m unittest",
     "python3 -m pytest",
     "pytest",
     "npm test",
@@ -76,6 +77,27 @@ DEFAULT_EXECUTOR_PREFIXES = [
     "cargo test",
     "dotnet test",
 ]
+GATEABLE_TEST_PREFIXES = [
+    "python3 -m unittest",
+    "python3 -B -m unittest",
+    "python -m unittest",
+    "python3 -m pytest",
+    "python -m pytest",
+    "pytest",
+    "npm test",
+    "npm run test",
+    "pnpm test",
+    "pnpm run test",
+    "yarn test",
+    "yarn run test",
+    "jest",
+    "npx jest",
+    "go test",
+    "cargo test",
+    "dotnet test",
+    "make test",
+]
+DUMB_COMMAND_PREFIXES = ["echo", "true", "false", "cat", "pwd", "ls", "printf"]
 
 SNAPSHOT_TABLES = [
     "project",
@@ -103,6 +125,7 @@ SNAPSHOT_TABLES = [
     "decisions",
     "adapters",
     "adapter_actions",
+    "ci_verifications",
     "invalidations",
     "agents",
     "agent_capabilities",
@@ -302,6 +325,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             executed_count_source text not null default '',
             allow_unlisted integer not null default 0,
             no_network integer not null default 0,
+            sandbox_profile text not null default 'none',
+            sandbox_status text not null default '',
+            allow_unlisted_reason text not null default '',
+            trust_anchor text not null default 'local-only',
+            trust_anchor_id text not null default '',
             policy_status text not null default '',
             policy_reason text not null default '',
             findings text not null,
@@ -333,6 +361,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             kind text not null,
             command_template text not null,
             description text not null default '',
+            gateable integer not null default 1,
+            gate_block_reason text not null default '',
             created_at text not null,
             updated_at text not null
         );
@@ -395,6 +425,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             executed_count_source text not null default '',
             allow_unlisted integer not null default 0,
             no_network integer not null default 0,
+            sandbox_profile text not null default 'none',
+            sandbox_status text not null default '',
+            allow_unlisted_reason text not null default '',
+            trust_anchor text not null default 'local-only',
+            trust_anchor_id text not null default '',
             policy_status text not null default '',
             policy_reason text not null default '',
             created_at text not null
@@ -471,6 +506,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
             session_id text not null default '',
             lease_task_id text not null default '',
             updated_at text not null
+        );
+        create table if not exists ci_verifications (
+            id text primary key,
+            provider text not null,
+            run_id text not null,
+            conclusion text not null,
+            commit_sha text not null,
+            external_link text not null default '',
+            created_at text not null,
+            unique(provider, run_id)
         );
         create table if not exists agent_capabilities (
             agent_id text not null references agents(id) on delete cascade,
@@ -552,8 +597,15 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "executed_count_source", "text not null default ''")
     ensure_column(conn, "validations", "allow_unlisted", "integer not null default 0")
     ensure_column(conn, "validations", "no_network", "integer not null default 0")
+    ensure_column(conn, "validations", "sandbox_profile", "text not null default 'none'")
+    ensure_column(conn, "validations", "sandbox_status", "text not null default ''")
+    ensure_column(conn, "validations", "allow_unlisted_reason", "text not null default ''")
+    ensure_column(conn, "validations", "trust_anchor", "text not null default 'local-only'")
+    ensure_column(conn, "validations", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "validations", "policy_status", "text not null default ''")
     ensure_column(conn, "validations", "policy_reason", "text not null default ''")
+    ensure_column(conn, "test_targets", "gateable", "integer not null default 1")
+    ensure_column(conn, "test_targets", "gate_block_reason", "text not null default ''")
     ensure_column(conn, "evidence", "command", "text not null default ''")
     ensure_column(conn, "evidence", "exit_code", "integer")
     ensure_column(conn, "evidence", "stdout_sha256", "text not null default ''")
@@ -564,6 +616,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "executed_count_source", "text not null default ''")
     ensure_column(conn, "evidence", "allow_unlisted", "integer not null default 0")
     ensure_column(conn, "evidence", "no_network", "integer not null default 0")
+    ensure_column(conn, "evidence", "sandbox_profile", "text not null default 'none'")
+    ensure_column(conn, "evidence", "sandbox_status", "text not null default ''")
+    ensure_column(conn, "evidence", "allow_unlisted_reason", "text not null default ''")
+    ensure_column(conn, "evidence", "trust_anchor", "text not null default 'local-only'")
+    ensure_column(conn, "evidence", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "evidence", "policy_status", "text not null default ''")
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
     ensure_default_executor_allowlist(conn)
@@ -872,10 +929,33 @@ def bool_int(value: bool) -> int:
     return 1 if value else 0
 
 
-def normalize_manual_execution_fields(executed_count: int | None, command: str) -> tuple[int, str, str, str]:
+def command_has_prefix(command: str, prefixes: list[str]) -> bool:
+    from core.executor import command_matches_prefix
+
+    return any(command_matches_prefix(command, prefix) for prefix in prefixes)
+
+
+def target_gateability(kind: str, command_template: str) -> tuple[int, str]:
+    if command_has_prefix(command_template, DUMB_COMMAND_PREFIXES):
+        return 0, "not a gateable test target: command is a shell utility or placeholder"
+    if kind in {"unit", "integration"} and not command_has_prefix(command_template, GATEABLE_TEST_PREFIXES):
+        return 0, "not a gateable test target: unit/integration command must use a known test runner"
+    return 1, ""
+
+
+def normalize_manual_execution_fields(
+    executed_count: int | None,
+    command: str,
+    *,
+    sandbox_profile: str = "none",
+    no_network: bool = False,
+    allow_unlisted_reason: str = "",
+) -> tuple[int, str, str, str, str, str, str]:
+    profile = "no-network" if no_network else sandbox_profile
+    sandbox_status = "unavailable" if profile == "no-network" else ""
     if executed_count is None:
-        return 0, "", "manual" if command else "", "recorded without executor"
-    return int(executed_count), "manual", "manual", "recorded via CLI"
+        return 0, "", "manual" if command else "", "recorded without executor", profile, sandbox_status, allow_unlisted_reason
+    return int(executed_count), "manual", "manual", "recorded via CLI", profile, sandbox_status, allow_unlisted_reason
 
 
 def test_target_command(conn: sqlite3.Connection, target_id: str) -> str:
@@ -2097,24 +2177,26 @@ def record_decision(root: Path, decision: str, reason: str) -> None:
 
 def add_test_target(root: Path, target_id: str, kind: str, command_template: str, description: str = "") -> None:
     guard_schema("validate_test_target", target_id, kind, command_template)
+    gateable, gate_block_reason = target_gateability(kind, command_template)
     with transaction(root, touched=[("test_target", target_id)]) as conn:
         conn.execute(
             """
-            insert into test_targets (id, kind, command_template, description, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into test_targets (id, kind, command_template, description, gateable, gate_block_reason, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, command_template=excluded.command_template,
-              description=excluded.description, updated_at=excluded.updated_at
+              description=excluded.description, gateable=excluded.gateable, gate_block_reason=excluded.gate_block_reason,
+              updated_at=excluded.updated_at
             """,
-            (target_id, kind, command_template, description, now_iso(), now_iso()),
+            (target_id, kind, command_template, description, gateable, gate_block_reason, now_iso(), now_iso()),
         )
-        emit_event(conn, "test_target_recorded", payload(id=target_id, kind=kind))
+        emit_event(conn, "test_target_recorded", payload(id=target_id, kind=kind, gateable=gateable))
     render_all(root)
 
 
 def list_test_targets(root: Path) -> list[str]:
     with connection(root) as conn:
-        rows = conn.execute("select id, kind, command_template, description from test_targets order by id").fetchall()
-    return [markdown_row([row["id"], row["kind"], row["command_template"], row["description"]]) for row in rows]
+        rows = conn.execute("select id, kind, command_template, description, gateable, gate_block_reason from test_targets order by id").fetchall()
+    return [markdown_row([row["id"], row["kind"], row["command_template"], row["description"], str(row["gateable"]), row["gate_block_reason"]]) for row in rows]
 
 
 def add_executor_prefix(root: Path, prefix: str, reason: str) -> None:
@@ -2161,16 +2243,57 @@ def record_validation(
     executed_count: int | None = None,
     allow_unlisted: bool = False,
     no_network: bool = False,
+    sandbox_profile: str = "none",
+    trust_anchor: str = "local-only",
+    trust_anchor_id: str = "",
+    allow_unlisted_reason: str = "",
 ) -> None:
     guard_schema("validate_validation", surface, findings, result)
+    guard_schema("validate_trust_anchor", trust_anchor)
+    guard_schema("validate_sandbox_profile", "no-network" if no_network else sandbox_profile)
     current_sha = git_head_sha(root) or "no-git"
     source_hash = git_source_tree_hash(root) or ""
     tracked_diff_hash = git_tracked_diff_hash(root) or ""
     artifact_path = normalize_artifact_path(root, artifact_path)
-    executed_count_value, executed_count_source, policy_status, policy_reason = normalize_manual_execution_fields(executed_count, command)
+    (
+        executed_count_value,
+        executed_count_source,
+        policy_status,
+        policy_reason,
+        sandbox_profile_value,
+        sandbox_status,
+        allow_unlisted_reason_value,
+    ) = normalize_manual_execution_fields(
+        executed_count,
+        command,
+        sandbox_profile=sandbox_profile,
+        no_network=no_network,
+        allow_unlisted_reason=allow_unlisted_reason,
+    )
     with transaction(root, touched=[("validation", "")]) as conn:
         if target_id:
             test_target_command(conn, target_id)
+        evidence_ids = parse_ids(evidence)
+        if not command and evidence_ids:
+            source_evidence = conn.execute("select * from evidence where id = ? and command != ''", (evidence_ids[0],)).fetchone()
+            if source_evidence:
+                command = source_evidence["command"]
+                exit_code = source_evidence["exit_code"]
+                stdout_sha256 = source_evidence["stdout_sha256"]
+                artifact_path = source_evidence["artifact_path"]
+                target_id = target_id or source_evidence["target_id"]
+                executed_count_value = int(source_evidence["executed_count"] or 0)
+                executed_count_source = source_evidence["executed_count_source"]
+                allow_unlisted = bool(source_evidence["allow_unlisted"])
+                no_network = bool(source_evidence["no_network"])
+                sandbox_profile_value = source_evidence["sandbox_profile"] if "sandbox_profile" in source_evidence.keys() else sandbox_profile_value
+                sandbox_status = source_evidence["sandbox_status"] if "sandbox_status" in source_evidence.keys() else sandbox_status
+                allow_unlisted_reason_value = source_evidence["allow_unlisted_reason"] if "allow_unlisted_reason" in source_evidence.keys() else allow_unlisted_reason_value
+                policy_status = source_evidence["policy_status"]
+                policy_reason = source_evidence["policy_reason"]
+                if trust_anchor == "local-only":
+                    trust_anchor = source_evidence["trust_anchor"] if "trust_anchor" in source_evidence.keys() else trust_anchor
+                    trust_anchor_id = source_evidence["trust_anchor_id"] if "trust_anchor_id" in source_evidence.keys() else trust_anchor_id
         validation_id = str(uuid.uuid4())
         project_revision = int(project_row(conn)["revision"])
         conn.execute(
@@ -2178,9 +2301,10 @@ def record_validation(
             insert into validations
             (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
-             policy_reason, findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
+             policy_reason, sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
              project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 validation_id,
@@ -2198,6 +2322,11 @@ def record_validation(
                 bool_int(no_network),
                 policy_status,
                 policy_reason,
+                sandbox_profile_value,
+                sandbox_status,
+                allow_unlisted_reason_value,
+                trust_anchor,
+                trust_anchor_id,
                 findings,
                 result,
                 risk,
@@ -2215,7 +2344,7 @@ def record_validation(
             if not test_row:
                 raise HarnessError(f"missing test: {test_id}")
             conn.execute("insert or ignore into validation_tests (validation_id, test_id) values (?, ?)", (validation_id, test_id))
-        for evidence_id in parse_ids(evidence):
+        for evidence_id in evidence_ids:
             if not conn.execute("select id from evidence where id = ?", (evidence_id,)).fetchone():
                 raise HarnessError(f"missing evidence: {evidence_id}")
             conn.execute("insert or ignore into validation_evidence (validation_id, evidence_id) values (?, ?)", (validation_id, evidence_id))
@@ -2257,10 +2386,30 @@ def record_evidence(
     executed_count: int | None = None,
     allow_unlisted: bool = False,
     no_network: bool = False,
+    sandbox_profile: str = "none",
+    trust_anchor: str = "local-only",
+    trust_anchor_id: str = "",
+    allow_unlisted_reason: str = "",
 ) -> None:
+    guard_schema("validate_trust_anchor", trust_anchor)
+    guard_schema("validate_sandbox_profile", "no-network" if no_network else sandbox_profile)
     artifact_path = normalize_artifact_path(root, artifact_path)
     source_hash = git_source_tree_hash(root) or ""
-    executed_count_value, executed_count_source, policy_status, policy_reason = normalize_manual_execution_fields(executed_count, command)
+    (
+        executed_count_value,
+        executed_count_source,
+        policy_status,
+        policy_reason,
+        sandbox_profile_value,
+        sandbox_status,
+        allow_unlisted_reason_value,
+    ) = normalize_manual_execution_fields(
+        executed_count,
+        command,
+        sandbox_profile=sandbox_profile,
+        no_network=no_network,
+        allow_unlisted_reason=allow_unlisted_reason,
+    )
     with transaction(root, touched=[("evidence", evidence_id)]) as conn:
         if target_id:
             test_target_command(conn, target_id)
@@ -2269,8 +2418,9 @@ def record_evidence(
             insert into evidence
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, summary=excluded.summary, uri=excluded.uri,
               hash=excluded.hash, command=excluded.command, exit_code=excluded.exit_code,
               stdout_sha256=excluded.stdout_sha256, artifact_path=excluded.artifact_path,
@@ -2278,6 +2428,9 @@ def record_evidence(
               executed_count=excluded.executed_count, executed_count_source=excluded.executed_count_source,
               allow_unlisted=excluded.allow_unlisted, no_network=excluded.no_network,
               policy_status=excluded.policy_status, policy_reason=excluded.policy_reason,
+              sandbox_profile=excluded.sandbox_profile, sandbox_status=excluded.sandbox_status,
+              allow_unlisted_reason=excluded.allow_unlisted_reason, trust_anchor=excluded.trust_anchor,
+              trust_anchor_id=excluded.trust_anchor_id,
               created_at=excluded.created_at
             """,
             (
@@ -2298,6 +2451,11 @@ def record_evidence(
                 bool_int(no_network),
                 policy_status,
                 policy_reason,
+                sandbox_profile_value,
+                sandbox_status,
+                allow_unlisted_reason_value,
+                trust_anchor,
+                trust_anchor_id,
                 now_iso(),
             ),
         )
@@ -2528,6 +2686,24 @@ def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id:
     render_tooling_map(root)
 
 
+def record_ci_verification(root: Path, provider: str, run_id: str, conclusion: str, commit_sha: str, *, external_link: str = "") -> str:
+    guard_schema("validate_ci_verification", provider, run_id, conclusion, commit_sha)
+    verification_id = f"{provider}:{run_id}"
+    with transaction(root, touched=[("ci_verification", verification_id)]) as conn:
+        conn.execute(
+            """
+            insert into ci_verifications (id, provider, run_id, conclusion, commit_sha, external_link, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            on conflict(provider, run_id) do update set conclusion=excluded.conclusion,
+              commit_sha=excluded.commit_sha, external_link=excluded.external_link, created_at=excluded.created_at
+            """,
+            (verification_id, provider, run_id, conclusion, commit_sha, external_link, now_iso()),
+        )
+        emit_event(conn, "ci_verification_recorded", payload(id=verification_id, provider=provider, run_id=run_id, conclusion=conclusion, commit_sha=commit_sha))
+    render_tooling_map(root)
+    return verification_id
+
+
 def adapter_plan(root: Path, tool: str, mode: str, artifact: str, action: str, *, payload_json: str = "{}", idempotency_key: str = "") -> str:
     guard_schema("validate_adapter_action", tool, mode, artifact, action, payload_json, "planned")
     action_id = str(uuid.uuid4())
@@ -2743,6 +2919,8 @@ def dispatch_run(
     target_id: str = "",
     allow_unlisted: bool = False,
     no_network: bool = False,
+    sandbox_profile: str = "none",
+    allow_unlisted_reason: str = "",
     executed_count: int | None = None,
 ) -> str:
     from core.executor import LocalExecutor
@@ -2753,14 +2931,17 @@ def dispatch_run(
             (agent,),
         ).fetchone()
     if not active:
-        dispatch_claim_next(root, agent)
+        try:
+            dispatch_claim_next(root, agent)
+        except HarnessError:
+            pass
     with connection(root) as conn:
         assignment = conn.execute(
             "select * from dispatch_assignments where agent_id = ? and status = 'claimed' order by claimed_at, task_id limit 1",
             (agent,),
         ).fetchone()
     if not assignment:
-        raise HarnessError(f"no claimed dispatch assignment for agent: {agent}")
+        assignment = {"run_id": "", "task_id": "local-execution"}
 
     with connection(root) as conn:
         target_command = test_target_command(conn, target_id) if target_id else ""
@@ -2774,6 +2955,8 @@ def dispatch_run(
         allowed_prefixes=prefixes,
         allow_unlisted=allow_unlisted,
         no_network=no_network,
+        sandbox_profile="no-network" if no_network else sandbox_profile,
+        allow_unlisted_reason=allow_unlisted_reason,
         executed_count=executed_count,
     )
     evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
@@ -2785,8 +2968,9 @@ def dispatch_run(
             insert into evidence
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-only', '', ?)
             """,
             (
                 evidence_id,
@@ -2805,18 +2989,22 @@ def dispatch_run(
                 bool_int(result.no_network),
                 result.policy_status,
                 result.policy_reason,
+                result.sandbox_profile,
+                result.sandbox_status,
+                result.allow_unlisted_reason,
                 now_iso(),
             ),
         )
-        conn.execute(
-            """
-            update dispatch_assignments
-            set status = ?, evidence = ?, updated_at = ?
-            where run_id = ? and task_id = ?
-            """,
-            (status, evidence_id, now_iso(), assignment["run_id"], assignment["task_id"]),
-        )
-        conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), assignment["run_id"]))
+        if assignment["run_id"]:
+            conn.execute(
+                """
+                update dispatch_assignments
+                set status = ?, evidence = ?, updated_at = ?
+                where run_id = ? and task_id = ?
+                """,
+                (status, evidence_id, now_iso(), assignment["run_id"], assignment["task_id"]),
+            )
+            conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), assignment["run_id"]))
         emit_event(
             conn,
             "dispatch_command_executed",
@@ -2827,10 +3015,14 @@ def dispatch_run(
                 evidence_id=evidence_id,
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
+                allow_unlisted_reason=result.allow_unlisted_reason,
+                sandbox_profile=result.sandbox_profile,
+                sandbox_status=result.sandbox_status,
             ),
         )
     if result.exit_code != 0:
-        raise HarnessError(f"dispatch command failed: {assignment['task_id']} exit_code={result.exit_code} evidence={evidence_id}")
+        detail = f" {result.policy_reason}" if result.policy_reason else ""
+        raise HarnessError(f"dispatch command failed: {assignment['task_id']} exit_code={result.exit_code} evidence={evidence_id}{detail}")
     return evidence_id
 
 
@@ -2955,6 +3147,11 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
         ("dispatch_assignments", "status", DISPATCH_STATUSES, "dispatch assignment status"),
         ("test_targets", "kind", TEST_TARGET_KINDS, "test target kind"),
+        ("validations", "trust_anchor", {"local-only", "human-confirmed", "external-session", "ci"}, "validation trust anchor"),
+        ("evidence", "trust_anchor", {"local-only", "human-confirmed", "external-session", "ci"}, "evidence trust anchor"),
+        ("validations", "sandbox_profile", {"none", "no-network"}, "validation sandbox profile"),
+        ("evidence", "sandbox_profile", {"none", "no-network"}, "evidence sandbox profile"),
+        ("ci_verifications", "conclusion", CI_CONCLUSIONS, "ci conclusion"),
     ]
     for table, column, allowed, label in enum_checks:
         id_column = "task_id" if table == "dispatch_assignments" else "id"
@@ -3065,6 +3262,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("finding.schema.json", "findings", [row_snapshot(row) or {} for row in conn.execute("select * from findings")]),
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
+        ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
         ("agent.schema.json", "agents", [row_snapshot(row) or {} for row in conn.execute("select * from agents")]),
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),
         ("dispatch-run.schema.json", "dispatch_runs", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_runs")]),

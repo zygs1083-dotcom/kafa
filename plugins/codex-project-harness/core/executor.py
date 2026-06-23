@@ -29,6 +29,9 @@ class CommandResult:
     executed_count_source: str = ""
     allow_unlisted: bool = False
     no_network: bool = False
+    sandbox_profile: str = "none"
+    sandbox_status: str = ""
+    allow_unlisted_reason: str = ""
     policy_status: str = "allowed"
     policy_reason: str = ""
 
@@ -72,12 +75,9 @@ def parse_executed_count(stdout: str | bytes) -> int:
     return 0
 
 
-def minimal_env(*, no_network: bool = False) -> dict[str, str]:
+def minimal_env() -> dict[str, str]:
     keep = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"]
-    env = {key: os.environ[key] for key in keep if key in os.environ}
-    if no_network:
-        env["NO_NETWORK"] = "1"
-    return env
+    return {key: os.environ[key] for key in keep if key in os.environ}
 
 
 class LocalExecutor:
@@ -95,11 +95,22 @@ class LocalExecutor:
         allowed_prefixes: list[str] | None = None,
         allow_unlisted: bool = False,
         no_network: bool = False,
+        sandbox_profile: str = "none",
+        allow_unlisted_reason: str = "",
         executed_count: int | None = None,
     ) -> CommandResult:
         if not command.strip():
             raise ValueError("command is required")
-        policy_status, policy_reason = self._policy(command, target_id, target_command_template, allowed_prefixes or [], allow_unlisted)
+        profile = "no-network" if no_network else sandbox_profile
+        sandbox_status = "unavailable" if profile == "no-network" else ""
+        policy_status, policy_reason = self._policy(
+            command,
+            target_id,
+            target_command_template,
+            allowed_prefixes or [],
+            allow_unlisted,
+            allow_unlisted_reason,
+        )
         if policy_status == "rejected":
             stdout = f"command rejected by policy: {policy_reason}\n".encode("utf-8")
             return self._write_result(
@@ -111,6 +122,9 @@ class LocalExecutor:
                 executed_count_source="policy",
                 allow_unlisted=allow_unlisted,
                 no_network=no_network,
+                sandbox_profile=profile,
+                sandbox_status=sandbox_status,
+                allow_unlisted_reason=allow_unlisted_reason,
                 policy_status=policy_status,
                 policy_reason=policy_reason,
             )
@@ -122,13 +136,13 @@ class LocalExecutor:
             completed = subprocess.run(
                 args,
                 cwd=self.root,
-                env=minimal_env(no_network=no_network),
+                env=minimal_env(),
                 capture_output=True,
                 check=False,
                 timeout=timeout,
             )
             exit_code = completed.returncode
-            stdout = completed.stdout or b""
+            stdout = (completed.stdout or b"") + (completed.stderr or b"")
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             exit_code = 124
@@ -149,6 +163,9 @@ class LocalExecutor:
             executed_count_source=count_source,
             allow_unlisted=allow_unlisted,
             no_network=no_network,
+            sandbox_profile=profile,
+            sandbox_status=sandbox_status,
+            allow_unlisted_reason=allow_unlisted_reason,
             policy_status=policy_status,
             policy_reason=policy_reason,
         )
@@ -160,6 +177,7 @@ class LocalExecutor:
         target_command_template: str,
         allowed_prefixes: list[str],
         allow_unlisted: bool,
+        allow_unlisted_reason: str,
     ) -> tuple[str, str]:
         if target_id:
             if not target_command_template:
@@ -171,7 +189,9 @@ class LocalExecutor:
             if command_matches_prefix(command, prefix):
                 return "allowed", f"prefix {prefix}"
         if allow_unlisted:
-            return "allowed", "explicit allow-unlisted"
+            if not allow_unlisted_reason.strip():
+                return "rejected", "--reason is required when --allow-unlisted is used"
+            return "allowed", f"explicit allow-unlisted: {allow_unlisted_reason}"
         return "rejected", "command is not registered target or allowed prefix"
 
     def _write_result(
@@ -186,6 +206,9 @@ class LocalExecutor:
         executed_count_source: str = "",
         allow_unlisted: bool = False,
         no_network: bool = False,
+        sandbox_profile: str = "none",
+        sandbox_status: str = "",
+        allow_unlisted_reason: str = "",
         policy_status: str = "allowed",
         policy_reason: str = "",
     ) -> CommandResult:
@@ -204,6 +227,9 @@ class LocalExecutor:
             executed_count_source=executed_count_source,
             allow_unlisted=allow_unlisted,
             no_network=no_network,
+            sandbox_profile=sandbox_profile,
+            sandbox_status=sandbox_status,
+            allow_unlisted_reason=allow_unlisted_reason,
             policy_status=policy_status,
             policy_reason=policy_reason,
         )

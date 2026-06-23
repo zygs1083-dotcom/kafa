@@ -51,6 +51,7 @@ from core.api import (
     migrate,
     ready_tasks,
     record_adapter,
+    record_ci_verification,
     record_decision,
     record_delivery,
     record_evidence,
@@ -263,6 +264,10 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--executed-count", type=int)
     validation_record.add_argument("--allow-unlisted", action="store_true")
     validation_record.add_argument("--no-network", action="store_true")
+    validation_record.add_argument("--trust-anchor", default="local-only", choices=["local-only", "human-confirmed", "external-session", "ci"])
+    validation_record.add_argument("--trust-anchor-id", default="")
+    validation_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
+    validation_record.add_argument("--reason", default="")
 
     test_target = sub.add_parser("test-target")
     test_target_sub = test_target.add_subparsers(dest="test_target_command", required=True)
@@ -295,6 +300,10 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_record.add_argument("--executed-count", type=int)
     evidence_record.add_argument("--allow-unlisted", action="store_true")
     evidence_record.add_argument("--no-network", action="store_true")
+    evidence_record.add_argument("--trust-anchor", default="local-only", choices=["local-only", "human-confirmed", "external-session", "ci"])
+    evidence_record.add_argument("--trust-anchor-id", default="")
+    evidence_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
+    evidence_record.add_argument("--reason", default="")
 
     test = sub.add_parser("test")
     test_sub = test.add_subparsers(dest="test_command", required=True)
@@ -370,6 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_complete.add_argument("--id", required=True)
     adapter_complete.add_argument("--external-id", default="")
     adapter_complete.add_argument("--external-link", default="")
+    adapter_ci = adapter_sub.add_parser("ci-verify")
+    adapter_ci.add_argument("--provider", required=True)
+    adapter_ci.add_argument("--run-id", required=True)
+    adapter_ci.add_argument("--conclusion", required=True, choices=["success", "failure", "cancelled", "skipped"])
+    adapter_ci.add_argument("--commit-sha", required=True)
+    adapter_ci.add_argument("--external-link", default="")
     adapter_sub.add_parser("reconcile")
 
     risk = sub.add_parser("risk")
@@ -414,7 +429,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_run.add_argument("--command", dest="dispatch_command_text", required=True)
     dispatch_run.add_argument("--timeout", type=int, default=120)
     dispatch_run.add_argument("--allow-unlisted", action="store_true")
+    dispatch_run.add_argument("--reason", default="")
     dispatch_run.add_argument("--no-network", action="store_true")
+    dispatch_run.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     dispatch_run.add_argument("--executed-count", type=int)
     dispatch_sub.add_parser("recover-stale")
     dispatch_sub.add_parser("status")
@@ -620,6 +637,10 @@ def main() -> int:
                 executed_count=args.executed_count,
                 allow_unlisted=args.allow_unlisted,
                 no_network=args.no_network,
+                sandbox_profile=args.sandbox_profile,
+                trust_anchor=args.trust_anchor,
+                trust_anchor_id=args.trust_anchor_id,
+                allow_unlisted_reason=args.reason,
             )
             print("OK: validation recorded")
         elif args.command == "test-target" and args.test_target_command == "add":
@@ -646,6 +667,10 @@ def main() -> int:
                 executed_count=args.executed_count,
                 allow_unlisted=args.allow_unlisted,
                 no_network=args.no_network,
+                sandbox_profile=args.sandbox_profile,
+                trust_anchor=args.trust_anchor,
+                trust_anchor_id=args.trust_anchor_id,
+                allow_unlisted_reason=args.reason,
             )
             print(f"OK: evidence recorded {args.id}")
         elif args.command == "test" and args.test_command == "record":
@@ -709,6 +734,9 @@ def main() -> int:
         elif args.command == "adapter" and args.adapter_command == "complete":
             adapter_transition(root, args.id, "completed", external_id=args.external_id, external_link=args.external_link)
             print(f"OK: adapter action completed {args.id}")
+        elif args.command == "adapter" and args.adapter_command == "ci-verify":
+            verification_id = record_ci_verification(root, args.provider, args.run_id, args.conclusion, args.commit_sha, external_link=args.external_link)
+            print(f"OK: ci verification recorded {verification_id}")
         elif args.command == "adapter" and args.adapter_command == "reconcile":
             issues = adapter_reconcile(root)
             if issues:
@@ -762,6 +790,8 @@ def main() -> int:
                 target_id=args.target,
                 allow_unlisted=args.allow_unlisted,
                 no_network=args.no_network,
+                sandbox_profile=args.sandbox_profile,
+                allow_unlisted_reason=args.reason,
                 executed_count=args.executed_count,
             )
             print(f"OK: dispatch command evidence {evidence_id}")

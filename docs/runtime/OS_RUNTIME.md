@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.2
+# Codex OS Runtime Layer v3.3
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.2 is an architecture generation for runtime consistency, semantic evidence, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.2.0` and the database schema version is `11`.
+Kernel v3.3 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.3.0` and the database schema version is `12`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.2
+## Kernel v3.3
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -44,7 +44,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 11
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 12
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -292,21 +292,12 @@ Evidence, test records, and findings are also structured:
 
 ```bash
 harness.py --root . test-target add --id NPM_TEST --kind unit --command-template "npm test"
-harness.py --root . evidence record \
-  --id EV1 \
-  --kind command \
-  --summary "npm test passed" \
-  --command "npm test" \
-  --exit-code 0 \
-  --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
-  --target NPM_TEST \
-  --executed-count 12
-harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence EV1
+harness.py --root . dispatch run --agent developer --target NPM_TEST --command "npm test"
+harness.py --root . test record --id TEST1 --surface "Profile CRUD" --command "npm test" --result pass --evidence <executor-evidence-id>
 harness.py --root . finding record --id F1 --surface "Profile CRUD" --severity medium --status open --summary "Needs follow-up"
 ```
 
-Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, `project_revision`, command, target, executed count, exit code, stdout hash, artifact path, and executor policy fields. Delivery readiness fails if a passing validation was recorded against an older code snapshot, lacks a registered target, does not match the target command template, or has `executed_count=0`.
+Validation records also capture `head_commit`, `source_tree_hash`, `tracked_diff_hash`, `project_revision`, command, target, executed count, exit code, stdout hash, artifact path, trust anchor, sandbox profile, and executor policy fields. Delivery readiness fails if a passing validation was recorded against an older code snapshot, lacks a gateable registered target, does not match the target command template, has `executed_count=0`, or was not parsed from executor output.
 
 Each active acceptance must have passing validation linked to at least one passing test or evidence item:
 
@@ -319,23 +310,27 @@ harness.py --root . validation record \
   --findings "passed" \
   --result pass \
   --test TEST1 \
-  --evidence EV1 \
-  --command "npm test" \
-  --exit-code 0 \
-  --stdout-sha256 <sha256> \
-  --artifact-path .ai-team/runtime/executions/<id>/stdout.txt \
+  --evidence <executor-evidence-id> \
   --target NPM_TEST \
-  --executed-count 12
+  --trust-anchor external-session \
+  --trust-anchor-id <session-id>
 ```
 
 `dispatch run` uses LocalExecutor policy before starting a process:
 
 ```bash
 harness.py --root . executor allow-prefix add --prefix "npm test" --reason "project test runner"
-harness.py --root . dispatch run --agent developer --target NPM_TEST --command "npm test" --no-network
+harness.py --root . dispatch run --agent developer --target NPM_TEST --command "npm test" --sandbox-profile none
+harness.py --root . dispatch run --agent developer --command "custom check" --allow-unlisted --reason "one-off diagnostic"
 ```
 
-`--no-network` records intent and sets `NO_NETWORK=1` in the minimized execution environment. It is not an OS-level network sandbox.
+`--no-network` is retained as a compatibility alias for `--sandbox-profile no-network`. In the local runtime, `no-network` records intent as `sandbox_status=unavailable`; it is not treated as OS-level isolation.
+
+Trust anchors define what risk level evidence can satisfy:
+
+- `local-only` and `human-confirmed` can satisfy low/medium delivery evidence.
+- `external-session` and `ci` can satisfy high/critical failure-mode coverage.
+- `ci` must reference a local `adapter ci-verify` record whose conclusion is `success` and whose commit SHA matches current HEAD.
 
 When a requirement, acceptance criterion, or failure mode changes, dependent validations and quality gates are invalidated until fresh validation or gate records resolve them.
 
@@ -347,7 +342,7 @@ Quality gates are fail-closed. Delivery readiness requires:
 - no blocking findings
 - validation records are `pass`
 - no unresolved invalidations remain
-- high/critical failure modes are covered by passing validation or formally accepted
+- high/critical failure modes are covered by passing validation with `ci` or `external-session` trust anchor, or formally accepted
 - active tasks are accepted
 - Git worktree is clean outside harness runtime files when Git exists
 - gate source tree hash matches current code outside harness runtime files when Git exists

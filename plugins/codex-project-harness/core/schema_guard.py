@@ -31,6 +31,10 @@ REQUIREMENT_KINDS = {"goal", "functional", "non-functional", "non-goal", "assump
 TEST_TARGET_KINDS = {"unit", "integration", "lint", "build"}
 POLICY_STATUSES = {"allowed", "rejected", "manual", ""}
 EXECUTED_COUNT_SOURCES = {"", "parsed", "manual", "policy"}
+TRUST_ANCHORS = {"local-only", "human-confirmed", "external-session", "ci"}
+SANDBOX_PROFILES = {"none", "no-network"}
+SANDBOX_STATUSES = {"", "available", "unavailable"}
+CI_CONCLUSIONS = {"success", "failure", "cancelled", "skipped"}
 
 
 def require_text(label: str, value: str) -> None:
@@ -99,3 +103,18 @@ def validate_test_target(target_id: str, kind: str, command_template: str) -> No
     require_text("test target id", target_id)
     require_choice("test target kind", kind, TEST_TARGET_KINDS)
     require_text("test target command template", command_template)
+
+
+def validate_trust_anchor(trust_anchor: str) -> None:
+    require_choice("trust anchor", trust_anchor, TRUST_ANCHORS)
+
+
+def validate_sandbox_profile(sandbox_profile: str) -> None:
+    require_choice("sandbox profile", sandbox_profile, SANDBOX_PROFILES)
+
+
+def validate_ci_verification(provider: str, run_id: str, conclusion: str, commit_sha: str) -> None:
+    require_text("ci provider", provider)
+    require_text("ci run id", run_id)
+    require_choice("ci conclusion", conclusion, CI_CONCLUSIONS)
+    require_text("ci commit sha", commit_sha)
