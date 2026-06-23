@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
@@ -21,11 +21,11 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
 from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXTERNAL_SESSION_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
+from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 13
 RUNTIME_VERSION = "3.3.1"
-DB_PATH = Path(".ai-team/state/harness.db")
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -143,28 +143,27 @@ class HarnessError(Exception):
     """User-facing runtime error."""
 
 
+_store_factory: Callable[[Path], Store] = SqliteStore
+
+
+def set_store_factory(factory: Callable[[Path], Store]) -> None:
+    """Test seam: override how stores are created."""
+    global _store_factory
+    _store_factory = factory
+
+
+def get_store(root: Path) -> Store:
+    return _store_factory(Path(root))
+
+
 def db_file(root: Path) -> Path:
     return root / DB_PATH
 
 
-def connect(root: Path) -> sqlite3.Connection:
-    path = db_file(root)
-    ensure_parent(path)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("pragma journal_mode = wal")
-    conn.execute("pragma foreign_keys = on")
-    conn.execute("pragma busy_timeout = 5000")
-    return conn
-
-
 @contextmanager
 def connection(root: Path) -> Iterator[sqlite3.Connection]:
-    conn = connect(root)
-    try:
+    with get_store(root).connection() as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 def transaction_invariant_issues(conn: sqlite3.Connection, root: Path, touched: list[tuple[str, str]] | None = None) -> list[object]:
@@ -193,20 +192,14 @@ def require_full_invariants(conn: sqlite3.Connection, root: Path, label: str) ->
 
 @contextmanager
 def transaction(root: Path, *, validate_invariants: bool = True, touched: list[tuple[str, str]] | None = None) -> Iterator[sqlite3.Connection]:
-    conn = connect(root)
-    try:
-        conn.execute("begin immediate")
-        yield conn
+    def before_commit(conn: sqlite3.Connection) -> None:
         if validate_invariants:
             issues = transaction_invariant_issues(conn, root, touched)
             if issues:
                 raise HarnessError("; ".join(str(issue) for issue in issues))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+
+    with get_store(root).transaction(before_commit=before_commit if validate_invariants else None) as conn:
+        yield conn
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
