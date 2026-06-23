@@ -267,7 +267,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 18)
+            self.assertEqual(project[0], 19)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
             self.assertIn("test_targets", tables)
@@ -466,7 +466,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "18")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "19")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -1667,12 +1667,23 @@ class HarnessOperatingSystemTest(unittest.TestCase):
 
             claimed = run_harness(root, "dispatch", "claim-next", "--agent", "developer")
             blocked_second = run_harness(root, "dispatch", "claim-next", "--agent", "developer", check=False)
+            not_recovered = run_harness(root, "dispatch", "recover-stale")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    """
+                    update dispatch_assignments
+                    set lease_expires_at = '2000-01-01T00:00:00+00:00'
+                    where task_id = 'T1'
+                    """
+                )
+                conn.commit()
             recovered = run_harness(root, "dispatch", "recover-stale")
             reclaimed = run_harness(root, "dispatch", "claim-next", "--agent", "developer")
 
             self.assertIn("T1", claimed.stdout)
             self.assertNotEqual(blocked_second.returncode, 0)
             self.assertIn("agent already has dispatch assignment", blocked_second.stdout)
+            self.assertIn("recovered 0 stale", not_recovered.stdout)
             self.assertIn("recovered 1 stale", recovered.stdout)
             self.assertIn("T1", reclaimed.stdout)
 

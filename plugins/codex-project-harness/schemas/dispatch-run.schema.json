@@ -5,7 +5,7 @@
   "properties": {
     "id": { "type": "string" },
     "scope": { "type": "string" },
-    "status": { "type": "string", "enum": ["planned", "claimed", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"] },
+    "status": { "type": "string", "enum": ["planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"] },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }
   }

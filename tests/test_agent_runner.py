@@ -34,6 +34,23 @@ def bootstrap_dispatch(root: Path) -> str:
     return result.stdout.strip().split()[-1]
 
 
+def add_test_target(root: Path, target_id: str, command: str) -> None:
+    run_harness(root, "test-target", "add", "--id", target_id, "--kind", "unit", "--command-template", command)
+
+
+def latest_agent_branch(root: Path) -> str:
+    with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+        row = conn.execute("select branch_name from dispatch_worktrees order by created_at desc limit 1").fetchone()
+    return row[0] if row else ""
+
+
+def branch_contains_path(root: Path, branch: str, path: str) -> bool:
+    if not branch:
+        return False
+    result = subprocess.run(["git", "cat-file", "-e", f"{branch}:{path}"], cwd=root, text=True, capture_output=True, check=False)
+    return result.returncode == 0
+
+
 class AgentRunnerTest(unittest.TestCase):
     def test_null_runner_default_dispatch_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -92,6 +109,91 @@ class AgentRunnerTest(unittest.TestCase):
             self.assertTrue((root / worktree[0] / "agent-a.txt").exists())
             log = subprocess.run(["git", "log", "--oneline", worktree[1], "-1"], cwd=root, text=True, capture_output=True, check=True)
             self.assertIn("Agent developer task T1", log.stdout)
+
+    def test_local_process_runner_rejects_branch_changes_outside_active_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_id = bootstrap_dispatch(root)
+            command = (
+                "python3 -c \"from pathlib import Path; import subprocess; "
+                "Path('claimed.txt').write_text('claimed\\\\n'); "
+                "Path('unclaimed.txt').write_text('unclaimed\\\\n'); "
+                "subprocess.run(['git', 'add', '.'], check=True); "
+                "subprocess.run(['git', '-c', 'user.name=Agent', '-c', 'user.email=agent@example.invalid', 'commit', '-m', 'agent raw commit'], check=True); "
+                "print('Ran 1 tests')\""
+            )
+            add_test_target(root, "UNIT", command)
+
+            result = run_harness(
+                root,
+                "dispatch",
+                "run",
+                "--runner",
+                "local-process",
+                "--agent",
+                "developer",
+                "--target",
+                "UNIT",
+                "--claim-file",
+                "claimed.txt",
+                "--command",
+                command,
+                check=False,
+            )
+
+            branch = latest_agent_branch(root)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                statuses = conn.execute(
+                    """
+                    select dr.status, da.status
+                    from dispatch_runs dr
+                    join dispatch_assignments da on da.run_id = dr.id
+                    where dr.id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(statuses, ("failed", "failed"))
+            self.assertFalse(branch_contains_path(root, branch, "unclaimed.txt"))
+
+    def test_local_process_runner_with_empty_claims_rejects_code_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_id = bootstrap_dispatch(root)
+            command = "python3 -c \"from pathlib import Path; Path('created-without-claim.txt').write_text('change\\\\n'); print('Ran 1 tests')\""
+            add_test_target(root, "UNIT", command)
+
+            result = run_harness(
+                root,
+                "dispatch",
+                "run",
+                "--runner",
+                "local-process",
+                "--agent",
+                "developer",
+                "--target",
+                "UNIT",
+                "--command",
+                command,
+                check=False,
+            )
+
+            branch = latest_agent_branch(root)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                statuses = conn.execute(
+                    """
+                    select dr.status, da.status
+                    from dispatch_runs dr
+                    join dispatch_assignments da on da.run_id = dr.id
+                    where dr.id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(statuses, ("failed", "failed"))
+            self.assertFalse(branch_contains_path(root, branch, "created-without-claim.txt"))
 
     def test_local_process_runner_request_id_replays_without_duplicate_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["task_id", "target_id"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "target_id": { "type": "string" }
+  }
+}

@@ -89,6 +89,38 @@ class DispatchIntegrationTest(unittest.TestCase):
             self.assertEqual(status, "integrated")
             self.assertEqual(cleaned, 2)
 
+    def test_integrate_uses_isolated_worktree_and_preserves_dirty_main_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_harness(root, "init")
+            run_id = "RUN4"
+            a = commit_branch(root, run_id, "T1", "developer", "base.txt", "agent\n")
+            record_run_and_worktrees(root, run_id, [("T1", "developer", *a)])
+            harness_db.validate_runtime = lambda _root, delivery=False: []
+            original_branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            root_literal = root.as_posix().replace("'", "'\"'\"'")
+            checkout_log = root / "root-checkout.log"
+            hook = root / ".git/hooks/post-checkout"
+            hook.write_text(
+                f"#!/bin/sh\nROOT='{root_literal}'\nif [ \"$PWD\" = \"$ROOT\" ]; then echo root-checkout >> \"$ROOT/root-checkout.log\"; fi\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            (root / "base.txt").write_text("user draft\n", encoding="utf-8")
+
+            target = harness_db.dispatch_integrate(root, run_id)
+
+            current_branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            integrated_file = subprocess.run(["git", "show", f"{target}:base.txt"], cwd=root, text=True, capture_output=True, check=True)
+            dirty_status = subprocess.run(["git", "status", "--short", "--", "base.txt"], cwd=root, text=True, capture_output=True, check=True)
+            self.assertEqual(target, "integration/RUN4")
+            self.assertEqual(current_branch, original_branch)
+            self.assertEqual((root / "base.txt").read_text(encoding="utf-8"), "user draft\n")
+            self.assertEqual(integrated_file.stdout, "agent\n")
+            self.assertTrue(dirty_status.stdout.startswith(" M "))
+            self.assertFalse(checkout_log.exists())
+
     def test_integrate_records_finding_on_merge_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
