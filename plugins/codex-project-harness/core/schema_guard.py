@@ -35,6 +35,9 @@ TRUST_ANCHORS = {"local-only", "human-confirmed", "external-session", "ci"}
 SANDBOX_PROFILES = {"none", "no-network"}
 SANDBOX_STATUSES = {"", "available", "unavailable"}
 CI_CONCLUSIONS = {"success", "failure", "cancelled", "skipped"}
+EXTERNAL_SESSION_CONCLUSIONS = {"verified", "failed"}
+ANCHOR_ORIGINS = {"manual", "connector"}
+CODE_IDENTITY_MODES = {"auto", "git", "content-hash"}
 
 
 def require_text(label: str, value: str) -> None:
@@ -113,8 +116,21 @@ def validate_sandbox_profile(sandbox_profile: str) -> None:
     require_choice("sandbox profile", sandbox_profile, SANDBOX_PROFILES)
 
 
-def validate_ci_verification(provider: str, run_id: str, conclusion: str, commit_sha: str) -> None:
+def validate_ci_verification(provider: str, run_id: str, conclusion: str, commit_sha: str, origin: str = "manual") -> None:
     require_text("ci provider", provider)
     require_text("ci run id", run_id)
     require_choice("ci conclusion", conclusion, CI_CONCLUSIONS)
     require_text("ci commit sha", commit_sha)
+    require_choice("ci origin", origin, ANCHOR_ORIGINS)
+
+
+def validate_external_session_verification(session_id: str, verifier: str, conclusion: str, commit_sha: str, origin: str = "manual") -> None:
+    require_text("external session id", session_id)
+    require_text("external session verifier", verifier)
+    require_choice("external session conclusion", conclusion, EXTERNAL_SESSION_CONCLUSIONS)
+    require_text("external session commit sha", commit_sha)
+    require_choice("external session origin", origin, ANCHOR_ORIGINS)
+
+
+def validate_code_identity_mode(mode: str) -> None:
+    require_choice("code identity mode", mode, CODE_IDENTITY_MODES)

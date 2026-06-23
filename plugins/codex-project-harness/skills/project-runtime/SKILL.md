@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 12`, `harness.py --root . migrate --from-version markdown-v1 --to-version 12 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 13`, `harness.py --root . migrate --from-version markdown-v1 --to-version 13 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -55,7 +55,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | Record adapter link | `harness.py --root . adapter record` |
 | Plan adapter action | `harness.py --root . adapter plan`, `harness.py --root . adapter draft`, `harness.py --root . adapter confirm`, `harness.py --root . adapter complete`, `harness.py --root . adapter reconcile` |
 | Checkpoint / audit events | `harness.py --root . checkpoint create`, `harness.py --root . checkpoint export`, `harness.py --root . checkpoint import`, `harness.py --root . event validate` |
-| Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . executor allow-prefix add --prefix "pytest" --reason "test runner"`, `harness.py --root . dispatch run --agent developer --target UNIT --command "pytest"`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
+| Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . executor allow-prefix add --prefix "pytest" --reason "test runner"`, `harness.py --root . dispatch run --agent developer --target UNIT --command "pytest" --code-identity content-hash`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
 | Sweep expired accepted risk | `harness.py --root . risk sweep-expired` |
 | Kernel diagnostics / projections | `harness.py --root . kernel doctor`, `harness.py --root . invariant validate`, `harness.py --root . projection rebuild` |
 | Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
@@ -143,7 +143,16 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . test-target ad
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch run \
   --agent developer \
   --target PROFILE_CRUD_TEST \
-  --command "npm test -- profile-crud"
+  --command "npm test -- profile-crud" \
+  --code-identity content-hash
+
+python3 plugins/codex-project-harness/scripts/harness.py --root . adapter external-session-verify \
+  --session-id <session-id> \
+  --verifier <independent-session> \
+  --conclusion verified \
+  --commit-sha <current-commit-sha> \
+  --origin connector \
+  --verification-token <connector-token>
 
 python3 plugins/codex-project-harness/scripts/harness.py --root . test record \
   --id TEST1 \
@@ -163,8 +172,10 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . validation rec
   --evidence <executor-evidence-id> \
   --target PROFILE_CRUD_TEST \
   --trust-anchor external-session \
-  --trust-anchor-id <session-id>
+  --trust-anchor-id <session-id>:<independent-session>
 ```
+
+For no-git projects, use `--code-identity content-hash` explicitly. For git projects, prefer the default git identity. Manual `ci` or `external-session` records are audit-only for high/critical risks; high-trust gates require connector-origin verification records with a token and current commit SHA.
 
 Record the independent quality gate before handoff:
 

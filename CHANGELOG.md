@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.0.1-beta.1 - 2026-06-23
+
+### Fixed
+
+- Delivery gates now fail closed when no committed code identity is available; no-git projects must explicitly use content-hash evidence.
+- Passing validation/evidence must carry a non-empty current source hash, and stdout artifacts are re-hashed at gate time to detect tampering.
+- Acceptance validation checks now scan all passing candidates and accept any trusted candidate instead of only inspecting the newest record.
+- `external-session` anchors must reference recorded external-session verification contracts.
+- CI anchors now distinguish `origin=manual` from `origin=connector`; only connector-origin records with verification tokens can cover high/critical failure modes.
+
+### Changed
+
+- Runtime schema version is now `13`; runtime implementation version is now `3.3.1`.
+- `dispatch run`, `validation record`, and `evidence record` support explicit `--code-identity content-hash` for no-git projects.
+- `adapter ci-verify` accepts optional `--origin` and `--verification-token`; `adapter external-session-verify` records independent-session verification contracts.
+
+### Boundaries
+
+- Manual CI/external-session records remain useful audit records, but they do not satisfy high/critical external trust gates.
+- This release still stops at verified code delivery and performs no deployment or real external writes.
+
 ## v1.0.0-beta.1 - 2026-06-23
 
 ### Added

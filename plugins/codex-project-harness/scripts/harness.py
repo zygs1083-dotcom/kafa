@@ -55,6 +55,7 @@ from core.api import (
     record_decision,
     record_delivery,
     record_evidence,
+    record_external_session_verification,
     record_finding,
     record_gate,
     record_test,
@@ -268,6 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--trust-anchor-id", default="")
     validation_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     validation_record.add_argument("--reason", default="")
+    validation_record.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
 
     test_target = sub.add_parser("test-target")
     test_target_sub = test_target.add_subparsers(dest="test_target_command", required=True)
@@ -304,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_record.add_argument("--trust-anchor-id", default="")
     evidence_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     evidence_record.add_argument("--reason", default="")
+    evidence_record.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
 
     test = sub.add_parser("test")
     test_sub = test.add_subparsers(dest="test_command", required=True)
@@ -385,6 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_ci.add_argument("--conclusion", required=True, choices=["success", "failure", "cancelled", "skipped"])
     adapter_ci.add_argument("--commit-sha", required=True)
     adapter_ci.add_argument("--external-link", default="")
+    adapter_ci.add_argument("--origin", default="manual", choices=["manual", "connector"])
+    adapter_ci.add_argument("--verification-token", default="")
+    adapter_session = adapter_sub.add_parser("external-session-verify")
+    adapter_session.add_argument("--session-id", required=True)
+    adapter_session.add_argument("--verifier", required=True)
+    adapter_session.add_argument("--conclusion", required=True, choices=["verified", "failed"])
+    adapter_session.add_argument("--commit-sha", required=True)
+    adapter_session.add_argument("--external-link", default="")
+    adapter_session.add_argument("--origin", default="manual", choices=["manual", "connector"])
+    adapter_session.add_argument("--verification-token", default="")
     adapter_sub.add_parser("reconcile")
 
     risk = sub.add_parser("risk")
@@ -433,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_run.add_argument("--no-network", action="store_true")
     dispatch_run.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     dispatch_run.add_argument("--executed-count", type=int)
+    dispatch_run.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
     dispatch_sub.add_parser("recover-stale")
     dispatch_sub.add_parser("status")
 
@@ -641,6 +655,7 @@ def main() -> int:
                 trust_anchor=args.trust_anchor,
                 trust_anchor_id=args.trust_anchor_id,
                 allow_unlisted_reason=args.reason,
+                code_identity=args.code_identity,
             )
             print("OK: validation recorded")
         elif args.command == "test-target" and args.test_target_command == "add":
@@ -671,6 +686,7 @@ def main() -> int:
                 trust_anchor=args.trust_anchor,
                 trust_anchor_id=args.trust_anchor_id,
                 allow_unlisted_reason=args.reason,
+                code_identity=args.code_identity,
             )
             print(f"OK: evidence recorded {args.id}")
         elif args.command == "test" and args.test_command == "record":
@@ -735,8 +751,29 @@ def main() -> int:
             adapter_transition(root, args.id, "completed", external_id=args.external_id, external_link=args.external_link)
             print(f"OK: adapter action completed {args.id}")
         elif args.command == "adapter" and args.adapter_command == "ci-verify":
-            verification_id = record_ci_verification(root, args.provider, args.run_id, args.conclusion, args.commit_sha, external_link=args.external_link)
+            verification_id = record_ci_verification(
+                root,
+                args.provider,
+                args.run_id,
+                args.conclusion,
+                args.commit_sha,
+                external_link=args.external_link,
+                origin=args.origin,
+                verification_token=args.verification_token,
+            )
             print(f"OK: ci verification recorded {verification_id}")
+        elif args.command == "adapter" and args.adapter_command == "external-session-verify":
+            verification_id = record_external_session_verification(
+                root,
+                args.session_id,
+                args.verifier,
+                args.conclusion,
+                args.commit_sha,
+                external_link=args.external_link,
+                origin=args.origin,
+                verification_token=args.verification_token,
+            )
+            print(f"OK: external session verification recorded {verification_id}")
         elif args.command == "adapter" and args.adapter_command == "reconcile":
             issues = adapter_reconcile(root)
             if issues:
@@ -793,6 +830,7 @@ def main() -> int:
                 sandbox_profile=args.sandbox_profile,
                 allow_unlisted_reason=args.reason,
                 executed_count=args.executed_count,
+                code_identity=args.code_identity,
             )
             print(f"OK: dispatch command evidence {evidence_id}")
         elif args.command == "dispatch" and args.dispatch_command == "recover-stale":

@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Codex Project Harness CI Verification",
+  "title": "Codex Project Harness External Session Verification",
   "type": "object",
-  "required": ["id", "provider", "run_id", "conclusion", "commit_sha", "origin", "created_at"],
+  "required": ["id", "session_id", "verifier", "conclusion", "commit_sha", "origin", "created_at"],
   "properties": {
     "id": { "type": "string" },
-    "provider": { "type": "string" },
-    "run_id": { "type": "string" },
-    "conclusion": { "type": "string", "enum": ["success", "failure", "cancelled", "skipped"] },
+    "session_id": { "type": "string" },
+    "verifier": { "type": "string" },
+    "conclusion": { "type": "string", "enum": ["verified", "failed"] },
     "commit_sha": { "type": "string" },
     "origin": { "type": "string", "enum": ["manual", "connector"] },
     "verification_token": { "type": "string" },

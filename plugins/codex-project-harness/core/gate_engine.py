@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
 from pathlib import Path
 
-from harness_lib import git_dirty, git_head_sha, git_source_tree_hash
+from harness_lib import content_source_tree_hash, git_dirty, git_head_sha, git_source_tree_hash
 from .executor import command_matches_template
 
 
@@ -13,15 +14,20 @@ def _value(row: sqlite3.Row, field: str) -> object:
     return row[field] if field in row.keys() else None
 
 
-def _artifact_is_available(root: Path, artifact_path: str) -> bool:
+def _artifact_digest(root: Path, artifact_path: str) -> tuple[bool, str, str]:
     if not artifact_path:
-        return False
+        return False, "", ""
     candidate = (root / artifact_path).resolve()
     try:
         candidate.relative_to(root.resolve())
     except ValueError:
-        return False
-    return candidate.exists() and candidate.is_file()
+        return False, "", ""
+    if not candidate.exists() or not candidate.is_file():
+        return False, "", ""
+    data = candidate.read_bytes()
+    if not data:
+        return True, "", "empty"
+    return True, hashlib.sha256(data).hexdigest(), ""
 
 
 def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, *, label: str) -> list[str]:
@@ -45,9 +51,19 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
         issues.append(f"{label} missing stdout_sha256")
     if not artifact_path:
         issues.append(f"{label} missing artifact_path")
-    elif not _artifact_is_available(root, artifact_path):
-        issues.append(f"{label} artifact unavailable: {artifact_path}")
-    if current_source_hash and source_tree_hash != current_source_hash:
+    else:
+        artifact_available, artifact_sha, artifact_issue = _artifact_digest(root, artifact_path)
+        if not artifact_available:
+            issues.append(f"{label} artifact unavailable: {artifact_path}")
+        elif artifact_issue == "empty":
+            issues.append(f"{label} artifact is empty: {artifact_path}")
+        elif stdout_sha256 and artifact_sha != stdout_sha256:
+            issues.append(f"{label} stdout_sha256 mismatch: stored={stdout_sha256} artifact={artifact_sha}")
+    if not source_tree_hash:
+        issues.append(f"{label} missing source_tree_hash")
+    elif not current_source_hash:
+        issues.append("delivery requires a committed code identity")
+    elif source_tree_hash != current_source_hash:
         issues.append(f"{label} source_tree_hash mismatch: evidence={source_tree_hash} current={current_source_hash}")
     if not target_id:
         issues.append(f"{label} missing target")
@@ -66,8 +82,24 @@ def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha
     issues: list[str] = []
     if require_external and trust_anchor not in {"ci", "external-session"}:
         issues.append(f"requires ci or external-session trust anchor: trust_anchor={trust_anchor}")
-    if trust_anchor == "external-session" and not trust_anchor_id:
-        issues.append("external-session trust anchor requires trust_anchor_id")
+    if trust_anchor == "external-session":
+        if not trust_anchor_id:
+            issues.append("external-session trust anchor requires trust_anchor_id")
+        else:
+            verification = conn.execute("select * from external_session_verifications where id = ?", (trust_anchor_id,)).fetchone()
+            if not verification:
+                issues.append(f"missing external-session verification: {trust_anchor_id}")
+            else:
+                if verification["conclusion"] != "verified":
+                    issues.append(f"external-session verification is not verified: {verification['conclusion']}")
+                if require_external and verification["origin"] != "connector":
+                    issues.append(f"external-session verification origin is not connector: {verification['origin']}")
+                if require_external and not verification["verification_token"]:
+                    issues.append("external-session verification requires connector verification_token")
+                if not current_sha:
+                    issues.append("external-session verification requires git HEAD")
+                elif verification["commit_sha"] != current_sha:
+                    issues.append(f"external-session verification sha mismatch: session={verification['commit_sha']} current={current_sha}")
     if trust_anchor == "ci":
         if not trust_anchor_id:
             issues.append("ci trust anchor requires trust_anchor_id")
@@ -78,6 +110,10 @@ def _trust_anchor_issues(conn: sqlite3.Connection, row: sqlite3.Row, current_sha
             else:
                 if ci["conclusion"] != "success":
                     issues.append(f"ci verification is not success: {ci['conclusion']}")
+                if require_external and ci["origin"] != "connector":
+                    issues.append(f"ci verification origin is not connector: {ci['origin']}")
+                if require_external and not ci["verification_token"]:
+                    issues.append("ci verification requires connector verification_token")
                 if not current_sha:
                     issues.append("ci verification requires git HEAD")
                 elif ci["commit_sha"] != current_sha:
@@ -131,40 +167,57 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
         issues.append(f"task is not accepted: {task['id']} status={task['status']}")
 
     current_sha = git_head_sha(root)
-    current_source_hash = (git_source_tree_hash(root) or "") if current_sha else ""
+    if current_sha:
+        current_source_hash = git_source_tree_hash(root) or ""
+    else:
+        current_source_hash = content_source_tree_hash(root)
     validations = conn.execute("select id, surface, result, source_tree_hash from validations order by created_at, id").fetchall()
     if not validations:
         issues.append("delivery requires validation evidence")
+    has_content_identity = False
     for validation in validations:
         if validation["result"] != "pass":
             issues.append(f"validation is not pass: {validation['surface']}={validation['result']}")
-        if current_sha and validation["source_tree_hash"] and validation["source_tree_hash"] != current_source_hash:
+        if str(validation["source_tree_hash"] or "").startswith("content:"):
+            has_content_identity = True
+        if validation["result"] == "pass" and not validation["source_tree_hash"]:
+            issues.append(f"validation source tree hash is empty: {validation['surface']}")
+        if validation["source_tree_hash"] and validation["source_tree_hash"] != current_source_hash:
             issues.append(
                 f"validation source tree hash does not match current code: {validation['surface']} "
                 f"validation={validation['source_tree_hash']} current={current_source_hash}"
             )
+    if not current_sha and not has_content_identity:
+        issues.append("delivery requires a committed code identity")
 
     active_acceptance = conn.execute("select id from acceptance where status != 'cancelled' order by id").fetchall()
     for acceptance in active_acceptance:
-        validation = conn.execute(
+        candidates = conn.execute(
             """
-            select id from validations
+            select * from validations
             where acceptance_id = ? and result = 'pass'
             order by created_at desc, id desc
-            limit 1
             """,
             (acceptance["id"],),
-        ).fetchone()
-        if not validation:
+        ).fetchall()
+        if not candidates:
             issues.append(f"acceptance has no passing validation: {acceptance['id']}")
-        elif not validation_has_test_or_evidence(conn, validation["id"]):
-            issues.append(f"acceptance validation lacks linked passing test or evidence: {acceptance['id']}")
         else:
-            validation_row = conn.execute("select * from validations where id = ?", (validation["id"],)).fetchone()
-            trusted_issues = validation_trusted_command_issues(conn, validation_row, root, current_source_hash, current_sha)
-            if trusted_issues:
+            candidate_issues: list[str] = []
+            trusted = False
+            for validation in candidates:
+                if not validation_has_test_or_evidence(conn, validation["id"]):
+                    candidate_issues.append(f"{validation['id']}: lacks linked passing test or evidence")
+                    continue
+                trusted_issues = validation_trusted_command_issues(conn, validation, root, current_source_hash, current_sha)
+                if trusted_issues:
+                    candidate_issues.append(f"{validation['id']}: {'; '.join(trusted_issues)}")
+                    continue
+                trusted = True
+                break
+            if not trusted:
                 issues.append(
-                    f"acceptance validation lacks trusted command evidence: {acceptance['id']} ({'; '.join(trusted_issues)})"
+                    f"acceptance validation lacks trusted command evidence: {acceptance['id']} ({'; '.join(candidate_issues)})"
                 )
 
     risky_failure_modes = conn.execute(

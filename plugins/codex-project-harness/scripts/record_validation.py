@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--trust-anchor-id", default="")
     parser.add_argument("--sandbox-profile", default="none")
     parser.add_argument("--reason", default="")
+    parser.add_argument("--code-identity", default="auto")
     args = parser.parse_args()
     command = [
         "validation",
@@ -73,6 +74,8 @@ def main() -> int:
         command.extend(["--sandbox-profile", args.sandbox_profile])
     if args.reason:
         command.extend(["--reason", args.reason])
+    if args.code_identity:
+        command.extend(["--code-identity", args.code_identity])
     for failure_mode in args.failure_mode:
         command.extend(["--failure-mode", failure_mode])
     for test in args.test:

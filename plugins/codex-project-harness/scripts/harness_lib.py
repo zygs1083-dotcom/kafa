@@ -19,6 +19,11 @@ HARNESS_GIT_PREFIXES = (
     ".codex/agents/",
     "docs/harness/",
 )
+CONTENT_HASH_EXCLUDE_PREFIXES = HARNESS_GIT_PREFIXES + (
+    ".git/",
+    "__pycache__/",
+    ".pytest_cache/",
+)
 
 
 def now_iso() -> str:
@@ -158,6 +163,29 @@ def git_source_tree_hash(root: Path) -> str | None:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def content_source_tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        relpath = path.relative_to(root).as_posix()
+        if relpath.startswith(CONTENT_HASH_EXCLUDE_PREFIXES):
+            continue
+        digest.update(relpath.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"content:{digest.hexdigest()}"
+
+
+def source_tree_hash_for_mode(root: Path, mode: str = "auto") -> str:
+    if mode == "content-hash":
+        return content_source_tree_hash(root)
+    if mode == "git":
+        return git_source_tree_hash(root) or ""
+    if mode == "auto":
+        return git_source_tree_hash(root) or ""
+    raise ValueError(f"unknown code identity mode: {mode}")
 
 
 def git_base_commit(root: Path) -> str | None:

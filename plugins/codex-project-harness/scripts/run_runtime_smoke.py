@@ -56,6 +56,12 @@ def scenario_full_project() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         ensure_dummy_unittest(root)
+        subprocess.run(["git", "init"], cwd=root, text=True, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "smoke@example.com"], cwd=root, text=True, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "Smoke Runner"], cwd=root, text=True, capture_output=True, check=True)
+        subprocess.run(["git", "add", "test_harness_dummy.py"], cwd=root, text=True, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "smoke baseline"], cwd=root, text=True, capture_output=True, check=True)
+        commit_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
         commands = []
         commands.append(run(root, "init"))
         commands.append(run(root, "phase", "project_bootstrap"))
@@ -81,11 +87,14 @@ def scenario_full_project() -> dict[str, object]:
         reviewer_token = token(review.stdout) if review.returncode == 0 else ""
         commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
         commands.append(run(root, "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", TEST_COMMAND, "--description", "Smoke unit target"))
-        evidence = run(root, "dispatch", "run", "--agent", "developer", "--target", "TARGET1", "--command", TEST_COMMAND)
+        evidence = run(root, "dispatch", "run", "--agent", "developer", "--target", "TARGET1", "--command", TEST_COMMAND, "--code-identity", "git")
         commands.append(evidence)
         evidence_id = evidence.stdout.strip().rsplit(" ", 1)[-1] if evidence.returncode == 0 else "EV1"
         commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", evidence_id))
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", "smoke-session-1"))
+        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector", "--verification-token", "smoke-token")
+        commands.append(session)
+        session_id = session.stdout.strip().rsplit(" ", 1)[-1] if session.returncode == 0 else "smoke-session-1:smoke-verifier"
+        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", session_id, "--code-identity", "git"))
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
         commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
@@ -129,7 +138,7 @@ def scenario_directed_invariant_benchmark() -> dict[str, object]:
             conn.executemany(
                 """
                 insert into events (id, schema_version, type, source, target, payload_json, created_at)
-                values (?, 12, 'benchmark_event', 'smoke', 'project', '{}', ?)
+                values (?, 13, 'benchmark_event', 'smoke', 'project', '{}', ?)
                 """,
                 [(f"bench-event-{i}", now) for i in range(5000)],
             )

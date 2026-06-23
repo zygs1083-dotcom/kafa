@@ -19,12 +19,12 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso
-from core.schema_guard import ADAPTER_MODES, CI_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
+from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
+from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXTERNAL_SESSION_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
 
 
-SCHEMA_VERSION = 12
-RUNTIME_VERSION = "3.3.0"
+SCHEMA_VERSION = 13
+RUNTIME_VERSION = "3.3.1"
 DB_PATH = Path(".ai-team/state/harness.db")
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -126,6 +126,7 @@ SNAPSHOT_TABLES = [
     "adapters",
     "adapter_actions",
     "ci_verifications",
+    "external_session_verifications",
     "invalidations",
     "agents",
     "agent_capabilities",
@@ -513,9 +514,23 @@ def create_schema(conn: sqlite3.Connection) -> None:
             run_id text not null,
             conclusion text not null,
             commit_sha text not null,
+            origin text not null default 'manual',
+            verification_token text not null default '',
             external_link text not null default '',
             created_at text not null,
             unique(provider, run_id)
+        );
+        create table if not exists external_session_verifications (
+            id text primary key,
+            session_id text not null,
+            verifier text not null,
+            conclusion text not null,
+            commit_sha text not null,
+            origin text not null default 'manual',
+            verification_token text not null default '',
+            external_link text not null default '',
+            created_at text not null,
+            unique(session_id, verifier)
         );
         create table if not exists agent_capabilities (
             agent_id text not null references agents(id) on delete cascade,
@@ -623,6 +638,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "evidence", "policy_status", "text not null default ''")
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
+    ensure_column(conn, "ci_verifications", "origin", "text not null default 'manual'")
+    ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
     ensure_default_executor_allowlist(conn)
 
 
@@ -2247,12 +2264,14 @@ def record_validation(
     trust_anchor: str = "local-only",
     trust_anchor_id: str = "",
     allow_unlisted_reason: str = "",
+    code_identity: str = "auto",
 ) -> None:
     guard_schema("validate_validation", surface, findings, result)
     guard_schema("validate_trust_anchor", trust_anchor)
     guard_schema("validate_sandbox_profile", "no-network" if no_network else sandbox_profile)
+    guard_schema("validate_code_identity_mode", code_identity)
     current_sha = git_head_sha(root) or "no-git"
-    source_hash = git_source_tree_hash(root) or ""
+    source_hash = source_tree_hash_for_mode(root, code_identity)
     tracked_diff_hash = git_tracked_diff_hash(root) or ""
     artifact_path = normalize_artifact_path(root, artifact_path)
     (
@@ -2390,11 +2409,13 @@ def record_evidence(
     trust_anchor: str = "local-only",
     trust_anchor_id: str = "",
     allow_unlisted_reason: str = "",
+    code_identity: str = "auto",
 ) -> None:
     guard_schema("validate_trust_anchor", trust_anchor)
     guard_schema("validate_sandbox_profile", "no-network" if no_network else sandbox_profile)
+    guard_schema("validate_code_identity_mode", code_identity)
     artifact_path = normalize_artifact_path(root, artifact_path)
-    source_hash = git_source_tree_hash(root) or ""
+    source_hash = source_tree_hash_for_mode(root, code_identity)
     (
         executed_count_value,
         executed_count_source,
@@ -2686,20 +2707,65 @@ def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id:
     render_tooling_map(root)
 
 
-def record_ci_verification(root: Path, provider: str, run_id: str, conclusion: str, commit_sha: str, *, external_link: str = "") -> str:
-    guard_schema("validate_ci_verification", provider, run_id, conclusion, commit_sha)
+def record_ci_verification(
+    root: Path,
+    provider: str,
+    run_id: str,
+    conclusion: str,
+    commit_sha: str,
+    *,
+    external_link: str = "",
+    origin: str = "manual",
+    verification_token: str = "",
+) -> str:
+    guard_schema("validate_ci_verification", provider, run_id, conclusion, commit_sha, origin)
     verification_id = f"{provider}:{run_id}"
     with transaction(root, touched=[("ci_verification", verification_id)]) as conn:
         conn.execute(
             """
-            insert into ci_verifications (id, provider, run_id, conclusion, commit_sha, external_link, created_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into ci_verifications (id, provider, run_id, conclusion, commit_sha, origin, verification_token, external_link, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(provider, run_id) do update set conclusion=excluded.conclusion,
-              commit_sha=excluded.commit_sha, external_link=excluded.external_link, created_at=excluded.created_at
+              commit_sha=excluded.commit_sha, origin=excluded.origin, verification_token=excluded.verification_token,
+              external_link=excluded.external_link, created_at=excluded.created_at
             """,
-            (verification_id, provider, run_id, conclusion, commit_sha, external_link, now_iso()),
+            (verification_id, provider, run_id, conclusion, commit_sha, origin, verification_token, external_link, now_iso()),
         )
-        emit_event(conn, "ci_verification_recorded", payload(id=verification_id, provider=provider, run_id=run_id, conclusion=conclusion, commit_sha=commit_sha))
+        emit_event(conn, "ci_verification_recorded", payload(id=verification_id, provider=provider, run_id=run_id, conclusion=conclusion, commit_sha=commit_sha, origin=origin))
+    render_tooling_map(root)
+    return verification_id
+
+
+def record_external_session_verification(
+    root: Path,
+    session_id: str,
+    verifier: str,
+    conclusion: str,
+    commit_sha: str,
+    *,
+    external_link: str = "",
+    origin: str = "manual",
+    verification_token: str = "",
+) -> str:
+    guard_schema("validate_external_session_verification", session_id, verifier, conclusion, commit_sha, origin)
+    verification_id = f"{session_id}:{verifier}"
+    with transaction(root, touched=[("external_session_verification", verification_id)]) as conn:
+        conn.execute(
+            """
+            insert into external_session_verifications
+            (id, session_id, verifier, conclusion, commit_sha, origin, verification_token, external_link, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(session_id, verifier) do update set conclusion=excluded.conclusion,
+              commit_sha=excluded.commit_sha, origin=excluded.origin, verification_token=excluded.verification_token,
+              external_link=excluded.external_link, created_at=excluded.created_at
+            """,
+            (verification_id, session_id, verifier, conclusion, commit_sha, origin, verification_token, external_link, now_iso()),
+        )
+        emit_event(
+            conn,
+            "external_session_verification_recorded",
+            payload(id=verification_id, session_id=session_id, verifier=verifier, conclusion=conclusion, commit_sha=commit_sha, origin=origin),
+        )
     render_tooling_map(root)
     return verification_id
 
@@ -2922,8 +2988,10 @@ def dispatch_run(
     sandbox_profile: str = "none",
     allow_unlisted_reason: str = "",
     executed_count: int | None = None,
+    code_identity: str = "auto",
 ) -> str:
     from core.executor import LocalExecutor
+    guard_schema("validate_code_identity_mode", code_identity)
 
     with connection(root) as conn:
         active = conn.execute(
@@ -2960,7 +3028,7 @@ def dispatch_run(
         executed_count=executed_count,
     )
     evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
-    source_hash = git_source_tree_hash(root) or ""
+    source_hash = source_tree_hash_for_mode(root, code_identity)
     status = "completed" if result.exit_code == 0 else "failed"
     with transaction(root, touched=[("dispatch_assignment", assignment["task_id"]), ("evidence", evidence_id)]) as conn:
         conn.execute(
@@ -3152,6 +3220,9 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("validations", "sandbox_profile", {"none", "no-network"}, "validation sandbox profile"),
         ("evidence", "sandbox_profile", {"none", "no-network"}, "evidence sandbox profile"),
         ("ci_verifications", "conclusion", CI_CONCLUSIONS, "ci conclusion"),
+        ("ci_verifications", "origin", ANCHOR_ORIGINS, "ci origin"),
+        ("external_session_verifications", "conclusion", EXTERNAL_SESSION_CONCLUSIONS, "external session conclusion"),
+        ("external_session_verifications", "origin", ANCHOR_ORIGINS, "external session origin"),
     ]
     for table, column, allowed, label in enum_checks:
         id_column = "task_id" if table == "dispatch_assignments" else "id"
@@ -3263,6 +3334,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
         ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
+        ("external-session-verification.schema.json", "external_session_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from external_session_verifications")]),
         ("agent.schema.json", "agents", [row_snapshot(row) or {} for row in conn.execute("select * from agents")]),
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),
         ("dispatch-run.schema.json", "dispatch_runs", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_runs")]),

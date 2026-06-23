@@ -92,6 +92,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             "TARGET1",
             "--command",
             DEFAULT_TEST_COMMAND,
+            "--code-identity",
+            "content-hash",
         )
         evidence_id = evidence_result.stdout.strip().rsplit(" ", 1)[-1]
         run_script(root, "harness.py", "test", "record", "--id", "TEST1", "--surface", "Example behavior", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", evidence_id)
@@ -113,6 +115,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             evidence_id,
             "--target",
             "TARGET1",
+            "--code-identity",
+            "content-hash",
         ]
         if failure_mode:
             command.extend(["--failure-mode", "FM1"])
