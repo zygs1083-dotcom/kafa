@@ -138,6 +138,8 @@ For isolated local agent execution, explicitly use `dispatch run --runner local-
 
 For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>`. Import records raw worker reports only; run `dispatch verify-attempt --run-id <run-id> --task <task-id>` for each reported task before `dispatch integrate --run-id <run-id>`.
 
+When an AgentProvider is available, use `dispatch provider start --run-id <run-id> --provider <provider>`, then `dispatch provider collect --run-id <run-id>` or `dispatch provider reconcile --run-id <run-id>` to manage the session lifecycle. Provider output remains a raw report; never treat it as delivery evidence until `dispatch verify-attempt` reruns the linked target and records controller evidence. The repository does not call Codex APIs or create user-visible Codex sessions by itself; real providers are host-supplied.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:

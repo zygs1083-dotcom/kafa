@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "id",
+    "run_id",
+    "task_id",
+    "provider",
+    "provider_session_id",
+    "provider_job_id",
+    "agent_id",
+    "status",
+    "fence"
+  ],
+  "properties": {
+    "id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "provider": { "type": "string" },
+    "provider_session_id": { "type": "string" },
+    "provider_job_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "status": { "type": "string" },
+    "fence": { "type": "integer" },
+    "branch_name": { "type": "string" },
+    "worktree_path": { "type": "string" },
+    "input_json": { "type": "string" },
+    "report_id": { "type": "string" },
+    "attempt_id": { "type": "string" },
+    "last_error": { "type": "string" },
+    "spawned_at": { "type": "string" },
+    "heartbeat_at": { "type": "string" },
+    "lease_expires_at": { "type": "string" },
+    "collected_at": { "type": "string" },
+    "cancelled_at": { "type": "string" },
+    "finished_at": { "type": "string" }
+  }
+}
