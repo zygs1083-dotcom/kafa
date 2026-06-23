@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.4.0
+# Codex OS Runtime Layer v3.4.1
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.4.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, and task lease fencing. The repository release remains a beta release, while the runtime implementation version is `3.4.0` and the database schema version is `15`.
+Kernel v3.4.1 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, and command idempotency. The repository release remains a beta release, while the runtime implementation version is `3.4.1` and the database schema version is `16`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.4.0
+## Kernel v3.4.1
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -39,6 +39,12 @@ SQLite state tables remain the primary runtime fact source. Events are audit sup
 Tasks carry a monotonic `fence` value. `task claim` returns the current fence with the lease token. `task review` bumps the fence when reviewer ownership is handed off and returns the new fence. `task recover-stale` and `task release` also bump the fence so stale holders cannot use old tokens to overwrite later work.
 
 Write commands that hold a task lease accept `--fence`. When supplied, `task start`, `task heartbeat`, `task submit`, `task complete`, `task accept`, `task block`, and `task release` validate the fence inside the write transaction and fail with `fence-stale` before committing if the holder is stale. Omitting `--fence` remains backward compatible for older clients.
+
+## Command Idempotency
+
+Most mutating CLI commands accept `--request-id`. The runtime writes a `command_log` row in the same transaction as the first business mutation. A retry with the same request id and same semantic arguments returns the first stdout without reapplying the mutation. A retry with the same request id but different arguments fails with `idempotency-conflict`.
+
+`init`, `migrate`, `repair`, and `checkpoint create/import` are admin or restore operations and do not support `--request-id` in this release.
 
 ## Fail-Closed Evidence Identity
 
@@ -70,7 +76,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 15
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 16
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild

@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.1.1-beta.1 - 2026-06-23
+
+### Added
+
+- Command-level idempotency for mutating CLI commands via `--request-id`.
+- `command_log` records request id, command name, stable argument hash, first stdout, and creation time.
+- Duplicate requests with the same arguments return the first stdout without reapplying the mutation.
+- Duplicate request ids with different arguments fail with `idempotency-conflict`.
+
+### Changed
+
+- Runtime schema version is now `16`; runtime implementation version is now `3.4.1`.
+- Admin/restore commands `init`, `migrate`, `repair`, and `checkpoint create/import` remain outside request-id idempotency for this release.
+
+### Boundaries
+
+- This release does not change task fencing, HMAC trust anchors, delivery gates, invariant logic, dispatch internals, or `core/store.py`.
+
 ## v1.1.0-beta.1 - 2026-06-23
 
 ### Added

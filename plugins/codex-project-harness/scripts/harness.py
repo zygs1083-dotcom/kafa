@@ -76,6 +76,7 @@ from core.api import (
     validate_events,
     validate_runtime,
     review_task,
+    run_idempotent,
 )
 
 
@@ -83,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="Target project root")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_request_id(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--request-id")
 
     init_parser = sub.add_parser("init")
     init_parser.add_argument("--dry-run", action="store_true")
@@ -104,12 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
     phase.add_argument("phase")
     phase.add_argument("--status")
     phase.add_argument("--owner")
+    add_request_id(phase)
 
     scope = sub.add_parser("scope")
     scope_sub = scope.add_subparsers(dest="scope_command", required=True)
     scope_confirm = scope_sub.add_parser("confirm")
     scope_confirm.add_argument("--by", required=True)
     scope_confirm.add_argument("--summary", required=True)
+    add_request_id(scope_confirm)
 
     baseline = sub.add_parser("baseline")
     baseline_sub = baseline.add_subparsers(dest="baseline_command", required=True)
@@ -117,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_freeze.add_argument("--id", required=True)
     baseline_freeze.add_argument("--summary", required=True)
     baseline_freeze.add_argument("--by", default="")
+    add_request_id(baseline_freeze)
     baseline_diff_parser = baseline_sub.add_parser("diff")
     baseline_diff_parser.add_argument("--from", dest="from_id", required=True)
     baseline_diff_parser.add_argument("--to", default="current")
@@ -129,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_add.add_argument("--criterion", required=True)
     acceptance_add.add_argument("--priority", default="")
     acceptance_add.add_argument("--tool-link", default="")
+    add_request_id(acceptance_add)
 
     requirement = sub.add_parser("requirement")
     requirement_sub = requirement.add_subparsers(dest="requirement_command", required=True)
@@ -139,9 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     requirement_add.add_argument("--priority", default="")
     requirement_add.add_argument("--status", default="active")
     requirement_add.add_argument("--tool-link", default="")
+    add_request_id(requirement_add)
     requirement_link = requirement_sub.add_parser("link")
     requirement_link.add_argument("--requirement", required=True)
     requirement_link.add_argument("--acceptance", required=True)
+    add_request_id(requirement_link)
 
     trace = sub.add_parser("trace")
     trace_sub = trace.add_subparsers(dest="trace_command", required=True)
@@ -166,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     fm_add.add_argument("--acceptance-reason", default="")
     fm_add.add_argument("--acceptance-scope", default="")
     fm_add.add_argument("--expires-at", default="")
+    add_request_id(fm_add)
 
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
@@ -179,11 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
     task_add.add_argument("--status", default="ready")
     task_add.add_argument("--evidence", default="")
     task_add.add_argument("--tool-link", default="")
+    add_request_id(task_add)
 
     task_update = task_sub.add_parser("update")
     task_update.add_argument("id")
     task_update.add_argument("--depends-on")
     task_update.add_argument("--status")
+    add_request_id(task_update)
 
     task_sub.add_parser("next")
 
@@ -191,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_claim.add_argument("id")
     task_claim.add_argument("--agent", required=True)
     task_claim.add_argument("--expected-revision", type=int, required=True)
+    add_request_id(task_claim)
 
     task_heartbeat = task_sub.add_parser("heartbeat")
     task_heartbeat.add_argument("id")
@@ -198,8 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_heartbeat.add_argument("--lease-token", required=True)
     task_heartbeat.add_argument("--expected-revision", type=int, required=True)
     task_heartbeat.add_argument("--fence", type=int)
+    add_request_id(task_heartbeat)
 
-    task_sub.add_parser("recover-stale")
+    task_recover = task_sub.add_parser("recover-stale")
+    add_request_id(task_recover)
 
     task_start = task_sub.add_parser("start")
     task_start.add_argument("id")
@@ -207,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_start.add_argument("--lease-token", required=True)
     task_start.add_argument("--expected-revision", type=int, required=True)
     task_start.add_argument("--fence", type=int)
+    add_request_id(task_start)
 
     task_submit = task_sub.add_parser("submit")
     task_submit.add_argument("id")
@@ -215,6 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_submit.add_argument("--expected-revision", type=int, required=True)
     task_submit.add_argument("--fence", type=int)
     task_submit.add_argument("--evidence", required=True)
+    add_request_id(task_submit)
 
     task_complete = task_sub.add_parser("complete")
     task_complete.add_argument("id")
@@ -223,11 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     task_complete.add_argument("--expected-revision", type=int, required=True)
     task_complete.add_argument("--fence", type=int)
     task_complete.add_argument("--evidence", required=True)
+    add_request_id(task_complete)
 
     task_review = task_sub.add_parser("review")
     task_review.add_argument("id")
     task_review.add_argument("--agent", required=True)
     task_review.add_argument("--expected-revision", type=int, required=True)
+    add_request_id(task_review)
 
     task_accept = task_sub.add_parser("accept")
     task_accept.add_argument("id")
@@ -236,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_accept.add_argument("--expected-revision", type=int, required=True)
     task_accept.add_argument("--fence", type=int)
     task_accept.add_argument("--evidence", required=True)
+    add_request_id(task_accept)
 
     task_block = task_sub.add_parser("block")
     task_block.add_argument("id")
@@ -244,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_block.add_argument("--expected-revision", type=int, required=True)
     task_block.add_argument("--fence", type=int)
     task_block.add_argument("--reason", required=True)
+    add_request_id(task_block)
 
     task_release = task_sub.add_parser("release")
     task_release.add_argument("id")
@@ -251,6 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_release.add_argument("--lease-token", required=True)
     task_release.add_argument("--expected-revision", type=int, required=True)
     task_release.add_argument("--fence", type=int)
+    add_request_id(task_release)
 
     validation = sub.add_parser("validation")
     validation_sub = validation.add_subparsers(dest="validation_command", required=True)
@@ -277,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     validation_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     validation_record.add_argument("--reason", default="")
     validation_record.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
+    add_request_id(validation_record)
 
     test_target = sub.add_parser("test-target")
     test_target_sub = test_target.add_subparsers(dest="test_target_command", required=True)
@@ -285,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     test_target_add.add_argument("--kind", required=True, choices=["unit", "integration", "lint", "build"])
     test_target_add.add_argument("--command-template", required=True)
     test_target_add.add_argument("--description", default="")
+    add_request_id(test_target_add)
     test_target_sub.add_parser("list")
 
     decision = sub.add_parser("decision")
@@ -292,6 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     decision_record = decision_sub.add_parser("record")
     decision_record.add_argument("--decision", required=True)
     decision_record.add_argument("--reason", required=True)
+    add_request_id(decision_record)
 
     evidence = sub.add_parser("evidence")
     evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
@@ -314,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_record.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     evidence_record.add_argument("--reason", default="")
     evidence_record.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
+    add_request_id(evidence_record)
 
     test = sub.add_parser("test")
     test_sub = test.add_subparsers(dest="test_command", required=True)
@@ -323,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     test_record.add_argument("--command", dest="test_command_text", default="")
     test_record.add_argument("--result", required=True, choices=["pass", "fail", "blocked", "partial"])
     test_record.add_argument("--evidence", default="")
+    add_request_id(test_record)
 
     finding = sub.add_parser("finding")
     finding_sub = finding.add_subparsers(dest="finding_command", required=True)
@@ -333,6 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
     finding_record.add_argument("--status", required=True, choices=["open", "resolved", "accepted", "false-positive"])
     finding_record.add_argument("--summary", required=True)
     finding_record.add_argument("--evidence", default="")
+    add_request_id(finding_record)
 
     gate = sub.add_parser("gate")
     gate_sub = gate.add_subparsers(dest="gate_command", required=True)
@@ -345,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate_record.add_argument("--blocking-findings", default="")
     gate_record.add_argument("--residual-risk", default="")
     gate_record.add_argument("--finding", action="append", default=[])
+    add_request_id(gate_record)
 
     delivery = sub.add_parser("delivery")
     delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
@@ -360,6 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
     delivery_record.add_argument("--collaboration-links", default="")
     delivery_record.add_argument("--known-gaps", default="")
     delivery_record.add_argument("--handoff", default="")
+    add_request_id(delivery_record)
 
     adapter = sub.add_parser("adapter")
     adapter_sub = adapter.add_subparsers(dest="adapter_command", required=True)
@@ -373,6 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_record.add_argument("--evidence", default="")
     adapter_record.add_argument("--fallback", default="")
     adapter_record.add_argument("--confirmation-needed", default="no")
+    add_request_id(adapter_record)
     adapter_plan_parser = adapter_sub.add_parser("plan")
     adapter_plan_parser.add_argument("--tool", required=True)
     adapter_plan_parser.add_argument("--mode", required=True, choices=["read-only", "draft-write", "write-confirm", "write-auto", "disabled"])
@@ -380,15 +412,19 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_plan_parser.add_argument("--action", required=True)
     adapter_plan_parser.add_argument("--payload-json", default="{}")
     adapter_plan_parser.add_argument("--idempotency-key", default="")
+    add_request_id(adapter_plan_parser)
     adapter_draft = adapter_sub.add_parser("draft")
     adapter_draft.add_argument("--id", required=True)
+    add_request_id(adapter_draft)
     adapter_confirm = adapter_sub.add_parser("confirm")
     adapter_confirm.add_argument("--id", required=True)
     adapter_confirm.add_argument("--confirmation", default="confirmed")
+    add_request_id(adapter_confirm)
     adapter_complete = adapter_sub.add_parser("complete")
     adapter_complete.add_argument("--id", required=True)
     adapter_complete.add_argument("--external-id", default="")
     adapter_complete.add_argument("--external-link", default="")
+    add_request_id(adapter_complete)
     adapter_ci = adapter_sub.add_parser("ci-verify")
     adapter_ci.add_argument("--provider", required=True)
     adapter_ci.add_argument("--run-id", required=True)
@@ -397,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_ci.add_argument("--external-link", default="")
     adapter_ci.add_argument("--origin", default="manual", choices=["manual", "connector"])
     adapter_ci.add_argument("--verification-token", default="")
+    add_request_id(adapter_ci)
     adapter_session = adapter_sub.add_parser("external-session-verify")
     adapter_session.add_argument("--session-id", required=True)
     adapter_session.add_argument("--verifier", required=True)
@@ -405,11 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_session.add_argument("--external-link", default="")
     adapter_session.add_argument("--origin", default="manual", choices=["manual", "connector"])
     adapter_session.add_argument("--verification-token", default="")
+    add_request_id(adapter_session)
     adapter_sub.add_parser("reconcile")
 
     risk = sub.add_parser("risk")
     risk_sub = risk.add_subparsers(dest="risk_command", required=True)
-    risk_sub.add_parser("sweep-expired")
+    risk_sweep = risk_sub.add_parser("sweep-expired")
+    add_request_id(risk_sweep)
 
     checkpoint = sub.add_parser("checkpoint")
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
@@ -436,11 +475,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_capability_add = agent_capability_sub.add_parser("add")
     agent_capability_add.add_argument("--agent", required=True)
     agent_capability_add.add_argument("--capability", required=True)
+    add_request_id(agent_capability_add)
 
     dispatch = sub.add_parser("dispatch")
     dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
     dispatch_plan_parser = dispatch_sub.add_parser("plan")
     dispatch_plan_parser.add_argument("--scope", required=True)
+    add_request_id(dispatch_plan_parser)
     dispatch_claim = dispatch_sub.add_parser("claim-next")
     dispatch_claim.add_argument("--agent", required=True)
     dispatch_run = dispatch_sub.add_parser("run")
@@ -454,7 +495,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_run.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     dispatch_run.add_argument("--executed-count", type=int)
     dispatch_run.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
-    dispatch_sub.add_parser("recover-stale")
+    add_request_id(dispatch_run)
+    dispatch_recover = dispatch_sub.add_parser("recover-stale")
+    add_request_id(dispatch_recover)
     dispatch_sub.add_parser("status")
 
     executor = sub.add_parser("executor")
@@ -464,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     executor_allow_add = executor_allow_sub.add_parser("add")
     executor_allow_add.add_argument("--prefix", required=True)
     executor_allow_add.add_argument("--reason", required=True)
+    add_request_id(executor_allow_add)
     executor_allow_sub.add_parser("list")
 
     invariant = sub.add_parser("invariant")
@@ -485,6 +529,12 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     root = Path(args.root).resolve()
+
+    def semantic_args() -> dict[str, object]:
+        return {key: value for key, value in vars(args).items() if key not in {"root", "request_id"}}
+
+    def mutate(command: str, fn) -> None:
+        print(run_idempotent(root, getattr(args, "request_id", None), command, semantic_args(), fn))
 
     try:
         if args.command == "init":
@@ -531,14 +581,11 @@ def main() -> int:
                 return 0
             print(f"OK: migrated {args.from_version}->{args.to_version}")
         elif args.command == "phase":
-            transition_phase(root, args.phase, status=args.status, owner=args.owner)
-            print(f"OK: phase={args.phase}")
+            mutate("phase.transition", lambda: (transition_phase(root, args.phase, status=args.status, owner=args.owner), f"OK: phase={args.phase}")[1])
         elif args.command == "scope" and args.scope_command == "confirm":
-            confirm_scope(root, args.by, args.summary)
-            print(f"OK: scope confirmed by {args.by}")
+            mutate("scope.confirm", lambda: (confirm_scope(root, args.by, args.summary), f"OK: scope confirmed by {args.by}")[1])
         elif args.command == "baseline" and args.baseline_command == "freeze":
-            freeze_baseline(root, args.id, args.summary, by=args.by)
-            print(f"OK: baseline frozen {args.id}")
+            mutate("baseline.freeze", lambda: (freeze_baseline(root, args.id, args.summary, by=args.by), f"OK: baseline frozen {args.id}")[1])
         elif args.command == "baseline" and args.baseline_command == "diff":
             print("\n".join(baseline_diff(root, args.from_id, args.to)))
         elif args.command == "baseline" and args.baseline_command == "validate":
@@ -549,14 +596,11 @@ def main() -> int:
                 return 1
             print("OK: baseline is current")
         elif args.command == "acceptance" and args.acceptance_command == "add":
-            add_acceptance(root, args.id, args.criterion, args.priority, args.tool_link)
-            print(f"OK: acceptance added {args.id}")
+            mutate("acceptance.add", lambda: (add_acceptance(root, args.id, args.criterion, args.priority, args.tool_link), f"OK: acceptance added {args.id}")[1])
         elif args.command == "requirement" and args.requirement_command == "add":
-            add_requirement(root, args.id, args.kind, args.body, priority=args.priority, status=args.status, tool_link=args.tool_link)
-            print(f"OK: requirement added {args.id}")
+            mutate("requirement.add", lambda: (add_requirement(root, args.id, args.kind, args.body, priority=args.priority, status=args.status, tool_link=args.tool_link), f"OK: requirement added {args.id}")[1])
         elif args.command == "requirement" and args.requirement_command == "link":
-            link_requirement_acceptance(root, args.requirement, args.acceptance)
-            print(f"OK: requirement linked {args.requirement}->{args.acceptance}")
+            mutate("requirement.link", lambda: (link_requirement_acceptance(root, args.requirement, args.acceptance), f"OK: requirement linked {args.requirement}->{args.acceptance}")[1])
         elif args.command == "trace" and args.trace_command == "show":
             print("\n".join(trace_show(root, args.requirement)))
         elif args.command == "trace" and args.trace_command == "validate":
@@ -567,41 +611,50 @@ def main() -> int:
                 return 1
             print("OK: traceability is valid")
         elif args.command == "failure-mode" and args.failure_mode_command == "add":
-            add_failure_mode(
-                root,
-                args.id,
-                args.feature,
-                args.scenario,
-                args.trigger,
-                args.expected,
-                risk=args.risk,
-                status=args.status,
-                acceptance=args.acceptance,
-                recovery=args.recovery,
-                data_safety=args.data_safety,
-                accepted_by=args.accepted_by,
-                acceptance_reason=args.acceptance_reason,
-                acceptance_scope=args.acceptance_scope,
-                expires_at=args.expires_at,
+            mutate(
+                "failure-mode.add",
+                lambda: (
+                    add_failure_mode(
+                        root,
+                        args.id,
+                        args.feature,
+                        args.scenario,
+                        args.trigger,
+                        args.expected,
+                        risk=args.risk,
+                        status=args.status,
+                        acceptance=args.acceptance,
+                        recovery=args.recovery,
+                        data_safety=args.data_safety,
+                        accepted_by=args.accepted_by,
+                        acceptance_reason=args.acceptance_reason,
+                        acceptance_scope=args.acceptance_scope,
+                        expires_at=args.expires_at,
+                    ),
+                    f"OK: failure mode added {args.id}",
+                )[1],
             )
-            print(f"OK: failure mode added {args.id}")
         elif args.command == "task" and args.task_command == "add":
-            add_task(
-                root,
-                args.id,
-                args.task,
-                owner=args.owner,
-                acceptance=args.acceptance,
-                failure_modes=", ".join(args.failure_mode),
-                depends_on=args.depends_on,
-                status=args.status,
-                evidence=args.evidence,
-                tool_link=args.tool_link,
+            mutate(
+                "task.add",
+                lambda: (
+                    add_task(
+                        root,
+                        args.id,
+                        args.task,
+                        owner=args.owner,
+                        acceptance=args.acceptance,
+                        failure_modes=", ".join(args.failure_mode),
+                        depends_on=args.depends_on,
+                        status=args.status,
+                        evidence=args.evidence,
+                        tool_link=args.tool_link,
+                    ),
+                    f"OK: task added {args.id}",
+                )[1],
             )
-            print(f"OK: task added {args.id}")
         elif args.command == "task" and args.task_command == "update":
-            update_task(root, args.id, depends_on=args.depends_on, status=args.status)
-            print(f"OK: task updated {args.id}")
+            mutate("task.update", lambda: (update_task(root, args.id, depends_on=args.depends_on, status=args.status), f"OK: task updated {args.id}")[1])
         elif args.command == "task" and args.task_command == "next":
             tasks = ready_tasks(root)
             if tasks:
@@ -609,178 +662,179 @@ def main() -> int:
             else:
                 print("NO_READY_TASKS")
         elif args.command == "task" and args.task_command == "claim":
-            token, fence = claim_task(root, args.id, args.agent, args.expected_revision)
-            print(f"OK: claimed {args.id} token={token} fence={fence}")
+            def claim_output() -> str:
+                token, fence = claim_task(root, args.id, args.agent, args.expected_revision)
+                return f"OK: claimed {args.id} token={token} fence={fence}"
+
+            mutate("task.claim", claim_output)
         elif args.command == "task" and args.task_command == "heartbeat":
-            heartbeat_task(root, args.id, args.agent, args.lease_token, args.expected_revision, expected_fence=args.fence)
-            print(f"OK: heartbeat {args.id}")
+            mutate("task.heartbeat", lambda: (heartbeat_task(root, args.id, args.agent, args.lease_token, args.expected_revision, expected_fence=args.fence), f"OK: heartbeat {args.id}")[1])
         elif args.command == "task" and args.task_command == "recover-stale":
-            recovered = recover_stale_leases(root)
-            print(f"OK: recovered {recovered} stale lease(s)")
+            mutate("task.recover-stale", lambda: f"OK: recovered {recover_stale_leases(root)} stale lease(s)")
         elif args.command == "task" and args.task_command == "start":
-            start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task started {args.id}")
+            mutate("task.start", lambda: (start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task started {args.id}")[1])
         elif args.command == "task" and args.task_command == "submit":
-            submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task submitted {args.id}")
+            mutate("task.submit", lambda: (submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task submitted {args.id}")[1])
         elif args.command == "task" and args.task_command == "complete":
-            complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task submitted {args.id}")
+            mutate("task.complete", lambda: (complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task submitted {args.id}")[1])
         elif args.command == "task" and args.task_command == "review":
-            token, fence = review_task(root, args.id, args.agent, args.expected_revision)
-            print(f"OK: task review started {args.id} token={token} fence={fence}")
+            def review_output() -> str:
+                token, fence = review_task(root, args.id, args.agent, args.expected_revision)
+                return f"OK: task review started {args.id} token={token} fence={fence}"
+
+            mutate("task.review", review_output)
         elif args.command == "task" and args.task_command == "accept":
-            accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task accepted {args.id}")
+            mutate("task.accept", lambda: (accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task accepted {args.id}")[1])
         elif args.command == "task" and args.task_command == "block":
-            block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task blocked {args.id}")
+            mutate("task.block", lambda: (block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task blocked {args.id}")[1])
         elif args.command == "task" and args.task_command == "release":
-            release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
-            print(f"OK: task released {args.id}")
+            mutate("task.release", lambda: (release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task released {args.id}")[1])
         elif args.command == "validation" and args.validation_command == "record":
-            record_validation(
-                root,
-                args.surface,
-                args.findings,
-                args.result,
-                acceptance=args.acceptance,
-                commands=args.commands,
-                risk=args.risk,
-                failure_modes=", ".join(args.failure_mode),
-                tests=", ".join(args.test),
-                evidence=", ".join(args.evidence),
-                command=args.validation_command_text,
-                exit_code=args.exit_code,
-                stdout_sha256=args.stdout_sha256,
-                artifact_path=args.artifact_path,
-                target_id=args.target,
-                executed_count=args.executed_count,
-                allow_unlisted=args.allow_unlisted,
-                no_network=args.no_network,
-                sandbox_profile=args.sandbox_profile,
-                trust_anchor=args.trust_anchor,
-                trust_anchor_id=args.trust_anchor_id,
-                allow_unlisted_reason=args.reason,
-                code_identity=args.code_identity,
+            mutate(
+                "validation.record",
+                lambda: (
+                    record_validation(
+                        root,
+                        args.surface,
+                        args.findings,
+                        args.result,
+                        acceptance=args.acceptance,
+                        commands=args.commands,
+                        risk=args.risk,
+                        failure_modes=", ".join(args.failure_mode),
+                        tests=", ".join(args.test),
+                        evidence=", ".join(args.evidence),
+                        command=args.validation_command_text,
+                        exit_code=args.exit_code,
+                        stdout_sha256=args.stdout_sha256,
+                        artifact_path=args.artifact_path,
+                        target_id=args.target,
+                        executed_count=args.executed_count,
+                        allow_unlisted=args.allow_unlisted,
+                        no_network=args.no_network,
+                        sandbox_profile=args.sandbox_profile,
+                        trust_anchor=args.trust_anchor,
+                        trust_anchor_id=args.trust_anchor_id,
+                        allow_unlisted_reason=args.reason,
+                        code_identity=args.code_identity,
+                    ),
+                    "OK: validation recorded",
+                )[1],
             )
-            print("OK: validation recorded")
         elif args.command == "test-target" and args.test_target_command == "add":
-            add_test_target(root, args.id, args.kind, args.command_template, args.description)
-            print(f"OK: test target recorded {args.id}")
+            mutate("test-target.add", lambda: (add_test_target(root, args.id, args.kind, args.command_template, args.description), f"OK: test target recorded {args.id}")[1])
         elif args.command == "test-target" and args.test_target_command == "list":
             print("\n".join(list_test_targets(root)))
         elif args.command == "decision" and args.decision_command == "record":
-            record_decision(root, args.decision, args.reason)
-            print("OK: decision recorded")
+            mutate("decision.record", lambda: (record_decision(root, args.decision, args.reason), "OK: decision recorded")[1])
         elif args.command == "evidence" and args.evidence_command == "record":
-            record_evidence(
-                root,
-                args.id,
-                args.kind,
-                args.summary,
-                uri=args.uri,
-                artifact_hash=args.hash,
-                command=args.evidence_command_text,
-                exit_code=args.exit_code,
-                stdout_sha256=args.stdout_sha256,
-                artifact_path=args.artifact_path,
-                target_id=args.target,
-                executed_count=args.executed_count,
-                allow_unlisted=args.allow_unlisted,
-                no_network=args.no_network,
-                sandbox_profile=args.sandbox_profile,
-                trust_anchor=args.trust_anchor,
-                trust_anchor_id=args.trust_anchor_id,
-                allow_unlisted_reason=args.reason,
-                code_identity=args.code_identity,
+            mutate(
+                "evidence.record",
+                lambda: (
+                    record_evidence(
+                        root,
+                        args.id,
+                        args.kind,
+                        args.summary,
+                        uri=args.uri,
+                        artifact_hash=args.hash,
+                        command=args.evidence_command_text,
+                        exit_code=args.exit_code,
+                        stdout_sha256=args.stdout_sha256,
+                        artifact_path=args.artifact_path,
+                        target_id=args.target,
+                        executed_count=args.executed_count,
+                        allow_unlisted=args.allow_unlisted,
+                        no_network=args.no_network,
+                        sandbox_profile=args.sandbox_profile,
+                        trust_anchor=args.trust_anchor,
+                        trust_anchor_id=args.trust_anchor_id,
+                        allow_unlisted_reason=args.reason,
+                        code_identity=args.code_identity,
+                    ),
+                    f"OK: evidence recorded {args.id}",
+                )[1],
             )
-            print(f"OK: evidence recorded {args.id}")
         elif args.command == "test" and args.test_command == "record":
-            record_test(root, args.id, args.surface, args.test_command_text, args.result, evidence_id=args.evidence)
-            print(f"OK: test recorded {args.id}")
+            mutate("test.record", lambda: (record_test(root, args.id, args.surface, args.test_command_text, args.result, evidence_id=args.evidence), f"OK: test recorded {args.id}")[1])
         elif args.command == "finding" and args.finding_command == "record":
-            record_finding(root, args.id, args.surface, args.severity, args.status, args.summary, evidence_id=args.evidence)
-            print(f"OK: finding recorded {args.id}")
+            mutate("finding.record", lambda: (record_finding(root, args.id, args.surface, args.severity, args.status, args.summary, evidence_id=args.evidence), f"OK: finding recorded {args.id}")[1])
         elif args.command == "gate" and args.gate_command == "record":
-            record_gate(
-                root,
-                args.reviewer_context,
-                args.result,
-                gate=args.gate,
-                commands=args.commands,
-                evidence=args.evidence,
-                blocking_findings=args.blocking_findings,
-                residual_risk=args.residual_risk,
-                findings=", ".join(args.finding),
+            mutate(
+                "gate.record",
+                lambda: (
+                    record_gate(
+                        root,
+                        args.reviewer_context,
+                        args.result,
+                        gate=args.gate,
+                        commands=args.commands,
+                        evidence=args.evidence,
+                        blocking_findings=args.blocking_findings,
+                        residual_risk=args.residual_risk,
+                        findings=", ".join(args.finding),
+                    ),
+                    f"OK: quality gate recorded {args.gate}={args.result}",
+                )[1],
             )
-            print(f"OK: quality gate recorded {args.gate}={args.result}")
         elif args.command == "delivery" and args.delivery_command == "record":
-            record_delivery(
-                root,
-                args.scope,
-                acceptance=args.acceptance,
-                changed_files=args.changed_files,
-                validation=args.validation,
-                qa=args.qa,
-                failure_mode_coverage=args.failure_mode_coverage,
-                quality_gate=args.quality_gate,
-                data_config_notes=args.data_config_notes,
-                collaboration_links=args.collaboration_links,
-                known_gaps=args.known_gaps,
-                handoff=args.handoff,
+            mutate(
+                "delivery.record",
+                lambda: (
+                    record_delivery(
+                        root,
+                        args.scope,
+                        acceptance=args.acceptance,
+                        changed_files=args.changed_files,
+                        validation=args.validation,
+                        qa=args.qa,
+                        failure_mode_coverage=args.failure_mode_coverage,
+                        quality_gate=args.quality_gate,
+                        data_config_notes=args.data_config_notes,
+                        collaboration_links=args.collaboration_links,
+                        known_gaps=args.known_gaps,
+                        handoff=args.handoff,
+                    ),
+                    "OK: delivery recorded",
+                )[1],
             )
-            print("OK: delivery recorded")
         elif args.command == "adapter" and args.adapter_command == "record":
-            record_adapter(
-                root,
-                args.tool,
-                args.mode,
-                args.artifact,
-                args.external_id,
-                args.idempotency_key,
-                external_link=args.external_link,
-                evidence=args.evidence,
-                fallback=args.fallback,
-                confirmation_needed=args.confirmation_needed,
+            mutate(
+                "adapter.record",
+                lambda: (
+                    record_adapter(
+                        root,
+                        args.tool,
+                        args.mode,
+                        args.artifact,
+                        args.external_id,
+                        args.idempotency_key,
+                        external_link=args.external_link,
+                        evidence=args.evidence,
+                        fallback=args.fallback,
+                        confirmation_needed=args.confirmation_needed,
+                    ),
+                    f"OK: adapter recorded {args.tool}",
+                )[1],
             )
-            print(f"OK: adapter recorded {args.tool}")
         elif args.command == "adapter" and args.adapter_command == "plan":
-            action_id = adapter_plan(root, args.tool, args.mode, args.artifact, args.action, payload_json=args.payload_json, idempotency_key=args.idempotency_key)
-            print(f"OK: adapter action planned {action_id}")
+            mutate("adapter.plan", lambda: f"OK: adapter action planned {adapter_plan(root, args.tool, args.mode, args.artifact, args.action, payload_json=args.payload_json, idempotency_key=args.idempotency_key)}")
         elif args.command == "adapter" and args.adapter_command == "draft":
-            adapter_transition(root, args.id, "draft")
-            print(f"OK: adapter action draft {args.id}")
+            mutate("adapter.draft", lambda: (adapter_transition(root, args.id, "draft"), f"OK: adapter action draft {args.id}")[1])
         elif args.command == "adapter" and args.adapter_command == "confirm":
-            adapter_transition(root, args.id, "confirmed", confirmation=args.confirmation)
-            print(f"OK: adapter action confirmed {args.id}")
+            mutate("adapter.confirm", lambda: (adapter_transition(root, args.id, "confirmed", confirmation=args.confirmation), f"OK: adapter action confirmed {args.id}")[1])
         elif args.command == "adapter" and args.adapter_command == "complete":
-            adapter_transition(root, args.id, "completed", external_id=args.external_id, external_link=args.external_link)
-            print(f"OK: adapter action completed {args.id}")
+            mutate("adapter.complete", lambda: (adapter_transition(root, args.id, "completed", external_id=args.external_id, external_link=args.external_link), f"OK: adapter action completed {args.id}")[1])
         elif args.command == "adapter" and args.adapter_command == "ci-verify":
-            verification_id = record_ci_verification(
-                root,
-                args.provider,
-                args.run_id,
-                args.conclusion,
-                args.commit_sha,
-                external_link=args.external_link,
-                origin=args.origin,
-                verification_token=args.verification_token,
+            mutate(
+                "adapter.ci-verify",
+                lambda: f"OK: ci verification recorded {record_ci_verification(root, args.provider, args.run_id, args.conclusion, args.commit_sha, external_link=args.external_link, origin=args.origin, verification_token=args.verification_token)}",
             )
-            print(f"OK: ci verification recorded {verification_id}")
         elif args.command == "adapter" and args.adapter_command == "external-session-verify":
-            verification_id = record_external_session_verification(
-                root,
-                args.session_id,
-                args.verifier,
-                args.conclusion,
-                args.commit_sha,
-                external_link=args.external_link,
-                origin=args.origin,
-                verification_token=args.verification_token,
+            mutate(
+                "adapter.external-session-verify",
+                lambda: f"OK: external session verification recorded {record_external_session_verification(root, args.session_id, args.verifier, args.conclusion, args.commit_sha, external_link=args.external_link, origin=args.origin, verification_token=args.verification_token)}",
             )
-            print(f"OK: external session verification recorded {verification_id}")
         elif args.command == "adapter" and args.adapter_command == "reconcile":
             issues = adapter_reconcile(root)
             if issues:
@@ -789,8 +843,7 @@ def main() -> int:
                 return 1
             print("OK: adapters reconciled")
         elif args.command == "risk" and args.risk_command == "sweep-expired":
-            count = sweep_expired_risks(root)
-            print(f"OK: swept {count} expired risk acceptance(s)")
+            mutate("risk.sweep-expired", lambda: f"OK: swept {sweep_expired_risks(root)} expired risk acceptance(s)")
         elif args.command == "checkpoint" and args.checkpoint_command == "create":
             checkpoint_id = create_checkpoint(root, args.label)
             print(f"OK: checkpoint created {checkpoint_id}")
@@ -817,37 +870,23 @@ def main() -> int:
                 return 1
             print("OK: events are audit-compatible")
         elif args.command == "agent" and args.agent_command == "capability" and args.agent_capability_command == "add":
-            add_agent_capability(root, args.agent, args.capability)
-            print(f"OK: agent capability added {args.agent}:{args.capability}")
+            mutate("agent.capability.add", lambda: (add_agent_capability(root, args.agent, args.capability), f"OK: agent capability added {args.agent}:{args.capability}")[1])
         elif args.command == "dispatch" and args.dispatch_command == "plan":
-            run_id = dispatch_plan(root, args.scope)
-            print(f"OK: dispatch planned {run_id}")
+            mutate("dispatch.plan", lambda: f"OK: dispatch planned {dispatch_plan(root, args.scope)}")
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")
         elif args.command == "dispatch" and args.dispatch_command == "run":
-            evidence_id = dispatch_run(
-                root,
-                args.agent,
-                args.dispatch_command_text,
-                timeout=args.timeout,
-                target_id=args.target,
-                allow_unlisted=args.allow_unlisted,
-                no_network=args.no_network,
-                sandbox_profile=args.sandbox_profile,
-                allow_unlisted_reason=args.reason,
-                executed_count=args.executed_count,
-                code_identity=args.code_identity,
+            mutate(
+                "dispatch.run",
+                lambda: f"OK: dispatch command evidence {dispatch_run(root, args.agent, args.dispatch_command_text, timeout=args.timeout, target_id=args.target, allow_unlisted=args.allow_unlisted, no_network=args.no_network, sandbox_profile=args.sandbox_profile, allow_unlisted_reason=args.reason, executed_count=args.executed_count, code_identity=args.code_identity)}",
             )
-            print(f"OK: dispatch command evidence {evidence_id}")
         elif args.command == "dispatch" and args.dispatch_command == "recover-stale":
-            count = dispatch_recover_stale(root)
-            print(f"OK: dispatch recovered {count} stale assignment(s)")
+            mutate("dispatch.recover-stale", lambda: f"OK: dispatch recovered {dispatch_recover_stale(root)} stale assignment(s)")
         elif args.command == "dispatch" and args.dispatch_command == "status":
             print("\n".join(dispatch_status(root)))
         elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "add":
-            add_executor_prefix(root, args.prefix, args.reason)
-            print(f"OK: executor prefix allowed {args.prefix}")
+            mutate("executor.allow-prefix.add", lambda: (add_executor_prefix(root, args.prefix, args.reason), f"OK: executor prefix allowed {args.prefix}")[1])
         elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "list":
             print("\n".join(list_executor_prefixes(root)))
         elif args.command == "invariant" and args.invariant_command == "validate":
