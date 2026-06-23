@@ -23,7 +23,10 @@
     "blocking_findings": { "type": "string" },
     "commands": { "type": "string" },
     "evidence": { "type": "string" },
-    "residual_risk": { "type": "string" }
+    "residual_risk": { "type": "string" },
+    "reviewer_session_id": { "type": "string" },
+    "reviewer_attestation_id": { "type": "string" },
+    "review_trust_level": { "type": "string", "enum": ["local-only", "human-confirmed", "connector"] }
   },
   "additionalProperties": true
 }

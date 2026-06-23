@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.8.0
+# Codex OS Runtime Layer v3.9.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.8.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, and auditable AgentProvider lifecycle tracking. The repository release remains a beta release, while the runtime implementation version is `3.8.0` and the database schema version is `20`.
+Kernel v3.9.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, and session attestation for independent QA. The repository release remains a beta release, while the runtime implementation version is `3.9.0` and the database schema version is `21`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.8.0
+## Kernel v3.9.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -78,6 +78,25 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verif
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
 ```
 
+## Session Attestation And Independent QA
+
+Independent QA is session-aware. `session attest` records an `agent_sessions` row plus a `session_attestations` row. Connector-origin attestations reuse the host-controlled connector HMAC key and validate the payload `agent-session:{session_id}:{agent_id}:{role}:{context_id}`. Without a key, connector-origin session attestations are recorded as manual and cannot satisfy high-trust independent QA.
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . session attest \
+  --session-id S-dev --agent developer --role developer --context-id ctx-dev
+python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 \
+  --agent developer --lease-token "<token>" --expected-revision 4 --fence "<fence>" \
+  --evidence "implemented" --session-id S-dev
+python3 plugins/codex-project-harness/scripts/harness.py --root . session attest \
+  --session-id S-qa --agent qa-reviewer --role qa-reviewer --context-id ctx-qa --origin connector
+python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
+  --reviewer-context fresh --result pass --reviewer-session-id S-qa \
+  --reviewer-attestation-id <session-attestation-id>
+```
+
+`task review` and `task accept` reject reuse of the producer session with `review-session-not-independent`. Reusing a role string with the same session id is still the same session and remains invalid for independent review. Session attestation proves that the host confirmed an independent context or session; it does not prove model reasoning quality. Reasoning quality and delivery eligibility still come from controller verification, quality gate review, and delivery gate checks.
+
 ## Fail-Closed Evidence Identity
 
 Delivery gates require a current code identity. Git projects use the committed HEAD plus tracked source-tree hash. No-git projects must explicitly opt into content-hash evidence when recording executor output:
@@ -88,13 +107,13 @@ harness.py --root . dispatch run --agent developer --target UNIT --command "pyte
 
 The gate rejects empty source hashes, stale source hashes, missing artifacts, empty artifacts, and artifact bytes whose SHA-256 does not match the stored `stdout_sha256`.
 
-High and critical failure-mode coverage requires a real external trust anchor. `adapter ci-verify` and `adapter external-session-verify` records with `origin=manual` are audit-only for high-risk gates. Connector-origin records must pass HMAC verification against a connector key controlled by the host or connector boundary and must match the current commit SHA.
+High and critical failure-mode coverage requires a real external trust anchor and a connector(HMAC) reviewer session attestation on the latest passing quality gate. `adapter ci-verify`, `adapter external-session-verify`, and `session attest` records with `origin=manual` are audit-only for high-risk gates. Connector-origin records must pass HMAC verification against a connector key controlled by the host or connector boundary and must match their bound payload.
 
 The trust ladder is:
 
 - `local-only`: local executor evidence from the current model session; eligible for low/medium risk.
 - `human-confirmed`: explicit human confirmation; eligible for low/medium risk.
-- `connector(HMAC)`: CI or external-session verification whose token is HMAC-SHA256 over the verification payload using `HARNESS_CONNECTOR_KEY` or the file referenced by `.ai-team/control/connector-key-path.txt`; required for high/critical risk unless the risk is formally accepted/exempt.
+- `connector(HMAC)`: CI, external-session, or reviewer session attestation whose token is HMAC-SHA256 over the verification payload using `HARNESS_CONNECTOR_KEY` or the file referenced by `.ai-team/control/connector-key-path.txt`; required for high/critical risk unless the risk is formally accepted/exempt.
 
 Recommended connector key placement is `.ai-team/runtime/connector.key`, referenced by `.ai-team/control/connector-key-path.txt`. The key itself must not be written to SQLite, event payloads, Markdown projections, or Git. `harness doctor` reports an error if the configured key file is tracked by Git.
 
@@ -108,7 +127,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 18
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 21
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild

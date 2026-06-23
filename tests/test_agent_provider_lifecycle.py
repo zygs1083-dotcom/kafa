@@ -104,9 +104,13 @@ class AgentProviderLifecycleTest(unittest.TestCase):
 
             self.assertIn("started 1 provider session", started.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                sessions = conn.execute("select task_id, provider, status, fence from agent_provider_sessions order by task_id").fetchall()
+                sessions = conn.execute("select task_id, provider, status, fence, agent_session_id from agent_provider_sessions order by task_id").fetchall()
+                agent_sessions = conn.execute("select agent_id, role, status, trust_level, provider_session_id from agent_sessions").fetchall()
                 assignments = conn.execute("select task_id, status, provider_session_id from dispatch_assignments where run_id = ? order by task_id", (run_id,)).fetchall()
-            self.assertEqual(sessions, [("T1", "fixture", "running", 0)])
+            self.assertEqual(sessions[0][:4], ("T1", "fixture", "running", 0))
+            self.assertTrue(sessions[0][4])
+            self.assertEqual(agent_sessions[0][:4], ("developer", "developer", "running", "local-only"))
+            self.assertTrue(agent_sessions[0][4])
             self.assertTrue(assignments[0][2])
             self.assertEqual(assignments[0][:2], ("T1", "claimed"))
             self.assertEqual(assignments[1], ("T2", "planned", ""))
@@ -128,13 +132,14 @@ class AgentProviderLifecycleTest(unittest.TestCase):
             self.assertIn("collected 1 provider report", collected.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 report_count = conn.execute("select count(*) from agent_reports where run_id = ?", (run_id,)).fetchone()[0]
-                attempt = conn.execute("select status, head_commit_sha, provider_session_id from task_attempts where run_id = ? and task_id = 'T1'", (run_id,)).fetchone()
+                attempt = conn.execute("select status, head_commit_sha, provider_session_id, agent_session_id from task_attempts where run_id = ? and task_id = 'T1'", (run_id,)).fetchone()
                 evidence_count = conn.execute("select count(*) from evidence where id like 'CODEX-%'").fetchone()[0]
                 assignment = conn.execute("select status from dispatch_assignments where run_id = ? and task_id = 'T1'", (run_id,)).fetchone()[0]
             self.assertEqual(report_count, 1)
             self.assertEqual(attempt[0], "reported")
             self.assertEqual(attempt[1], head)
             self.assertTrue(attempt[2])
+            self.assertTrue(attempt[3])
             self.assertEqual(evidence_count, 0)
             self.assertEqual(assignment, "reported")
 
@@ -156,8 +161,10 @@ class AgentProviderLifecycleTest(unittest.TestCase):
             self.assertIn("OK: dispatch attempt verified", verified.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 evidence = conn.execute("select executed_count_source, verified_by from evidence where id like 'CODEX-%'").fetchone()
+                agent_status = conn.execute("select status from agent_sessions").fetchone()[0]
                 task = conn.execute("select status from tasks where id = 'T1'").fetchone()[0]
             self.assertEqual(evidence, ("parsed", "controller-local"))
+            self.assertEqual(agent_status, "verified")
             self.assertEqual(task, "submitted")
 
 

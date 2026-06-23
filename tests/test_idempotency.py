@@ -190,7 +190,7 @@ class CommandIdempotencyTest(unittest.TestCase):
                 conn.execute("update project set schema_version = 15, runtime_version = '3.4.0'")
                 conn.commit()
 
-            run_harness(root, "migrate", "--from-version", "15", "--to-version", "20")
+            run_harness(root, "migrate", "--from-version", "15", "--to-version", "21")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 exists = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'command_log'").fetchone()

@@ -26,17 +26,19 @@ if str(PLUGIN_ROOT) not in sys.path:
 from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
 from core.connector_trust import (
     ConnectorTrustError,
+    agent_session_payload,
     ci_payload,
     configured_key_path,
     external_session_payload,
     prepare_connector_record,
+    verify_connector_record,
 )
 from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXTERNAL_SESSION_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 20
-RUNTIME_VERSION = "3.8.0"
+SCHEMA_VERSION = 21
+RUNTIME_VERSION = "3.9.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -74,6 +76,10 @@ PHASE_TRANSITIONS = {
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 DISPATCH_STATUSES = {"planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
+SESSION_ROLES = {"developer", "qa-reviewer", "reviewer", "architect", "product", "security"}
+REVIEWER_SESSION_ROLES = {"qa-reviewer", "reviewer", "architect", "security"}
+ACTIVE_SESSION_STATUSES = {"active", "running", "reported", "verified"}
+SESSION_TRUST_LEVELS = {"local-only", "human-confirmed", "connector"}
 CODEX_FANOUT_INPUT_FIELDS = [
     "item_id",
     "task",
@@ -177,6 +183,8 @@ SNAPSHOT_TABLES = [
     "external_session_verifications",
     "invalidations",
     "agents",
+    "agent_sessions",
+    "session_attestations",
     "agent_capabilities",
     "executor_allowlist",
     "dispatch_runs",
@@ -391,7 +399,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             evidence text not null default '',
             tool_link text not null default '',
             submitted_by text not null default '',
+            submitted_session_id text not null default '',
             accepted_by text not null default '',
+            accepted_session_id text not null default '',
             lease_agent text,
             lease_token text,
             lease_heartbeat_at text,
@@ -436,6 +446,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             target_id text not null default '',
             status text not null,
             provider_session_id text not null default '',
+            agent_session_id text not null default '',
             report_id text not null default '',
             evidence_id text not null default '',
             started_at text not null default '',
@@ -516,6 +527,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             commands text not null default '',
             evidence text not null default '',
             residual_risk text not null default '',
+            reviewer_session_id text not null default '',
+            reviewer_attestation_id text not null default '',
+            review_trust_level text not null default 'local-only',
             created_at text not null
         );
         create table if not exists quality_gate_findings (
@@ -645,6 +659,32 @@ def create_schema(conn: sqlite3.Connection) -> None:
             lease_task_id text not null default '',
             updated_at text not null
         );
+        create table if not exists agent_sessions (
+            session_id text primary key,
+            agent_id text not null,
+            role text not null,
+            context_id text not null,
+            provider_session_id text not null default '',
+            origin text not null default 'manual',
+            trust_level text not null default 'local-only',
+            status text not null default 'active',
+            started_at text not null,
+            ended_at text not null default ''
+        );
+        create table if not exists session_attestations (
+            id text primary key,
+            session_id text not null,
+            agent_id text not null,
+            role text not null,
+            context_id text not null,
+            provider_session_id text not null default '',
+            origin text not null default 'manual',
+            verification_token text not null default '',
+            token_status text not null default 'unchecked',
+            token_reason text not null default '',
+            trust_level text not null default 'local-only',
+            created_at text not null
+        );
         create table if not exists ci_verifications (
             id text primary key,
             provider text not null,
@@ -751,6 +791,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             agent_id text not null default '',
             status text not null,
             fence integer not null default 0,
+            agent_session_id text not null default '',
             branch_name text not null default '',
             worktree_path text not null default '',
             input_json text not null default '',
@@ -826,7 +867,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "failure_modes", "acceptance_scope", "text not null default ''")
     ensure_column(conn, "failure_modes", "accepted_revision", "integer")
     ensure_column(conn, "tasks", "submitted_by", "text not null default ''")
+    ensure_column(conn, "tasks", "submitted_session_id", "text not null default ''")
     ensure_column(conn, "tasks", "accepted_by", "text not null default ''")
+    ensure_column(conn, "tasks", "accepted_session_id", "text not null default ''")
     ensure_column(conn, "tasks", "lease_heartbeat_at", "text")
     ensure_column(conn, "tasks", "lease_expires_at", "text")
     ensure_column(conn, "tasks", "fence", "integer not null default 0")
@@ -834,6 +877,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "head_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
+    ensure_column(conn, "quality_gates", "reviewer_session_id", "text not null default ''")
+    ensure_column(conn, "quality_gates", "reviewer_attestation_id", "text not null default ''")
+    ensure_column(conn, "quality_gates", "review_trust_level", "text not null default 'local-only'")
     ensure_column(conn, "validations", "head_commit", "text not null default ''")
     ensure_column(conn, "validations", "source_tree_hash", "text not null default ''")
     ensure_column(conn, "validations", "attempt_id", "text not null default ''")
@@ -893,7 +939,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "dispatch_assignments", "lease_expires_at", "text")
     ensure_column(conn, "dispatch_assignments", "provider_session_id", "text not null default ''")
     ensure_column(conn, "task_attempts", "provider_session_id", "text not null default ''")
+    ensure_column(conn, "task_attempts", "agent_session_id", "text not null default ''")
     ensure_column(conn, "agent_reports", "provider_session_id", "text not null default ''")
+    ensure_column(conn, "agent_provider_sessions", "agent_session_id", "text not null default ''")
     ensure_default_executor_allowlist(conn)
 
 
@@ -2055,6 +2103,49 @@ def require_agent(conn: sqlite3.Connection, agent: str) -> sqlite3.Row:
     return row
 
 
+def session_trust_level(origin: str, token_status: str) -> str:
+    if origin == "connector" and token_status == "hmac-valid":
+        return "connector"
+    if origin == "manual" or token_status.startswith("downgraded"):
+        return "human-confirmed"
+    return "local-only"
+
+
+def require_agent_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    agent: str,
+    *,
+    allowed_roles: set[str] | None = None,
+) -> sqlite3.Row:
+    row = conn.execute("select * from agent_sessions where session_id = ?", (session_id,)).fetchone()
+    if not row:
+        raise HarnessError(f"missing agent session: {session_id}")
+    if row["agent_id"] != agent:
+        raise HarnessError(f"agent-session-mismatch: {session_id} agent={row['agent_id']} expected={agent}")
+    if allowed_roles is not None and row["role"] not in allowed_roles:
+        raise HarnessError(f"agent-session-role-invalid: {session_id} role={row['role']}")
+    if row["status"] not in ACTIVE_SESSION_STATUSES:
+        raise HarnessError(f"agent-session-inactive: {session_id} status={row['status']}")
+    return row
+
+
+def latest_session_attestation(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from session_attestations where session_id = ? order by created_at desc, id desc limit 1",
+        (session_id,),
+    ).fetchone()
+
+
+def require_session_attestation(conn: sqlite3.Connection, attestation_id: str, session_id: str = "") -> sqlite3.Row:
+    row = conn.execute("select * from session_attestations where id = ?", (attestation_id,)).fetchone()
+    if not row:
+        raise HarnessError(f"missing session attestation: {attestation_id}")
+    if session_id and row["session_id"] != session_id:
+        raise HarnessError(f"session-attestation-mismatch: {attestation_id} session={row['session_id']} expected={session_id}")
+    return row
+
+
 def require_revision(row: sqlite3.Row, expected_revision: int | None) -> None:
     from core.lock_manager import require_revision as core_require_revision
 
@@ -2074,6 +2165,99 @@ def require_fence(row: sqlite3.Row, expected_fence: int | None) -> None:
 
 def parse_ids(value: str) -> list[str]:
     return [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+
+
+def record_session_attestation(
+    root: Path,
+    session_id: str,
+    agent: str,
+    role: str,
+    context_id: str,
+    *,
+    provider_session_id: str = "",
+    origin: str = "manual",
+    verification_token: str = "",
+) -> str:
+    if role not in SESSION_ROLES:
+        raise HarnessError(f"invalid session role: {role}")
+    if origin not in ANCHOR_ORIGINS:
+        raise HarnessError(f"invalid attestation origin: {origin}")
+    payload_value = agent_session_payload(session_id, agent, role, context_id)
+    try:
+        stored_origin, stored_token, token_status, token_reason = prepare_connector_record(root, origin, verification_token, payload_value)
+    except ConnectorTrustError as exc:
+        raise HarnessError(str(exc)) from exc
+    trust = session_trust_level(stored_origin, token_status)
+    attestation_id = f"SESSION-ATTEST-{uuid.uuid4().hex[:12]}"
+    now = now_iso()
+    with transaction(root, touched=[("agent_session", session_id), ("session_attestation", attestation_id)]) as conn:
+        require_agent(conn, agent)
+        conn.execute(
+            """
+            insert into agent_sessions
+            (session_id, agent_id, role, context_id, provider_session_id, origin, trust_level, status, started_at, ended_at)
+            values (?, ?, ?, ?, ?, ?, ?, 'active', ?, '')
+            on conflict(session_id) do update set
+              agent_id=excluded.agent_id, role=excluded.role, context_id=excluded.context_id,
+              provider_session_id=excluded.provider_session_id, origin=excluded.origin,
+              trust_level=excluded.trust_level, status='active', ended_at=''
+            """,
+            (session_id, agent, role, context_id, provider_session_id, stored_origin, trust, now),
+        )
+        conn.execute(
+            """
+            insert into session_attestations
+            (id, session_id, agent_id, role, context_id, provider_session_id, origin, verification_token,
+             token_status, token_reason, trust_level, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attestation_id,
+                session_id,
+                agent,
+                role,
+                context_id,
+                provider_session_id,
+                stored_origin,
+                stored_token,
+                token_status,
+                token_reason,
+                trust,
+                now,
+            ),
+        )
+        emit_event(
+            conn,
+            "session_attested",
+            payload(session_id=session_id, agent=agent, role=role, context_id=context_id, origin=stored_origin, token_status=token_status, trust_level=trust),
+        )
+    return attestation_id
+
+
+def session_status_lines(root: Path, *, agent: str = "") -> list[str]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if agent:
+        clauses.append("agent_id = ?")
+        params.append(agent)
+    where = f" where {' and '.join(clauses)}" if clauses else ""
+    with connection(root) as conn:
+        rows = conn.execute(
+            f"select session_id, agent_id, role, context_id, origin, trust_level, status, provider_session_id from agent_sessions{where} order by started_at, session_id",
+            tuple(params),
+        ).fetchall()
+    lines = ["| Session | Agent | Role | Context | Origin | Trust | Status | Provider Session |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["session_id"], row["agent_id"], row["role"], row["context_id"], row["origin"], row["trust_level"], row["status"], row["provider_session_id"]]) for row in rows)
+    return lines
+
+
+def close_agent_session(root: Path, session_id: str) -> None:
+    with transaction(root, touched=[("agent_session", session_id)]) as conn:
+        row = conn.execute("select * from agent_sessions where session_id = ?", (session_id,)).fetchone()
+        if not row:
+            raise HarnessError(f"missing agent session: {session_id}")
+        conn.execute("update agent_sessions set status = 'closed', ended_at = ? where session_id = ?", (now_iso(), session_id))
+        emit_event(conn, "session_closed", payload(session_id=session_id))
 
 
 def assert_no_dependency_cycle(conn: sqlite3.Connection, task_id: str, depends_on: str) -> None:
@@ -2349,22 +2533,24 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
     render_all(root)
 
 
-def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
+def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None, session_id: str = "") -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
         require_fence(row, expected_fence)
+        if session_id:
+            require_agent_session(conn, session_id, agent, allowed_roles=SESSION_ROLES)
         if row["status"] != "in_progress":
             raise HarnessError(f"task status is not submittable: {task_id} status={row['status']}")
         conn.execute(
             """
             update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null, lease_token = null,
               lease_heartbeat_at = null, lease_expires_at = null,
-              revision = revision + 1, updated_at = ? where id = ?
+              submitted_session_id = ?, revision = revision + 1, updated_at = ? where id = ?
             """,
-            (evidence, agent, now_iso(), task_id),
+            (evidence, agent, session_id, now_iso(), task_id),
         )
         conn.execute(
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
@@ -2384,15 +2570,19 @@ def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
     render_all(root)
 
 
-def complete_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
-    submit_task(root, task_id, evidence, agent=agent, lease_token=lease_token, expected_revision=expected_revision, expected_fence=expected_fence)
+def complete_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None, session_id: str = "") -> None:
+    submit_task(root, task_id, evidence, agent=agent, lease_token=lease_token, expected_revision=expected_revision, expected_fence=expected_fence, session_id=session_id)
 
 
-def review_task(root: Path, task_id: str, agent: str, expected_revision: int) -> tuple[str, int]:
+def review_task(root: Path, task_id: str, agent: str, expected_revision: int, *, session_id: str = "") -> tuple[str, int]:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         active_lease = require_agent(conn, agent)
         require_revision(row, expected_revision)
+        if session_id:
+            require_agent_session(conn, session_id, agent, allowed_roles=REVIEWER_SESSION_ROLES)
+            if row["submitted_session_id"] and row["submitted_session_id"] == session_id:
+                raise HarnessError(f"review-session-not-independent: {task_id} session={session_id}")
         if row["status"] != "submitted":
             raise HarnessError(f"task status is not reviewable: {task_id} status={row['status']}")
         if row["owner"] == agent:
@@ -2427,22 +2617,26 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int) ->
     return token, fence
 
 
-def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
+def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None, session_id: str = "") -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
         require_fence(row, expected_fence)
+        if session_id:
+            require_agent_session(conn, session_id, agent, allowed_roles=REVIEWER_SESSION_ROLES)
+            if row["submitted_session_id"] and row["submitted_session_id"] == session_id:
+                raise HarnessError(f"review-session-not-independent: {task_id} session={session_id}")
         if row["status"] != "review":
             raise HarnessError(f"task status is not acceptable: {task_id} status={row['status']}")
         conn.execute(
             """
             update tasks set status = 'accepted', evidence = ?, accepted_by = ?, lease_agent = null, lease_token = null,
               lease_heartbeat_at = null, lease_expires_at = null,
-              revision = revision + 1, updated_at = ? where id = ?
+              accepted_session_id = ?, revision = revision + 1, updated_at = ? where id = ?
             """,
-            (evidence, agent, now_iso(), task_id),
+            (evidence, agent, session_id, now_iso(), task_id),
         )
         conn.execute(
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
@@ -2887,7 +3081,20 @@ def sweep_expired_risks(root: Path) -> int:
     return swept
 
 
-def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "independent_qa", commands: str = "", evidence: str = "", blocking_findings: str = "", residual_risk: str = "", findings: str = "") -> None:
+def record_gate(
+    root: Path,
+    reviewer_context: str,
+    result: str,
+    *,
+    gate: str = "independent_qa",
+    commands: str = "",
+    evidence: str = "",
+    blocking_findings: str = "",
+    residual_risk: str = "",
+    findings: str = "",
+    reviewer_session_id: str = "",
+    reviewer_attestation_id: str = "",
+) -> None:
     guard_schema("validate_gate", reviewer_context, result, gate)
     current_sha = git_head_sha(root) or "no-git"
     base_commit = git_base_commit(root) or current_sha
@@ -2897,13 +3104,35 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
         raise HarnessError("cannot record a passing quality gate with a dirty git worktree")
     with transaction(root) as conn:
         project_revision = int(project_row(conn)["revision"])
+        review_trust_level = "local-only"
+        if reviewer_session_id:
+            session = conn.execute("select * from agent_sessions where session_id = ?", (reviewer_session_id,)).fetchone()
+            if not session:
+                raise HarnessError(f"missing agent session: {reviewer_session_id}")
+            if session["status"] not in ACTIVE_SESSION_STATUSES:
+                raise HarnessError(f"agent-session-inactive: {reviewer_session_id} status={session['status']}")
+            if session["role"] not in REVIEWER_SESSION_ROLES:
+                raise HarnessError(f"agent-session-role-invalid: {reviewer_session_id} role={session['role']}")
+            review_trust_level = session["trust_level"]
+        if reviewer_attestation_id:
+            attestation = require_session_attestation(conn, reviewer_attestation_id, reviewer_session_id)
+            review_trust_level = attestation["trust_level"]
+            if attestation["origin"] == "connector":
+                ok, reason = verify_connector_record(
+                    root,
+                    attestation["verification_token"],
+                    agent_session_payload(attestation["session_id"], attestation["agent_id"], attestation["role"], attestation["context_id"]),
+                )
+                if not ok:
+                    raise HarnessError(f"session connector HMAC invalid: {reason}")
         gate_id = str(uuid.uuid4())
         conn.execute(
             """
             insert into quality_gates
             (id, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
-             project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk,
+             reviewer_session_id, reviewer_attestation_id, review_trust_level, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 gate_id,
@@ -2921,6 +3150,9 @@ def record_gate(root: Path, reviewer_context: str, result: str, *, gate: str = "
                 commands,
                 evidence,
                 residual_risk,
+                reviewer_session_id,
+                reviewer_attestation_id,
+                review_trust_level,
                 now_iso(),
             ),
         )
@@ -3592,14 +3824,25 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
             )
             handle = provider.spawn(request)
             session_id = str(uuid.uuid4())
+            agent_session_id = f"AGENT-SESSION-{uuid.uuid4().hex[:12]}"
+            role = agent_id if agent_id in SESSION_ROLES else "developer"
+            context_id = f"{run_id}:{row['task_id']}"
             now = now_iso()
+            conn.execute(
+                """
+                insert into agent_sessions
+                (session_id, agent_id, role, context_id, provider_session_id, origin, trust_level, status, started_at, ended_at)
+                values (?, ?, ?, ?, ?, 'manual', 'local-only', 'running', ?, '')
+                """,
+                (agent_session_id, agent_id, role, context_id, handle.provider_session_id, now),
+            )
             conn.execute(
                 """
                 insert into agent_provider_sessions
                 (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
-                 branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
+                 agent_session_id, branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
                  heartbeat_at, lease_expires_at, collected_at, cancelled_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', '', ?, ?, ?, ?, '', '', '')
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', '', ?, ?, ?, ?, '', '', '')
                 """,
                 (
                     session_id,
@@ -3611,6 +3854,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     agent_id,
                     handle.status,
                     int(row["fence"]),
+                    agent_session_id,
                     branch_name,
                     stable_json(request.input_json),
                     handle.message,
@@ -4236,8 +4480,8 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
                 """
                 insert into task_attempts
                 (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
-                 branch_name, target_id, status, provider_session_id, report_id, evidence_id, started_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', '', ?, '', ?, '')
+                 branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', '', '', ?, '', ?, '')
                 """,
                 (
                     attempt_id,
@@ -4372,8 +4616,8 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 """
                 insert into task_attempts
                 (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
-                 branch_name, target_id, status, provider_session_id, report_id, evidence_id, started_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, '', ?, '')
+                 branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, ?, '', ?, '')
                 """,
                 (
                     attempt_id,
@@ -4387,6 +4631,7 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                     result["branch_name"],
                     result["target_id"],
                     session["provider_session_id"],
+                    session["agent_session_id"],
                     report_id,
                     now_iso(),
                 ),
@@ -4437,6 +4682,11 @@ def dispatch_provider_cancel(root: Path, run_id: str, *, task_id: str = "", reas
                 "update agent_provider_sessions set status = 'cancelled', last_error = ?, cancelled_at = ?, finished_at = ? where id = ?",
                 (reason, now_iso(), now_iso(), session["id"]),
             )
+            if session["agent_session_id"]:
+                conn.execute(
+                    "update agent_sessions set status = 'cancelled', ended_at = ? where session_id = ?",
+                    (now_iso(), session["agent_session_id"]),
+                )
             conn.execute(
                 """
                 update dispatch_assignments
@@ -4466,6 +4716,11 @@ def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
                 "update agent_provider_sessions set status = 'timed_out', last_error = 'provider session timed out', finished_at = ? where id = ?",
                 (now_iso(), row["id"]),
             )
+            if row["agent_session_id"]:
+                conn.execute(
+                    "update agent_sessions set status = 'timed_out', ended_at = ? where session_id = ?",
+                    (now_iso(), row["agent_session_id"]),
+                )
             conn.execute(
                 """
                 update dispatch_assignments
@@ -4682,6 +4937,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 "update agent_provider_sessions set status = 'verified', attempt_id = ?, finished_at = ? where provider_session_id = ? and run_id = ? and task_id = ?",
                 (attempt["id"], now_iso(), attempt["provider_session_id"], run_id, task_id),
             )
+        if attempt["agent_session_id"]:
+            conn.execute(
+                "update agent_sessions set status = 'verified' where session_id = ?",
+                (attempt["agent_session_id"],),
+            )
         conn.execute(
             "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
             (evidence_id, now_iso(), run_id, task_id),
@@ -4691,11 +4951,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
         if task and task["status"] in {"ready", "claimed", "in_progress"}:
             conn.execute(
                 """
-                update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null,
+                update tasks set status = 'submitted', evidence = ?, submitted_by = ?, submitted_session_id = ?, lease_agent = null,
                   lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
                   revision = revision + 1, updated_at = ? where id = ?
                 """,
-                (evidence_id, attempt["agent_id"], now_iso(), task_id),
+                (evidence_id, attempt["agent_id"], attempt["agent_session_id"], now_iso(), task_id),
             )
         emit_event(conn, "dispatch_attempt_verified", payload(run_id=run_id, task_id=task_id, attempt_id=attempt["id"], evidence_id=evidence_id, verified_by=verified_by))
     render_all(root)
@@ -4809,9 +5069,21 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("ci_verifications", "origin", ANCHOR_ORIGINS, "ci origin"),
         ("external_session_verifications", "conclusion", EXTERNAL_SESSION_CONCLUSIONS, "external session conclusion"),
         ("external_session_verifications", "origin", ANCHOR_ORIGINS, "external session origin"),
+        ("agent_sessions", "role", SESSION_ROLES, "agent session role"),
+        ("agent_sessions", "origin", ANCHOR_ORIGINS, "agent session origin"),
+        ("agent_sessions", "trust_level", SESSION_TRUST_LEVELS, "agent session trust level"),
+        ("agent_sessions", "status", {"active", "running", "reported", "verified", "closed", "cancelled", "timed_out", "verification_failed"}, "agent session status"),
+        ("session_attestations", "role", SESSION_ROLES, "session attestation role"),
+        ("session_attestations", "origin", ANCHOR_ORIGINS, "session attestation origin"),
+        ("session_attestations", "trust_level", SESSION_TRUST_LEVELS, "session attestation trust level"),
     ]
     for table, column, allowed, label in enum_checks:
-        id_column = "task_id" if table == "dispatch_assignments" else "id"
+        if table == "dispatch_assignments":
+            id_column = "task_id"
+        elif table == "agent_sessions":
+            id_column = "session_id"
+        else:
+            id_column = "id"
         for row in conn.execute(f"select {id_column} as id, {column} as value from {table} where {column} not in ({','.join('?' for _ in allowed)})", tuple(allowed)):
             issues.append(f"invalid {label}: {table}.{row['id']}={row['value']}")
     for row in conn.execute("select id, payload_json from events"):
@@ -4925,6 +5197,8 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("command-log.schema.json", "command_log", [row_snapshot(row) or {} for row in conn.execute("select * from command_log")]),
         ("external-session-verification.schema.json", "external_session_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from external_session_verifications")]),
         ("agent.schema.json", "agents", [row_snapshot(row) or {} for row in conn.execute("select * from agents")]),
+        ("agent-session.schema.json", "agent_sessions", [row_snapshot(row) or {} for row in conn.execute("select * from agent_sessions")]),
+        ("session-attestation.schema.json", "session_attestations", [row_snapshot(row) or {} for row in conn.execute("select * from session_attestations")]),
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),
         ("dispatch-run.schema.json", "dispatch_runs", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_runs")]),
         ("dispatch-assignment.schema.json", "dispatch_assignments", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_assignments")]),

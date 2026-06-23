@@ -69,6 +69,10 @@ def external_session_payload(session_id: str, verifier: str, commit_sha: str, co
     return f"external-session:{session_id}:{verifier}:{commit_sha}:{conclusion}"
 
 
+def agent_session_payload(session_id: str, agent_id: str, role: str, context_id: str) -> str:
+    return f"agent-session:{session_id}:{agent_id}:{role}:{context_id}"
+
+
 def prepare_connector_record(root: Path, origin: str, provided_token: str, payload: str) -> tuple[str, str, str, str]:
     if origin != "connector":
         return origin, provided_token if origin == "manual" else "", "manual", ""

@@ -42,6 +42,10 @@ def token(stdout: str) -> str:
     return stdout.split("token=", 1)[1].split(None, 1)[0].strip()
 
 
+def stdout_field(stdout: str, name: str) -> str:
+    return stdout.split(f"{name}=", 1)[1].split(None, 1)[0].strip()
+
+
 def ensure_dummy_unittest(root: Path) -> None:
     (root / "test_harness_dummy.py").write_text(
         "import unittest\n\n"
@@ -101,7 +105,10 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(session)
         session_id = session.stdout.strip().rsplit(" ", 1)[-1] if session.returncode == 0 else "smoke-session-1:smoke-verifier"
         commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", session_id, "--code-identity", "git"))
-        commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed"))
+        reviewer_session = run(root, "session", "attest", "--session-id", "smoke-qa-session", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "smoke-qa-context", "--origin", "connector")
+        commands.append(reviewer_session)
+        reviewer_attestation_id = stdout_field(reviewer_session.stdout, "attestation") if reviewer_session.returncode == 0 else ""
+        commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed", "--reviewer-session-id", "smoke-qa-session", "--reviewer-attestation-id", reviewer_attestation_id))
         commands.append(run(root, "phase", "delivery_readiness"))
         commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
         ok = all(command.returncode == 0 for command in commands)
