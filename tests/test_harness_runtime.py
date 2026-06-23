@@ -31,7 +31,7 @@ def task_revision(root: Path, task_id: str) -> int:
 
 
 def token_from_stdout(stdout: str) -> str:
-    return stdout.split("token=", 1)[1].strip()
+    return stdout.split("token=", 1)[1].split(None, 1)[0].strip()
 
 
 def trusted_artifact(root: Path, suffix: str = "1", *, content: str = "ok\n") -> tuple[str, str]:

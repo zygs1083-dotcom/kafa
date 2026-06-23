@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 14`, `harness.py --root . migrate --from-version markdown-v1 --to-version 14 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 15`, `harness.py --root . migrate --from-version markdown-v1 --to-version 15 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -121,12 +121,12 @@ Update task state as implementation progresses:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . task claim T1 --agent developer --expected-revision 1
-python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1 --agent developer --lease-token "<token>" --expected-revision 2
-python3 plugins/codex-project-harness/scripts/harness.py --root . task heartbeat T1 --agent developer --lease-token "<token>" --expected-revision 3
-python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 --agent developer --lease-token "<token>" --expected-revision 4 \
+python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1 --agent developer --lease-token "<token>" --expected-revision 2 --fence "<fence>"
+python3 plugins/codex-project-harness/scripts/harness.py --root . task heartbeat T1 --agent developer --lease-token "<token>" --expected-revision 3 --fence "<fence>"
+python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 --agent developer --lease-token "<token>" --expected-revision 4 --fence "<fence>" \
   --evidence "npm test -- profile-crud passed"
 python3 plugins/codex-project-harness/scripts/harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
-python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 --agent qa-reviewer --lease-token "<review-token>" --expected-revision 6 \
+python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 --agent qa-reviewer --lease-token "<review-token>" --expected-revision 6 --fence "<review-fence>" \
   --evidence "independent QA accepted"
 ```
 

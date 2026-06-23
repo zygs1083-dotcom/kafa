@@ -31,8 +31,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 14
-RUNTIME_VERSION = "3.3.2"
+SCHEMA_VERSION = 15
+RUNTIME_VERSION = "3.4.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -293,6 +293,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             lease_expires_at text,
             retry_count integer not null default 0,
             retry_budget integer not null default 2,
+            fence integer not null default 0,
             revision integer not null default 1,
             updated_at text not null
         );
@@ -599,6 +600,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "tasks", "accepted_by", "text not null default ''")
     ensure_column(conn, "tasks", "lease_heartbeat_at", "text")
     ensure_column(conn, "tasks", "lease_expires_at", "text")
+    ensure_column(conn, "tasks", "fence", "integer not null default 0")
     ensure_column(conn, "quality_gates", "base_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "head_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
@@ -1800,6 +1802,11 @@ def require_lease(row: sqlite3.Row, agent: str, lease_token: str | None) -> None
     core_require_lease(row, agent, lease_token, error_factory=HarnessError)
 
 
+def require_fence(row: sqlite3.Row, expected_fence: int | None) -> None:
+    if expected_fence is not None and int(row["fence"]) != int(expected_fence):
+        raise HarnessError(f"fence-stale: {row['id']} expected={expected_fence} actual={row['fence']}")
+
+
 def parse_ids(value: str) -> list[str]:
     return [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
 
@@ -1918,7 +1925,7 @@ def require_task_runnable(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     core_require_task_runnable(conn, row, error_factory=HarnessError)
 
 
-def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> str:
+def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> tuple[str, int]:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_revision(row, expected_revision)
@@ -1930,6 +1937,7 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
         if row["status"] != "ready":
             raise HarnessError(f"task status is not ready: {task_id} status={row['status']}")
         require_task_runnable(conn, row)
+        fence = int(row["fence"])
         token = str(uuid.uuid4())
         conn.execute(
             """
@@ -1957,15 +1965,16 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
             command="task claim",
         )
     render_all(root)
-    return token
+    return token, fence
 
 
-def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expected_revision: int) -> None:
+def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expected_revision: int, *, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         conn.execute(
             "update tasks set lease_heartbeat_at = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ? where id = ?",
             (now_iso(), lease_deadline(), now_iso(), task_id),
@@ -2000,7 +2009,7 @@ def recover_stale_leases(root: Path) -> int:
             conn.execute(
                 """
                 update tasks set status = ?, lease_agent = null, lease_token = null, lease_heartbeat_at = null,
-                  lease_expires_at = null, revision = revision + 1, updated_at = ? where id = ?
+                  lease_expires_at = null, revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
                 """,
                 (next_status, now_iso(), row["id"]),
             )
@@ -2016,16 +2025,17 @@ def recover_stale_leases(root: Path) -> int:
     return recovered
 
 
-def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None) -> None:
+def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         conn.execute(
             """
             update tasks set lease_agent = null, lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
-              status = 'ready', revision = revision + 1, updated_at = ? where id = ?
+              status = 'ready', revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
             """,
             (now_iso(), task_id),
         )
@@ -2044,7 +2054,7 @@ def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | Non
     render_all(root)
 
 
-def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None) -> None:
+def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
@@ -2052,6 +2062,7 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
         if row["status"] != "claimed":
             raise HarnessError(f"task status is not startable: {task_id} status={row['status']}")
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         require_task_runnable(conn, row)
         conn.execute(
             """
@@ -2073,12 +2084,13 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
     render_all(root)
 
 
-def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
+def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         if row["status"] != "in_progress":
             raise HarnessError(f"task status is not submittable: {task_id} status={row['status']}")
         conn.execute(
@@ -2107,11 +2119,11 @@ def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
     render_all(root)
 
 
-def complete_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
-    submit_task(root, task_id, evidence, agent=agent, lease_token=lease_token, expected_revision=expected_revision)
+def complete_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
+    submit_task(root, task_id, evidence, agent=agent, lease_token=lease_token, expected_revision=expected_revision, expected_fence=expected_fence)
 
 
-def review_task(root: Path, task_id: str, agent: str, expected_revision: int) -> str:
+def review_task(root: Path, task_id: str, agent: str, expected_revision: int) -> tuple[str, int]:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         active_lease = require_agent(conn, agent)
@@ -2126,7 +2138,7 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int) ->
         conn.execute(
             """
             update tasks set status = 'review', lease_agent = ?, lease_token = ?, lease_heartbeat_at = ?, lease_expires_at = ?,
-              revision = revision + 1, updated_at = ? where id = ?
+              revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
             """,
             (agent, token, now_iso(), lease_deadline(), now_iso(), task_id),
         )
@@ -2145,16 +2157,18 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int) ->
             actor=agent,
             command="task review",
         )
+        fence = int(after["fence"])
     render_all(root)
-    return token
+    return token, fence
 
 
-def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
+def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         if row["status"] != "review":
             raise HarnessError(f"task status is not acceptable: {task_id} status={row['status']}")
         conn.execute(
@@ -2183,12 +2197,13 @@ def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
     render_all(root)
 
 
-def block_task(root: Path, task_id: str, reason: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None) -> None:
+def block_task(root: Path, task_id: str, reason: str, *, agent: str, lease_token: str | None = None, expected_revision: int | None = None, expected_fence: int | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         row = require_task(conn, task_id)
         require_agent(conn, agent)
         require_revision(row, expected_revision)
         require_lease(row, agent, lease_token)
+        require_fence(row, expected_fence)
         conn.execute(
             """
             update tasks set status = 'blocked', evidence = ?, lease_agent = null, lease_token = null,

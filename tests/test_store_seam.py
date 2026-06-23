@@ -38,10 +38,10 @@ class StoreSeamTest(unittest.TestCase):
             harness_db.init_runtime(root)
             harness_db.add_acceptance(root, "AC1", "Example acceptance")
             harness_db.add_task(root, "T1", "Example task", owner="developer", acceptance="AC1")
-            producer_token = harness_db.claim_task(root, "T1", "developer", task_revision(root, "T1"))
+            producer_token, _ = harness_db.claim_task(root, "T1", "developer", task_revision(root, "T1"))
             harness_db.start_task(root, "T1", "developer", lease_token=producer_token, expected_revision=task_revision(root, "T1"))
             harness_db.submit_task(root, "T1", "implemented", agent="developer", lease_token=producer_token, expected_revision=task_revision(root, "T1"))
-            reviewer_token = harness_db.review_task(root, "T1", "qa-reviewer", task_revision(root, "T1"))
+            reviewer_token, _ = harness_db.review_task(root, "T1", "qa-reviewer", task_revision(root, "T1"))
             harness_db.accept_task(root, "T1", "accepted", agent="qa-reviewer", lease_token=reviewer_token, expected_revision=task_revision(root, "T1"))
 
             with harness_db.connection(root) as conn:

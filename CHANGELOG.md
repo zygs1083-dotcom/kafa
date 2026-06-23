@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.1.0-beta.1 - 2026-06-23
+
+### Added
+
+- Store seam from T1: runtime DB access is mediated through the store abstraction and supports in-memory test stores.
+- Task fencing from T2: tasks now carry a monotonic `fence` value so stale lease holders can be rejected inside the write transaction.
+- `task claim` and `task review` print `fence=<n>` alongside the lease token.
+- `task start`, `task heartbeat`, `task submit`, `task complete`, `task accept`, `task block`, and `task release` accept optional `--fence`.
+
+### Changed
+
+- `task review`, `task recover-stale`, and `task release` bump the task fence when ownership changes or stale leases are recovered.
+- Runtime schema version is now `15`; runtime implementation version is now `3.4.0`.
+
+### Boundaries
+
+- Fencing is limited to task lease write paths in this release. Validation/evidence records, dispatch runs, HMAC trust anchors, delivery gates, idempotency, and `core/store.py` behavior are unchanged.
+
 ## v1.0.2-beta.1 - 2026-06-23
 
 ### Fixed
