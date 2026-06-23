@@ -32,6 +32,10 @@ from core.api import (
     confirm_scope,
     create_checkpoint,
     dispatch_claim_next,
+    dispatch_file_claim_add,
+    dispatch_file_claim_list,
+    dispatch_file_claim_release,
+    dispatch_integrate,
     dispatch_plan,
     dispatch_recover_stale,
     dispatch_run,
@@ -495,9 +499,30 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_run.add_argument("--sandbox-profile", default="none", choices=["none", "no-network"])
     dispatch_run.add_argument("--executed-count", type=int)
     dispatch_run.add_argument("--code-identity", default="auto", choices=["auto", "git", "content-hash"])
+    dispatch_run.add_argument("--runner", default="null", choices=["null", "local-process"])
+    dispatch_run.add_argument("--claim-file", action="append", default=[])
     add_request_id(dispatch_run)
     dispatch_recover = dispatch_sub.add_parser("recover-stale")
     add_request_id(dispatch_recover)
+    dispatch_file_claim = dispatch_sub.add_parser("file-claim")
+    dispatch_file_claim_sub = dispatch_file_claim.add_subparsers(dest="dispatch_file_claim_command", required=True)
+    dispatch_file_claim_add_parser = dispatch_file_claim_sub.add_parser("add")
+    dispatch_file_claim_add_parser.add_argument("--task", required=True)
+    dispatch_file_claim_add_parser.add_argument("--agent", required=True)
+    dispatch_file_claim_add_parser.add_argument("--path", required=True)
+    add_request_id(dispatch_file_claim_add_parser)
+    dispatch_file_claim_list_parser = dispatch_file_claim_sub.add_parser("list")
+    dispatch_file_claim_list_parser.add_argument("--task", default="")
+    dispatch_file_claim_list_parser.add_argument("--agent", default="")
+    dispatch_file_claim_release_parser = dispatch_file_claim_sub.add_parser("release")
+    dispatch_file_claim_release_parser.add_argument("--task", required=True)
+    dispatch_file_claim_release_parser.add_argument("--agent", required=True)
+    dispatch_file_claim_release_parser.add_argument("--path", default="")
+    add_request_id(dispatch_file_claim_release_parser)
+    dispatch_integrate_parser = dispatch_sub.add_parser("integrate")
+    dispatch_integrate_parser.add_argument("--run-id", required=True)
+    dispatch_integrate_parser.add_argument("--target-branch", default="")
+    add_request_id(dispatch_integrate_parser)
     dispatch_sub.add_parser("status")
 
     executor = sub.add_parser("executor")
@@ -879,10 +904,18 @@ def main() -> int:
         elif args.command == "dispatch" and args.dispatch_command == "run":
             mutate(
                 "dispatch.run",
-                lambda: f"OK: dispatch command evidence {dispatch_run(root, args.agent, args.dispatch_command_text, timeout=args.timeout, target_id=args.target, allow_unlisted=args.allow_unlisted, no_network=args.no_network, sandbox_profile=args.sandbox_profile, allow_unlisted_reason=args.reason, executed_count=args.executed_count, code_identity=args.code_identity)}",
+                lambda: f"OK: dispatch command evidence {dispatch_run(root, args.agent, args.dispatch_command_text, timeout=args.timeout, target_id=args.target, allow_unlisted=args.allow_unlisted, no_network=args.no_network, sandbox_profile=args.sandbox_profile, allow_unlisted_reason=args.reason, executed_count=args.executed_count, code_identity=args.code_identity, runner=args.runner, claim_files=args.claim_file)}",
             )
         elif args.command == "dispatch" and args.dispatch_command == "recover-stale":
             mutate("dispatch.recover-stale", lambda: f"OK: dispatch recovered {dispatch_recover_stale(root)} stale assignment(s)")
+        elif args.command == "dispatch" and args.dispatch_command == "file-claim" and args.dispatch_file_claim_command == "add":
+            mutate("dispatch.file-claim.add", lambda: f"OK: file claimed {dispatch_file_claim_add(root, args.task, args.agent, args.path)}")
+        elif args.command == "dispatch" and args.dispatch_command == "file-claim" and args.dispatch_file_claim_command == "list":
+            print("\n".join(dispatch_file_claim_list(root, task_id=args.task, agent=args.agent)))
+        elif args.command == "dispatch" and args.dispatch_command == "file-claim" and args.dispatch_file_claim_command == "release":
+            mutate("dispatch.file-claim.release", lambda: f"OK: file claims released {dispatch_file_claim_release(root, args.task, args.agent, path=args.path)}")
+        elif args.command == "dispatch" and args.dispatch_command == "integrate":
+            mutate("dispatch.integrate", lambda: f"OK: dispatch integrated {dispatch_integrate(root, args.run_id, target_branch=args.target_branch)}")
         elif args.command == "dispatch" and args.dispatch_command == "status":
             print("\n".join(dispatch_status(root)))
         elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "add":

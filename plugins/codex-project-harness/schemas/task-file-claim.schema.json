@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "run_id", "task_id", "agent_id", "path", "worktree_path", "branch_name", "status", "created_at", "released_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "path": { "type": "string" },
+    "worktree_path": { "type": "string" },
+    "branch_name": { "type": "string" },
+    "status": { "type": "string", "enum": ["active", "released"] },
+    "created_at": { "type": "string" },
+    "released_at": { "type": "string" }
+  }
+}

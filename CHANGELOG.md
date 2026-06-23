@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.2.0-beta.1 - 2026-06-23
+
+### Added
+
+- AgentRunner abstraction for dispatch execution, with compatible `null` runner and explicit `local-process` runner.
+- Local process dispatch can run commands in agent-specific git worktrees and record executor-style command evidence.
+- File claim tracking rejects concurrent active claims for the same repo-relative path with `file-claim-conflict`.
+- Dispatch integration merges agent branches into a staging `integration/<run-id>` branch and reruns delivery validation.
+
+### Changed
+
+- Runtime schema version is now `17`; runtime implementation version is now `3.5.0`.
+- `dispatch run` supports `--runner` and repeated `--claim-file`.
+
+### Boundaries
+
+- LocalProcessRunner is not an OS sandbox. It does not create real Codex sub-sessions, cross-machine locks, external writes, deployment, or production release.
+
 ## v1.1.1-beta.1 - 2026-06-23
 
 ### Added

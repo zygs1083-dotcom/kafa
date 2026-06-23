@@ -33,8 +33,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 16
-RUNTIME_VERSION = "3.4.1"
+SCHEMA_VERSION = 17
+RUNTIME_VERSION = "3.5.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -71,7 +71,7 @@ PHASE_TRANSITIONS = {
 }
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
-DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale"}
+DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
 DEFAULT_EXECUTOR_PREFIXES = [
     "python3 -m unittest",
     "python3 -B -m unittest",
@@ -142,6 +142,8 @@ SNAPSHOT_TABLES = [
     "executor_allowlist",
     "dispatch_runs",
     "dispatch_assignments",
+    "dispatch_worktrees",
+    "task_file_claims",
     "runtime_snapshots",
     "command_log",
     "migrations",
@@ -626,6 +628,31 @@ def create_schema(conn: sqlite3.Connection) -> None:
             updated_at text not null,
             primary key (run_id, task_id)
         );
+        create table if not exists dispatch_worktrees (
+            id text primary key,
+            run_id text not null,
+            task_id text not null,
+            agent_id text not null,
+            branch_name text not null,
+            worktree_path text not null,
+            status text not null,
+            created_at text not null,
+            cleaned_at text not null default ''
+        );
+        create table if not exists task_file_claims (
+            id text primary key,
+            run_id text not null,
+            task_id text not null,
+            agent_id text not null,
+            path text not null,
+            worktree_path text not null default '',
+            branch_name text not null default '',
+            status text not null,
+            created_at text not null,
+            released_at text not null default ''
+        );
+        create unique index if not exists task_file_claims_active_path
+            on task_file_claims(path) where status = 'active';
         create table if not exists runtime_snapshots (
             id text primary key,
             label text not null,
@@ -3133,23 +3160,21 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
         return assignment["task_id"]
 
 
-def dispatch_run(
-    root: Path,
-    agent: str,
-    command: str,
-    *,
-    timeout: int = 120,
-    target_id: str = "",
-    allow_unlisted: bool = False,
-    no_network: bool = False,
-    sandbox_profile: str = "none",
-    allow_unlisted_reason: str = "",
-    executed_count: int | None = None,
-    code_identity: str = "auto",
-) -> str:
-    from core.executor import LocalExecutor
-    guard_schema("validate_code_identity_mode", code_identity)
+def normalize_claim_path(path: str) -> str:
+    value = path.strip()
+    if not value:
+        raise HarnessError("file claim path is required")
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise HarnessError(f"invalid file claim path: {path}")
+    return candidate.as_posix()
 
+
+def safe_branch_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value).strip("-") or "item"
+
+
+def assignment_for_agent(root: Path, agent: str) -> dict[str, Any]:
     with connection(root) as conn:
         active = conn.execute(
             "select * from dispatch_assignments where agent_id = ? and status = 'claimed' order by claimed_at, task_id limit 1",
@@ -3165,15 +3190,169 @@ def dispatch_run(
             "select * from dispatch_assignments where agent_id = ? and status = 'claimed' order by claimed_at, task_id limit 1",
             (agent,),
         ).fetchone()
-    if not assignment:
-        assignment = {"run_id": "", "task_id": "local-execution"}
+    if assignment:
+        return row_snapshot(assignment) or {}
+    return {"run_id": "", "task_id": "local-execution", "agent_id": agent}
+
+
+def ensure_dispatch_worktree(root: Path, run_id: str, task_id: str, agent: str) -> tuple[str, str]:
+    run_part = safe_branch_part(run_id or "local")
+    task_part = safe_branch_part(task_id)
+    agent_part = safe_branch_part(agent)
+    branch = f"agent/{run_part}/{task_part}/{agent_part}"
+    worktree = root / ".ai-team" / "runtime" / "worktrees" / run_part / task_part / agent_part
+    with connection(root) as conn:
+        existing = conn.execute(
+            "select * from dispatch_worktrees where run_id = ? and task_id = ? and agent_id = ? and status = 'active' order by created_at desc limit 1",
+            (run_id, task_id, agent),
+        ).fetchone()
+        if existing and (root / existing["worktree_path"]).exists():
+            return existing["branch_name"], existing["worktree_path"]
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if not (root / ".git").exists():
+        raise HarnessError("local-process runner requires a git repository")
+    subprocess.run(["git", "worktree", "prune"], cwd=root, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        ["git", "worktree", "add", "-B", branch, str(worktree), "HEAD"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(f"worktree create failed: {result.stderr.strip() or result.stdout.strip()}")
+    rel = worktree.relative_to(root).as_posix()
+    with transaction(root, touched=[("dispatch_worktree", task_id)]) as conn:
+        conn.execute(
+            """
+            insert into dispatch_worktrees
+            (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
+            values (?, ?, ?, ?, ?, ?, 'active', ?, '')
+            """,
+            (str(uuid.uuid4()), run_id, task_id, agent, branch, rel, now_iso()),
+        )
+        emit_event(conn, "dispatch_worktree_created", payload(run_id=run_id, task_id=task_id, agent=agent, branch=branch, worktree_path=rel))
+    return branch, rel
+
+
+def commit_worktree_claims(work_dir: Path, agent: str, task_id: str, claim_files: list[str]) -> None:
+    if not claim_files:
+        return
+    subprocess.run(["git", "add", "--", *claim_files], cwd=work_dir, text=True, capture_output=True, check=False)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=work_dir, text=True, capture_output=True, check=False)
+    if diff.returncode == 0:
+        return
+    result = subprocess.run(
+        ["git", "-c", "user.name=Codex Harness", "-c", "user.email=harness@example.invalid", "commit", "-m", f"Agent {agent} task {task_id}"],
+        cwd=work_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(f"worktree commit failed: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def dispatch_file_claim_add(root: Path, task_id: str, agent: str, path: str, *, run_id: str = "", worktree_path: str = "", branch_name: str = "") -> str:
+    normalized = normalize_claim_path(path)
+    with transaction(root, touched=[("task_file_claim", normalized)]) as conn:
+        existing = conn.execute(
+            "select id from task_file_claims where task_id = ? and agent_id = ? and path = ? and status = 'active'",
+            (task_id, agent, normalized),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        try:
+            claim_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                insert into task_file_claims
+                (id, run_id, task_id, agent_id, path, worktree_path, branch_name, status, created_at, released_at)
+                values (?, ?, ?, ?, ?, ?, ?, 'active', ?, '')
+                """,
+                (claim_id, run_id, task_id, agent, normalized, worktree_path, branch_name, now_iso()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HarnessError(f"file-claim-conflict: {normalized}") from exc
+        emit_event(conn, "task_file_claimed", payload(id=claim_id, run_id=run_id, task_id=task_id, agent=agent, path=normalized))
+        return claim_id
+
+
+def dispatch_file_claim_list(root: Path, *, task_id: str = "", agent: str = "") -> list[str]:
+    clauses = ["status = 'active'"]
+    params: list[str] = []
+    if task_id:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if agent:
+        clauses.append("agent_id = ?")
+        params.append(agent)
+    query = f"select * from task_file_claims where {' and '.join(clauses)} order by path"
+    with connection(root) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    lines = ["| Path | Task | Agent | Run | Worktree |", "| --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["path"], row["task_id"], row["agent_id"], row["run_id"], row["worktree_path"]]) for row in rows)
+    return lines
+
+
+def dispatch_file_claim_release(root: Path, task_id: str, agent: str, *, path: str = "") -> int:
+    normalized = normalize_claim_path(path) if path else ""
+    clauses = ["task_id = ?", "agent_id = ?", "status = 'active'"]
+    params: list[str] = [task_id, agent]
+    if normalized:
+        clauses.append("path = ?")
+        params.append(normalized)
+    with transaction(root, touched=[("task_file_claim", normalized or task_id)]) as conn:
+        rows = conn.execute(f"select id from task_file_claims where {' and '.join(clauses)}", tuple(params)).fetchall()
+        for row in rows:
+            conn.execute("update task_file_claims set status = 'released', released_at = ? where id = ?", (now_iso(), row["id"]))
+        if rows:
+            emit_event(conn, "task_file_claim_released", payload(task_id=task_id, agent=agent, path=normalized, count=len(rows)))
+    return len(rows)
+
+
+def dispatch_run(
+    root: Path,
+    agent: str,
+    command: str,
+    *,
+    timeout: int = 120,
+    target_id: str = "",
+    allow_unlisted: bool = False,
+    no_network: bool = False,
+    sandbox_profile: str = "none",
+    allow_unlisted_reason: str = "",
+    executed_count: int | None = None,
+    code_identity: str = "auto",
+    runner: str = "null",
+    claim_files: list[str] | None = None,
+) -> str:
+    from dataclasses import replace
+    from core.agent_runner import RunnerRequest, runner_for
+    guard_schema("validate_code_identity_mode", code_identity)
+
+    assignment = assignment_for_agent(root, agent)
+    run_id = assignment["run_id"]
+    task_id = assignment["task_id"]
+    branch_name = ""
+    worktree_path = ""
+    work_dir = root
+    if runner == "local-process":
+        branch_name, worktree_path = ensure_dispatch_worktree(root, run_id, task_id, agent)
+        work_dir = root / worktree_path
+    elif runner != "null":
+        raise HarnessError(f"unknown runner: {runner}")
+    for claim_file in claim_files or []:
+        dispatch_file_claim_add(root, task_id, agent, claim_file, run_id=run_id, worktree_path=worktree_path, branch_name=branch_name)
 
     with connection(root) as conn:
         target_command = test_target_command(conn, target_id) if target_id else ""
         prefixes = executor_prefixes(conn)
 
-    result = LocalExecutor(root).run(
-        command,
+    runner_result = runner_for(runner).run(RunnerRequest(
+        root=root,
+        work_dir=work_dir,
+        command=command,
         timeout=timeout,
         target_id=target_id,
         target_command_template=target_command,
@@ -3183,11 +3362,22 @@ def dispatch_run(
         sandbox_profile="no-network" if no_network else sandbox_profile,
         allow_unlisted_reason=allow_unlisted_reason,
         executed_count=executed_count,
-    )
+    ))
+    result = runner_result.evidence
+    normalized_claims = [normalize_claim_path(path) for path in (claim_files or [])]
+    if runner == "local-process" and result.exit_code == 0:
+        commit_worktree_claims(work_dir, agent, task_id, normalized_claims)
+    if runner == "local-process":
+        source_artifact = work_dir / result.artifact_path
+        stdout = source_artifact.read_bytes()
+        artifact = root / ".ai-team" / "runtime" / "executions" / uuid.uuid4().hex / "stdout.txt"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(stdout)
+        result = replace(result, artifact_path=artifact.relative_to(root).as_posix(), stdout_sha256=hashlib.sha256(stdout).hexdigest())
     evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
     source_hash = source_tree_hash_for_mode(root, code_identity)
     status = "completed" if result.exit_code == 0 else "failed"
-    with transaction(root, touched=[("dispatch_assignment", assignment["task_id"]), ("evidence", evidence_id)]) as conn:
+    with transaction(root, touched=[("dispatch_assignment", task_id), ("evidence", evidence_id)]) as conn:
         conn.execute(
             """
             insert into evidence
@@ -3199,7 +3389,7 @@ def dispatch_run(
             """,
             (
                 evidence_id,
-                f"dispatch {assignment['task_id']} command exit {result.exit_code}",
+                f"dispatch {task_id} command exit {result.exit_code}",
                 f"local://{result.artifact_path}",
                 result.stdout_sha256,
                 result.command,
@@ -3220,26 +3410,28 @@ def dispatch_run(
                 now_iso(),
             ),
         )
-        if assignment["run_id"]:
+        if run_id:
             conn.execute(
                 """
                 update dispatch_assignments
                 set status = ?, evidence = ?, updated_at = ?
                 where run_id = ? and task_id = ?
                 """,
-                (status, evidence_id, now_iso(), assignment["run_id"], assignment["task_id"]),
+                (status, evidence_id, now_iso(), run_id, task_id),
             )
-            conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), assignment["run_id"]))
+            conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), run_id))
         emit_event(
             conn,
             "dispatch_command_executed",
             payload(
-                run_id=assignment["run_id"],
-                task_id=assignment["task_id"],
+                run_id=run_id,
+                task_id=task_id,
                 agent=agent,
                 evidence_id=evidence_id,
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
+                runner=runner,
+                file_claims=normalized_claims,
                 allow_unlisted_reason=result.allow_unlisted_reason,
                 sandbox_profile=result.sandbox_profile,
                 sandbox_status=result.sandbox_status,
@@ -3247,7 +3439,7 @@ def dispatch_run(
         )
     if result.exit_code != 0:
         detail = f" {result.policy_reason}" if result.policy_reason else ""
-        raise HarnessError(f"dispatch command failed: {assignment['task_id']} exit_code={result.exit_code} evidence={evidence_id}{detail}")
+        raise HarnessError(f"dispatch command failed: {task_id} exit_code={result.exit_code} evidence={evidence_id}{detail}")
     return evidence_id
 
 
@@ -3271,6 +3463,71 @@ def dispatch_recover_stale(root: Path) -> int:
         if recovered:
             emit_event(conn, "dispatch_stale_recovered", payload(count=recovered))
     return recovered
+
+
+def record_integration_finding(conn: sqlite3.Connection, run_id: str, summary: str) -> str:
+    finding_id = f"INT-{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        insert into findings
+        (id, surface, severity, status, summary, evidence_id, created_at)
+        values (?, 'dispatch-integration', 'high', 'open', ?, '', ?)
+        """,
+        (finding_id, summary[:1000], now_iso()),
+    )
+    emit_event(conn, "dispatch_integration_finding_recorded", payload(run_id=run_id, finding_id=finding_id, summary=summary[:500]))
+    return finding_id
+
+
+def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> str:
+    if not (root / ".git").exists():
+        raise HarnessError("dispatch integrate requires a git repository")
+    target = target_branch or f"integration/{safe_branch_part(run_id)}"
+    current = subprocess.run(["git", "branch", "--show-current"], cwd=root, text=True, capture_output=True, check=False).stdout.strip()
+    if not current:
+        raise HarnessError("dispatch integrate requires a named current branch")
+    with connection(root) as conn:
+        rows = conn.execute(
+            "select * from dispatch_worktrees where run_id = ? and status = 'active' order by created_at",
+            (run_id,),
+        ).fetchall()
+    if not rows:
+        raise HarnessError(f"no active dispatch worktrees for run: {run_id}")
+    try:
+        reset = subprocess.run(["git", "switch", "-C", target, current], cwd=root, text=True, capture_output=True, check=False)
+        if reset.returncode != 0:
+            raise HarnessError(f"integration branch create failed: {reset.stderr.strip() or reset.stdout.strip()}")
+        for row in rows:
+            merge = subprocess.run(["git", "merge", "--no-ff", "--no-edit", row["branch_name"]], cwd=root, text=True, capture_output=True, check=False)
+            if merge.returncode != 0:
+                subprocess.run(["git", "merge", "--abort"], cwd=root, text=True, capture_output=True, check=False)
+                summary = f"merge conflict for {row['task_id']} from {row['branch_name']}: {merge.stderr.strip() or merge.stdout.strip()}"
+                with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
+                    record_integration_finding(conn, run_id, summary)
+                    conn.execute("update dispatch_runs set status = 'integration_conflict', updated_at = ? where id = ?", (now_iso(), run_id))
+                    conn.execute("update dispatch_assignments set status = 'integration_conflict', updated_at = ? where run_id = ?", (now_iso(), run_id))
+                    emit_event(conn, "dispatch_integration_conflict", payload(run_id=run_id, branch=row["branch_name"]))
+                raise HarnessError(f"integration conflict: {row['task_id']}")
+        issues = validate_runtime(root, delivery=True)
+        if issues:
+            summary = "; ".join(issues[:5])
+            with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
+                record_integration_finding(conn, run_id, f"delivery validation failed after integration: {summary}")
+                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
+                emit_event(conn, "dispatch_integration_verification_failed", payload(run_id=run_id, issues=issues[:10]))
+            raise HarnessError(f"integration verification failed: {summary}")
+        with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+            conn.execute("update dispatch_runs set status = 'integrated', updated_at = ? where id = ?", (now_iso(), run_id))
+            conn.execute("update dispatch_assignments set status = 'integrated', updated_at = ? where run_id = ?", (now_iso(), run_id))
+            for row in rows:
+                worktree = root / row["worktree_path"]
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
+                conn.execute("update dispatch_worktrees set status = 'cleaned', cleaned_at = ? where id = ?", (now_iso(), row["id"]))
+            emit_event(conn, "dispatch_integrated", payload(run_id=run_id, target_branch=target))
+        return target
+    finally:
+        subprocess.run(["git", "switch", current], cwd=root, text=True, capture_output=True, check=False)
 
 
 def dispatch_status(root: Path) -> list[str]:
@@ -3497,6 +3754,8 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),
         ("dispatch-run.schema.json", "dispatch_runs", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_runs")]),
         ("dispatch-assignment.schema.json", "dispatch_assignments", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_assignments")]),
+        ("dispatch-worktree.schema.json", "dispatch_worktrees", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_worktrees")]),
+        ("task-file-claim.schema.json", "task_file_claims", [row_snapshot(row) or {} for row in conn.execute("select * from task_file_claims")]),
         ("runtime-snapshot.schema.json", "runtime_snapshots", [row_snapshot(row) or {} for row in conn.execute("select * from runtime_snapshots")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),
         ("event.schema.json", "events", [row_snapshot(row) or {} for row in conn.execute("select * from events")]),
