@@ -100,6 +100,8 @@ REQUIRED_SCHEMAS = [
     "agent-report.schema.json",
     "agent-provider-session.schema.json",
     "agent-provider-event.schema.json",
+    "sandbox-execution.schema.json",
+    "integration-attempt.schema.json",
     "runtime-snapshot.schema.json",
 ]
 

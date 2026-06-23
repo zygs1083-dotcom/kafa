@@ -37,16 +37,43 @@ def commit_branch(root: Path, run_id: str, task_id: str, agent: str, file_name: 
     worktree = root / ".ai-team/runtime/worktrees" / run_id / task_id / agent
     worktree.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "worktree", "add", "-B", branch, str(worktree), "HEAD"], cwd=root, check=True, capture_output=True)
-    (worktree / file_name).write_text(content, encoding="utf-8")
+    target = worktree / file_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
     subprocess.run(["git", "add", file_name], cwd=worktree, check=True)
     subprocess.run(["git", "commit", "-m", f"{task_id}"], cwd=worktree, check=True, capture_output=True)
     return branch, worktree.relative_to(root).as_posix()
+
+
+def branch_head_and_tree(root: Path, branch: str) -> tuple[str, str]:
+    head = subprocess.run(["git", "rev-parse", branch], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+    tree = subprocess.run(["git", "rev-parse", f"{branch}^{{tree}}"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+    return head, tree
+
+
+def branch_changed_files(root: Path, branch: str) -> list[str]:
+    return subprocess.run(["git", "diff", "--name-only", f"HEAD..{branch}"], cwd=root, text=True, capture_output=True, check=True).stdout.splitlines()
 
 
 def record_run_and_worktrees(root: Path, run_id: str, rows: list[tuple[str, str, str, str]]) -> None:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
         conn.execute("insert into dispatch_runs (id, scope, status, created_at, updated_at) values (?, 'scope', 'planned', 'now', 'now')", (run_id,))
         for task_id, agent, branch, worktree in rows:
+            head, tree = branch_head_and_tree(root, branch)
+            conn.execute("insert or ignore into tasks (id, task, owner, status, updated_at) values (?, ?, ?, 'submitted', 'now')", (task_id, task_id, agent))
+            conn.execute(
+                "insert into dispatch_assignments (run_id, task_id, agent_id, status, evidence, updated_at) values (?, ?, ?, 'completed', 'EV', 'now')",
+                (run_id, task_id, agent),
+            )
+            conn.execute(
+                """
+                insert into task_attempts
+                (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+                 branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, 0, 'HEAD', ?, ?, ?, 'UNIT', 'verified', '', '', '', 'EV', 'now', 'now')
+                """,
+                (f"ATTEMPT-{task_id}", run_id, task_id, agent, head, tree, branch),
+            )
             conn.execute(
                 """
                 insert into dispatch_worktrees
@@ -55,6 +82,15 @@ def record_run_and_worktrees(root: Path, run_id: str, rows: list[tuple[str, str,
                 """,
                 (f"{task_id}-{agent}", run_id, task_id, agent, branch, worktree),
             )
+            for path in branch_changed_files(root, branch):
+                conn.execute(
+                    """
+                    insert into task_file_claims
+                    (id, run_id, task_id, agent_id, path, worktree_path, branch_name, status, created_at, released_at)
+                    values (?, ?, ?, ?, ?, ?, ?, 'active', 'now', '')
+                    """,
+                    (f"CLAIM-{task_id}-{path}", run_id, task_id, agent, path, worktree, branch),
+                )
         conn.commit()
 
 
@@ -127,8 +163,8 @@ class DispatchIntegrationTest(unittest.TestCase):
             git_repo(root)
             run_harness(root, "init")
             run_id = "RUN2"
-            a = commit_branch(root, run_id, "T1", "developer", "base.txt", "A\n")
-            b = commit_branch(root, run_id, "T2", "qa-reviewer", "base.txt", "B\n")
+            a = commit_branch(root, run_id, "T1", "developer", "conflict", "A\n")
+            b = commit_branch(root, run_id, "T2", "qa-reviewer", "conflict/child.txt", "B\n")
             record_run_and_worktrees(root, run_id, [("T1", "developer", *a), ("T2", "qa-reviewer", *b)])
 
             with self.assertRaises(harness_db.HarnessError):
@@ -158,6 +194,52 @@ class DispatchIntegrationTest(unittest.TestCase):
                 finding = conn.execute("select summary from findings where surface = 'dispatch-integration'").fetchone()[0]
             self.assertEqual(status, "verification_failed")
             self.assertIn("delivery validation failed", finding)
+
+    def test_integrate_rejects_unverified_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_harness(root, "init")
+            run_id = "RUN5"
+            a = commit_branch(root, run_id, "T1", "developer", "a.txt", "A\n")
+            record_run_and_worktrees(root, run_id, [("T1", "developer", *a)])
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update task_attempts set status = 'reported', evidence_id = '' where run_id = ? and task_id = 'T1'", (run_id,))
+                conn.commit()
+
+            with self.assertRaisesRegex(harness_db.HarnessError, "integration-unverified-branch"):
+                harness_db.dispatch_integrate(root, run_id)
+
+    def test_integrate_rejects_branch_drift_after_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_harness(root, "init")
+            run_id = "RUN6"
+            branch, worktree = commit_branch(root, run_id, "T1", "developer", "a.txt", "A\n")
+            record_run_and_worktrees(root, run_id, [("T1", "developer", branch, worktree)])
+            worktree_path = root / worktree
+            (worktree_path / "a.txt").write_text("drift\n", encoding="utf-8")
+            subprocess.run(["git", "add", "a.txt"], cwd=worktree_path, check=True)
+            subprocess.run(["git", "commit", "-m", "drift"], cwd=worktree_path, check=True, capture_output=True)
+
+            with self.assertRaisesRegex(harness_db.HarnessError, "integration-branch-drift"):
+                harness_db.dispatch_integrate(root, run_id)
+
+    def test_integrate_rechecks_file_claim_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            run_harness(root, "init")
+            run_id = "RUN7"
+            a = commit_branch(root, run_id, "T1", "developer", "a.txt", "A\n")
+            record_run_and_worktrees(root, run_id, [("T1", "developer", *a)])
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("delete from task_file_claims where run_id = ? and path = 'a.txt'", (run_id,))
+                conn.commit()
+
+            with self.assertRaisesRegex(harness_db.HarnessError, "file-claim-violation"):
+                harness_db.dispatch_integrate(root, run_id)
 
 
 if __name__ == "__main__":

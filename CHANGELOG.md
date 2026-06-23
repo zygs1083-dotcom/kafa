@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.7.0-beta.1 - 2026-06-23
+
+### Added
+
+- Real Docker/Podman-backed controller verification through `dispatch verify-attempt --runner container`.
+- `sandbox_executions` schema 22 audit records, plus sandbox execution links on evidence and validations.
+- `integration_attempts` audit records for integration prechecks, conflicts, validation failures, and successful staging integration.
+- Optional `--container-image` with precedence: CLI argument, `.ai-team/control/container-image.txt`, then `python:3.12-slim`.
+
+### Changed
+
+- Runtime schema version is now `22`; runtime implementation version is now `4.0.0`.
+- Requested container verification now fails closed with `sandbox-unavailable` when Docker/Podman is unavailable; it no longer records container intent as a local fallback.
+- `dispatch integrate` now refuses unverified branches, branch head/tree drift after verification, and branch diffs outside active file claims before attempting a merge.
+
+### Boundaries
+
+- Container verification is for controller-side evidence generation, not code generation.
+- LocalProcessRunner and provider/worker reports remain non-sandboxed/raw until controller verification produces trusted evidence.
+- High/critical delivery gate semantics, HMAC anchors, fencing, idempotency, and provider raw-report boundaries are unchanged.
+
 ## v1.6.0-beta.1 - 2026-06-23
 
 ### Added

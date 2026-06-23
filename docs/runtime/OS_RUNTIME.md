@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.9.0
+# Codex OS Runtime Layer v4.0.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.9.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, and session attestation for independent QA. The repository release remains a beta release, while the runtime implementation version is `3.9.0` and the database schema version is `21`.
+Kernel v4.0.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, and hardened integration. The repository release remains a beta release, while the runtime implementation version is `4.0.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.9.0
+## Kernel v4.0.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -50,7 +50,20 @@ Most mutating CLI commands accept `--request-id`. The runtime writes a `command_
 
 `dispatch run` defaults to the compatible `null` runner. Passing `--runner local-process` creates or reuses an agent-specific git worktree under `.ai-team/runtime/worktrees/`, runs the command there, verifies that all branch changes are inside active `--claim-file` paths, commits claimed file changes on the agent branch, and records executor-style command evidence. File edits intended for integration must be declared with `--claim-file`; active claims conflict fail closed by exact repo-relative path. `dispatch integrate` merges agent branches inside a dedicated integration worktree and reruns delivery validation before marking the run integrated, so the user's main worktree is not branch-switched.
 
+Before merging, `dispatch integrate` requires each active agent worktree branch to have a latest verified `task_attempt`, checks that the branch head and tree still match the verified attempt, and recomputes `git diff base..branch` to ensure every changed file is covered by active file claims for that task/agent. Unverified branches, branch drift, and claim violations fail closed and write high integration findings plus `integration_attempts` audit rows.
+
 LocalProcessRunner is not an OS sandbox and does not create real Codex sub-sessions. Unattended use still requires host or container isolation.
+
+## Container Controller Verification
+
+`dispatch verify-attempt --runner container` uses Docker or Podman to rerun the linked target command in a no-network container against a read-only verification worktree for the agent branch. The controller writes stdout/stderr artifacts under `.ai-team/runtime/`, records a `sandbox_executions` audit row, and links `sandbox_execution_id`, `sandbox_engine`, and `container_image` into evidence and validation rows.
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt \
+  --run-id <run-id> --task T1 --runner container --container-image python:3.12-slim
+```
+
+Container image precedence is CLI `--container-image`, then `.ai-team/control/container-image.txt`, then `python:3.12-slim`. If Docker/Podman is unavailable, a requested container verification fails closed with `sandbox-unavailable`; it does not silently fall back to local execution.
 
 ## Native Codex Fan-Out
 
@@ -127,7 +140,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 21
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 22
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild

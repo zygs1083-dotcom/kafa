@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "runner", "command", "sandbox_status", "started_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "runner": { "type": "string", "enum": ["container", "local", "null", "local-process"] },
+    "engine": { "type": "string" },
+    "image": { "type": "string" },
+    "command": { "type": "string" },
+    "target_id": { "type": "string" },
+    "source_ref": { "type": "string" },
+    "tree_sha": { "type": "string" },
+    "network_mode": { "type": "string" },
+    "timeout_seconds": { "type": "integer" },
+    "resource_limits": { "type": "string" },
+    "exit_code": { "type": ["integer", "null"] },
+    "artifact_path": { "type": "string" },
+    "artifact_sha256": { "type": "string" },
+    "sandbox_status": { "type": "string", "enum": ["", "available", "unavailable"] },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": "string" }
+  }
+}

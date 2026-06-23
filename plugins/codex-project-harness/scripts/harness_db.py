@@ -37,9 +37,10 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 21
-RUNTIME_VERSION = "3.9.0"
+SCHEMA_VERSION = 22
+RUNTIME_VERSION = "4.0.0"
 LEASE_TTL_SECONDS = 3600
+DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
     ".ai-team/backups/",
@@ -194,6 +195,8 @@ SNAPSHOT_TABLES = [
     "agent_reports",
     "agent_provider_sessions",
     "agent_provider_events",
+    "sandbox_executions",
+    "integration_attempts",
     "codex_fanout_exports",
     "runtime_snapshots",
     "command_log",
@@ -468,6 +471,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             no_network integer not null default 0,
             sandbox_profile text not null default 'none',
             sandbox_status text not null default '',
+            sandbox_execution_id text not null default '',
+            sandbox_engine text not null default '',
+            container_image text not null default '',
             allow_unlisted_reason text not null default '',
             trust_anchor text not null default 'local-only',
             trust_anchor_id text not null default '',
@@ -575,6 +581,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             no_network integer not null default 0,
             sandbox_profile text not null default 'none',
             sandbox_status text not null default '',
+            sandbox_execution_id text not null default '',
+            sandbox_engine text not null default '',
+            container_image text not null default '',
             allow_unlisted_reason text not null default '',
             trust_anchor text not null default 'local-only',
             trust_anchor_id text not null default '',
@@ -816,6 +825,38 @@ def create_schema(conn: sqlite3.Connection) -> None:
             payload_json text not null default '',
             created_at text not null
         );
+        create table if not exists sandbox_executions (
+            id text primary key,
+            runner text not null,
+            engine text not null default '',
+            image text not null default '',
+            command text not null,
+            target_id text not null default '',
+            source_ref text not null default '',
+            tree_sha text not null default '',
+            network_mode text not null default '',
+            timeout_seconds integer not null default 0,
+            resource_limits text not null default '',
+            exit_code integer,
+            artifact_path text not null default '',
+            artifact_sha256 text not null default '',
+            sandbox_status text not null,
+            started_at text not null,
+            finished_at text not null default ''
+        );
+        create table if not exists integration_attempts (
+            id text primary key,
+            run_id text not null,
+            target_branch text not null,
+            integration_worktree text not null default '',
+            base_ref text not null default '',
+            merged_branches text not null default '',
+            status text not null,
+            validation_result text not null default '',
+            finding_id text not null default '',
+            started_at text not null,
+            finished_at text not null default ''
+        );
         create table if not exists codex_fanout_exports (
             id text primary key,
             run_id text not null,
@@ -899,6 +940,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "no_network", "integer not null default 0")
     ensure_column(conn, "validations", "sandbox_profile", "text not null default 'none'")
     ensure_column(conn, "validations", "sandbox_status", "text not null default ''")
+    ensure_column(conn, "validations", "sandbox_execution_id", "text not null default ''")
+    ensure_column(conn, "validations", "sandbox_engine", "text not null default ''")
+    ensure_column(conn, "validations", "container_image", "text not null default ''")
     ensure_column(conn, "validations", "allow_unlisted_reason", "text not null default ''")
     ensure_column(conn, "validations", "trust_anchor", "text not null default 'local-only'")
     ensure_column(conn, "validations", "trust_anchor_id", "text not null default ''")
@@ -922,6 +966,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "no_network", "integer not null default 0")
     ensure_column(conn, "evidence", "sandbox_profile", "text not null default 'none'")
     ensure_column(conn, "evidence", "sandbox_status", "text not null default ''")
+    ensure_column(conn, "evidence", "sandbox_execution_id", "text not null default ''")
+    ensure_column(conn, "evidence", "sandbox_engine", "text not null default ''")
+    ensure_column(conn, "evidence", "container_image", "text not null default ''")
     ensure_column(conn, "evidence", "allow_unlisted_reason", "text not null default ''")
     ensure_column(conn, "evidence", "trust_anchor", "text not null default 'local-only'")
     ensure_column(conn, "evidence", "trust_anchor_id", "text not null default ''")
@@ -4310,6 +4357,114 @@ def record_integration_finding(conn: sqlite3.Connection, run_id: str, summary: s
     return finding_id
 
 
+def git_changed_files_between(root: Path, base_ref: str, branch_name: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{base_ref}..{branch_name}"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(f"branch diff failed: {result.stderr.strip() or result.stdout.strip()}")
+    return sorted(path for path in result.stdout.splitlines() if path and not path.startswith(".ai-team/"))
+
+
+def record_integration_attempt_start(conn: sqlite3.Connection, run_id: str, target_branch: str, integration_worktree: Path, base_ref: str) -> str:
+    attempt_id = f"INTEGRATION-{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        insert into integration_attempts
+        (id, run_id, target_branch, integration_worktree, base_ref, merged_branches, status,
+         validation_result, finding_id, started_at, finished_at)
+        values (?, ?, ?, ?, ?, '', 'running', '', '', ?, '')
+        """,
+        (attempt_id, run_id, target_branch, integration_worktree.as_posix(), base_ref, now_iso()),
+    )
+    return attempt_id
+
+
+def finish_integration_attempt(
+    conn: sqlite3.Connection,
+    attempt_id: str,
+    status: str,
+    *,
+    merged_branches: list[str] | None = None,
+    validation_result: str = "",
+    finding_id: str = "",
+) -> None:
+    conn.execute(
+        """
+        update integration_attempts
+        set status = ?, merged_branches = ?, validation_result = ?, finding_id = ?, finished_at = ?
+        where id = ?
+        """,
+        (
+            status,
+            stable_json(merged_branches or []),
+            validation_result[:2000],
+            finding_id,
+            now_iso(),
+            attempt_id,
+        ),
+    )
+
+
+def fail_integration_precheck(root: Path, run_id: str, attempt_id: str, status: str, message: str) -> None:
+    with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
+        finding_id = record_integration_finding(conn, run_id, message)
+        finish_integration_attempt(conn, attempt_id, status, validation_result=message, finding_id=finding_id)
+        conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+        conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
+        emit_event(conn, "dispatch_integration_precheck_failed", payload(run_id=run_id, status=status, message=message[:500]))
+
+
+def integration_verified_attempt(conn: sqlite3.Connection, run_id: str, task_id: str, branch_name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        select * from task_attempts
+        where run_id = ? and task_id = ? and branch_name = ? and status = 'verified' and evidence_id != ''
+        order by finished_at desc, started_at desc, id desc
+        limit 1
+        """,
+        (run_id, task_id, branch_name),
+    ).fetchone()
+
+
+def verify_integration_inputs(root: Path, run_id: str, rows: list[sqlite3.Row], attempt_id: str) -> None:
+    with connection(root) as conn:
+        for row in rows:
+            attempt = integration_verified_attempt(conn, run_id, row["task_id"], row["branch_name"])
+            if not attempt:
+                message = f"integration-unverified-branch: {row['task_id']} {row['branch_name']}"
+                fail_integration_precheck(root, run_id, attempt_id, "integration_unverified_branch", message)
+                raise HarnessError(message)
+            actual_head = git_ref_commit(root, row["branch_name"])
+            actual_tree = git_ref_tree(root, row["branch_name"])
+            if actual_head != attempt["head_commit_sha"] or actual_tree != attempt["tree_sha"]:
+                message = (
+                    f"integration-branch-drift: {row['task_id']} {row['branch_name']} "
+                    f"expected_head={attempt['head_commit_sha']} actual_head={actual_head} "
+                    f"expected_tree={attempt['tree_sha']} actual_tree={actual_tree}"
+                )
+                fail_integration_precheck(root, run_id, attempt_id, "integration_branch_drift", message)
+                raise HarnessError(message)
+            changed_files = git_changed_files_between(root, attempt["base_commit_sha"] or "HEAD", row["branch_name"])
+            claim_rows = conn.execute(
+                """
+                select path from task_file_claims
+                where run_id = ? and task_id = ? and agent_id = ? and status = 'active'
+                """,
+                (run_id, row["task_id"], row["agent_id"]),
+            ).fetchall()
+            allowed = {claim["path"] for claim in claim_rows}
+            unexpected = sorted(path for path in changed_files if path not in allowed)
+            if unexpected:
+                message = f"file-claim-violation: {row['task_id']} {', '.join(unexpected)}"
+                fail_integration_precheck(root, run_id, attempt_id, "file_claim_violation", message)
+                raise HarnessError(message)
+
+
 def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> str:
     if not (root / ".git").exists():
         raise HarnessError("dispatch integrate requires a git repository")
@@ -4325,6 +4480,9 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
     if not rows:
         raise HarnessError(f"no active dispatch worktrees for run: {run_id}")
     integration_worktree = root / ".ai-team" / "runtime" / "integration-worktrees" / safe_branch_part(run_id)
+    with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+        integration_attempt_id = record_integration_attempt_start(conn, run_id, target, integration_worktree, current)
+    verify_integration_inputs(root, run_id, rows, integration_attempt_id)
     integration_worktree.parent.mkdir(parents=True, exist_ok=True)
     if integration_worktree.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, text=True, capture_output=True, check=False)
@@ -4340,7 +4498,8 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
                 subprocess.run(["git", "merge", "--abort"], cwd=integration_worktree, text=True, capture_output=True, check=False)
                 summary = f"merge conflict for {row['task_id']} from {row['branch_name']}: {merge.stderr.strip() or merge.stdout.strip()}"
                 with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
-                    record_integration_finding(conn, run_id, summary)
+                    finding_id = record_integration_finding(conn, run_id, summary)
+                    finish_integration_attempt(conn, integration_attempt_id, "integration_conflict", merged_branches=[r["branch_name"] for r in rows], validation_result=summary, finding_id=finding_id)
                     conn.execute("update dispatch_runs set status = 'integration_conflict', updated_at = ? where id = ?", (now_iso(), run_id))
                     conn.execute("update dispatch_assignments set status = 'integration_conflict', updated_at = ? where run_id = ?", (now_iso(), run_id))
                     emit_event(conn, "dispatch_integration_conflict", payload(run_id=run_id, branch=row["branch_name"]))
@@ -4349,12 +4508,14 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
         if issues:
             summary = "; ".join(issues[:5])
             with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
-                record_integration_finding(conn, run_id, f"delivery validation failed after integration: {summary}")
+                finding_id = record_integration_finding(conn, run_id, f"delivery validation failed after integration: {summary}")
+                finish_integration_attempt(conn, integration_attempt_id, "verification_failed", merged_branches=[r["branch_name"] for r in rows], validation_result=summary, finding_id=finding_id)
                 conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
                 emit_event(conn, "dispatch_integration_verification_failed", payload(run_id=run_id, issues=issues[:10]))
             raise HarnessError(f"integration verification failed: {summary}")
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+            finish_integration_attempt(conn, integration_attempt_id, "integrated", merged_branches=[r["branch_name"] for r in rows], validation_result="pass")
             conn.execute("update dispatch_runs set status = 'integrated', updated_at = ? where id = ?", (now_iso(), run_id))
             conn.execute("update dispatch_assignments set status = 'integrated', updated_at = ? where run_id = ?", (now_iso(), run_id))
             for row in rows:
@@ -4373,6 +4534,17 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
 def resolve_runtime_path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def resolve_container_image(root: Path, container_image: str = "") -> str:
+    if container_image.strip():
+        return container_image.strip()
+    config = root / ".ai-team" / "control" / "container-image.txt"
+    if config.exists():
+        configured = config.read_text(encoding="utf-8").strip()
+        if configured:
+            return configured
+    return DEFAULT_CONTAINER_IMAGE
 
 
 def read_csv_dicts(path: Path) -> list[dict[str, str]]:
@@ -4757,7 +4929,7 @@ def record_attempt_failure(conn: sqlite3.Connection, run_id: str, task_id: str, 
     conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
 
 
-def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: str = "local") -> str:
+def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: str = "local", container_image: str = "") -> str:
     from core.executor import LocalExecutor
     from core.agent_runner import RunnerRequest, runner_for
 
@@ -4798,18 +4970,26 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
     with connection(root) as conn:
         prefixes = executor_prefixes(conn)
     if runner == "container":
-        result = runner_for("container").run(
-            RunnerRequest(
-                root=root,
-                work_dir=worktree,
-                command=target["command_template"],
-                target_id=target["id"],
-                target_command_template=target["command_template"],
-                allowed_prefixes=prefixes,
-                no_network=True,
-                sandbox_profile="no-network",
+        image = resolve_container_image(root, container_image)
+        try:
+            runner_result = runner_for("container").run(
+                RunnerRequest(
+                    root=root,
+                    work_dir=worktree,
+                    command=target["command_template"],
+                    target_id=target["id"],
+                    target_command_template=target["command_template"],
+                    allowed_prefixes=prefixes,
+                    no_network=True,
+                    sandbox_profile="no-network",
+                    container_image=image,
+                )
             )
-        ).evidence
+        except RuntimeError as exc:
+            if str(exc).startswith("sandbox-unavailable"):
+                raise HarnessError(str(exc)) from exc
+            raise
+        result = runner_result.evidence
     else:
         executor = LocalExecutor(worktree)
         result = executor.run(
@@ -4818,7 +4998,8 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             target_command_template=target["command_template"],
             allowed_prefixes=prefixes,
         )
-    if runner == "container" and result.sandbox_status != "unavailable":
+        runner_result = None
+    if runner == "container" and result.sandbox_status == "available":
         verified_by = "controller-container"
     elif runner == "container":
         verified_by = "controller-container-unavailable"
@@ -4827,12 +5008,19 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
     head_commit = git_ref_commit(root, attempt["branch_name"])
     tree_sha = git_ref_tree(root, attempt["branch_name"])
     source_hash = source_tree_hash_for_mode(worktree, "auto")
-    source_artifact = worktree / result.artifact_path
+    source_artifact = (root / result.artifact_path) if runner == "container" else (worktree / result.artifact_path)
     artifact = root / ".ai-team" / "runtime" / "executions" / uuid.uuid4().hex / "stdout.txt"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(source_artifact.read_bytes())
     artifact_rel = artifact.relative_to(root).as_posix()
     artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    sandbox_execution_id = ""
+    sandbox_engine = ""
+    sandbox_image = ""
+    if runner == "container":
+        sandbox_execution_id = f"SANDBOX-{uuid.uuid4().hex[:12]}"
+        sandbox_engine = str((runner_result.sandbox_execution or {}).get("engine", "")) if runner_result else ""
+        sandbox_image = str((runner_result.sandbox_execution or {}).get("image", "")) if runner_result else ""
     issues: list[str] = []
     if result.exit_code != 0:
         issues.append(f"exit_code={result.exit_code}")
@@ -4846,6 +5034,34 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
         issues.append("source tree hash unavailable")
     if issues:
         with transaction(root, touched=[("task_attempt", attempt["id"]), ("finding", task_id)]) as conn:
+            if sandbox_execution_id:
+                conn.execute(
+                    """
+                    insert into sandbox_executions
+                    (id, runner, engine, image, command, target_id, source_ref, tree_sha, network_mode,
+                     timeout_seconds, resource_limits, exit_code, artifact_path, artifact_sha256,
+                     sandbox_status, started_at, finished_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sandbox_execution_id,
+                        runner,
+                        sandbox_engine,
+                        sandbox_image,
+                        result.command,
+                        target["id"],
+                        attempt["branch_name"],
+                        tree_sha,
+                        120,
+                        stable_json({"cpus": "1", "memory": "512m", "pids_limit": "256"}),
+                        result.exit_code,
+                        artifact_rel,
+                        artifact_hash,
+                        result.sandbox_status,
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
             record_attempt_failure(conn, run_id, task_id, attempt["id"], "; ".join(issues))
         raise HarnessError(f"dispatch attempt verification failed: {'; '.join(issues)}")
 
@@ -4858,9 +5074,9 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             insert into evidence
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
-             sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             sandbox_profile, sandbox_status, sandbox_execution_id, sandbox_engine, container_image, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              attempt_id, tree_sha, code_ref, verified_by, created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '', 'local-only', '',
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
                     ?, ?, ?, ?, ?)
             """,
             (
@@ -4881,6 +5097,9 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 result.policy_reason,
                 result.sandbox_profile,
                 result.sandbox_status,
+                sandbox_execution_id,
+                sandbox_engine,
+                sandbox_image,
                 attempt["id"],
                 tree_sha,
                 attempt["branch_name"],
@@ -4894,10 +5113,10 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             insert into validations
             (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
-             policy_reason, sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             policy_reason, sandbox_profile, sandbox_status, sandbox_execution_id, sandbox_engine, container_image, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              findings, result, residual_risk, head_commit, source_tree_hash, attempt_id, tree_sha, code_ref,
              verified_by, tracked_diff_hash, project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '', 'local-only', '',
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
                     'controller verification passed', 'pass', '', ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
@@ -4917,6 +5136,9 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 result.policy_reason,
                 result.sandbox_profile,
                 result.sandbox_status,
+                sandbox_execution_id,
+                sandbox_engine,
+                sandbox_image,
                 head_commit,
                 source_hash,
                 attempt["id"],
@@ -4928,6 +5150,34 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             ),
         )
         conn.execute("insert into validation_evidence (validation_id, evidence_id) values (?, ?)", (validation_id, evidence_id))
+        if sandbox_execution_id:
+            conn.execute(
+                """
+                insert into sandbox_executions
+                (id, runner, engine, image, command, target_id, source_ref, tree_sha, network_mode,
+                 timeout_seconds, resource_limits, exit_code, artifact_path, artifact_sha256,
+                 sandbox_status, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sandbox_execution_id,
+                    runner,
+                    sandbox_engine,
+                    sandbox_image,
+                    result.command,
+                    target["id"],
+                    attempt["branch_name"],
+                    tree_sha,
+                    120,
+                    stable_json({"cpus": "1", "memory": "512m", "pids_limit": "256"}),
+                    result.exit_code,
+                    artifact_rel,
+                    artifact_hash,
+                    result.sandbox_status,
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
         conn.execute(
             "update task_attempts set status = 'verified', evidence_id = ?, head_commit_sha = ?, tree_sha = ?, finished_at = ? where id = ?",
             (evidence_id, head_commit, tree_sha, now_iso(), attempt["id"]),
@@ -5076,6 +5326,8 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("session_attestations", "role", SESSION_ROLES, "session attestation role"),
         ("session_attestations", "origin", ANCHOR_ORIGINS, "session attestation origin"),
         ("session_attestations", "trust_level", SESSION_TRUST_LEVELS, "session attestation trust level"),
+        ("sandbox_executions", "sandbox_status", {"", "available", "unavailable"}, "sandbox execution status"),
+        ("integration_attempts", "status", {"running", "integrated", "integration_conflict", "verification_failed", "integration_unverified_branch", "integration_branch_drift", "file_claim_violation"}, "integration attempt status"),
     ]
     for table, column, allowed, label in enum_checks:
         if table == "dispatch_assignments":
@@ -5207,6 +5459,8 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("agent-report.schema.json", "agent_reports", [row_snapshot(row) or {} for row in conn.execute("select * from agent_reports")]),
         ("agent-provider-session.schema.json", "agent_provider_sessions", [row_snapshot(row) or {} for row in conn.execute("select * from agent_provider_sessions")]),
         ("agent-provider-event.schema.json", "agent_provider_events", [row_snapshot(row) or {} for row in conn.execute("select * from agent_provider_events")]),
+        ("sandbox-execution.schema.json", "sandbox_executions", [row_snapshot(row) or {} for row in conn.execute("select * from sandbox_executions")]),
+        ("integration-attempt.schema.json", "integration_attempts", [row_snapshot(row) or {} for row in conn.execute("select * from integration_attempts")]),
         ("codex-fanout-export.schema.json", "codex_fanout_exports", [row_snapshot(row) or {} for row in conn.execute("select * from codex_fanout_exports")]),
         ("runtime-snapshot.schema.json", "runtime_snapshots", [row_snapshot(row) or {} for row in conn.execute("select * from runtime_snapshots")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),
