@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.4.1
+# Codex OS Runtime Layer v3.5.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.4.1 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, and command idempotency. The repository release remains a beta release, while the runtime implementation version is `3.4.1` and the database schema version is `16`.
+Kernel v3.5.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, and isolated agent dispatch. The repository release remains a beta release, while the runtime implementation version is `3.5.0` and the database schema version is `17`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.4.1
+## Kernel v3.5.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -45,6 +45,12 @@ Write commands that hold a task lease accept `--fence`. When supplied, `task sta
 Most mutating CLI commands accept `--request-id`. The runtime writes a `command_log` row in the same transaction as the first business mutation. A retry with the same request id and same semantic arguments returns the first stdout without reapplying the mutation. A retry with the same request id but different arguments fails with `idempotency-conflict`.
 
 `init`, `migrate`, `repair`, and `checkpoint create/import` are admin or restore operations and do not support `--request-id` in this release.
+
+## Agent Runner Isolation
+
+`dispatch run` defaults to the compatible `null` runner. Passing `--runner local-process` creates or reuses an agent-specific git worktree under `.ai-team/runtime/worktrees/`, runs the command there, commits claimed file changes on the agent branch, and records executor-style command evidence. File edits intended for integration must be declared with `--claim-file`; active claims conflict fail closed by exact repo-relative path. `dispatch integrate` merges agent branches into a staging `integration/<run-id>` branch and reruns delivery validation before marking the run integrated.
+
+LocalProcessRunner is not an OS sandbox and does not create real Codex sub-sessions. Unattended use still requires host or container isolation.
 
 ## Fail-Closed Evidence Identity
 
@@ -76,7 +82,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 16
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 17
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -354,6 +360,8 @@ harness.py --root . validation record \
 harness.py --root . executor allow-prefix add --prefix "npm test" --reason "project test runner"
 harness.py --root . dispatch run --agent developer --target NPM_TEST --command "npm test" --sandbox-profile none
 harness.py --root . dispatch run --agent developer --command "custom check" --allow-unlisted --reason "one-off diagnostic"
+harness.py --root . dispatch run --agent developer --runner local-process --claim-file src/app.py --command "npm test" --allow-unlisted --reason "isolated agent run"
+harness.py --root . dispatch integrate --run-id <run-id>
 ```
 
 `--no-network` is retained as a compatibility alias for `--sandbox-profile no-network`. In the local runtime, `no-network` records intent as `sandbox_status=unavailable`; it is not treated as OS-level isolation.

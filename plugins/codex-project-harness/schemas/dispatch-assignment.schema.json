@@ -7,7 +7,7 @@
     "task_id": { "type": "string" },
     "agent_id": { "type": "string" },
     "capability": { "type": "string" },
-    "status": { "type": "string", "enum": ["planned", "claimed", "completed", "failed", "stale"] },
+    "status": { "type": "string", "enum": ["planned", "claimed", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"] },
     "evidence": { "type": "string" },
     "claimed_at": { "type": ["string", "null"] },
     "updated_at": { "type": "string" }

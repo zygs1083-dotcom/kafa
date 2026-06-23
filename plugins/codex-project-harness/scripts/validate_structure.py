@@ -37,6 +37,7 @@ REQUIRED_CORE = [
     "schema_guard.py",
     "event_bus.py",
     "executor.py",
+    "agent_runner.py",
     "invariant_checker.py",
     "projections.py",
 ]
@@ -88,6 +89,8 @@ REQUIRED_SCHEMAS = [
     "baseline.schema.json",
     "dispatch-run.schema.json",
     "dispatch-assignment.schema.json",
+    "dispatch-worktree.schema.json",
+    "task-file-claim.schema.json",
     "runtime-snapshot.schema.json",
 ]
 
