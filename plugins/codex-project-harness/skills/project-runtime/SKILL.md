@@ -163,6 +163,8 @@ When an AgentProvider is available, use `dispatch provider start --run-id <run-i
 
 `dispatch integrate` only merges active agent branches that have a verified task attempt, whose current branch head/tree still match that verified attempt, and whose changed files remain within active file claims. Unverified branches, branch drift, and file-claim violations are high findings and fail closed before merge.
 
+For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixture`. It is the deterministic Agent E2E evaluation for scheduling, provider raw reports, controller verification, file claims, and integration blocking. `run_skill_eval.py` is only a transcript marker check.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:
@@ -254,5 +256,6 @@ Before claiming delivery readiness:
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
 5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor and connector(HMAC) reviewer session attestation, or explicitly accepted.
 6. Confirm any claimed no-network sandbox evidence has `sandbox_status=available`; otherwise describe it as local/manual verification, not sandbox execution.
-7. Confirm delivery record includes local or external collaboration links.
-8. State any warnings or residual risk.
+7. For harness runtime changes, run `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture`.
+8. Confirm delivery record includes local or external collaboration links.
+9. State any warnings or residual risk.

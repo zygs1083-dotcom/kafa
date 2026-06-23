@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.0.0
+# Codex OS Runtime Layer v4.1.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.0.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, and hardened integration. The repository release remains a beta release, while the runtime implementation version is `4.0.0` and the database schema version is `22`.
+Kernel v4.1.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, and deterministic Agent E2E evaluation. The repository release remains a beta release, while the runtime implementation version is `4.1.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.0.0
+## Kernel v4.1.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -90,6 +90,18 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provi
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
 ```
+
+## Agent E2E Evaluation
+
+`run_agent_e2e_eval.py --mode fixture` is the default capability evaluation. It creates temporary Git repositories, calls the real CLI, writes SQLite/worktree/attempt/evidence/integration audit state, and reports JSON metrics for five deterministic scenarios: parallel success, dependency blocking, same-file claim conflict, forged evidence blocking, and integration regression blocking.
+
+```bash
+python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
+```
+
+`run_skill_eval.py` remains a transcript marker check. It is useful for format drift, but it is not an Agent capability evaluation. Optional live dogfood can use `run_agent_e2e_eval.py --mode live-command` with `CODEX_AGENT_EVAL_CMD`; when unset, live mode reports `live_skipped=true`.
+
+A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-eval-example.json`; real run durations are intentionally not committed.
 
 ## Session Attestation And Independent QA
 
@@ -533,4 +545,4 @@ python3 plugins/codex-project-harness/scripts/run_forward_eval.py
 python3 plugins/codex-project-harness/scripts/run_skill_eval.py
 ```
 
-GitHub Actions runs structure checks, JSON checks, Python compilation, runtime tests, runtime smoke, forward wrapper, local skill eval, and a Kernel diagnostic smoke on push and pull request.
+GitHub Actions runs structure checks, JSON checks, Python compilation, runtime tests, runtime smoke, forward wrapper, local skill eval, Agent E2E fixture eval, and a Kernel diagnostic smoke on push and pull request.

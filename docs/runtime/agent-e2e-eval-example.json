@@ -1,0 +1,51 @@
+{
+  "agent_runtime_seconds": null,
+  "estimated_cost": null,
+  "live_skipped": false,
+  "mode": "fixture",
+  "scenarios": [
+    {
+      "details": {},
+      "duration_seconds": 0.0,
+      "name": "parallel_success",
+      "pass": true
+    },
+    {
+      "details": {},
+      "duration_seconds": 0.0,
+      "name": "dependency_blocked",
+      "pass": true
+    },
+    {
+      "details": {},
+      "duration_seconds": 0.0,
+      "name": "same_file_conflict",
+      "pass": true
+    },
+    {
+      "details": {},
+      "duration_seconds": 0.0,
+      "name": "forged_evidence_blocked",
+      "pass": true
+    },
+    {
+      "details": {},
+      "duration_seconds": 0.0,
+      "name": "integration_regression_blocked",
+      "pass": true
+    }
+  ],
+  "summary": {
+    "duration_seconds": 0.0,
+    "failed_count": 0,
+    "false_pass_count": 0,
+    "forged_evidence_block_count": 1,
+    "human_intervention_count": 0,
+    "merge_conflict_count": 0,
+    "passed_count": 5,
+    "retry_count": 0,
+    "scenario_count": 5,
+    "task_once_completion_rate": 1.0
+  },
+  "token_count": null
+}
