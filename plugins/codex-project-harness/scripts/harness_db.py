@@ -35,8 +35,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 19
-RUNTIME_VERSION = "3.7.0"
+SCHEMA_VERSION = 20
+RUNTIME_VERSION = "3.8.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -184,6 +184,8 @@ SNAPSHOT_TABLES = [
     "dispatch_worktrees",
     "task_file_claims",
     "agent_reports",
+    "agent_provider_sessions",
+    "agent_provider_events",
     "codex_fanout_exports",
     "runtime_snapshots",
     "command_log",
@@ -433,6 +435,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             branch_name text not null default '',
             target_id text not null default '',
             status text not null,
+            provider_session_id text not null default '',
             report_id text not null default '',
             evidence_id text not null default '',
             started_at text not null default '',
@@ -695,6 +698,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             capability text not null default '',
             status text not null,
             evidence text not null default '',
+            provider_session_id text not null default '',
             claimed_at text,
             heartbeat_at text,
             lease_expires_at text,
@@ -730,10 +734,45 @@ def create_schema(conn: sqlite3.Connection) -> None:
             id text primary key,
             run_id text not null,
             task_id text not null,
+            provider_session_id text not null default '',
             job_id text not null default '',
             status text not null,
             last_error text not null default '',
             result_json text not null,
+            created_at text not null
+        );
+        create table if not exists agent_provider_sessions (
+            id text primary key,
+            run_id text not null,
+            task_id text not null,
+            provider text not null,
+            provider_session_id text not null default '',
+            provider_job_id text not null default '',
+            agent_id text not null default '',
+            status text not null,
+            fence integer not null default 0,
+            branch_name text not null default '',
+            worktree_path text not null default '',
+            input_json text not null default '',
+            report_id text not null default '',
+            attempt_id text not null default '',
+            last_error text not null default '',
+            spawned_at text not null default '',
+            heartbeat_at text not null default '',
+            lease_expires_at text not null default '',
+            collected_at text not null default '',
+            cancelled_at text not null default '',
+            finished_at text not null default '',
+            unique(run_id, task_id, provider)
+        );
+        create table if not exists agent_provider_events (
+            id text primary key,
+            session_id text not null,
+            run_id text not null,
+            task_id text not null,
+            provider text not null,
+            event_type text not null,
+            payload_json text not null default '',
             created_at text not null
         );
         create table if not exists codex_fanout_exports (
@@ -852,6 +891,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "external_session_verifications", "token_reason", "text not null default ''")
     ensure_column(conn, "dispatch_assignments", "heartbeat_at", "text")
     ensure_column(conn, "dispatch_assignments", "lease_expires_at", "text")
+    ensure_column(conn, "dispatch_assignments", "provider_session_id", "text not null default ''")
+    ensure_column(conn, "task_attempts", "provider_session_id", "text not null default ''")
+    ensure_column(conn, "agent_reports", "provider_session_id", "text not null default ''")
     ensure_default_executor_allowlist(conn)
 
 
@@ -3463,6 +3505,138 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
         return assignment["task_id"]
 
 
+def provider_event(conn: sqlite3.Connection, session: sqlite3.Row | dict[str, Any], event_type: str, values: dict[str, Any] | None = None) -> None:
+    data = dict(values or {})
+    if isinstance(session, sqlite3.Row):
+        session_id = session["id"]
+        run_id = session["run_id"]
+        task_id = session["task_id"]
+        provider = session["provider"]
+    else:
+        session_id = session.get("id", "")
+        run_id = session.get("run_id", "")
+        task_id = session.get("task_id", "")
+        provider = session.get("provider", "")
+    conn.execute(
+        """
+        insert into agent_provider_events
+        (id, session_id, run_id, task_id, provider, event_type, payload_json, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (str(uuid.uuid4()), session_id, run_id, task_id, provider, event_type, stable_json(data), now_iso()),
+    )
+
+
+def provider_assignment_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    from core.scheduler import ready_queue
+
+    ready_ids = set(ready_queue(conn))
+    if not ready_ids:
+        return []
+    placeholders = ",".join("?" for _ in ready_ids)
+    return conn.execute(
+        f"""
+        select da.*, t.task, t.owner, t.fence
+        from dispatch_assignments da
+        join tasks t on t.id = da.task_id
+        where da.run_id = ? and da.status in ('planned', 'claimed') and t.status = 'ready'
+          and da.task_id in ({placeholders})
+        order by da.updated_at, da.task_id
+        """,
+        (run_id, *tuple(ready_ids)),
+    ).fetchall()
+
+
+def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_concurrency: int = 6) -> int:
+    from core.agent_provider import AgentJobRequest, provider_for
+
+    if max_concurrency < 1 or max_concurrency > 6:
+        raise HarnessError("max concurrency must be between 1 and 6")
+    provider = provider_for(provider_name)
+    started = 0
+    with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+        run = conn.execute("select * from dispatch_runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HarnessError(f"missing dispatch run: {run_id}")
+        rows = provider_assignment_rows(conn, run_id)[:max_concurrency]
+        for row in rows:
+            existing = conn.execute(
+                """
+                select * from agent_provider_sessions
+                where run_id = ? and task_id = ? and provider = ? and status in ('spawning', 'running', 'reported')
+                """,
+                (run_id, row["task_id"], provider.name),
+            ).fetchone()
+            if existing:
+                continue
+            agent_id = row["agent_id"] or row["capability"] or row["owner"] or "developer"
+            branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(row['task_id'])}/{safe_branch_part(agent_id)}"
+            target = task_target(conn, row["task_id"])
+            request = AgentJobRequest(
+                root=root,
+                run_id=run_id,
+                task_id=row["task_id"],
+                agent_id=agent_id,
+                branch_name=branch_name,
+                fence=int(row["fence"]),
+                target_id=target["id"] if target else "",
+                command_template=target["command_template"] if target else "",
+                instruction=f"Work on task {row['task_id']}: {row['task']}",
+                input_json={
+                    "run_id": run_id,
+                    "task_id": row["task_id"],
+                    "task": row["task"],
+                    "branch_name": branch_name,
+                    "target_id": target["id"] if target else "",
+                },
+            )
+            handle = provider.spawn(request)
+            session_id = str(uuid.uuid4())
+            now = now_iso()
+            conn.execute(
+                """
+                insert into agent_provider_sessions
+                (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
+                 branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
+                 heartbeat_at, lease_expires_at, collected_at, cancelled_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', '', ?, ?, ?, ?, '', '', '')
+                """,
+                (
+                    session_id,
+                    run_id,
+                    row["task_id"],
+                    provider.name,
+                    handle.provider_session_id,
+                    handle.provider_job_id,
+                    agent_id,
+                    handle.status,
+                    int(row["fence"]),
+                    branch_name,
+                    stable_json(request.input_json),
+                    handle.message,
+                    now,
+                    now,
+                    lease_deadline(),
+                ),
+            )
+            conn.execute(
+                """
+                update dispatch_assignments
+                set agent_id = ?, status = 'claimed', provider_session_id = ?, claimed_at = coalesce(claimed_at, ?),
+                    heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                where run_id = ? and task_id = ?
+                """,
+                (agent_id, handle.provider_session_id, now, now, lease_deadline(), now, run_id, row["task_id"]),
+            )
+            session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
+            provider_event(conn, session, "started", {"provider_status": handle.status})
+            emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, provider_session_id=handle.provider_session_id))
+            started += 1
+        if started:
+            conn.execute("update dispatch_runs set status = 'claimed', updated_at = ? where id = ?", (now_iso(), run_id))
+    return started
+
+
 def normalize_claim_path(path: str) -> str:
     value = path.strip()
     if not value:
@@ -4053,8 +4227,8 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
             conn.execute(
                 """
                 insert into agent_reports
-                (id, run_id, task_id, job_id, status, last_error, result_json, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, run_id, task_id, provider_session_id, job_id, status, last_error, result_json, created_at)
+                values (?, ?, ?, '', ?, ?, ?, ?, ?)
                 """,
                 (report_id, run_id, item_id, row["job_id"], row["status"], row["last_error"], row["result_json"], now_iso()),
             )
@@ -4062,8 +4236,8 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
                 """
                 insert into task_attempts
                 (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
-                 branch_name, target_id, status, report_id, evidence_id, started_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, '', ?, '')
+                 branch_name, target_id, status, provider_session_id, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', '', ?, '', ?, '')
                 """,
                 (
                     attempt_id,
@@ -4111,6 +4285,216 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
     return f"imported {imported} report(s)"
 
 
+def provider_handle_from_row(row: sqlite3.Row) -> Any:
+    from core.agent_provider import AgentJobHandle
+
+    return AgentJobHandle(
+        provider=row["provider"],
+        provider_session_id=row["provider_session_id"],
+        provider_job_id=row["provider_job_id"],
+        status=row["status"],
+        message=row["last_error"],
+    )
+
+
+def expected_from_provider_session(session: sqlite3.Row) -> dict[str, str]:
+    data = json.loads(session["input_json"] or "{}")
+    return {
+        "item_id": session["task_id"],
+        "target_id": str(data.get("target_id", "")),
+        "branch_name": session["branch_name"],
+        "fence": str(session["fence"]),
+        "agent_id": session["agent_id"],
+    }
+
+
+def dispatch_provider_collect(root: Path, run_id: str) -> int:
+    from core.agent_provider import provider_for
+
+    collected = 0
+    with connection(root) as conn:
+        sessions = conn.execute(
+            "select * from agent_provider_sessions where run_id = ? and status = 'running' order by spawned_at, task_id",
+            (run_id,),
+        ).fetchall()
+    for session in sessions:
+        provider = provider_for(session["provider"])
+        report = provider.collect(provider_handle_from_row(session), root=root, run_id=run_id, task_id=session["task_id"])
+        if report is None:
+            with transaction(root, touched=[("agent_provider_session", session["id"])]) as conn:
+                conn.execute(
+                    "update agent_provider_sessions set heartbeat_at = ?, lease_expires_at = ? where id = ?",
+                    (now_iso(), lease_deadline(), session["id"]),
+                )
+            continue
+        if report.status != "success" or report.last_error:
+            with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                record_integration_finding(conn, run_id, f"provider report failed for {session['task_id']}: {report.last_error or report.status}")
+                conn.execute(
+                    "update agent_provider_sessions set status = 'verification_failed', last_error = ?, collected_at = ?, finished_at = ? where id = ?",
+                    (report.last_error or report.status, now_iso(), now_iso(), session["id"]),
+                )
+                conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
+                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                provider_event(conn, session, "collect_failed", {"status": report.status, "last_error": report.last_error})
+            continue
+        try:
+            result = json.loads(report.result_json)
+        except json.JSONDecodeError as exc:
+            with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                record_integration_finding(conn, run_id, f"provider report invalid for {session['task_id']}: {exc.msg}")
+                conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", (exc.msg, now_iso(), session["id"]))
+            continue
+        with connection(root) as conn:
+            issues = codex_report_issues(root, conn, expected_from_provider_session(session), result)
+        if issues:
+            with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                record_integration_finding(conn, run_id, f"provider report rejected for {session['task_id']}: {'; '.join(issues[:5])}")
+                conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", ("; ".join(issues[:5]), now_iso(), session["id"]))
+                conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
+                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                provider_event(conn, session, "collect_rejected", {"issues": issues[:5]})
+            continue
+        report_id = f"REPORT-{uuid.uuid4().hex[:12]}"
+        attempt_id = f"ATTEMPT-{uuid.uuid4().hex[:12]}"
+        head_commit = git_ref_commit(root, result["branch_name"])
+        tree_sha = git_ref_tree(root, result["branch_name"])
+        with transaction(root, touched=[("agent_provider_session", session["id"]), ("task_attempt", attempt_id)]) as conn:
+            conn.execute(
+                """
+                insert into agent_reports
+                (id, run_id, task_id, provider_session_id, job_id, status, last_error, result_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (report_id, run_id, session["task_id"], session["provider_session_id"], report.provider_job_id, report.status, report.last_error, report.result_json, now_iso()),
+            )
+            conn.execute(
+                """
+                insert into task_attempts
+                (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+                 branch_name, target_id, status, provider_session_id, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, '', ?, '')
+                """,
+                (
+                    attempt_id,
+                    run_id,
+                    session["task_id"],
+                    session["agent_id"],
+                    int(session["fence"]),
+                    git_base_commit(root) or "",
+                    head_commit,
+                    tree_sha,
+                    result["branch_name"],
+                    result["target_id"],
+                    session["provider_session_id"],
+                    report_id,
+                    now_iso(),
+                ),
+            )
+            conn.execute(
+                "update agent_provider_sessions set status = 'reported', report_id = ?, attempt_id = ?, collected_at = ? where id = ?",
+                (report_id, attempt_id, now_iso(), session["id"]),
+            )
+            conn.execute(
+                "update dispatch_assignments set status = 'reported', provider_session_id = ?, updated_at = ? where run_id = ? and task_id = ?",
+                (session["provider_session_id"], now_iso(), run_id, session["task_id"]),
+            )
+            conn.execute(
+                """
+                insert into dispatch_worktrees
+                (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
+                values (?, ?, ?, ?, ?, '', 'active', ?, '')
+                """,
+                (str(uuid.uuid4()), run_id, session["task_id"], session["agent_id"], result["branch_name"], now_iso()),
+            )
+            provider_event(conn, session, "collected", {"report_id": report_id, "attempt_id": attempt_id})
+            emit_event(conn, "agent_provider_report_collected", payload(run_id=run_id, task_id=session["task_id"], provider=session["provider"], report_id=report_id, attempt_id=attempt_id))
+        collected += 1
+    if collected:
+        with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+            conn.execute("update dispatch_runs set status = 'reported', updated_at = ? where id = ?", (now_iso(), run_id))
+    return collected
+
+
+def dispatch_provider_cancel(root: Path, run_id: str, *, task_id: str = "", reason: str = "") -> int:
+    from core.agent_provider import provider_for
+
+    clauses = ["run_id = ?", "status in ('spawning', 'running', 'reported')"]
+    params: list[str] = [run_id]
+    if task_id:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    with connection(root) as conn:
+        sessions = conn.execute(f"select * from agent_provider_sessions where {' and '.join(clauses)}", tuple(params)).fetchall()
+    cancelled = 0
+    for session in sessions:
+        provider = provider_for(session["provider"])
+        provider.cancel(provider_handle_from_row(session), reason)
+        with transaction(root, touched=[("agent_provider_session", session["id"])]) as conn:
+            if reason:
+                record_integration_finding(conn, run_id, f"provider session cancelled for {session['task_id']}: {reason}")
+            conn.execute(
+                "update agent_provider_sessions set status = 'cancelled', last_error = ?, cancelled_at = ?, finished_at = ? where id = ?",
+                (reason, now_iso(), now_iso(), session["id"]),
+            )
+            conn.execute(
+                """
+                update dispatch_assignments
+                set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                    lease_expires_at = null, updated_at = ?
+                where run_id = ? and task_id = ? and status != 'completed'
+                """,
+                (now_iso(), run_id, session["task_id"]),
+            )
+            provider_event(conn, session, "cancelled", {"reason": reason})
+        cancelled += 1
+    return cancelled
+
+
+def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
+    with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+        rows = conn.execute(
+            """
+            select * from agent_provider_sessions
+            where run_id = ? and status in ('spawning', 'running') and lease_expires_at is not null
+              and lease_expires_at != '' and lease_expires_at <= ?
+            """,
+            (run_id, now_iso()),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "update agent_provider_sessions set status = 'timed_out', last_error = 'provider session timed out', finished_at = ? where id = ?",
+                (now_iso(), row["id"]),
+            )
+            conn.execute(
+                """
+                update dispatch_assignments
+                set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                    lease_expires_at = null, updated_at = ?
+                where run_id = ? and task_id = ? and status != 'completed'
+                """,
+                (now_iso(), run_id, row["task_id"]),
+            )
+            provider_event(conn, row, "timed_out", {})
+        if rows:
+            emit_event(conn, "agent_provider_sessions_reconciled", payload(run_id=run_id, count=len(rows)))
+        return len(rows)
+
+
+def dispatch_provider_status(root: Path, run_id: str) -> list[str]:
+    with connection(root) as conn:
+        rows = conn.execute(
+            """
+            select task_id, provider, provider_session_id, agent_id, status, heartbeat_at, lease_expires_at, last_error
+            from agent_provider_sessions where run_id = ? order by task_id, provider
+            """,
+            (run_id,),
+        ).fetchall()
+    lines = ["| Task | Provider | Session | Agent | Status | Heartbeat | Expires | Error |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["task_id"], row["provider"], row["provider_session_id"], row["agent_id"], row["status"], row["heartbeat_at"], row["lease_expires_at"], row["last_error"]]) for row in rows)
+    return lines
+
+
 def record_attempt_failure(conn: sqlite3.Connection, run_id: str, task_id: str, attempt_id: str, message: str) -> None:
     record_integration_finding(conn, run_id, f"dispatch attempt verification failed for {task_id}: {message}")
     conn.execute("update task_attempts set status = 'verification_failed', finished_at = ? where id = ?", (now_iso(), attempt_id))
@@ -4133,6 +4517,23 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             raise HarnessError(f"missing task attempt: {run_id}/{task_id}")
         target = conn.execute("select * from test_targets where id = ?", (attempt["target_id"],)).fetchone()
         acceptance = conn.execute("select acceptance_id from task_acceptance where task_id = ? order by acceptance_id limit 1", (task_id,)).fetchone()
+        task = conn.execute("select fence from tasks where id = ?", (task_id,)).fetchone()
+        assignment = conn.execute("select provider_session_id from dispatch_assignments where run_id = ? and task_id = ?", (run_id, task_id)).fetchone()
+        provider_session = None
+        if attempt["provider_session_id"]:
+            provider_session = conn.execute(
+                "select * from agent_provider_sessions where provider_session_id = ? and run_id = ? and task_id = ?",
+                (attempt["provider_session_id"], run_id, task_id),
+            ).fetchone()
+    if task and int(task["fence"]) != int(attempt["fence"]):
+        raise HarnessError(f"fence-stale: {task_id} expected={attempt['fence']} actual={task['fence']}")
+    if attempt["provider_session_id"]:
+        if not provider_session:
+            raise HarnessError(f"provider-session-stale: {attempt['provider_session_id']}")
+        if provider_session["status"] in {"cancelled", "timed_out", "verification_failed"}:
+            raise HarnessError(f"provider-session-stale: {attempt['provider_session_id']} status={provider_session['status']}")
+        if assignment and assignment["provider_session_id"] and assignment["provider_session_id"] != attempt["provider_session_id"]:
+            raise HarnessError(f"provider-session-stale: {attempt['provider_session_id']}")
     if not target:
         raise HarnessError(f"missing test target: {attempt['target_id']}")
     if not int(target["gateable"]):
@@ -4276,6 +4677,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             "update task_attempts set status = 'verified', evidence_id = ?, head_commit_sha = ?, tree_sha = ?, finished_at = ? where id = ?",
             (evidence_id, head_commit, tree_sha, now_iso(), attempt["id"]),
         )
+        if attempt["provider_session_id"]:
+            conn.execute(
+                "update agent_provider_sessions set status = 'verified', attempt_id = ?, finished_at = ? where provider_session_id = ? and run_id = ? and task_id = ?",
+                (attempt["id"], now_iso(), attempt["provider_session_id"], run_id, task_id),
+            )
         conn.execute(
             "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
             (evidence_id, now_iso(), run_id, task_id),
@@ -4525,6 +4931,8 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("dispatch-worktree.schema.json", "dispatch_worktrees", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_worktrees")]),
         ("task-file-claim.schema.json", "task_file_claims", [row_snapshot(row) or {} for row in conn.execute("select * from task_file_claims")]),
         ("agent-report.schema.json", "agent_reports", [row_snapshot(row) or {} for row in conn.execute("select * from agent_reports")]),
+        ("agent-provider-session.schema.json", "agent_provider_sessions", [row_snapshot(row) or {} for row in conn.execute("select * from agent_provider_sessions")]),
+        ("agent-provider-event.schema.json", "agent_provider_events", [row_snapshot(row) or {} for row in conn.execute("select * from agent_provider_events")]),
         ("codex-fanout-export.schema.json", "codex_fanout_exports", [row_snapshot(row) or {} for row in conn.execute("select * from codex_fanout_exports")]),
         ("runtime-snapshot.schema.json", "runtime_snapshots", [row_snapshot(row) or {} for row in conn.execute("select * from runtime_snapshots")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),

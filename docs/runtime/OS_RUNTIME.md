@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.7.0
+# Codex OS Runtime Layer v3.8.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.7.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, and controller-side fan-out verification. The repository release remains a beta release, while the runtime implementation version is `3.7.0` and the database schema version is `19`.
+Kernel v3.8.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, and auditable AgentProvider lifecycle tracking. The repository release remains a beta release, while the runtime implementation version is `3.8.0` and the database schema version is `20`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.7.0
+## Kernel v3.8.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -62,6 +62,18 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch plan 
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch export-csv <run-id>
 # Host/user invokes Codex spawn_agents_on_csv using .ai-team/runtime/codex-fanout/<run-id>/spawn_config.json.
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch import-csv <run-id> --result .ai-team/runtime/codex-fanout/<run-id>/output.csv
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
+```
+
+## AgentProvider Lifecycle
+
+`dispatch provider start` records host/manual/fixture-managed agent sessions for ready dispatch assignments. `dispatch provider collect` imports provider output as raw `agent_reports` and `task_attempts`; it never writes delivery-eligible evidence. `dispatch provider cancel` and `dispatch provider reconcile` make cancellation and timeout recovery auditable without allowing stale reports to overwrite newer work. Real Codex session creation remains a host/provider capability; the repository does not call Codex APIs or create user-visible Codex sessions by itself.
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider start --run-id <run-id> --provider manual-csv
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider collect --run-id <run-id>
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider reconcile --run-id <run-id>
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
 ```
@@ -483,7 +495,7 @@ Runtime behavior is covered by:
 ```bash
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
 python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py
-python3 -m unittest tests/test_harness_runtime.py tests/test_harness_operating_system.py
+python3 -m unittest discover -s tests -p 'test_*.py'
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
 python3 plugins/codex-project-harness/scripts/run_forward_eval.py
 python3 plugins/codex-project-harness/scripts/run_skill_eval.py

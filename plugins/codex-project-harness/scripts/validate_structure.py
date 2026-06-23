@@ -38,6 +38,7 @@ REQUIRED_CORE = [
     "event_bus.py",
     "executor.py",
     "agent_runner.py",
+    "agent_provider.py",
     "invariant_checker.py",
     "projections.py",
 ]
@@ -95,6 +96,8 @@ REQUIRED_SCHEMAS = [
     "dispatch-worktree.schema.json",
     "task-file-claim.schema.json",
     "agent-report.schema.json",
+    "agent-provider-session.schema.json",
+    "agent-provider-event.schema.json",
     "runtime-snapshot.schema.json",
 ]
 

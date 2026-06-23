@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.5.0-beta.1 - 2026-06-23
+
+### Added
+
+- AgentProvider lifecycle tracking for host/manual/fixture-managed agent sessions.
+- `dispatch provider start/status/collect/cancel/reconcile` commands for auditable provider session management.
+- `agent_provider_sessions` and `agent_provider_events` schema 20 tables, plus provider session links on reports, attempts, and dispatch assignments.
+
+### Changed
+
+- Runtime schema version is now `20`; runtime implementation version is now `3.8.0`.
+- Provider collection records raw reports and attempts only; trusted delivery evidence still requires controller `dispatch verify-attempt` or an existing HMAC/CI trust path.
+
+### Boundaries
+
+- Harness still does not call Codex APIs or create user-visible Codex sessions by itself.
+- Fixture provider is for tests and local smoke only; real AgentProvider implementations must be supplied by the host boundary.
+
 ## v1.4.0-beta.1 - 2026-06-23
 
 ### Added

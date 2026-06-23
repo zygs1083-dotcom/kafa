@@ -39,6 +39,11 @@ from core.api import (
     dispatch_import_csv,
     dispatch_integrate,
     dispatch_plan,
+    dispatch_provider_cancel,
+    dispatch_provider_collect,
+    dispatch_provider_reconcile,
+    dispatch_provider_start,
+    dispatch_provider_status,
     dispatch_recover_stale,
     dispatch_run,
     dispatch_status,
@@ -554,6 +559,26 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_integrate_parser.add_argument("--run-id", required=True)
     dispatch_integrate_parser.add_argument("--target-branch", default="")
     add_request_id(dispatch_integrate_parser)
+    dispatch_provider = dispatch_sub.add_parser("provider")
+    dispatch_provider_sub = dispatch_provider.add_subparsers(dest="dispatch_provider_command", required=True)
+    dispatch_provider_start_parser = dispatch_provider_sub.add_parser("start")
+    dispatch_provider_start_parser.add_argument("--run-id", required=True)
+    dispatch_provider_start_parser.add_argument("--provider", required=True, choices=["manual-csv", "fixture", "host-codex"])
+    dispatch_provider_start_parser.add_argument("--max-concurrency", type=int, default=6)
+    add_request_id(dispatch_provider_start_parser)
+    dispatch_provider_status_parser = dispatch_provider_sub.add_parser("status")
+    dispatch_provider_status_parser.add_argument("--run-id", required=True)
+    dispatch_provider_collect_parser = dispatch_provider_sub.add_parser("collect")
+    dispatch_provider_collect_parser.add_argument("--run-id", required=True)
+    add_request_id(dispatch_provider_collect_parser)
+    dispatch_provider_cancel_parser = dispatch_provider_sub.add_parser("cancel")
+    dispatch_provider_cancel_parser.add_argument("--run-id", required=True)
+    dispatch_provider_cancel_parser.add_argument("--task", default="")
+    dispatch_provider_cancel_parser.add_argument("--reason", default="")
+    add_request_id(dispatch_provider_cancel_parser)
+    dispatch_provider_reconcile_parser = dispatch_provider_sub.add_parser("reconcile")
+    dispatch_provider_reconcile_parser.add_argument("--run-id", required=True)
+    add_request_id(dispatch_provider_reconcile_parser)
     dispatch_sub.add_parser("status")
 
     executor = sub.add_parser("executor")
@@ -959,6 +984,16 @@ def main() -> int:
             mutate("dispatch.file-claim.release", lambda: f"OK: file claims released {dispatch_file_claim_release(root, args.task, args.agent, path=args.path)}")
         elif args.command == "dispatch" and args.dispatch_command == "integrate":
             mutate("dispatch.integrate", lambda: f"OK: dispatch integrated {dispatch_integrate(root, args.run_id, target_branch=args.target_branch)}")
+        elif args.command == "dispatch" and args.dispatch_command == "provider" and args.dispatch_provider_command == "start":
+            mutate("dispatch.provider.start", lambda: f"OK: started {dispatch_provider_start(root, args.run_id, args.provider, max_concurrency=args.max_concurrency)} provider session(s)")
+        elif args.command == "dispatch" and args.dispatch_command == "provider" and args.dispatch_provider_command == "status":
+            print("\n".join(dispatch_provider_status(root, args.run_id)))
+        elif args.command == "dispatch" and args.dispatch_command == "provider" and args.dispatch_provider_command == "collect":
+            mutate("dispatch.provider.collect", lambda: f"OK: collected {dispatch_provider_collect(root, args.run_id)} provider report(s)")
+        elif args.command == "dispatch" and args.dispatch_command == "provider" and args.dispatch_provider_command == "cancel":
+            mutate("dispatch.provider.cancel", lambda: f"OK: cancelled {dispatch_provider_cancel(root, args.run_id, task_id=args.task, reason=args.reason)} provider session(s)")
+        elif args.command == "dispatch" and args.dispatch_command == "provider" and args.dispatch_provider_command == "reconcile":
+            mutate("dispatch.provider.reconcile", lambda: f"OK: reconciled {dispatch_provider_reconcile(root, args.run_id)} provider session(s)")
         elif args.command == "dispatch" and args.dispatch_command == "status":
             print("\n".join(dispatch_status(root)))
         elif args.command == "executor" and args.executor_command == "allow-prefix" and args.executor_allow_command == "add":
