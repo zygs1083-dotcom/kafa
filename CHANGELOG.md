@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.6.0-beta.1 - 2026-06-23
+
+### Added
+
+- Session identity tracking through `agent_sessions` and host/connector `session_attestations`.
+- `session attest/status/close` commands for recording and auditing producer, reviewer, provider, and QA session identity.
+- Optional `--session-id` on task submit/review/accept and optional reviewer session fields on `gate record`.
+
+### Changed
+
+- Runtime schema version is now `21`; runtime implementation version is now `3.9.0`.
+- Independent QA is session-aware: a reviewer cannot accept a task with the same `session_id` that submitted it, even if the agent string changes.
+- High/critical delivery gates now require connector(HMAC) reviewer session attestation in addition to existing trusted validation anchors.
+- Provider start creates low-trust agent sessions, provider collect links attempts to those sessions, and cancel/reconcile closes stale provider sessions.
+
+### Boundaries
+
+- Session attestation proves that the host confirmed an independent context/session identity. It does not prove model reasoning quality.
+- Provider reports and worker self-reports remain raw reports; trusted evidence still requires controller verification or existing HMAC/CI trust paths.
+- Manual session attestations remain useful audit records and low/medium-risk compatibility paths, but do not satisfy high/critical independent QA.
+
 ## v1.5.0-beta.1 - 2026-06-23
 
 ### Added

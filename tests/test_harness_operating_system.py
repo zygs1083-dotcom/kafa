@@ -67,6 +67,30 @@ def token_from_stdout(stdout: str) -> str:
     return stdout.split(marker, 1)[1].split(None, 1)[0].strip()
 
 
+def stdout_field(stdout: str, name: str) -> str:
+    return stdout.split(f"{name}=", 1)[1].split(None, 1)[0].strip()
+
+
+def connector_reviewer_attestation(root: Path, *, session_id: str = "S-qa-hmac", context_id: str = "ctx-qa") -> str:
+    result = run_harness(
+        root,
+        "session",
+        "attest",
+        "--session-id",
+        session_id,
+        "--agent",
+        "qa-reviewer",
+        "--role",
+        "qa-reviewer",
+        "--context-id",
+        context_id,
+        "--origin",
+        "connector",
+        env=connector_env(),
+    )
+    return stdout_field(result.stdout, "attestation")
+
+
 def claim_start_submit(root: Path, task_id: str, *, agent: str = "developer") -> None:
     claim = run_harness(root, "task", "claim", task_id, "--agent", agent, "--expected-revision", str(task_revision(root, task_id)))
     token = token_from_stdout(claim.stdout)
@@ -267,7 +291,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 20)
+            self.assertEqual(project[0], 21)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
             self.assertIn("test_targets", tables)
@@ -466,7 +490,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "20")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "21")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -1344,7 +1368,25 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
                 conn.commit()
             self.assertEqual(token, ci_hmac(CONNECTOR_KEY, "github", "run-1", sha, "success"))
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            attestation_id = connector_reviewer_attestation(root)
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                "review",
+                "--evidence",
+                "review",
+                "--reviewer-session-id",
+                "S-qa-hmac",
+                "--reviewer-attestation-id",
+                attestation_id,
+                env=connector_env(),
+            )
 
             validate = run_harness(root, "validate", "--delivery", env=connector_env())
 
@@ -1430,7 +1472,25 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            attestation_id = connector_reviewer_attestation(root)
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                "review",
+                "--evidence",
+                "review",
+                "--reviewer-session-id",
+                "S-qa-hmac",
+                "--reviewer-attestation-id",
+                attestation_id,
+                env=connector_env(),
+            )
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1544,7 +1604,25 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            attestation_id = connector_reviewer_attestation(root)
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                "review",
+                "--evidence",
+                "review",
+                "--reviewer-session-id",
+                "S-qa-hmac",
+                "--reviewer-attestation-id",
+                attestation_id,
+                env=connector_env(),
+            )
 
             ci_validate = run_harness(root, "validate", "--delivery", env=connector_env())
             self.assertEqual(ci_validate.returncode, 0, ci_validate.stdout + ci_validate.stderr)
@@ -1575,7 +1653,25 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 conn.execute("update validations set trust_anchor = 'external-session', trust_anchor_id = ?", (verification_id,))
                 conn.commit()
             self.assertEqual(token, external_session_hmac(CONNECTOR_KEY, "session-1", "independent-codex", sha, "verified"))
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            attestation_id = connector_reviewer_attestation(root)
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                "review",
+                "--evidence",
+                "review",
+                "--reviewer-session-id",
+                "S-qa-hmac",
+                "--reviewer-attestation-id",
+                attestation_id,
+                env=connector_env(),
+            )
 
             session_validate = run_harness(root, "validate", "--delivery", env=connector_env())
             self.assertEqual(session_validate.returncode, 0, session_validate.stdout + session_validate.stderr)

@@ -32,7 +32,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 18`, `harness.py --root . migrate --from-version markdown-v1 --to-version 18 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 21`, `harness.py --root . migrate --from-version markdown-v1 --to-version 21 --dry-run` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -134,6 +134,25 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1
 
 Use stable `--request-id` values when an automation may retry a mutating command. Reusing the same id with the same arguments returns the first stdout; reusing it with different arguments fails with `idempotency-conflict`. Admin commands `init`, `migrate`, `repair`, and `checkpoint create/import` do not support `--request-id`.
 
+For session-aware independent QA, attest the producer and reviewer sessions and pass `--session-id` through task submit/review/accept. Connector-origin reviewer attestations require the host-controlled HMAC key and are mandatory for high/critical delivery gates:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . session attest \
+  --session-id S-dev --agent developer --role developer --context-id ctx-dev
+python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 \
+  --agent developer --lease-token "<token>" --expected-revision 4 --fence "<fence>" \
+  --evidence "implemented" --session-id S-dev
+python3 plugins/codex-project-harness/scripts/harness.py --root . session attest \
+  --session-id S-qa --agent qa-reviewer --role qa-reviewer --context-id ctx-qa --origin connector
+python3 plugins/codex-project-harness/scripts/harness.py --root . task review T1 \
+  --agent qa-reviewer --expected-revision 5 --session-id S-qa
+python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 \
+  --agent qa-reviewer --lease-token "<review-token>" --expected-revision 6 --fence "<review-fence>" \
+  --evidence "independent QA accepted" --session-id S-qa
+```
+
+Session attestation proves an independent context/session identity, not reasoning quality. Provider and worker reports remain raw reports until controller verification creates trusted evidence.
+
 For isolated local agent execution, explicitly use `dispatch run --runner local-process --claim-file <path> ...`; then run `dispatch integrate --run-id <id>` to merge agent branches through a staging integration branch and rerun delivery validation. LocalProcessRunner is not an OS sandbox or a real Codex sub-session.
 
 For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>`. Import records raw worker reports only; run `dispatch verify-attempt --run-id <run-id> --task <task-id>` for each reported task before `dispatch integrate --run-id <run-id>`.
@@ -184,7 +203,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . validation rec
   --trust-anchor-id <session-id>:<independent-session>
 ```
 
-For no-git projects, use `--code-identity content-hash` explicitly. For git projects, prefer the default git identity. Manual `ci` or `external-session` records are audit-only for high/critical risks; high-trust gates require connector-origin verification records whose token validates with the host-controlled HMAC key and current commit SHA. The key must come from `HARNESS_CONNECTOR_KEY` or `.ai-team/control/connector-key-path.txt`; it must not be written to DB, events, Markdown, or Git.
+For no-git projects, use `--code-identity content-hash` explicitly. For git projects, prefer the default git identity. Manual `ci`, `external-session`, or session attestation records are audit-only for high/critical risks; high-trust gates require connector-origin verification records whose token validates with the host-controlled HMAC key and current commit SHA, plus connector(HMAC) reviewer session attestation on the latest passing quality gate. The key must come from `HARNESS_CONNECTOR_KEY` or `.ai-team/control/connector-key-path.txt`; it must not be written to DB, events, Markdown, or Git.
 
 Record the independent quality gate before handoff:
 
@@ -229,6 +248,6 @@ Before claiming delivery readiness:
 2. Run `harness.py --root . validate --delivery`.
 3. Confirm validation evidence has a gateable registered target, matching command, `executed_count_source=parsed`, `executed_count>0`, and `exit_code=0`.
 4. Confirm the latest quality gate is `pass` for the reviewed revision.
-5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor, or explicitly accepted.
+5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor and connector(HMAC) reviewer session attestation, or explicitly accepted.
 6. Confirm delivery record includes local or external collaboration links.
 7. State any warnings or residual risk.

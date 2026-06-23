@@ -7,7 +7,7 @@ import hashlib
 from pathlib import Path
 
 from harness_lib import content_source_tree_hash, git_dirty, git_head_sha, git_source_tree_hash
-from .connector_trust import ci_payload, external_session_payload, verify_connector_record
+from .connector_trust import agent_session_payload, ci_payload, external_session_payload, verify_connector_record
 from .executor import command_matches_template
 
 
@@ -290,6 +290,25 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
         high_risk_present = conn.execute("select 1 from failure_modes where risk in ('high', 'critical') limit 1").fetchone()
         if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
             issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")
+        if high_risk_present:
+            review_trust_level = str(_value(latest_gate, "review_trust_level") or "local-only")
+            reviewer_attestation_id = str(_value(latest_gate, "reviewer_attestation_id") or "")
+            if review_trust_level != "connector" or not reviewer_attestation_id:
+                issues.append("high/critical risk delivery requires connector(HMAC) reviewer session attestation")
+            else:
+                attestation = conn.execute("select * from session_attestations where id = ?", (reviewer_attestation_id,)).fetchone()
+                if not attestation:
+                    issues.append(f"missing reviewer session attestation: {reviewer_attestation_id}")
+                elif attestation["origin"] != "connector":
+                    issues.append(f"reviewer session attestation origin is not connector: {attestation['origin']}")
+                else:
+                    ok, reason = verify_connector_record(
+                        root,
+                        attestation["verification_token"],
+                        agent_session_payload(attestation["session_id"], attestation["agent_id"], attestation["role"], attestation["context_id"]),
+                    )
+                    if not ok:
+                        issues.append(f"reviewer session connector HMAC invalid: {reason}")
         if current_sha:
             if git_dirty(root):
                 issues.append("git worktree is dirty after quality gate")

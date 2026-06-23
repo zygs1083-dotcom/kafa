@@ -90,6 +90,8 @@ REQUIRED_SCHEMAS = [
     "codex-fanout-export.schema.json",
     "external-session-verification.schema.json",
     "agent.schema.json",
+    "agent-session.schema.json",
+    "session-attestation.schema.json",
     "baseline.schema.json",
     "dispatch-run.schema.json",
     "dispatch-assignment.schema.json",

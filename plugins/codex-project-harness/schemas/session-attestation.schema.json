@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Session Attestation",
+  "type": "object",
+  "required": ["id", "session_id", "agent_id", "role", "context_id", "origin", "token_status", "trust_level"],
+  "properties": {
+    "id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "role": { "type": "string", "enum": ["developer", "qa-reviewer", "reviewer", "architect", "product", "security"] },
+    "context_id": { "type": "string" },
+    "provider_session_id": { "type": "string" },
+    "origin": { "type": "string", "enum": ["manual", "connector"] },
+    "verification_token": { "type": "string" },
+    "token_status": { "type": "string" },
+    "token_reason": { "type": "string" },
+    "trust_level": { "type": "string", "enum": ["local-only", "human-confirmed", "connector"] },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

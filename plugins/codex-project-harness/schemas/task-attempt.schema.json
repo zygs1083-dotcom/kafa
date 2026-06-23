@@ -14,6 +14,8 @@
     "branch_name": { "type": "string" },
     "target_id": { "type": "string" },
     "status": { "type": "string", "enum": ["reported", "verified", "verification_failed"] },
+    "provider_session_id": { "type": "string" },
+    "agent_session_id": { "type": "string" },
     "report_id": { "type": "string" },
     "evidence_id": { "type": "string" },
     "started_at": { "type": "string" },

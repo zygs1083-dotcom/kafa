@@ -30,6 +30,7 @@ from core.api import (
     claim_task,
     complete_task,
     confirm_scope,
+    connection,
     create_checkpoint,
     dispatch_claim_next,
     dispatch_file_claim_add,
@@ -72,6 +73,7 @@ from core.api import (
     record_external_session_verification,
     record_finding,
     record_gate,
+    record_session_attestation,
     record_test,
     record_validation,
     projection_rebuild,
@@ -79,6 +81,8 @@ from core.api import (
     recover_stale_leases,
     release_task,
     repair,
+    close_agent_session,
+    session_status_lines,
     start_task,
     status_lines,
     submit_task,
@@ -246,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_submit.add_argument("--expected-revision", type=int, required=True)
     task_submit.add_argument("--fence", type=int)
     task_submit.add_argument("--evidence", required=True)
+    task_submit.add_argument("--session-id", default="")
     add_request_id(task_submit)
 
     task_complete = task_sub.add_parser("complete")
@@ -255,12 +260,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_complete.add_argument("--expected-revision", type=int, required=True)
     task_complete.add_argument("--fence", type=int)
     task_complete.add_argument("--evidence", required=True)
+    task_complete.add_argument("--session-id", default="")
     add_request_id(task_complete)
 
     task_review = task_sub.add_parser("review")
     task_review.add_argument("id")
     task_review.add_argument("--agent", required=True)
     task_review.add_argument("--expected-revision", type=int, required=True)
+    task_review.add_argument("--session-id", default="")
     add_request_id(task_review)
 
     task_accept = task_sub.add_parser("accept")
@@ -270,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_accept.add_argument("--expected-revision", type=int, required=True)
     task_accept.add_argument("--fence", type=int)
     task_accept.add_argument("--evidence", required=True)
+    task_accept.add_argument("--session-id", default="")
     add_request_id(task_accept)
 
     task_block = task_sub.add_parser("block")
@@ -392,6 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
     gate_record.add_argument("--blocking-findings", default="")
     gate_record.add_argument("--residual-risk", default="")
     gate_record.add_argument("--finding", action="append", default=[])
+    gate_record.add_argument("--reviewer-session-id", default="")
+    gate_record.add_argument("--reviewer-attestation-id", default="")
     add_request_id(gate_record)
 
     delivery = sub.add_parser("delivery")
@@ -501,6 +511,23 @@ def build_parser() -> argparse.ArgumentParser:
     agents_install.add_argument("--dir", default=".codex/agents")
     agents_install.add_argument("--force", action="store_true")
     add_request_id(agents_install)
+
+    session = sub.add_parser("session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_attest = session_sub.add_parser("attest")
+    session_attest.add_argument("--session-id", required=True)
+    session_attest.add_argument("--agent", required=True)
+    session_attest.add_argument("--role", required=True, choices=["developer", "qa-reviewer", "reviewer", "architect", "product", "security"])
+    session_attest.add_argument("--context-id", required=True)
+    session_attest.add_argument("--provider-session-id", default="")
+    session_attest.add_argument("--origin", default="manual", choices=["manual", "connector"])
+    session_attest.add_argument("--verification-token", default="")
+    add_request_id(session_attest)
+    session_status = session_sub.add_parser("status")
+    session_status.add_argument("--agent", default="")
+    session_close = session_sub.add_parser("close")
+    session_close.add_argument("--session-id", required=True)
+    add_request_id(session_close)
 
     dispatch = sub.add_parser("dispatch")
     dispatch_sub = dispatch.add_subparsers(dest="dispatch_command", required=True)
@@ -755,17 +782,17 @@ def main() -> int:
         elif args.command == "task" and args.task_command == "start":
             mutate("task.start", lambda: (start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task started {args.id}")[1])
         elif args.command == "task" and args.task_command == "submit":
-            mutate("task.submit", lambda: (submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task submitted {args.id}")[1])
+            mutate("task.submit", lambda: (submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence, session_id=args.session_id), f"OK: task submitted {args.id}")[1])
         elif args.command == "task" and args.task_command == "complete":
-            mutate("task.complete", lambda: (complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task submitted {args.id}")[1])
+            mutate("task.complete", lambda: (complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence, session_id=args.session_id), f"OK: task submitted {args.id}")[1])
         elif args.command == "task" and args.task_command == "review":
             def review_output() -> str:
-                token, fence = review_task(root, args.id, args.agent, args.expected_revision)
+                token, fence = review_task(root, args.id, args.agent, args.expected_revision, session_id=args.session_id)
                 return f"OK: task review started {args.id} token={token} fence={fence}"
 
             mutate("task.review", review_output)
         elif args.command == "task" and args.task_command == "accept":
-            mutate("task.accept", lambda: (accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task accepted {args.id}")[1])
+            mutate("task.accept", lambda: (accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence, session_id=args.session_id), f"OK: task accepted {args.id}")[1])
         elif args.command == "task" and args.task_command == "block":
             mutate("task.block", lambda: (block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task blocked {args.id}")[1])
         elif args.command == "task" and args.task_command == "release":
@@ -856,6 +883,8 @@ def main() -> int:
                         blocking_findings=args.blocking_findings,
                         residual_risk=args.residual_risk,
                         findings=", ".join(args.finding),
+                        reviewer_session_id=args.reviewer_session_id,
+                        reviewer_attestation_id=args.reviewer_attestation_id,
                     ),
                     f"OK: quality gate recorded {args.gate}={args.result}",
                 )[1],
@@ -956,6 +985,27 @@ def main() -> int:
             mutate("agent.capability.add", lambda: (add_agent_capability(root, args.agent, args.capability), f"OK: agent capability added {args.agent}:{args.capability}")[1])
         elif args.command == "agents" and args.agents_command == "install":
             mutate("agents.install", lambda: f"OK: agents installed {install_agents(root, target_dir=args.dir, force=args.force, strict_no_overwrite=True)}")
+        elif args.command == "session" and args.session_command == "attest":
+            def attest_output() -> str:
+                attestation_id = record_session_attestation(
+                    root,
+                    args.session_id,
+                    args.agent,
+                    args.role,
+                    args.context_id,
+                    provider_session_id=args.provider_session_id,
+                    origin=args.origin,
+                    verification_token=args.verification_token,
+                )
+                with connection(root) as conn:
+                    row = conn.execute("select origin, token_status, trust_level from session_attestations where id = ?", (attestation_id,)).fetchone()
+                return f"OK: session attested {args.session_id} attestation={attestation_id} origin={row['origin']} token_status={row['token_status']} trust={row['trust_level']}"
+
+            mutate("session.attest", attest_output)
+        elif args.command == "session" and args.session_command == "status":
+            print("\n".join(session_status_lines(root, agent=args.agent)))
+        elif args.command == "session" and args.session_command == "close":
+            mutate("session.close", lambda: (close_agent_session(root, args.session_id), f"OK: session closed {args.session_id}")[1])
         elif args.command == "dispatch" and args.dispatch_command == "plan":
             mutate("dispatch.plan", lambda: f"OK: dispatch planned {dispatch_plan(root, args.scope)}")
         elif args.command == "dispatch" and args.dispatch_command == "export-csv":
