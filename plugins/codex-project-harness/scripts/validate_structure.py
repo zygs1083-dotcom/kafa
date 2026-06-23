@@ -82,6 +82,7 @@ REQUIRED_SCHEMAS = [
     "adapter.schema.json",
     "adapter-action.schema.json",
     "ci-verification.schema.json",
+    "command-log.schema.json",
     "external-session-verification.schema.json",
     "agent.schema.json",
     "baseline.schema.json",

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import contextvars
 import hashlib
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -31,8 +33,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 15
-RUNTIME_VERSION = "3.4.0"
+SCHEMA_VERSION = 16
+RUNTIME_VERSION = "3.4.1"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -141,6 +143,7 @@ SNAPSHOT_TABLES = [
     "dispatch_runs",
     "dispatch_assignments",
     "runtime_snapshots",
+    "command_log",
     "migrations",
     "events",
 ]
@@ -148,6 +151,9 @@ SNAPSHOT_TABLES = [
 
 class HarnessError(Exception):
     """User-facing runtime error."""
+
+
+_active_request: "contextvars.ContextVar[dict[str, Any] | None]" = contextvars.ContextVar("active_request", default=None)
 
 
 _store_factory: Callable[[Path], Store] = SqliteStore
@@ -197,16 +203,70 @@ def require_full_invariants(conn: sqlite3.Connection, root: Path, label: str) ->
         raise HarnessError(f"{label} invariant failed: " + "; ".join(str(issue) for issue in issues))
 
 
+def stable_args_hash(command: str, args: dict[str, Any]) -> str:
+    payload_json = json.dumps({"command": command, "args": args}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def insert_active_command_log(conn: sqlite3.Connection) -> None:
+    req = _active_request.get()
+    if not req or not req.get("request_id") or req.get("inserted"):
+        return
+    conn.execute(
+        """
+        insert into command_log (request_id, command, args_hash, result_json, created_at)
+        values (?, ?, ?, '', ?)
+        """,
+        (req["request_id"], req["command"], req["args_hash"], now_iso()),
+    )
+    req["inserted"] = True
+    fail_request_id = os.environ.get("HARNESS_TEST_FAIL_AFTER_COMMAND_LOG", "")
+    if fail_request_id and fail_request_id == req["request_id"]:
+        raise HarnessError(f"test command_log rollback: {fail_request_id}")
+
+
 @contextmanager
 def transaction(root: Path, *, validate_invariants: bool = True, touched: list[tuple[str, str]] | None = None) -> Iterator[sqlite3.Connection]:
     def before_commit(conn: sqlite3.Connection) -> None:
+        insert_active_command_log(conn)
         if validate_invariants:
             issues = transaction_invariant_issues(conn, root, touched)
             if issues:
                 raise HarnessError("; ".join(str(issue) for issue in issues))
 
-    with get_store(root).transaction(before_commit=before_commit if validate_invariants else None) as conn:
+    with get_store(root).transaction(before_commit=before_commit) as conn:
         yield conn
+
+
+def run_idempotent(root: Path, request_id: str | None, command: str, args: dict[str, Any], fn: Callable[[], str]) -> str:
+    if not request_id:
+        return fn()
+    args_hash = stable_args_hash(command, args)
+    with connection(root) as conn:
+        existing = conn.execute("select args_hash, result_json from command_log where request_id = ?", (request_id,)).fetchone()
+    if existing:
+        if existing["args_hash"] != args_hash:
+            raise HarnessError(f"idempotency-conflict: {request_id}")
+        return existing["result_json"] if existing["result_json"] else f"already-applied: {request_id}"
+
+    token = _active_request.set({"request_id": request_id, "command": command, "args_hash": args_hash, "inserted": False})
+    try:
+        result = fn()
+    except sqlite3.IntegrityError:
+        _active_request.reset(token)
+        return run_idempotent(root, request_id, command, args, fn)
+    except Exception:
+        _active_request.reset(token)
+        raise
+    else:
+        _active_request.reset(token)
+
+    try:
+        with transaction(root, validate_invariants=False) as conn:
+            conn.execute("update command_log set result_json = ? where request_id = ?", (result, request_id))
+    except Exception:
+        pass
+    return result
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -571,6 +631,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
             label text not null,
             event_sequence integer not null,
             snapshot_json text not null,
+            created_at text not null
+        );
+        create table if not exists command_log (
+            request_id text primary key,
+            command text not null,
+            args_hash text not null,
+            result_json text not null default '',
             created_at text not null
         );
         create table if not exists migrations (
@@ -3424,6 +3491,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
         ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
+        ("command-log.schema.json", "command_log", [row_snapshot(row) or {} for row in conn.execute("select * from command_log")]),
         ("external-session-verification.schema.json", "external_session_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from external_session_verifications")]),
         ("agent.schema.json", "agents", [row_snapshot(row) or {} for row in conn.execute("select * from agents")]),
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),

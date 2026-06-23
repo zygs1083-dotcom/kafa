@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.1.0-beta.1**，架构代际定位为 **Codex Harness Kernel v3.4.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.1.1-beta.1**，架构代际定位为 **Codex Harness Kernel v3.4.1**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v1.1.0-beta.1
+git show v1.1.1-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -133,6 +133,8 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 从 v1.0.2 开始，connector-origin 不再只看 `verification_token` 是否非空，而是要求宿主保管的 HMAC key 参与校验。运行时从 `HARNESS_CONNECTOR_KEY` 或 `.ai-team/control/connector-key-path.txt` 指向的文件加载 key，并用该 key 计算 CI / external-session verification token。没有 key、token 不匹配、commit SHA 或 conclusion 被篡改时，该记录在门禁中降级为 manual/local-only 等价，不能覆盖 high/critical failure mode。key 本身不得写入 DB、事件、Markdown 或 Git；推荐放在已忽略的 `.ai-team/runtime/connector.key`。
 
 从 v1.1.0 开始，任务 lease 使用 fencing 防止过期持有者覆写新持有者工作。`task claim` 和 `task review` 会输出 `fence=<n>`；`task start|heartbeat|submit|complete|accept|block|release` 可传 `--fence <n>`，当任务已被回收或重新交接导致 fence 过期时，写回会以 `fence-stale` 在事务内失败并回滚。
+
+从 v1.1.1 开始，多数写命令支持 `--request-id` 命令幂等。首次执行会在业务事务内写入 `command_log`，重试同一 request id 与相同参数时直接返回首次 stdout，不重复应用业务变更；相同 request id 搭配不同参数会返回 `idempotency-conflict`。`init`、`migrate`、`repair`、`checkpoint create/import` 暂不支持 `--request-id`。
 
 信任等级按强度分为三档：
 
@@ -297,8 +299,8 @@ harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 15
-harness.py --root . migrate --from-version markdown-v1 --to-version 15 --dry-run
+harness.py --root . migrate --from-version 6 --to-version 16
+harness.py --root . migrate --from-version markdown-v1 --to-version 16 --dry-run
 harness.py --root . invariant validate
 harness.py --root . projection rebuild
 harness.py --root . kernel doctor
