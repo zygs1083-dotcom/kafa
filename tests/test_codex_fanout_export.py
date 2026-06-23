@@ -22,6 +22,7 @@ def bootstrap_run(root: Path) -> str:
     run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
     run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", "python3 -m unittest")
     run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
+    run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
     return run_harness(root, "dispatch", "plan", "--scope", "Example").stdout.strip().split()[-1]
 
 
@@ -64,6 +65,29 @@ class CodexFanoutExportTest(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("max concurrency", result.stdout)
+
+    def test_export_csv_uses_task_linked_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "test-target", "add", "--id", "AA_UNIT", "--kind", "unit", "--command-template", "python3 -m unittest tests.test_unit")
+            run_harness(root, "test-target", "add", "--id", "ZZ_INTEGRATION", "--kind", "integration", "--command-template", "python3 -m unittest tests.test_integration")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Integration slice", "--acceptance", "AC1")
+            run_harness(root, "task", "add", "--id", "T2", "--task", "Unit slice", "--acceptance", "AC1")
+            run_harness(root, "test-target", "link", "--task", "T1", "--target", "ZZ_INTEGRATION")
+            run_harness(root, "test-target", "link", "--task", "T2", "--target", "AA_UNIT")
+            run_id = run_harness(root, "dispatch", "plan", "--scope", "Linked targets").stdout.strip().split()[-1]
+
+            run_harness(root, "dispatch", "export-csv", run_id)
+
+            input_csv = root / ".ai-team/runtime/codex-fanout" / run_id / "input.csv"
+            with input_csv.open(encoding="utf-8") as handle:
+                rows = {row["item_id"]: row for row in csv.DictReader(handle)}
+            self.assertEqual(rows["T1"]["target_id"], "ZZ_INTEGRATION")
+            self.assertEqual(rows["T1"]["command_template"], "python3 -m unittest tests.test_integration")
+            self.assertEqual(rows["T2"]["target_id"], "AA_UNIT")
+            self.assertEqual(rows["T2"]["command_template"], "python3 -m unittest tests.test_unit")
 
 
 if __name__ == "__main__":

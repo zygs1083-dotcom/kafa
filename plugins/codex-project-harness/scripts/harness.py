@@ -42,6 +42,7 @@ from core.api import (
     dispatch_recover_stale,
     dispatch_run,
     dispatch_status,
+    dispatch_verify_attempt,
     doctor,
     export_checkpoint,
     export_events,
@@ -52,6 +53,7 @@ from core.api import (
     install_agents,
     kernel_doctor,
     link_requirement_acceptance,
+    link_task_test_target,
     list_checkpoints,
     list_executor_prefixes,
     list_test_targets,
@@ -317,6 +319,10 @@ def build_parser() -> argparse.ArgumentParser:
     test_target_add.add_argument("--command-template", required=True)
     test_target_add.add_argument("--description", default="")
     add_request_id(test_target_add)
+    test_target_link = test_target_sub.add_parser("link")
+    test_target_link.add_argument("--task", required=True)
+    test_target_link.add_argument("--target", required=True)
+    add_request_id(test_target_link)
     test_target_sub.add_parser("list")
 
     decision = sub.add_parser("decision")
@@ -506,6 +512,11 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_import.add_argument("run_id")
     dispatch_import.add_argument("--result", required=True)
     add_request_id(dispatch_import)
+    dispatch_verify = dispatch_sub.add_parser("verify-attempt")
+    dispatch_verify.add_argument("--run-id", required=True)
+    dispatch_verify.add_argument("--task", required=True)
+    dispatch_verify.add_argument("--runner", default="local", choices=["local", "container"])
+    add_request_id(dispatch_verify)
     dispatch_claim = dispatch_sub.add_parser("claim-next")
     dispatch_claim.add_argument("--agent", required=True)
     dispatch_run = dispatch_sub.add_parser("run")
@@ -768,6 +779,8 @@ def main() -> int:
             )
         elif args.command == "test-target" and args.test_target_command == "add":
             mutate("test-target.add", lambda: (add_test_target(root, args.id, args.kind, args.command_template, args.description), f"OK: test target recorded {args.id}")[1])
+        elif args.command == "test-target" and args.test_target_command == "link":
+            mutate("test-target.link", lambda: (link_task_test_target(root, args.task, args.target), f"OK: test target linked {args.task}->{args.target}")[1])
         elif args.command == "test-target" and args.test_target_command == "list":
             print("\n".join(list_test_targets(root)))
         elif args.command == "decision" and args.decision_command == "record":
@@ -926,6 +939,8 @@ def main() -> int:
         elif args.command == "dispatch" and args.dispatch_command == "import-csv":
             result_path = Path(args.result)
             mutate("dispatch.import-csv", lambda: f"OK: dispatch csv imported {dispatch_import_csv(root, args.run_id, result_path if result_path.is_absolute() else root / result_path)}")
+        elif args.command == "dispatch" and args.dispatch_command == "verify-attempt":
+            mutate("dispatch.verify-attempt", lambda: f"OK: dispatch attempt verified {dispatch_verify_attempt(root, args.run_id, args.task, runner=args.runner)}")
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":
             task_id = dispatch_claim_next(root, args.agent)
             print(f"OK: dispatch claimed {task_id}")

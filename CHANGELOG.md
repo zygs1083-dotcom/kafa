@@ -4,6 +4,29 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.4.0-beta.1 - 2026-06-23
+
+### Added
+
+- Controller-side Codex fan-out verification through `dispatch verify-attempt`, which reruns linked test targets on the reported agent branch before producing trusted evidence.
+- `task_attempts`, `agent_reports`, and `task_test_targets` runtime records for branch-bound attempts, raw worker reports, and per-task validation targets.
+- `test-target link --task <id> --target <id>` so dispatch export no longer assigns every task the first global gateable target.
+- Dispatch assignment lease expiry fields so `dispatch recover-stale` only recovers truly expired work.
+
+### Changed
+
+- Runtime schema version is now `19`; runtime implementation version is now `3.7.0`.
+- `dispatch import-csv` now imports worker reports only; worker self-reported command evidence is not delivery-eligible.
+- Dispatch planning, CSV export, and claim-next now use the dependency-aware ready queue.
+- Local-process agent branches are checked against active file claims, including commits created inside the agent command.
+- `dispatch integrate` uses an isolated integration worktree instead of switching the user's main worktree.
+- CI now runs `python3 -m unittest discover -s tests -p 'test_*.py'` so all harness regression tests are covered.
+
+### Boundaries
+
+- Harness still does not spawn Codex sessions or call Codex APIs. Native fan-out execution remains host/user-provided.
+- `ContainerRunner` records container/no-network intent and falls back honestly when host isolation is unavailable; it is not a production sandbox guarantee.
+
 ## v1.3.0-beta.1 - 2026-06-23
 
 ### Added

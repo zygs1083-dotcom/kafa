@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Protocol
 
 from core.executor import CommandResult, LocalExecutor
@@ -77,9 +78,37 @@ class LocalProcessRunner:
         return RunnerResult(evidence=result, work_dir=request.work_dir, runner=self.name)
 
 
+class ContainerRunner:
+    name = "container"
+
+    def run(self, request: RunnerRequest) -> RunnerResult:
+        # The harness records container intent here, but does not pretend to
+        # provide OS-level isolation when Docker/Podman is unavailable.
+        has_container = bool(shutil.which("docker") or shutil.which("podman"))
+        result = LocalExecutor(request.work_dir).run(
+            request.command,
+            timeout=request.timeout,
+            target_id=request.target_id,
+            target_command_template=request.target_command_template,
+            allowed_prefixes=request.allowed_prefixes,
+            allow_unlisted=request.allow_unlisted,
+            no_network=True,
+            sandbox_profile="no-network",
+            allow_unlisted_reason=request.allow_unlisted_reason,
+            executed_count=request.executed_count,
+        )
+        if not has_container and result.sandbox_status != "unavailable":
+            # LocalExecutor currently marks no-network as unavailable. Keep the
+            # branch explicit so future real container support remains honest.
+            pass
+        return RunnerResult(evidence=result, work_dir=request.work_dir, runner=self.name)
+
+
 def runner_for(name: str) -> AgentRunner:
     if name == "null":
         return NullRunner()
     if name == "local-process":
         return LocalProcessRunner()
+    if name == "container":
+        return ContainerRunner()
     raise ValueError(f"unknown agent runner: {name}")

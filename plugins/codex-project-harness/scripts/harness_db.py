@@ -35,8 +35,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 18
-RUNTIME_VERSION = "3.6.0"
+SCHEMA_VERSION = 19
+RUNTIME_VERSION = "3.7.0"
 LEASE_TTL_SECONDS = 3600
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
@@ -73,7 +73,7 @@ PHASE_TRANSITIONS = {
 }
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
-DISPATCH_STATUSES = {"planned", "claimed", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
+DISPATCH_STATUSES = {"planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
 CODEX_FANOUT_INPUT_FIELDS = [
     "item_id",
     "task",
@@ -156,6 +156,8 @@ SNAPSHOT_TABLES = [
     "task_acceptance",
     "task_failure_modes",
     "task_dependencies",
+    "task_test_targets",
+    "task_attempts",
     "validations",
     "validation_failure_modes",
     "validation_tests",
@@ -181,6 +183,7 @@ SNAPSHOT_TABLES = [
     "dispatch_assignments",
     "dispatch_worktrees",
     "task_file_claims",
+    "agent_reports",
     "codex_fanout_exports",
     "runtime_snapshots",
     "command_log",
@@ -413,6 +416,28 @@ def create_schema(conn: sqlite3.Connection) -> None:
             primary key (task_id, depends_on),
             check (task_id != depends_on)
         );
+        create table if not exists task_test_targets (
+            task_id text not null references tasks(id) on delete cascade,
+            target_id text not null references test_targets(id) on delete cascade,
+            primary key (task_id, target_id)
+        );
+        create table if not exists task_attempts (
+            id text primary key,
+            run_id text not null,
+            task_id text not null references tasks(id) on delete cascade,
+            agent_id text not null,
+            fence integer not null default 0,
+            base_commit_sha text not null default '',
+            head_commit_sha text not null default '',
+            tree_sha text not null default '',
+            branch_name text not null default '',
+            target_id text not null default '',
+            status text not null,
+            report_id text not null default '',
+            evidence_id text not null default '',
+            started_at text not null default '',
+            finished_at text not null default ''
+        );
         create table if not exists validations (
             id text primary key,
             surface text not null,
@@ -439,6 +464,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             residual_risk text not null default '',
             head_commit text not null default '',
             source_tree_hash text not null default '',
+            attempt_id text not null default '',
+            tree_sha text not null default '',
+            code_ref text not null default '',
+            verified_by text not null default '',
             tracked_diff_hash text not null default '',
             project_revision integer not null default 0,
             created_at text not null
@@ -534,6 +563,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             trust_anchor_id text not null default '',
             policy_status text not null default '',
             policy_reason text not null default '',
+            attempt_id text not null default '',
+            tree_sha text not null default '',
+            code_ref text not null default '',
+            verified_by text not null default '',
             created_at text not null
         );
         create table if not exists tests (
@@ -663,6 +696,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             status text not null,
             evidence text not null default '',
             claimed_at text,
+            heartbeat_at text,
+            lease_expires_at text,
             updated_at text not null,
             primary key (run_id, task_id)
         );
@@ -691,6 +726,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create unique index if not exists task_file_claims_active_path
             on task_file_claims(path) where status = 'active';
+        create table if not exists agent_reports (
+            id text primary key,
+            run_id text not null,
+            task_id text not null,
+            job_id text not null default '',
+            status text not null,
+            last_error text not null default '',
+            result_json text not null,
+            created_at text not null
+        );
         create table if not exists codex_fanout_exports (
             id text primary key,
             run_id text not null,
@@ -752,6 +797,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
     ensure_column(conn, "validations", "head_commit", "text not null default ''")
     ensure_column(conn, "validations", "source_tree_hash", "text not null default ''")
+    ensure_column(conn, "validations", "attempt_id", "text not null default ''")
+    ensure_column(conn, "validations", "tree_sha", "text not null default ''")
+    ensure_column(conn, "validations", "code_ref", "text not null default ''")
+    ensure_column(conn, "validations", "verified_by", "text not null default ''")
     ensure_column(conn, "validations", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "validations", "project_revision", "integer not null default 0")
     ensure_column(conn, "validations", "command", "text not null default ''")
@@ -777,6 +826,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "stdout_sha256", "text not null default ''")
     ensure_column(conn, "evidence", "artifact_path", "text not null default ''")
     ensure_column(conn, "evidence", "source_tree_hash", "text not null default ''")
+    ensure_column(conn, "evidence", "attempt_id", "text not null default ''")
+    ensure_column(conn, "evidence", "tree_sha", "text not null default ''")
+    ensure_column(conn, "evidence", "code_ref", "text not null default ''")
+    ensure_column(conn, "evidence", "verified_by", "text not null default ''")
     ensure_column(conn, "evidence", "target_id", "text not null default ''")
     ensure_column(conn, "evidence", "executed_count", "integer not null default 0")
     ensure_column(conn, "evidence", "executed_count_source", "text not null default ''")
@@ -797,6 +850,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "external_session_verifications", "verification_token", "text not null default ''")
     ensure_column(conn, "external_session_verifications", "token_status", "text not null default 'unchecked'")
     ensure_column(conn, "external_session_verifications", "token_reason", "text not null default ''")
+    ensure_column(conn, "dispatch_assignments", "heartbeat_at", "text")
+    ensure_column(conn, "dispatch_assignments", "lease_expires_at", "text")
     ensure_default_executor_allowlist(conn)
 
 
@@ -2425,6 +2480,30 @@ def add_test_target(root: Path, target_id: str, kind: str, command_template: str
     render_all(root)
 
 
+def link_task_test_target(root: Path, task_id: str, target_id: str) -> None:
+    with transaction(root, touched=[("task", task_id)]) as conn:
+        if not conn.execute("select id from tasks where id = ?", (task_id,)).fetchone():
+            raise HarnessError(f"missing task: {task_id}")
+        if not conn.execute("select id from test_targets where id = ?", (target_id,)).fetchone():
+            raise HarnessError(f"missing test target: {target_id}")
+        conn.execute("insert or ignore into task_test_targets (task_id, target_id) values (?, ?)", (task_id, target_id))
+        emit_event(conn, "task_test_target_linked", payload(task_id=task_id, target_id=target_id))
+    render_all(root)
+
+
+def task_target(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        select tt.* from task_test_targets link
+        join test_targets tt on tt.id = link.target_id
+        where link.task_id = ?
+        order by tt.id
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+
+
 def list_test_targets(root: Path) -> list[str]:
     with connection(root) as conn:
         rows = conn.execute("select id, kind, command_template, description, gateable, gate_block_reason from test_targets order by id").fetchall()
@@ -3183,13 +3262,17 @@ def add_agent_capability(root: Path, agent: str, capability: str) -> None:
 
 
 def dispatch_plan(root: Path, scope: str) -> str:
+    from core.scheduler import ready_queue
+
     run_id = str(uuid.uuid4())
     with transaction(root) as conn:
         conn.execute(
             "insert into dispatch_runs (id, scope, status, created_at, updated_at) values (?, ?, 'planned', ?, ?)",
             (run_id, scope, now_iso(), now_iso()),
         )
-        for task in conn.execute("select id, owner from tasks where status = 'ready' order by id"):
+        ready_ids = ready_queue(conn)
+        for task_id in ready_ids:
+            task = conn.execute("select id, owner from tasks where id = ?", (task_id,)).fetchone()
             capability = task["owner"] if task["owner"] and task["owner"] != "unassigned" else "developer"
             conn.execute(
                 "insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, ?, ?, 'planned', ?)",
@@ -3233,6 +3316,8 @@ def dispatch_export_csv(
     max_concurrency: int = 6,
     max_runtime_seconds: int = 1800,
 ) -> Path:
+    from core.scheduler import ready_queue
+
     if max_concurrency < 1 or max_concurrency > 6:
         raise HarnessError("max concurrency must be between 1 and 6")
     if max_runtime_seconds < 1 or max_runtime_seconds > 1800:
@@ -3245,6 +3330,7 @@ def dispatch_export_csv(
     spawn_config_path = output_dir / "spawn_config.json"
 
     with connection(root) as conn:
+        ready_ids = set(ready_queue(conn))
         assignments = conn.execute(
             """
             select da.run_id, da.task_id, da.agent_id, da.capability, da.status as assignment_status,
@@ -3256,15 +3342,16 @@ def dispatch_export_csv(
             """,
             (run_id,),
         ).fetchall()
+        assignments = [assignment for assignment in assignments if assignment["task_id"] in ready_ids]
         if not assignments:
             raise HarnessError(f"no ready dispatch assignments for run: {run_id}")
-        target = conn.execute("select id, command_template from test_targets where gateable = 1 order by id limit 1").fetchone()
         rows: list[dict[str, str]] = []
         for assignment in assignments:
             acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id").get(assignment["task_id"], "")
             failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id").get(assignment["task_id"], "")
             agent_id = assignment["agent_id"] or assignment["capability"] or assignment["owner"] or "developer"
             branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(assignment['task_id'])}/{safe_branch_part(agent_id)}"
+            target = task_target(conn, assignment["task_id"])
             rows.append(
                 {
                     "item_id": assignment["task_id"],
@@ -3336,6 +3423,8 @@ def dispatch_export_csv(
 
 
 def dispatch_claim_next(root: Path, agent: str) -> str:
+    from core.scheduler import ready_queue
+
     with transaction(root) as conn:
         require_agent(conn, agent)
         active = conn.execute(
@@ -3349,22 +3438,26 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
             for row in conn.execute("select capability from agent_capabilities where agent_id = ?", (agent,))
         }
         capabilities.add(agent)
+        ready_ids = ready_queue(conn)
+        if not ready_ids:
+            raise HarnessError(f"no dispatch assignment for agent: {agent}")
         assignment = conn.execute(
             f"""
             select da.* from dispatch_assignments da
             join tasks t on t.id = da.task_id
             where da.status = 'planned' and t.status = 'ready'
               and da.capability in ({','.join('?' for _ in capabilities)})
+              and da.task_id in ({','.join('?' for _ in ready_ids)})
             order by da.updated_at, da.task_id
             limit 1
             """,
-            tuple(capabilities),
+            tuple(capabilities) + tuple(ready_ids),
         ).fetchone()
         if not assignment:
             raise HarnessError(f"no dispatch assignment for agent: {agent}")
         conn.execute(
-            "update dispatch_assignments set agent_id = ?, status = 'claimed', claimed_at = ?, updated_at = ? where run_id = ? and task_id = ?",
-            (agent, now_iso(), now_iso(), assignment["run_id"], assignment["task_id"]),
+            "update dispatch_assignments set agent_id = ?, status = 'claimed', claimed_at = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ? where run_id = ? and task_id = ?",
+            (agent, now_iso(), now_iso(), lease_deadline(), now_iso(), assignment["run_id"], assignment["task_id"]),
         )
         emit_event(conn, "dispatch_assignment_claimed", payload(run_id=assignment["run_id"], task_id=assignment["task_id"], agent=agent))
         return assignment["task_id"]
@@ -3382,6 +3475,41 @@ def normalize_claim_path(path: str) -> str:
 
 def safe_branch_part(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value).strip("-") or "item"
+
+
+def git_ref_commit(root: Path, ref: str) -> str:
+    result = subprocess.run(["git", "rev-parse", "--verify", ref], cwd=root, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise HarnessError(f"branch is missing: {ref}")
+    return result.stdout.strip()
+
+
+def git_ref_tree(root: Path, ref: str) -> str:
+    result = subprocess.run(["git", "rev-parse", "--verify", f"{ref}^{{tree}}"], cwd=root, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise HarnessError(f"tree is unavailable for ref: {ref}")
+    return result.stdout.strip()
+
+
+def ensure_verification_worktree(root: Path, branch_name: str, run_id: str, task_id: str) -> Path:
+    worktree = root / ".ai-team" / "runtime" / "controller-verifications" / safe_branch_part(run_id) / safe_branch_part(task_id)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
+        shutil.rmtree(worktree, ignore_errors=True)
+    result = subprocess.run(["git", "worktree", "add", str(worktree), branch_name], cwd=root, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise HarnessError(f"verification worktree create failed: {result.stderr.strip() or result.stdout.strip()}")
+    return worktree
+
+
+def ensure_integration_runtime_link(root: Path, worktree: Path) -> None:
+    source = root / ".ai-team"
+    target = worktree / ".ai-team"
+    if target.exists() or target.is_symlink():
+        return
+    if source.exists():
+        os.symlink(source, target, target_is_directory=True)
 
 
 def assignment_for_agent(root: Path, agent: str) -> dict[str, Any]:
@@ -3445,8 +3573,55 @@ def ensure_dispatch_worktree(root: Path, run_id: str, task_id: str, agent: str) 
     return branch, rel
 
 
-def commit_worktree_claims(work_dir: Path, agent: str, task_id: str, claim_files: list[str]) -> None:
-    if not claim_files:
+def changed_worktree_files(work_dir: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=work_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(f"worktree status failed: {result.stderr.strip() or result.stdout.strip()}")
+    changed: list[str] = []
+    for line in result.stdout.splitlines():
+        relpath = line[3:] if len(line) > 3 else ""
+        if " -> " in relpath:
+            relpath = relpath.split(" -> ", 1)[1]
+        if relpath and not relpath.startswith(".ai-team/"):
+            changed.append(relpath)
+    return sorted(set(changed))
+
+
+def committed_files_since(work_dir: Path, base_commit: str) -> list[str]:
+    if not base_commit:
+        return []
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{base_commit}..HEAD"],
+        cwd=work_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(f"worktree diff failed: {result.stderr.strip() or result.stdout.strip()}")
+    return sorted(path for path in result.stdout.splitlines() if path and not path.startswith(".ai-team/"))
+
+
+def reset_worktree_to_base(work_dir: Path, base_commit: str) -> None:
+    if base_commit:
+        subprocess.run(["git", "reset", "--hard", base_commit], cwd=work_dir, text=True, capture_output=True, check=False)
+    subprocess.run(["git", "clean", "-fd"], cwd=work_dir, text=True, capture_output=True, check=False)
+
+
+def commit_worktree_claims(work_dir: Path, agent: str, task_id: str, claim_files: list[str], *, base_commit: str = "") -> None:
+    changed = sorted(set(changed_worktree_files(work_dir) + committed_files_since(work_dir, base_commit)))
+    allowed = set(claim_files)
+    unexpected = sorted(path for path in changed if path not in allowed)
+    if unexpected:
+        reset_worktree_to_base(work_dir, base_commit)
+        raise HarnessError(f"file-claim-violation: {', '.join(unexpected)}")
+    if not claim_files or not changed:
         return
     subprocess.run(["git", "add", "--", *claim_files], cwd=work_dir, text=True, capture_output=True, check=False)
     diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=work_dir, text=True, capture_output=True, check=False)
@@ -3547,6 +3722,7 @@ def dispatch_run(
     branch_name = ""
     worktree_path = ""
     work_dir = root
+    base_commit = git_head_sha(root) or ""
     if runner == "local-process":
         branch_name, worktree_path = ensure_dispatch_worktree(root, run_id, task_id, agent)
         work_dir = root / worktree_path
@@ -3576,7 +3752,15 @@ def dispatch_run(
     result = runner_result.evidence
     normalized_claims = [normalize_claim_path(path) for path in (claim_files or [])]
     if runner == "local-process" and result.exit_code == 0:
-        commit_worktree_claims(work_dir, agent, task_id, normalized_claims)
+        try:
+            commit_worktree_claims(work_dir, agent, task_id, normalized_claims, base_commit=base_commit)
+        except HarnessError:
+            if run_id:
+                with transaction(root, touched=[("dispatch_assignment", task_id)]) as conn:
+                    conn.execute("update dispatch_assignments set status = 'failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
+                    conn.execute("update dispatch_runs set status = 'failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                    emit_event(conn, "dispatch_command_failed", payload(run_id=run_id, task_id=task_id, agent=agent, reason="file-claim-violation"))
+            raise
     if runner == "local-process":
         source_artifact = work_dir / result.artifact_path
         stdout = source_artifact.read_bytes()
@@ -3585,7 +3769,9 @@ def dispatch_run(
         artifact.write_bytes(stdout)
         result = replace(result, artifact_path=artifact.relative_to(root).as_posix(), stdout_sha256=hashlib.sha256(stdout).hexdigest())
     evidence_id = f"EXEC-{uuid.uuid4().hex[:12]}"
-    source_hash = source_tree_hash_for_mode(root, code_identity)
+    source_hash = source_tree_hash_for_mode(work_dir, code_identity)
+    code_ref = branch_name if runner == "local-process" else ""
+    tree_sha = git_ref_tree(root, branch_name) if branch_name else ""
     status = "completed" if result.exit_code == 0 else "failed"
     with transaction(root, touched=[("dispatch_assignment", task_id), ("evidence", evidence_id)]) as conn:
         conn.execute(
@@ -3594,8 +3780,9 @@ def dispatch_run(
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
              sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             attempt_id, tree_sha, code_ref, verified_by,
              created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-only', '', ?)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-only', '', ?, ?, ?, 'controller-local', ?)
             """,
             (
                 evidence_id,
@@ -3617,6 +3804,9 @@ def dispatch_run(
                 result.sandbox_profile,
                 result.sandbox_status,
                 result.allow_unlisted_reason,
+                "",
+                tree_sha,
+                code_ref,
                 now_iso(),
             ),
         )
@@ -3630,6 +3820,17 @@ def dispatch_run(
                 (status, evidence_id, now_iso(), run_id, task_id),
             )
             conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), run_id))
+            if result.exit_code == 0:
+                task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
+                if task and task["status"] in {"ready", "claimed", "in_progress"}:
+                    conn.execute(
+                        """
+                        update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null,
+                          lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
+                          revision = revision + 1, updated_at = ? where id = ?
+                        """,
+                        (evidence_id, agent, now_iso(), task_id),
+                    )
         emit_event(
             conn,
             "dispatch_command_executed",
@@ -3661,12 +3862,14 @@ def dispatch_recover_stale(root: Path) -> int:
             select da.run_id, da.task_id from dispatch_assignments da
             join tasks t on t.id = da.task_id
             where da.status = 'claimed' and t.status = 'ready'
+              and da.lease_expires_at is not null and da.lease_expires_at <= ?
             order by da.updated_at
-            """
+            """,
+            (now_iso(),),
         ).fetchall()
         for row in rows:
             conn.execute(
-                "update dispatch_assignments set agent_id = '', status = 'planned', claimed_at = null, updated_at = ? where run_id = ? and task_id = ?",
+                "update dispatch_assignments set agent_id = '', status = 'planned', claimed_at = null, heartbeat_at = null, lease_expires_at = null, updated_at = ? where run_id = ? and task_id = ?",
                 (now_iso(), row["run_id"], row["task_id"]),
             )
             recovered += 1
@@ -3703,14 +3906,20 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
         ).fetchall()
     if not rows:
         raise HarnessError(f"no active dispatch worktrees for run: {run_id}")
+    integration_worktree = root / ".ai-team" / "runtime" / "integration-worktrees" / safe_branch_part(run_id)
+    integration_worktree.parent.mkdir(parents=True, exist_ok=True)
+    if integration_worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, text=True, capture_output=True, check=False)
+        shutil.rmtree(integration_worktree, ignore_errors=True)
+    create = subprocess.run(["git", "worktree", "add", "-B", target, str(integration_worktree), current], cwd=root, text=True, capture_output=True, check=False)
+    if create.returncode != 0:
+        raise HarnessError(f"integration worktree create failed: {create.stderr.strip() or create.stdout.strip()}")
+    ensure_integration_runtime_link(root, integration_worktree)
     try:
-        reset = subprocess.run(["git", "switch", "-C", target, current], cwd=root, text=True, capture_output=True, check=False)
-        if reset.returncode != 0:
-            raise HarnessError(f"integration branch create failed: {reset.stderr.strip() or reset.stdout.strip()}")
         for row in rows:
-            merge = subprocess.run(["git", "merge", "--no-ff", "--no-edit", row["branch_name"]], cwd=root, text=True, capture_output=True, check=False)
+            merge = subprocess.run(["git", "merge", "--no-ff", "--no-edit", row["branch_name"]], cwd=integration_worktree, text=True, capture_output=True, check=False)
             if merge.returncode != 0:
-                subprocess.run(["git", "merge", "--abort"], cwd=root, text=True, capture_output=True, check=False)
+                subprocess.run(["git", "merge", "--abort"], cwd=integration_worktree, text=True, capture_output=True, check=False)
                 summary = f"merge conflict for {row['task_id']} from {row['branch_name']}: {merge.stderr.strip() or merge.stdout.strip()}"
                 with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
                     record_integration_finding(conn, run_id, summary)
@@ -3718,7 +3927,7 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
                     conn.execute("update dispatch_assignments set status = 'integration_conflict', updated_at = ? where run_id = ?", (now_iso(), run_id))
                     emit_event(conn, "dispatch_integration_conflict", payload(run_id=run_id, branch=row["branch_name"]))
                 raise HarnessError(f"integration conflict: {row['task_id']}")
-        issues = validate_runtime(root, delivery=True)
+        issues = validate_runtime(integration_worktree, delivery=True)
         if issues:
             summary = "; ".join(issues[:5])
             with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
@@ -3736,9 +3945,11 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
                     subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
                 conn.execute("update dispatch_worktrees set status = 'cleaned', cleaned_at = ? where id = ?", (now_iso(), row["id"]))
             emit_event(conn, "dispatch_integrated", payload(run_id=run_id, target_branch=target))
+        subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, text=True, capture_output=True, check=False)
         return target
     finally:
-        subprocess.run(["git", "switch", current], cwd=root, text=True, capture_output=True, check=False)
+        if integration_worktree.exists():
+            subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, text=True, capture_output=True, check=False)
 
 
 def resolve_runtime_path(root: Path, value: str) -> Path:
@@ -3767,9 +3978,7 @@ def codex_import_failure(conn: sqlite3.Connection, run_id: str, task_id: str, me
     conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
 
 
-def codex_result_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any]) -> list[str]:
-    from core.executor import command_matches_template
-
+def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     for field in CODEX_FANOUT_OUTPUT_FIELDS:
         if field not in result:
@@ -3778,40 +3987,13 @@ def codex_result_issues(root: Path, conn: sqlite3.Connection, expected: dict[str
         return issues
     if result["status"] != "success":
         issues.append(f"result status is not success: {result['status']}")
-    if int(result["exit_code"]) != 0:
-        issues.append(f"exit_code is not zero: {result['exit_code']}")
-    if result["executed_count_source"] != "parsed":
-        issues.append(f"executed_count_source is not parsed: {result['executed_count_source']}")
-    if int(result["executed_count"]) <= 0:
-        issues.append("executed_count must be > 0")
-    target = conn.execute("select * from test_targets where id = ?", (result["target_id"],)).fetchone()
-    if not target:
-        issues.append(f"missing test target: {result['target_id']}")
-    elif not int(target["gateable"]):
-        issues.append(f"test target is not gateable: {result['target_id']}")
-    elif not command_matches_template(result["command"], target["command_template"]):
-        issues.append(f"command does not match target: {result['target_id']}")
+    target = conn.execute("select * from test_targets where id = ?", (expected.get("target_id") or result["target_id"],)).fetchone()
     if expected.get("target_id") and result["target_id"] != expected["target_id"]:
         issues.append(f"target differs from export: expected={expected['target_id']} actual={result['target_id']}")
+    elif expected.get("target_id") and not target:
+        issues.append(f"missing test target: {result['target_id']}")
     if result["branch_name"] != expected["branch_name"]:
         issues.append(f"branch differs from export: expected={expected['branch_name']} actual={result['branch_name']}")
-    artifact = resolve_runtime_path(root, str(result["artifact_path"]))
-    try:
-        normalized_artifact = normalize_artifact_path(root, str(artifact))
-    except HarnessError as exc:
-        issues.append(str(exc))
-        normalized_artifact = ""
-    if not artifact.exists() or not artifact.is_file():
-        issues.append(f"artifact is missing: {result['artifact_path']}")
-    elif normalized_artifact:
-        actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        if actual_hash != result["stdout_sha256"]:
-            issues.append("stdout_sha256 does not match artifact bytes")
-    current_hash = source_tree_hash_for_mode(root, "auto")
-    if not current_hash:
-        issues.append("current source tree hash is unavailable")
-    elif result["source_tree_hash"] != current_hash:
-        issues.append(f"source_tree_hash does not match current code: result={result['source_tree_hash']} current={current_hash}")
     branch = subprocess.run(["git", "rev-parse", "--verify", str(result["branch_name"])], cwd=root, text=True, capture_output=True, check=False)
     if branch.returncode != 0:
         issues.append(f"branch is missing: {result['branch_name']}")
@@ -3857,43 +4039,50 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
             failed = True
             continue
         with connection(root) as conn:
-            issues = codex_result_issues(root, conn, expected, result)
+            issues = codex_report_issues(root, conn, expected, result)
         if issues:
             with transaction(root, touched=[("dispatch_run", run_id), ("finding", item_id)]) as conn:
                 codex_import_failure(conn, run_id, item_id, "; ".join(issues[:5]))
             failed = True
             continue
-        evidence_id = f"CODEX-{uuid.uuid4().hex[:12]}"
-        artifact_path = normalize_artifact_path(root, str(result["artifact_path"]))
-        with transaction(root, touched=[("dispatch_assignment", item_id), ("evidence", evidence_id)]) as conn:
+        report_id = f"REPORT-{uuid.uuid4().hex[:12]}"
+        attempt_id = f"ATTEMPT-{uuid.uuid4().hex[:12]}"
+        head_commit = git_ref_commit(root, result["branch_name"])
+        tree_sha = git_ref_tree(root, result["branch_name"])
+        with transaction(root, touched=[("dispatch_assignment", item_id), ("task_attempt", attempt_id)]) as conn:
             conn.execute(
                 """
-                insert into evidence
-                (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
-                 target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
-                 sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id, created_at)
-                values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'allowed', 'codex fanout import',
-                        'none', '', '', 'local-only', '', ?)
+                insert into agent_reports
+                (id, run_id, task_id, job_id, status, last_error, result_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (report_id, run_id, item_id, row["job_id"], row["status"], row["last_error"], row["result_json"], now_iso()),
+            )
+            conn.execute(
+                """
+                insert into task_attempts
+                (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+                 branch_name, target_id, status, report_id, evidence_id, started_at, finished_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, '', ?, '')
                 """,
                 (
-                    evidence_id,
-                    f"codex fanout {item_id} command exit {result['exit_code']}",
-                    f"local://{artifact_path}",
-                    result["stdout_sha256"],
-                    result["command"],
-                    int(result["exit_code"]),
-                    result["stdout_sha256"],
-                    artifact_path,
-                    result["source_tree_hash"],
+                    attempt_id,
+                    run_id,
+                    item_id,
+                    expected["agent_id"],
+                    int(expected["fence"]),
+                    git_base_commit(root) or "",
+                    head_commit,
+                    tree_sha,
+                    result["branch_name"],
                     result["target_id"],
-                    int(result["executed_count"]),
-                    result["executed_count_source"],
+                    report_id,
                     now_iso(),
                 ),
             )
             conn.execute(
-                "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
-                (evidence_id, now_iso(), run_id, item_id),
+                "update dispatch_assignments set status = 'reported', updated_at = ? where run_id = ? and task_id = ?",
+                (now_iso(), run_id, item_id),
             )
             conn.execute(
                 """
@@ -3903,7 +4092,7 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
                 """,
                 (str(uuid.uuid4()), run_id, item_id, expected["agent_id"], result["branch_name"], now_iso()),
             )
-            emit_event(conn, "codex_fanout_result_imported", payload(run_id=run_id, item_id=item_id, evidence_id=evidence_id))
+            emit_event(conn, "codex_fanout_report_imported", payload(run_id=run_id, item_id=item_id, report_id=report_id, attempt_id=attempt_id))
         imported += 1
     missing = sorted(set(expected_rows) - seen)
     for item_id in missing:
@@ -3916,10 +4105,195 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
             ("verification_failed" if failed else "imported", now_iso(), run_id),
         )
         if not failed:
-            conn.execute("update dispatch_runs set status = 'completed', updated_at = ? where id = ?", (now_iso(), run_id))
+            conn.execute("update dispatch_runs set status = 'reported', updated_at = ? where id = ?", (now_iso(), run_id))
     if failed:
         raise HarnessError(f"codex fanout import failed: {run_id}")
-    return f"imported {imported} result(s)"
+    return f"imported {imported} report(s)"
+
+
+def record_attempt_failure(conn: sqlite3.Connection, run_id: str, task_id: str, attempt_id: str, message: str) -> None:
+    record_integration_finding(conn, run_id, f"dispatch attempt verification failed for {task_id}: {message}")
+    conn.execute("update task_attempts set status = 'verification_failed', finished_at = ? where id = ?", (now_iso(), attempt_id))
+    conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
+    conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+
+
+def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: str = "local") -> str:
+    from core.executor import LocalExecutor
+    from core.agent_runner import RunnerRequest, runner_for
+
+    if runner not in {"local", "container"}:
+        raise HarnessError(f"unknown verification runner: {runner}")
+    with connection(root) as conn:
+        attempt = conn.execute(
+            "select * from task_attempts where run_id = ? and task_id = ? order by started_at desc, id desc limit 1",
+            (run_id, task_id),
+        ).fetchone()
+        if not attempt:
+            raise HarnessError(f"missing task attempt: {run_id}/{task_id}")
+        target = conn.execute("select * from test_targets where id = ?", (attempt["target_id"],)).fetchone()
+        acceptance = conn.execute("select acceptance_id from task_acceptance where task_id = ? order by acceptance_id limit 1", (task_id,)).fetchone()
+    if not target:
+        raise HarnessError(f"missing test target: {attempt['target_id']}")
+    if not int(target["gateable"]):
+        raise HarnessError(f"test target is not gateable: {attempt['target_id']}")
+
+    worktree = ensure_verification_worktree(root, attempt["branch_name"], run_id, task_id)
+    with connection(root) as conn:
+        prefixes = executor_prefixes(conn)
+    if runner == "container":
+        result = runner_for("container").run(
+            RunnerRequest(
+                root=root,
+                work_dir=worktree,
+                command=target["command_template"],
+                target_id=target["id"],
+                target_command_template=target["command_template"],
+                allowed_prefixes=prefixes,
+                no_network=True,
+                sandbox_profile="no-network",
+            )
+        ).evidence
+    else:
+        executor = LocalExecutor(worktree)
+        result = executor.run(
+            target["command_template"],
+            target_id=target["id"],
+            target_command_template=target["command_template"],
+            allowed_prefixes=prefixes,
+        )
+    if runner == "container" and result.sandbox_status != "unavailable":
+        verified_by = "controller-container"
+    elif runner == "container":
+        verified_by = "controller-container-unavailable"
+    else:
+        verified_by = "controller-local"
+    head_commit = git_ref_commit(root, attempt["branch_name"])
+    tree_sha = git_ref_tree(root, attempt["branch_name"])
+    source_hash = source_tree_hash_for_mode(worktree, "auto")
+    source_artifact = worktree / result.artifact_path
+    artifact = root / ".ai-team" / "runtime" / "executions" / uuid.uuid4().hex / "stdout.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(source_artifact.read_bytes())
+    artifact_rel = artifact.relative_to(root).as_posix()
+    artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    issues: list[str] = []
+    if result.exit_code != 0:
+        issues.append(f"exit_code={result.exit_code}")
+    if result.executed_count_source != "parsed":
+        issues.append(f"executed_count_source={result.executed_count_source}")
+    if result.executed_count <= 0:
+        issues.append("executed_count must be > 0")
+    if result.policy_status == "rejected":
+        issues.append(f"policy rejected: {result.policy_reason}")
+    if not source_hash:
+        issues.append("source tree hash unavailable")
+    if issues:
+        with transaction(root, touched=[("task_attempt", attempt["id"]), ("finding", task_id)]) as conn:
+            record_attempt_failure(conn, run_id, task_id, attempt["id"], "; ".join(issues))
+        raise HarnessError(f"dispatch attempt verification failed: {'; '.join(issues)}")
+
+    evidence_id = f"CODEX-{uuid.uuid4().hex[:12]}"
+    validation_id = f"CODEX-VAL-{uuid.uuid4().hex[:8]}"
+    acceptance_id = acceptance["acceptance_id"] if acceptance else ""
+    with transaction(root, touched=[("task_attempt", attempt["id"]), ("evidence", evidence_id), ("validation", validation_id), ("task", task_id)]) as conn:
+        conn.execute(
+            """
+            insert into evidence
+            (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             attempt_id, tree_sha, code_ref, verified_by, created_at)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '', 'local-only', '',
+                    ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id,
+                f"controller verified {task_id} command exit {result.exit_code}",
+                f"local://{artifact_rel}",
+                artifact_hash,
+                result.command,
+                result.exit_code,
+                artifact_hash,
+                artifact_rel,
+                source_hash,
+                target["id"],
+                result.executed_count,
+                result.executed_count_source,
+                bool_int(runner == "container"),
+                result.policy_status,
+                result.policy_reason,
+                result.sandbox_profile,
+                result.sandbox_status,
+                attempt["id"],
+                tree_sha,
+                attempt["branch_name"],
+                verified_by,
+                now_iso(),
+            ),
+        )
+        project_revision = int(project_row(conn)["revision"])
+        conn.execute(
+            """
+            insert into validations
+            (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
+             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
+             policy_reason, sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
+             findings, result, residual_risk, head_commit, source_tree_hash, attempt_id, tree_sha, code_ref,
+             verified_by, tracked_diff_hash, project_revision, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, '', 'local-only', '',
+                    'controller verification passed', 'pass', '', ?, ?, ?, ?, ?, ?, '', ?, ?)
+            """,
+            (
+                validation_id,
+                f"dispatch {task_id}",
+                acceptance_id,
+                result.command,
+                result.command,
+                result.exit_code,
+                artifact_hash,
+                artifact_rel,
+                target["id"],
+                result.executed_count,
+                result.executed_count_source,
+                bool_int(runner == "container"),
+                result.policy_status,
+                result.policy_reason,
+                result.sandbox_profile,
+                result.sandbox_status,
+                head_commit,
+                source_hash,
+                attempt["id"],
+                tree_sha,
+                attempt["branch_name"],
+                verified_by,
+                project_revision,
+                now_iso(),
+            ),
+        )
+        conn.execute("insert into validation_evidence (validation_id, evidence_id) values (?, ?)", (validation_id, evidence_id))
+        conn.execute(
+            "update task_attempts set status = 'verified', evidence_id = ?, head_commit_sha = ?, tree_sha = ?, finished_at = ? where id = ?",
+            (evidence_id, head_commit, tree_sha, now_iso(), attempt["id"]),
+        )
+        conn.execute(
+            "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
+            (evidence_id, now_iso(), run_id, task_id),
+        )
+        conn.execute("update dispatch_runs set status = 'completed', updated_at = ? where id = ?", (now_iso(), run_id))
+        task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
+        if task and task["status"] in {"ready", "claimed", "in_progress"}:
+            conn.execute(
+                """
+                update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null,
+                  lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
+                  revision = revision + 1, updated_at = ? where id = ?
+                """,
+                (evidence_id, attempt["agent_id"], now_iso(), task_id),
+            )
+        emit_event(conn, "dispatch_attempt_verified", payload(run_id=run_id, task_id=task_id, attempt_id=attempt["id"], evidence_id=evidence_id, verified_by=verified_by))
+    render_all(root)
+    return evidence_id
 
 
 def dispatch_status(root: Path) -> list[str]:
@@ -4130,6 +4504,8 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("requirement.schema.json", "requirements", [row_snapshot(row) or {} for row in conn.execute("select * from requirements")]),
         ("failure-mode.schema.json", "failure_modes", [row_snapshot(row) or {} for row in conn.execute("select * from failure_modes")]),
         ("task.schema.json", "tasks", tasks),
+        ("task-test-target.schema.json", "task_test_targets", [row_snapshot(row) or {} for row in conn.execute("select * from task_test_targets")]),
+        ("task-attempt.schema.json", "task_attempts", [row_snapshot(row) or {} for row in conn.execute("select * from task_attempts")]),
         ("validation.schema.json", "validations", validations),
         ("test-target.schema.json", "test_targets", [row_snapshot(row) or {} for row in conn.execute("select * from test_targets")]),
         ("quality-gate.schema.json", "quality_gates", [row_snapshot(row) or {} for row in conn.execute("select * from quality_gates")]),
@@ -4148,6 +4524,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("dispatch-assignment.schema.json", "dispatch_assignments", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_assignments")]),
         ("dispatch-worktree.schema.json", "dispatch_worktrees", [row_snapshot(row) or {} for row in conn.execute("select * from dispatch_worktrees")]),
         ("task-file-claim.schema.json", "task_file_claims", [row_snapshot(row) or {} for row in conn.execute("select * from task_file_claims")]),
+        ("agent-report.schema.json", "agent_reports", [row_snapshot(row) or {} for row in conn.execute("select * from agent_reports")]),
         ("codex-fanout-export.schema.json", "codex_fanout_exports", [row_snapshot(row) or {} for row in conn.execute("select * from codex_fanout_exports")]),
         ("runtime-snapshot.schema.json", "runtime_snapshots", [row_snapshot(row) or {} for row in conn.execute("select * from runtime_snapshots")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),

@@ -30,6 +30,10 @@
     "residual_risk": { "type": "string" },
     "head_commit": { "type": "string" },
     "source_tree_hash": { "type": "string" },
+    "attempt_id": { "type": "string" },
+    "tree_sha": { "type": "string" },
+    "code_ref": { "type": "string" },
+    "verified_by": { "type": "string" },
     "tracked_diff_hash": { "type": "string" },
     "project_revision": { "type": "integer" },
     "created_at": { "type": "string" }

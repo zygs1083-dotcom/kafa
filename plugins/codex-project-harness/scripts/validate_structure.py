@@ -70,6 +70,8 @@ REQUIRED_SCHEMAS = [
     "requirement.schema.json",
     "acceptance.schema.json",
     "task.schema.json",
+    "task-attempt.schema.json",
+    "task-test-target.schema.json",
     "event.schema.json",
     "quality-gate.schema.json",
     "failure-mode.schema.json",
@@ -92,6 +94,7 @@ REQUIRED_SCHEMAS = [
     "dispatch-assignment.schema.json",
     "dispatch-worktree.schema.json",
     "task-file-claim.schema.json",
+    "agent-report.schema.json",
     "runtime-snapshot.schema.json",
 ]
 
