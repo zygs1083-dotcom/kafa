@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v3.3.2
+# Codex OS Runtime Layer v3.4.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v3.3.2 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, and safer local execution. The repository release remains a beta release, while the runtime implementation version is `3.3.2` and the database schema version is `14`.
+Kernel v3.4.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, and task lease fencing. The repository release remains a beta release, while the runtime implementation version is `3.4.0` and the database schema version is `15`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v3.3.2
+## Kernel v3.4.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -33,6 +33,12 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `projections.py` is the only Markdown projection writer.
 
 SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
+
+## Task Lease Fencing
+
+Tasks carry a monotonic `fence` value. `task claim` returns the current fence with the lease token. `task review` bumps the fence when reviewer ownership is handed off and returns the new fence. `task recover-stale` and `task release` also bump the fence so stale holders cannot use old tokens to overwrite later work.
+
+Write commands that hold a task lease accept `--fence`. When supplied, `task start`, `task heartbeat`, `task submit`, `task complete`, `task accept`, `task block`, and `task release` validate the fence inside the write transaction and fail with `fence-stale` before committing if the holder is stale. Omitting `--fence` remains backward compatible for older clients.
 
 ## Fail-Closed Evidence Identity
 
@@ -64,7 +70,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
 python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair
 python3 plugins/codex-project-harness/scripts/harness.py --root . repair --dry-run
-python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 14
+python3 plugins/codex-project-harness/scripts/harness.py --root . migrate --from-version 6 --to-version 15
 python3 plugins/codex-project-harness/scripts/harness.py --root . trace validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . invariant validate
 python3 plugins/codex-project-harness/scripts/harness.py --root . projection rebuild
@@ -160,11 +166,11 @@ Key commands:
 harness.py --root . task add --id T1 --task "Implement API" --acceptance AC1
 harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
-harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2
-harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3
-harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --evidence "tests passed"
+harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2 --fence <fence>
+harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3 --fence <fence>
+harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --fence <fence> --evidence "tests passed"
 harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
-harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --evidence "review passed"
+harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --fence <review-fence> --evidence "review passed"
 harness.py --root . task block T1 --reason "waiting for schema decision"
 harness.py --root . task release T1 --agent developer
 harness.py --root . task recover-stale

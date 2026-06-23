@@ -39,7 +39,7 @@ def task_revision(root: Path, task_id: str) -> str:
 
 
 def token(stdout: str) -> str:
-    return stdout.split("token=", 1)[1].strip()
+    return stdout.split("token=", 1)[1].split(None, 1)[0].strip()
 
 
 def ensure_dummy_unittest(root: Path) -> None:

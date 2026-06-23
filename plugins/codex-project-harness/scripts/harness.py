@@ -197,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_heartbeat.add_argument("--agent", required=True)
     task_heartbeat.add_argument("--lease-token", required=True)
     task_heartbeat.add_argument("--expected-revision", type=int, required=True)
+    task_heartbeat.add_argument("--fence", type=int)
 
     task_sub.add_parser("recover-stale")
 
@@ -205,12 +206,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_start.add_argument("--agent", required=True)
     task_start.add_argument("--lease-token", required=True)
     task_start.add_argument("--expected-revision", type=int, required=True)
+    task_start.add_argument("--fence", type=int)
 
     task_submit = task_sub.add_parser("submit")
     task_submit.add_argument("id")
     task_submit.add_argument("--agent", required=True)
     task_submit.add_argument("--lease-token", required=True)
     task_submit.add_argument("--expected-revision", type=int, required=True)
+    task_submit.add_argument("--fence", type=int)
     task_submit.add_argument("--evidence", required=True)
 
     task_complete = task_sub.add_parser("complete")
@@ -218,6 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_complete.add_argument("--agent", required=True)
     task_complete.add_argument("--lease-token", required=True)
     task_complete.add_argument("--expected-revision", type=int, required=True)
+    task_complete.add_argument("--fence", type=int)
     task_complete.add_argument("--evidence", required=True)
 
     task_review = task_sub.add_parser("review")
@@ -230,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_accept.add_argument("--agent", required=True)
     task_accept.add_argument("--lease-token", required=True)
     task_accept.add_argument("--expected-revision", type=int, required=True)
+    task_accept.add_argument("--fence", type=int)
     task_accept.add_argument("--evidence", required=True)
 
     task_block = task_sub.add_parser("block")
@@ -237,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_block.add_argument("--agent", required=True)
     task_block.add_argument("--lease-token", required=True)
     task_block.add_argument("--expected-revision", type=int, required=True)
+    task_block.add_argument("--fence", type=int)
     task_block.add_argument("--reason", required=True)
 
     task_release = task_sub.add_parser("release")
@@ -244,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_release.add_argument("--agent", required=True)
     task_release.add_argument("--lease-token", required=True)
     task_release.add_argument("--expected-revision", type=int, required=True)
+    task_release.add_argument("--fence", type=int)
 
     validation = sub.add_parser("validation")
     validation_sub = validation.add_subparsers(dest="validation_command", required=True)
@@ -602,34 +609,34 @@ def main() -> int:
             else:
                 print("NO_READY_TASKS")
         elif args.command == "task" and args.task_command == "claim":
-            token = claim_task(root, args.id, args.agent, args.expected_revision)
-            print(f"OK: claimed {args.id} token={token}")
+            token, fence = claim_task(root, args.id, args.agent, args.expected_revision)
+            print(f"OK: claimed {args.id} token={token} fence={fence}")
         elif args.command == "task" and args.task_command == "heartbeat":
-            heartbeat_task(root, args.id, args.agent, args.lease_token, args.expected_revision)
+            heartbeat_task(root, args.id, args.agent, args.lease_token, args.expected_revision, expected_fence=args.fence)
             print(f"OK: heartbeat {args.id}")
         elif args.command == "task" and args.task_command == "recover-stale":
             recovered = recover_stale_leases(root)
             print(f"OK: recovered {recovered} stale lease(s)")
         elif args.command == "task" and args.task_command == "start":
-            start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            start_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task started {args.id}")
         elif args.command == "task" and args.task_command == "submit":
-            submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            submit_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task submitted {args.id}")
         elif args.command == "task" and args.task_command == "complete":
-            complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            complete_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task submitted {args.id}")
         elif args.command == "task" and args.task_command == "review":
-            token = review_task(root, args.id, args.agent, args.expected_revision)
-            print(f"OK: task review started {args.id} token={token}")
+            token, fence = review_task(root, args.id, args.agent, args.expected_revision)
+            print(f"OK: task review started {args.id} token={token} fence={fence}")
         elif args.command == "task" and args.task_command == "accept":
-            accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task accepted {args.id}")
         elif args.command == "task" and args.task_command == "block":
-            block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task blocked {args.id}")
         elif args.command == "task" and args.task_command == "release":
-            release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision)
+            release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence)
             print(f"OK: task released {args.id}")
         elif args.command == "validation" and args.validation_command == "record":
             record_validation(

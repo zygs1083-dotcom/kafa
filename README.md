@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.0.2-beta.1**，架构代际定位为 **Codex Harness Kernel v3.3.2**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.1.0-beta.1**，架构代际定位为 **Codex Harness Kernel v3.4.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v1.0.2-beta.1
+git show v1.1.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -131,6 +131,8 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 从 v1.0.1 开始，门禁进一步 fail-closed：无 git 项目不会静默跳过代码身份校验，必须显式记录 `--code-identity content-hash`；用于交付的证据必须有非空且当前有效的 source hash；stdout artifact 会在门禁阶段重算 SHA-256；`ci` 与 `external-session` 高信任锚必须来自 connector-origin 契约，manual-origin 记录只作为审计事实。
 
 从 v1.0.2 开始，connector-origin 不再只看 `verification_token` 是否非空，而是要求宿主保管的 HMAC key 参与校验。运行时从 `HARNESS_CONNECTOR_KEY` 或 `.ai-team/control/connector-key-path.txt` 指向的文件加载 key，并用该 key 计算 CI / external-session verification token。没有 key、token 不匹配、commit SHA 或 conclusion 被篡改时，该记录在门禁中降级为 manual/local-only 等价，不能覆盖 high/critical failure mode。key 本身不得写入 DB、事件、Markdown 或 Git；推荐放在已忽略的 `.ai-team/runtime/connector.key`。
+
+从 v1.1.0 开始，任务 lease 使用 fencing 防止过期持有者覆写新持有者工作。`task claim` 和 `task review` 会输出 `fence=<n>`；`task start|heartbeat|submit|complete|accept|block|release` 可传 `--fence <n>`，当任务已被回收或重新交接导致 fence 过期时，写回会以 `fence-stale` 在事务内失败并回滚。
 
 信任等级按强度分为三档：
 
@@ -295,8 +297,8 @@ harness.py --root . doctor
 harness.py --root . validate --delivery
 harness.py --root . repair
 harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 14
-harness.py --root . migrate --from-version markdown-v1 --to-version 14 --dry-run
+harness.py --root . migrate --from-version 6 --to-version 15
+harness.py --root . migrate --from-version markdown-v1 --to-version 15 --dry-run
 harness.py --root . invariant validate
 harness.py --root . projection rebuild
 harness.py --root . kernel doctor
@@ -314,12 +316,12 @@ harness.py --root . failure-mode add --id FM1 --feature "Example" --scenario "Ri
 harness.py --root . task add --id T1 --task "Implement example" --acceptance AC1 --failure-mode FM1
 harness.py --root . task next
 harness.py --root . task claim T1 --agent developer --expected-revision 1
-harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2
-harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3
+harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2 --fence <fence>
+harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3 --fence <fence>
 harness.py --root . task recover-stale
-harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --evidence "tests passed"
+harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --fence <fence> --evidence "tests passed"
 harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
-harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --evidence "review passed"
+harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --fence <review-fence> --evidence "review passed"
 harness.py --root . decision record --decision "Selected local runtime" --reason "SQLite is the source of truth"
 harness.py --root . test-target add --id UNIT --kind unit --command-template "pytest"
 harness.py --root . dispatch run --agent developer --target UNIT --command "pytest"

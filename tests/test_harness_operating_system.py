@@ -64,7 +64,7 @@ def task_revision(root: Path, task_id: str) -> int:
 
 def token_from_stdout(stdout: str) -> str:
     marker = "token="
-    return stdout.split(marker, 1)[1].strip()
+    return stdout.split(marker, 1)[1].split(None, 1)[0].strip()
 
 
 def claim_start_submit(root: Path, task_id: str, *, agent: str = "developer") -> None:
@@ -267,7 +267,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 14)
+            self.assertEqual(project[0], 15)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
             self.assertIn("test_targets", tables)
@@ -466,7 +466,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "14")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "15")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
