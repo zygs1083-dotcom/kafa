@@ -4,6 +4,19 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.8.1-beta.1 - 2026-06-24
+
+### Changed
+
+- Runtime implementation version is now `4.1.1`; runtime schema remains `22`.
+- Phase 0 feature expansion freeze is now enforced by structure validation and regression tests.
+- `validate_structure.py` now rejects unexpected schema, core, and runtime script files, and requires plugin version alignment with the root `VERSION`.
+
+### Boundaries
+
+- This is a maintenance hardening release, not a product capability release.
+- New tables, commands, Skills, runtime states, core modules, runtime scripts, and schema files are intentionally blocked unless a later PR explicitly updates the freeze baseline.
+
 ## v1.8.0-beta.1 - 2026-06-23
 
 ### Added
