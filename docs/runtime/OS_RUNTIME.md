@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.1.0
+# Codex OS Runtime Layer v4.1.1
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.1.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, and deterministic Agent E2E evaluation. The repository release remains a beta release, while the runtime implementation version is `4.1.0` and the database schema version is `22`.
+Kernel v4.1.1 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, and Phase 0 feature-freeze guardrails. The repository release remains a beta release, while the runtime implementation version is `4.1.1` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.1.0
+## Kernel v4.1.1
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -102,6 +102,10 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixtu
 `run_skill_eval.py` remains a transcript marker check. It is useful for format drift, but it is not an Agent capability evaluation. Optional live dogfood can use `run_agent_e2e_eval.py --mode live-command` with `CODEX_AGENT_EVAL_CMD`; when unset, live mode reports `live_skipped=true`.
 
 A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-eval-example.json`; real run durations are intentionally not committed.
+
+## Feature Expansion Freeze
+
+v1.8.1 is a Phase 0 maintenance release. It intentionally freezes product surface growth before the Phase 1 `harness_db.py` decomposition work. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline.
 
 ## Session Attestation And Independent QA
 

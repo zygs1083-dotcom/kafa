@@ -31,6 +31,7 @@ REQUIRED_REFERENCES = [
 REQUIRED_CORE = [
     "__init__.py",
     "api.py",
+    "connector_trust.py",
     "scheduler.py",
     "gate_engine.py",
     "lock_manager.py",
@@ -41,6 +42,7 @@ REQUIRED_CORE = [
     "agent_provider.py",
     "invariant_checker.py",
     "projections.py",
+    "store.py",
 ]
 
 REQUIRED_SCRIPTS = [
@@ -123,6 +125,9 @@ def main() -> int:
     errors: list[str] = []
     if data.get("name") != "codex-project-harness":
         errors.append("plugin name must be codex-project-harness")
+    version_file = root.parent.parent / "VERSION"
+    if version_file.exists() and data.get("version") != version_file.read_text(encoding="utf-8").strip():
+        errors.append("plugin version must match root VERSION")
     if "schema_version" in data:
         errors.append("plugin.json must not use legacy schema_version")
     if "display_name" in data:
@@ -188,11 +193,17 @@ def main() -> int:
         core_path = root / "core" / core_file
         if not core_path.exists():
             errors.append(f"missing kernel core file: {core_path}")
+    core_files = {path.name for path in (root / "core").iterdir() if path.is_file() and path.suffix == ".py"}
+    for core_file in sorted(core_files - set(REQUIRED_CORE)):
+        errors.append(f"unexpected kernel core file: {root / 'core' / core_file}")
 
     for script in REQUIRED_SCRIPTS:
         script_path = root / "scripts" / script
         if not script_path.exists():
             errors.append(f"missing runtime script: {script_path}")
+    script_files = {path.name for path in (root / "scripts").iterdir() if path.is_file() and path.suffix == ".py"}
+    for script in sorted(script_files - set(REQUIRED_SCRIPTS)):
+        errors.append(f"unexpected runtime script: {root / 'scripts' / script}")
 
     runtime_cli = root / "skills" / "project-runtime" / "scripts" / "harness.py"
     if not runtime_cli.exists():
@@ -207,6 +218,9 @@ def main() -> int:
             json.loads(schema_path.read_text(encoding="utf-8"))
         except Exception as exc:
             errors.append(f"invalid schema json {schema_path}: {exc}")
+    schema_files = {path.name for path in (root / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
+    for schema in sorted(schema_files - set(REQUIRED_SCHEMAS)):
+        errors.append(f"unexpected schema file: {root / 'schemas' / schema}")
 
     install_md = root.parent.parent / "INSTALL.md"
     if install_md.exists() and "Copy every folder under" in install_md.read_text(encoding="utf-8"):

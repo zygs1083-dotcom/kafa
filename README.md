@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.8.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.1.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.8.1-beta.1**，架构代际定位为 **Codex Harness Kernel v4.1.1**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -14,7 +14,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 cat VERSION
 git tag --list
 git show v0.4.0-beta.1
-git show v1.8.0-beta.1
+git show v1.8.1-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -147,6 +147,8 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 从 v1.7.0 开始，控制器复验可以显式使用真实容器执行：`dispatch verify-attempt --runner container [--container-image <image>]` 会在 agent branch 的只读代码副本中用 Docker/Podman 运行目标命令，默认断网、最小资源限制，不挂载宿主 HOME/SSH/Git 凭证，并把 stdout/stderr 由宿主写入 artifact。Docker/Podman 不可用时，container runner 以 `sandbox-unavailable` fail-closed，不会静默降级为 local。`dispatch integrate` 也会在 merge 前强制检查：每个 agent 分支必须有最新 `task_attempt.status=verified`，当前 head/tree 必须匹配复验证据，且 `git diff base..branch` 只能包含该 task/agent 的 active file claims。
 
 从 v1.8.0 开始，仓库新增真实 Agent E2E 评测脚本。`run_agent_e2e_eval.py --mode fixture` 会在临时 Git repo 中调用真实 CLI，覆盖并行成功、依赖阻塞、同文件 claim 冲突、伪造 worker evidence 阻断、集成后回归阻断五个场景，并输出稳定 JSON 指标。`run_skill_eval.py` 仍保留为 transcript marker 检查，但不再代表 Agent 能力评测。
+
+从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定当前 schema 22、CLI surface、Skill/schema/core/script 文件集合。后续 Phase 1 若为了拆分 `harness_db.py` 需要新增或移动模块，必须在对应 PR 中显式更新冻结基线并解释原因。
 
 信任等级按强度分为三档：
 
@@ -562,7 +564,7 @@ git diff --check
 
 ## 版本状态
 
-当前 README 描述的是 v1.8 beta / Kernel v4.1 插件格式：
+当前 README 描述的是 v1.8.1 beta / Kernel v4.1.1 插件格式：
 
 - `plugin.json` 使用官方风格 `interface` 元数据。
 - `skills` 使用插件目录引用。

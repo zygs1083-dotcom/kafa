@@ -165,6 +165,8 @@ When an AgentProvider is available, use `dispatch provider start --run-id <run-i
 
 For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixture`. It is the deterministic Agent E2E evaluation for scheduling, provider raw reports, controller verification, file claims, and integration blocking. `run_skill_eval.py` is only a transcript marker check.
 
+From v1.8.1, Phase 0 freezes feature expansion. Harness runtime changes must pass `tests/test_feature_freeze.py`; do not add new tables, commands, Skills, schema files, runtime scripts, core modules, or runtime states unless the PR explicitly updates the freeze baseline and explains why.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:
@@ -257,5 +259,6 @@ Before claiming delivery readiness:
 5. Confirm high/critical failure modes are covered by HMAC-valid connector `ci` or `external-session` trust anchor and connector(HMAC) reviewer session attestation, or explicitly accepted.
 6. Confirm any claimed no-network sandbox evidence has `sandbox_status=available`; otherwise describe it as local/manual verification, not sandbox execution.
 7. For harness runtime changes, run `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture`.
-8. Confirm delivery record includes local or external collaboration links.
-9. State any warnings or residual risk.
+8. For harness runtime surface changes, run `python3 -m unittest tests/test_feature_freeze.py`.
+9. Confirm delivery record includes local or external collaboration links.
+10. State any warnings or residual risk.
