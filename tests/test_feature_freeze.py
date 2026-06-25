@@ -26,8 +26,8 @@ from core import KERNEL_VERSION  # noqa: E402
 from validate_structure import REQUIRED_CORE, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
 
 
-EXPECTED_PLUGIN_VERSION = "1.8.1-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.1.1"
+EXPECTED_PLUGIN_VERSION = "1.9.0-beta.1"
+EXPECTED_RUNTIME_VERSION = "4.2.0"
 EXPECTED_SCHEMA_VERSION = 22
 
 EXPECTED_TABLES = {
@@ -201,7 +201,7 @@ EXPECTED_CLI_SURFACE = {
 
 
 class FeatureFreezeTest(unittest.TestCase):
-    def test_versions_are_consistent_for_v181(self) -> None:
+    def test_versions_are_consistent_for_v190(self) -> None:
         plugin = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
         self.assertEqual((REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(), EXPECTED_PLUGIN_VERSION)

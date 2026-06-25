@@ -38,7 +38,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 22
-RUNTIME_VERSION = "4.1.1"
+RUNTIME_VERSION = "4.2.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -3867,10 +3867,50 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     "task": row["task"],
                     "branch_name": branch_name,
                     "target_id": target["id"] if target else "",
+                    "command_template": target["command_template"] if target else "",
                 },
             )
             handle = provider.spawn(request)
             session_id = str(uuid.uuid4())
+            handle_meta: dict[str, Any] = {}
+            if handle.message:
+                try:
+                    handle_meta = json.loads(handle.message)
+                except json.JSONDecodeError:
+                    handle_meta = {"message": handle.message}
+            provider_input_json = dict(request.input_json)
+            if handle_meta:
+                provider_input_json["provider_metadata"] = handle_meta
+            if handle.status == "spawn_failed":
+                now = now_iso()
+                conn.execute(
+                    """
+                    insert into agent_provider_sessions
+                    (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
+                     agent_session_id, branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
+                     heartbeat_at, lease_expires_at, collected_at, cancelled_at, finished_at)
+                    values (?, ?, ?, ?, ?, ?, ?, 'spawn_failed', ?, '', ?, '', ?, '', '', ?, ?, '', '', '', '', ?)
+                    """,
+                    (
+                        session_id,
+                        run_id,
+                        row["task_id"],
+                        provider.name,
+                        handle.provider_session_id,
+                        handle.provider_job_id,
+                        agent_id,
+                        int(row["fence"]),
+                        branch_name,
+                        stable_json(provider_input_json),
+                        handle.message,
+                        now,
+                        now,
+                    ),
+                )
+                session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
+                provider_event(conn, session, "spawn_failed", handle_meta)
+                emit_event(conn, "agent_provider_session_spawn_failed", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, error=handle.message))
+                continue
             agent_session_id = f"AGENT-SESSION-{uuid.uuid4().hex[:12]}"
             role = agent_id if agent_id in SESSION_ROLES else "developer"
             context_id = f"{run_id}:{row['task_id']}"
@@ -3903,7 +3943,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     int(row["fence"]),
                     agent_session_id,
                     branch_name,
-                    stable_json(request.input_json),
+                    stable_json(provider_input_json),
                     handle.message,
                     now,
                     now,
@@ -3920,7 +3960,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                 (agent_id, handle.provider_session_id, now, now, lease_deadline(), now, run_id, row["task_id"]),
             )
             session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
-            provider_event(conn, session, "started", {"provider_status": handle.status})
+            provider_event(conn, session, "started", {"provider_status": handle.status, **handle_meta})
             emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, provider_session_id=handle.provider_session_id))
             started += 1
         if started:
@@ -4569,7 +4609,7 @@ def codex_import_failure(conn: sqlite3.Connection, run_id: str, task_id: str, me
     conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
 
 
-def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any]) -> list[str]:
+def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any], *, strict_evidence_fields: bool = False) -> list[str]:
     issues: list[str] = []
     for field in CODEX_FANOUT_OUTPUT_FIELDS:
         if field not in result:
@@ -4583,6 +4623,23 @@ def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str
         issues.append(f"target differs from export: expected={expected['target_id']} actual={result['target_id']}")
     elif expected.get("target_id") and not target:
         issues.append(f"missing test target: {result['target_id']}")
+    if strict_evidence_fields:
+        if target and int(target["gateable"]) != 1:
+            issues.append(f"target is not gateable: {result['target_id']}")
+        if expected.get("command_template") and result["command"] != expected["command_template"]:
+            issues.append(f"command differs from target: expected={expected['command_template']} actual={result['command']}")
+        try:
+            if int(result["exit_code"]) != 0:
+                issues.append(f"exit_code is not 0: {result['exit_code']}")
+        except (TypeError, ValueError):
+            issues.append(f"exit_code is not an integer: {result['exit_code']}")
+        if result["executed_count_source"] != "parsed":
+            issues.append(f"executed_count_source is not parsed: {result['executed_count_source']}")
+        try:
+            if int(result["executed_count"]) <= 0:
+                issues.append(f"executed_count is not positive: {result['executed_count']}")
+        except (TypeError, ValueError):
+            issues.append(f"executed_count is not an integer: {result['executed_count']}")
     if result["branch_name"] != expected["branch_name"]:
         issues.append(f"branch differs from export: expected={expected['branch_name']} actual={result['branch_name']}")
     branch = subprocess.run(["git", "rev-parse", "--verify", str(result["branch_name"])], cwd=root, text=True, capture_output=True, check=False)
@@ -4722,6 +4779,7 @@ def expected_from_provider_session(session: sqlite3.Row) -> dict[str, str]:
         "branch_name": session["branch_name"],
         "fence": str(session["fence"]),
         "agent_id": session["agent_id"],
+        "command_template": str(data.get("command_template", "")),
     }
 
 
@@ -4761,9 +4819,11 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
                 record_integration_finding(conn, run_id, f"provider report invalid for {session['task_id']}: {exc.msg}")
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", (exc.msg, now_iso(), session["id"]))
+                conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
+                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
             continue
         with connection(root) as conn:
-            issues = codex_report_issues(root, conn, expected_from_provider_session(session), result)
+            issues = codex_report_issues(root, conn, expected_from_provider_session(session), result, strict_evidence_fields=session["provider"] == "host-codex")
         if issues:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
                 record_integration_finding(conn, run_id, f"provider report rejected for {session['task_id']}: {'; '.join(issues[:5])}")
