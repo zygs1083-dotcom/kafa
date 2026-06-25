@@ -69,6 +69,11 @@ REQUIRED_SCRIPTS = [
     "run_agent_e2e_eval.py",
 ]
 
+REQUIRED_HOOKS = [
+    "hooks.json",
+    "harness_hook.py",
+]
+
 REQUIRED_SCHEMAS = [
     "project-state.schema.json",
     "requirement.schema.json",
@@ -204,6 +209,24 @@ def main() -> int:
     script_files = {path.name for path in (root / "scripts").iterdir() if path.is_file() and path.suffix == ".py"}
     for script in sorted(script_files - set(REQUIRED_SCRIPTS)):
         errors.append(f"unexpected runtime script: {root / 'scripts' / script}")
+
+    hooks_dir = root / "hooks"
+    for hook in REQUIRED_HOOKS:
+        hook_path = hooks_dir / hook
+        if not hook_path.exists():
+            errors.append(f"missing hook file: {hook_path}")
+            continue
+        if hook_path.suffix == ".json":
+            try:
+                json.loads(hook_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                errors.append(f"invalid hook json {hook_path}: {exc}")
+    if hooks_dir.exists():
+        hook_files = {path.name for path in hooks_dir.iterdir() if path.is_file()}
+        for hook in sorted(hook_files - set(REQUIRED_HOOKS)):
+            errors.append(f"unexpected hook file: {hooks_dir / hook}")
+    else:
+        errors.append(f"missing hooks directory: {hooks_dir}")
 
     runtime_cli = root / "skills" / "project-runtime" / "scripts" / "harness.py"
     if not runtime_cli.exists():
