@@ -6,7 +6,23 @@ on:
 
 jobs:
   harness:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+            e2e: stability
+          - os: macos-latest
+            python: python3
+            e2e: fixture
+          - os: windows-latest
+            python: python
+            e2e: fixture
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,39 +32,56 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Provide python3 shim on Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          mkdir -p .ci-bin
+          printf '#!/usr/bin/env bash\npython "$@"\n' > .ci-bin/python3
+          chmod +x .ci-bin/python3
+          echo "$PWD/.ci-bin" >> "$GITHUB_PATH"
+
       - name: Validate plugin structure
-        run: python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
 
       - name: Validate JSON files
         run: |
-          python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
-          find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec python3 -m json.tool {} \; >/dev/null
+          ${{ matrix.python }} -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
+          ${{ matrix.python }} -m json.tool plugins/codex-project-harness/hooks/hooks.json >/dev/null
+          find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec ${{ matrix.python }} -m json.tool {} \; >/dev/null
 
       - name: Compile Python
-        run: python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
+        run: ${{ matrix.python }} -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
 
       - name: Run runtime tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'
 
       - name: Run runtime smoke
-        run: python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
+        if: matrix.os == 'ubuntu-latest'
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_runtime_smoke.py
 
       - name: Run forward compatibility wrapper
-        run: python3 plugins/codex-project-harness/scripts/run_forward_eval.py
+        if: matrix.os == 'ubuntu-latest'
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_forward_eval.py
 
       - name: Run skill eval fixture
-        run: python3 plugins/codex-project-harness/scripts/run_skill_eval.py
+        if: matrix.os == 'ubuntu-latest'
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_skill_eval.py
 
       - name: Run agent E2E eval fixture
-        run: python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
+
+      - name: Run agent E2E stability matrix
+        if: matrix.e2e == 'stability'
+        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 
       - name: Run kernel diagnostic smoke
+        if: matrix.os == 'ubuntu-latest'
         run: |
           tmp="$(mktemp -d)"
-          python3 plugins/codex-project-harness/scripts/harness.py --root "$tmp" init
-          python3 plugins/codex-project-harness/scripts/harness.py --root "$tmp" kernel doctor
-          python3 plugins/codex-project-harness/scripts/harness.py --root "$tmp" invariant validate
-          python3 plugins/codex-project-harness/scripts/harness.py --root "$tmp" projection rebuild
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" init
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" kernel doctor
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" invariant validate
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" projection rebuild
 
       - name: Check whitespace
         run: git diff --check

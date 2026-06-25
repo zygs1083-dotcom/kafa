@@ -2,37 +2,118 @@
   "agent_runtime_seconds": null,
   "estimated_cost": null,
   "live_skipped": false,
-  "mode": "fixture",
+  "matrix": {
+    "codex_available": false,
+    "connector_mock": true,
+    "container_available": false,
+    "git_version": "git version x.y.z",
+    "live_skipped_reasons": [],
+    "platform": "example-platform",
+    "profile": "stability",
+    "python_version": "3.x",
+    "sqlite_stress": true
+  },
+  "mode": "stability",
   "scenarios": [
     {
+      "category": "fixture",
       "details": {},
       "duration_seconds": 0.0,
+      "mode": "fixture",
       "name": "parallel_success",
-      "pass": true
+      "pass": true,
+      "skip_reason": ""
     },
     {
+      "category": "fixture",
       "details": {},
       "duration_seconds": 0.0,
+      "mode": "fixture",
       "name": "dependency_blocked",
-      "pass": true
+      "pass": true,
+      "skip_reason": ""
     },
     {
+      "category": "fixture",
       "details": {},
       "duration_seconds": 0.0,
+      "mode": "fixture",
       "name": "same_file_conflict",
-      "pass": true
+      "pass": true,
+      "skip_reason": ""
     },
     {
-      "details": {},
+      "category": "fixture",
+      "details": {
+        "controller_evidence_count": 0
+      },
       "duration_seconds": 0.0,
+      "mode": "fixture",
       "name": "forged_evidence_blocked",
-      "pass": true
+      "pass": true,
+      "skip_reason": ""
     },
     {
+      "category": "fixture",
       "details": {},
       "duration_seconds": 0.0,
+      "mode": "fixture",
       "name": "integration_regression_blocked",
-      "pass": true
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "host-codex",
+      "details": {},
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "host_codex_fake_app_server_e2e",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "session",
+      "details": {},
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "multi_role_thread_lifecycle",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "connector",
+      "details": {
+        "evidence_count": 0
+      },
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "connector_mock_server_e2e",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "recovery",
+      "details": {
+        "attempts": 1,
+        "evidence": 1,
+        "reports": 1
+      },
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "crash_retry_recovery",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "sqlite",
+      "details": {
+        "sqlite_lock_error_count": 0
+      },
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "sqlite_contention_stress",
+      "pass": true,
+      "skip_reason": ""
     }
   ],
   "summary": {
@@ -42,9 +123,11 @@
     "forged_evidence_block_count": 1,
     "human_intervention_count": 0,
     "merge_conflict_count": 0,
-    "passed_count": 5,
+    "passed_count": 10,
     "retry_count": 0,
-    "scenario_count": 5,
+    "scenario_count": 10,
+    "skipped_count": 0,
+    "sqlite_lock_error_count": 0,
     "task_once_completion_rate": 1.0
   },
   "token_count": null
