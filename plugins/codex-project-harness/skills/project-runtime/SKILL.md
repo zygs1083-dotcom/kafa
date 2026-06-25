@@ -28,6 +28,16 @@ When the plugin source is vendored in the target project, use:
 python3 plugins/codex-project-harness/scripts/harness.py --root . status
 ```
 
+For local installation and release checks, install the root helper package and manage the Codex marketplace entry with `kafa`:
+
+```bash
+python3 -m pip install -e .
+kafa plugin install --repo .
+kafa doctor --repo .
+```
+
+`kafa` is an installer and preflight helper only. It writes Codex marketplace JSON and, for user scope, a copied plugin directory. It does not create trusted evidence, write harness DB rows, mutate Codex plugin caches, add runtime commands, or replace `harness.py`.
+
 | Need | Script |
 | --- | --- |
 | Show current state | `harness.py --root . status` |
@@ -173,6 +183,8 @@ For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixtur
 
 From v1.8.1, Phase 0 freezes feature expansion. Harness runtime changes must pass `tests/test_feature_freeze.py`; do not add new tables, commands, Skills, schema files, runtime scripts, core modules, or runtime states unless the PR explicitly updates the freeze baseline and explains why.
 
+From v1.13.0, installation/release changes must also pass `tests/test_install_release.py`, `python3 -m pip install -e .`, `kafa --version`, and `kafa doctor --repo .`. Keep packaging changes at the repository root; do not use install work as a reason to expand the frozen plugin runtime surface.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:
@@ -266,5 +278,6 @@ Before claiming delivery readiness:
 6. Confirm any claimed no-network sandbox evidence has `sandbox_status=available`; otherwise describe it as local/manual verification, not sandbox execution.
 7. For harness runtime changes, run `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture` and `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability`.
 8. For harness runtime surface changes, run `python3 -m unittest tests/test_feature_freeze.py`.
-9. Confirm delivery record includes local or external collaboration links.
-10. State any warnings or residual risk.
+9. For install/release changes, run `python3 -m unittest tests/test_install_release.py`, `python3 -m pip install -e .`, `kafa --version`, and `kafa doctor --repo .`.
+10. Confirm delivery record includes local or external collaboration links.
+11. State any warnings or residual risk.

@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.5.0
+# Codex OS Runtime Layer v4.6.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.5.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, and an offline stability matrix for release gating. The repository release remains a beta release, while the runtime implementation version is `4.5.0` and the database schema version is `22`.
+Kernel v4.6.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, an offline stability matrix for release gating, and a local installation/release helper. The repository release remains a beta release, while the runtime implementation version is `4.6.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.5.0
+## Kernel v4.6.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -126,7 +126,26 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changes eval, CI, tests, docs, and version metadata without expanding schema, CLI, core, runtime scripts, Skills, or runtime states.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 adds only root-level packaging and the `kafa` installer/release helper; it does not add harness runtime commands, DB tables, schema files, core modules, plugin scripts, Skills, hooks, or runtime states.
+
+## Installation And Release Helper
+
+`kafa` is a root-level packaging helper, not a runtime state machine. Install it locally with:
+
+```bash
+python3 -m pip install -e .
+kafa plugin install --repo .
+kafa doctor --repo .
+```
+
+Repo-scope install writes `.agents/plugins/marketplace.json` with a local `codex-project-harness` plugin entry. User-scope install copies the plugin to `~/.agents/plugins/codex-project-harness` and writes `~/.agents/plugins/marketplace.json`. Upgrade and uninstall use the same marketplace files:
+
+```bash
+kafa plugin upgrade --repo .
+kafa plugin uninstall --repo .
+```
+
+`kafa` does not write harness DB rows, does not add harness runtime CLI commands, does not publish PyPI packages, and does not directly mutate Codex plugin caches.
 
 ## Session Attestation And Independent QA
 

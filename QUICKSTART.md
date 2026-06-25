@@ -1,5 +1,26 @@
 # Quick Start
 
+## Install Locally
+
+From the repository root:
+
+```bash
+python3 -m pip install -e .
+kafa plugin install --repo .
+kafa doctor --repo .
+```
+
+This creates the repo-scoped Codex marketplace entry at `.agents/plugins/marketplace.json` without copying plugin files. Restart Codex, open the plugin directory, choose the `kafa-local` marketplace, and install `codex-project-harness`.
+
+For user-scope installation:
+
+```bash
+python3 -m pip install -e .
+kafa plugin install --scope user --repo .
+```
+
+Use `kafa plugin upgrade --repo .` after pulling a new release and `kafa plugin uninstall --repo .` to remove only the marketplace entry. See `INSTALL.md` for Windows, migration, uninstall, and troubleshooting details.
+
 ## Full Project
 
 Say:

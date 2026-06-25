@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kafa"
+version = "1.13.0b1"
+description = "Local installer and release helper for Codex Project Harness"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "zygs1083-dotcom" }
+]
+keywords = ["codex", "plugins", "harness", "installer"]
+dependencies = []
+
+[project.scripts]
+kafa = "kafa.cli:main"
+
+[tool.setuptools]
+packages = ["kafa"]
