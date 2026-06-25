@@ -159,7 +159,9 @@ For controller-side sandbox verification, explicitly use `dispatch verify-attemp
 
 For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>`. Import records raw worker reports only; run `dispatch verify-attempt --run-id <run-id> --task <task-id>` for each reported task before `dispatch integrate --run-id <run-id>`.
 
-When an AgentProvider is available, use `dispatch provider start --run-id <run-id> --provider <provider>`, then `dispatch provider collect --run-id <run-id>` or `dispatch provider reconcile --run-id <run-id>` to manage the session lifecycle. Provider output remains a raw report; never treat it as delivery evidence until `dispatch verify-attempt` reruns the linked target and records controller evidence. The repository does not call Codex APIs or create user-visible Codex sessions by itself; real providers are host-supplied.
+When an AgentProvider is available, use `dispatch provider start --run-id <run-id> --provider <provider>`, then `dispatch provider collect --run-id <run-id>` or `dispatch provider reconcile --run-id <run-id>` to manage the session lifecycle. Provider output remains a raw report; never treat it as delivery evidence until `dispatch verify-attempt` reruns the linked target and records controller evidence.
+
+`--provider host-codex` uses Codex App Server over stdio to create one Codex thread/turn per assignment. By default it runs `codex app-server`; override with `HARNESS_CODEX_APP_SERVER_CMD` and bound the turn with `HARNESS_CODEX_TURN_TIMEOUT_SECONDS`. Host Codex reports are stricter than fixture/manual reports, but they are still raw reports until controller verification.
 
 `dispatch integrate` only merges active agent branches that have a verified task attempt, whose current branch head/tree still match that verified attempt, and whose changed files remain within active file claims. Unverified branches, branch drift, and file-claim violations are high findings and fail closed before merge.
 

@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.1.1
+# Codex OS Runtime Layer v4.2.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.1.1 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, and Phase 0 feature-freeze guardrails. The repository release remains a beta release, while the runtime implementation version is `4.1.1` and the database schema version is `22`.
+Kernel v4.2.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, and a real Codex Host Bridge over App Server stdio. The repository release remains a beta release, while the runtime implementation version is `4.2.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.1.1
+## Kernel v4.2.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -83,6 +83,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integ
 
 `dispatch provider start` records host/manual/fixture-managed agent sessions for ready dispatch assignments. `dispatch provider collect` imports provider output as raw `agent_reports` and `task_attempts`; it never writes delivery-eligible evidence. `dispatch provider cancel` and `dispatch provider reconcile` make cancellation and timeout recovery auditable without allowing stale reports to overwrite newer work. Real Codex session creation remains a host/provider capability; the repository does not call Codex APIs or create user-visible Codex sessions by itself.
 
+`--provider host-codex` now starts Codex App Server over stdio, initializes the JSON-RPC connection, creates one Codex thread/turn per dispatch assignment, and records thread/turn metadata in existing provider session input/events. The worker must return a final JSON report matching the provider output contract. That report is still raw input: use `dispatch verify-attempt` to produce trusted controller evidence before integration or delivery.
+
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider start --run-id <run-id> --provider manual-csv
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider collect --run-id <run-id>
@@ -105,7 +107,7 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 ## Feature Expansion Freeze
 
-v1.8.1 is a Phase 0 maintenance release. It intentionally freezes product surface growth before the Phase 1 `harness_db.py` decomposition work. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.9 implements the existing `host-codex` provider surface without expanding schema or CLI.
 
 ## Session Attestation And Independent QA
 

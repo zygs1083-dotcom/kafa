@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.9.0-beta.1 - 2026-06-25
+
+### Added
+
+- Real `host-codex` AgentProvider bridge using Codex App Server over stdio JSON-RPC.
+- One task maps to one Codex thread/turn; thread and turn metadata is recorded in existing provider session input/events.
+- Host Codex worker final JSON reports are imported only as raw provider reports and task attempts.
+
+### Changed
+
+- Runtime implementation version is now `4.2.0`; runtime schema remains `22`.
+- `host-codex` provider reports use stricter collect-time validation for command, exit code, parsed executed count, branch, target, and fence.
+
+### Boundaries
+
+- No new CLI commands, DB tables, schema files, runtime states, or core files are introduced.
+- Host Codex output still cannot satisfy delivery gates until `dispatch verify-attempt` produces controller evidence.
+
 ## v1.8.1-beta.1 - 2026-06-24
 
 ### Changed
