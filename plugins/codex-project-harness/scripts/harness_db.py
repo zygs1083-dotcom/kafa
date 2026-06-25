@@ -8,6 +8,7 @@ import contextvars
 import csv
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -17,8 +18,10 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
 from typing import Any, Callable, Iterator
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +42,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 22
-RUNTIME_VERSION = "4.7.0"
+SCHEMA_VERSION = 23
+RUNTIME_VERSION = "4.8.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -78,6 +81,7 @@ PHASE_TRANSITIONS = {
 }
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
+CONNECTOR_STATUSES = {"available", "degraded", "blocked"}
 DISPATCH_STATUSES = {"planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
 SESSION_ROLES = {"developer", "qa-reviewer", "reviewer", "architect", "product", "security"}
 REVIEWER_SESSION_ROLES = {"qa-reviewer", "reviewer", "architect", "security"}
@@ -182,6 +186,7 @@ SNAPSHOT_TABLES = [
     "decisions",
     "adapters",
     "adapter_actions",
+    "connector_budgets",
     "ci_verifications",
     "external_session_verifications",
     "invalidations",
@@ -209,6 +214,36 @@ SNAPSHOT_TABLES = [
 
 class HarnessError(Exception):
     """User-facing runtime error."""
+
+
+@dataclass
+class ConnectorStats:
+    tool: str
+    operation: str
+    scope_key: str
+    status: str = "available"
+    attempt_count: int = 0
+    retry_after_at: str = ""
+    rate_limit_remaining: int | None = None
+    rate_limit_reset_at: str = ""
+    last_status_code: int | None = None
+    last_error: str = ""
+    free_plan_risk: str = ""
+
+
+class ConnectorFailure(HarnessError):
+    """Connector failure with budget/retry metadata."""
+
+    def __init__(self, message: str, stats: ConnectorStats) -> None:
+        super().__init__(message)
+        self.stats = stats
+
+
+@dataclass
+class ConnectorOutcome:
+    external_id: str
+    external_link: str
+    stats: ConnectorStats
 
 
 _active_request: "contextvars.ContextVar[dict[str, Any] | None]" = contextvars.ContextVar("active_request", default=None)
@@ -646,9 +681,28 @@ def create_schema(conn: sqlite3.Connection) -> None:
             external_id text not null default '',
             external_link text not null default '',
             idempotency_key text not null,
+            attempt_count integer not null default 0,
+            next_retry_at text not null default '',
+            connector_status text not null default 'available',
+            blocked_reason text not null default '',
             created_at text not null,
             updated_at text not null,
             unique(tool, idempotency_key)
+        );
+        create table if not exists connector_budgets (
+            id text primary key,
+            tool text not null,
+            operation text not null,
+            scope_key text not null default '',
+            status text not null,
+            retry_after_at text not null default '',
+            rate_limit_remaining integer,
+            rate_limit_reset_at text not null default '',
+            last_status_code integer,
+            last_error text not null default '',
+            free_plan_risk text not null default '',
+            updated_at text not null,
+            unique(tool, operation, scope_key)
         );
         create table if not exists invalidations (
             id text primary key,
@@ -991,6 +1045,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "task_attempts", "agent_session_id", "text not null default ''")
     ensure_column(conn, "agent_reports", "provider_session_id", "text not null default ''")
     ensure_column(conn, "agent_provider_sessions", "agent_session_id", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "attempt_count", "integer not null default 0")
+    ensure_column(conn, "adapter_actions", "next_retry_at", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "connector_status", "text not null default 'available'")
+    ensure_column(conn, "adapter_actions", "blocked_reason", "text not null default ''")
     ensure_default_executor_allowlist(conn)
 
 
@@ -3302,6 +3360,9 @@ CONNECTOR_OPERATIONS = {
 }
 PROBE_OPERATIONS = {"github.probe", "linear.probe", "notion.probe", "figma.probe", "slack.probe"}
 WRITE_CONNECTOR_MODES = {"write-confirm", "write-auto"}
+DEFAULT_CONNECTOR_MAX_ATTEMPTS = 3
+RETRYABLE_CONNECTOR_CODES = {403, 429, 500, 502, 503, 504, 529}
+_CONNECTOR_THROTTLE_LAST: dict[str, float] = {}
 
 
 def connector_marker(idempotency_key: str) -> str:
@@ -3321,6 +3382,211 @@ def require_param(params: dict[str, Any], key: str) -> str:
     if value is None or str(value) == "":
         raise HarnessError(f"connector payload missing param: {key}")
     return str(value)
+
+
+def connector_scope_key(tool: str, operation: str, params: dict[str, Any]) -> str:
+    if tool == "github":
+        return str(params.get("repo", ""))
+    if tool == "slack":
+        return str(params.get("channel", ""))
+    if tool == "figma":
+        return str(params.get("file_key", ""))
+    if tool == "notion":
+        return str(params.get("page_id") or params.get("parent_page_id") or "")
+    if tool == "linear":
+        return str(params.get("team_id") or params.get("issue_id") or "")
+    return operation
+
+
+def connector_stats(tool: str, operation: str, params: dict[str, Any]) -> ConnectorStats:
+    return ConnectorStats(tool=tool, operation=operation, scope_key=connector_scope_key(tool, operation, params))
+
+
+def connector_budget_id(stats: ConnectorStats) -> str:
+    digest = hashlib.sha256(f"{stats.tool}:{stats.operation}:{stats.scope_key}".encode("utf-8")).hexdigest()[:16]
+    return f"connector-budget:{digest}"
+
+
+def connector_max_attempts() -> int:
+    try:
+        value = int(os.environ.get("HARNESS_CONNECTOR_MAX_ATTEMPTS", str(DEFAULT_CONNECTOR_MAX_ATTEMPTS)))
+    except ValueError:
+        value = DEFAULT_CONNECTOR_MAX_ATTEMPTS
+    return max(1, min(value, 10))
+
+
+def parse_retry_after(value: str) -> int:
+    value = value.strip()
+    if not value:
+        return 0
+    if value.isdigit():
+        return max(0, int(value))
+    try:
+        parsed = datetime.strptime(value, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0
+    return max(0, int((parsed - datetime.now(timezone.utc)).total_seconds()))
+
+
+def iso_after_seconds(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, seconds))).replace(microsecond=0).isoformat()
+
+
+def rate_limit_reset_iso(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(value), timezone.utc).replace(microsecond=0).isoformat()
+    except ValueError:
+        return ""
+
+
+def retry_delay_seconds(stats: ConnectorStats, attempt_index: int, retry_after: int) -> int:
+    if retry_after > 0:
+        return retry_after
+    seed = int(hashlib.sha256(f"{stats.tool}:{stats.operation}:{attempt_index}".encode("utf-8")).hexdigest()[:2], 16)
+    jitter = seed % 2
+    return min(30, (2 ** attempt_index) + jitter)
+
+
+def maybe_sleep_connector(delay_seconds: int) -> None:
+    try:
+        cap = float(os.environ.get("HARNESS_CONNECTOR_RETRY_SLEEP", "1"))
+    except ValueError:
+        cap = 1.0
+    if cap <= 0:
+        return
+    time.sleep(min(float(delay_seconds), cap))
+
+
+def throttle_connector(stats: ConnectorStats) -> None:
+    interval = 0.0
+    scope = stats.scope_key
+    if stats.tool == "notion":
+        interval = 0.5
+        scope = "global"
+    elif stats.operation == "slack.message.post" and stats.scope_key:
+        interval = 1.0
+    if interval <= 0:
+        return
+    key = f"{stats.tool}:{stats.operation}:{scope}"
+    now = time.monotonic()
+    previous = _CONNECTOR_THROTTLE_LAST.get(key)
+    _CONNECTOR_THROTTLE_LAST[key] = now
+    if previous is None:
+        return
+    wait = interval - (now - previous)
+    if wait > 0:
+        maybe_sleep_connector(max(0, int(wait + 0.999)))
+
+
+def note_connector_headers(stats: ConnectorStats, headers: Any) -> None:
+    get = headers.get if hasattr(headers, "get") else lambda _key, _default=None: None
+    retry_after = parse_retry_after(str(get("Retry-After", "") or get("retry-after", "") or ""))
+    if retry_after:
+        stats.retry_after_at = iso_after_seconds(retry_after)
+    remaining = str(get("x-ratelimit-remaining", "") or get("X-RateLimit-Remaining", "") or "")
+    if remaining:
+        try:
+            stats.rate_limit_remaining = int(remaining)
+        except ValueError:
+            pass
+    reset = str(get("x-ratelimit-reset", "") or get("X-RateLimit-Reset", "") or "")
+    if reset:
+        stats.rate_limit_reset_at = rate_limit_reset_iso(reset)
+    figma_bits = []
+    for header in ["x-figma-plan-tier", "x-figma-rate-limit-type", "x-figma-upgrade-link"]:
+        value = str(get(header, "") or get(header.title(), "") or "")
+        if value:
+            figma_bits.append(f"{header}={value}")
+    if figma_bits:
+        stats.free_plan_risk = "; ".join(figma_bits)
+
+
+def note_gh_rate_limit(stderr: str, stats: ConnectorStats) -> int:
+    retry_after = 0
+    match = re.search(r"retry-after[:=]\s*(\d+)", stderr, re.IGNORECASE)
+    if match:
+        retry_after = int(match.group(1))
+        stats.retry_after_at = iso_after_seconds(retry_after)
+    remaining = re.search(r"x-ratelimit-remaining[:=]\s*(\d+)", stderr, re.IGNORECASE)
+    if remaining:
+        stats.rate_limit_remaining = int(remaining.group(1))
+    reset = re.search(r"x-ratelimit-reset[:=]\s*(\d+)", stderr, re.IGNORECASE)
+    if reset:
+        stats.rate_limit_reset_at = rate_limit_reset_iso(reset.group(1))
+    return retry_after
+
+
+def is_retryable_connector_status(status_code: int, detail: str = "") -> bool:
+    if status_code in (RETRYABLE_CONNECTOR_CODES - {403}):
+        return True
+    if status_code == 403 and ("rate limit" in detail.lower() or "secondary rate" in detail.lower()):
+        return True
+    return False
+
+
+def upsert_connector_budget(conn: sqlite3.Connection, stats: ConnectorStats) -> None:
+    conn.execute(
+        """
+        insert into connector_budgets
+        (id, tool, operation, scope_key, status, retry_after_at, rate_limit_remaining, rate_limit_reset_at,
+         last_status_code, last_error, free_plan_risk, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(tool, operation, scope_key) do update set status=excluded.status,
+          retry_after_at=excluded.retry_after_at, rate_limit_remaining=excluded.rate_limit_remaining,
+          rate_limit_reset_at=excluded.rate_limit_reset_at, last_status_code=excluded.last_status_code,
+          last_error=excluded.last_error, free_plan_risk=excluded.free_plan_risk, updated_at=excluded.updated_at
+        """,
+        (
+            connector_budget_id(stats),
+            stats.tool,
+            stats.operation,
+            stats.scope_key,
+            stats.status,
+            stats.retry_after_at,
+            stats.rate_limit_remaining,
+            stats.rate_limit_reset_at,
+            stats.last_status_code,
+            stats.last_error,
+            stats.free_plan_risk,
+            now_iso(),
+        ),
+    )
+
+
+def mark_connector_blocked(root: Path, action_id: str, stats: ConnectorStats, reason: str) -> None:
+    stats.status = "blocked"
+    stats.last_error = reason[:1000]
+    finding_id = f"connector:{action_id}:blocked"
+    with get_store(root).transaction() as conn:
+        row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not row:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if row["status"] != "blocked":
+            conn.execute(
+                """
+                update adapter_actions set status = 'blocked', connector_status = 'blocked',
+                  blocked_reason = ?, attempt_count = ?, next_retry_at = ?, updated_at = ? where id = ?
+                """,
+                (stats.last_error, stats.attempt_count, stats.retry_after_at, now_iso(), action_id),
+            )
+            conn.execute(
+                """
+                insert into findings (id, surface, severity, status, summary, evidence_id, created_at)
+                values (?, 'connector', 'medium', 'open', ?, '', ?)
+                on conflict(id) do update set summary=excluded.summary, status=excluded.status, created_at=excluded.created_at
+                """,
+                (
+                    finding_id,
+                    f"Connector blocked for {stats.tool} {stats.operation}: {stats.last_error}. Local .ai-team fact source remains available.",
+                    now_iso(),
+                ),
+            )
+            emit_event(conn, "connector_action_blocked", payload(id=action_id, tool=stats.tool, operation=stats.operation, reason=stats.last_error), idempotency_key=row["idempotency_key"])
+        upsert_connector_budget(conn, stats)
+    render_tooling_map(root)
 
 
 def load_connector_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -3375,41 +3641,67 @@ def infer_github_repo(root: Path) -> str:
     return value
 
 
-def run_gh_api(root: Path, endpoint: str, fields: dict[str, str]) -> dict[str, Any]:
+def run_gh_api(root: Path, endpoint: str, fields: dict[str, str], stats: ConnectorStats) -> dict[str, Any]:
     if not shutil.which("gh"):
-        raise HarnessError("github connector requires gh CLI")
+        raise ConnectorFailure("github connector requires gh CLI", stats)
     command = ["gh", "api", endpoint]
     for key, value in fields.items():
         command.extend(["-f", f"{key}={value}"])
-    result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
-    if result.returncode != 0:
-        raise HarnessError(f"github connector failed: {result.stderr.strip() or result.stdout.strip() or result.returncode}")
-    try:
-        data = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise HarnessError(f"github connector returned invalid JSON: {exc.msg}") from exc
-    if not isinstance(data, dict):
-        raise HarnessError("github connector returned non-object JSON")
-    return data
+    max_attempts = connector_max_attempts()
+    for attempt_index in range(max_attempts):
+        throttle_connector(stats)
+        stats.attempt_count += 1
+        result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+        if result.returncode == 0:
+            stats.status = "available"
+            stats.last_status_code = 200
+            stats.last_error = ""
+            try:
+                data = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise ConnectorFailure(f"github connector returned invalid JSON: {exc.msg}", stats) from exc
+            if not isinstance(data, dict):
+                raise ConnectorFailure("github connector returned non-object JSON", stats)
+            return data
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        stats.last_error = detail[:1000]
+        retry_after = note_gh_rate_limit(detail, stats)
+        stats.last_status_code = 429 if "429" in detail or "rate limit" in detail.lower() else 500
+        retryable = "rate limit" in detail.lower() or "secondary rate" in detail.lower()
+        if retryable and attempt_index < max_attempts - 1:
+            stats.status = "degraded"
+            maybe_sleep_connector(retry_delay_seconds(stats, attempt_index, retry_after))
+            continue
+        stats.status = "blocked"
+        raise ConnectorFailure(f"github connector failed: {detail}", stats)
+    stats.status = "blocked"
+    raise ConnectorFailure("github connector failed: retry budget exhausted", stats)
 
 
-def execute_github_connector(root: Path, operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+def execute_github_connector(root: Path, operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
+    stats = connector_stats("github", operation, params)
     if operation == "github.probe":
-        data = run_gh_api(root, "user", {})
+        data = run_gh_api(root, "user", {}, stats)
         login = data.get("login") or data.get("viewer", {}).get("login") or "ok"
-        return f"github:probe:{login}", ""
+        return ConnectorOutcome(f"github:probe:{login}", "", stats)
     repo = str(params.get("repo") or infer_github_repo(root))
+    params = {**params, "repo": repo}
+    stats.scope_key = connector_scope_key("github", operation, params)
+    existing = find_existing_connector_object(root, operation, params, idempotency_key, stats)
+    if existing:
+        return ConnectorOutcome(existing[0], existing[1], stats)
     if operation == "github.issue.create":
         data = run_gh_api(
             root,
             f"repos/{repo}/issues",
             {"title": require_param(params, "title"), "body": with_connector_marker(str(params.get("body", "")), idempotency_key)},
+            stats,
         )
-        return f"github:issue:{data.get('number') or data.get('id')}", str(data.get("html_url", ""))
+        return ConnectorOutcome(f"github:issue:{data.get('number') or data.get('id')}", str(data.get("html_url", "")), stats)
     if operation == "github.issue.comment":
         issue_number = require_param(params, "issue_number")
-        data = run_gh_api(root, f"repos/{repo}/issues/{issue_number}/comments", {"body": with_connector_marker(require_param(params, "body"), idempotency_key)})
-        return f"github:comment:{data.get('id')}", str(data.get("html_url", ""))
+        data = run_gh_api(root, f"repos/{repo}/issues/{issue_number}/comments", {"body": with_connector_marker(require_param(params, "body"), idempotency_key)}, stats)
+        return ConnectorOutcome(f"github:comment:{data.get('id')}", str(data.get("html_url", "")), stats)
     if operation == "github.pr.create":
         fields = {
             "title": require_param(params, "title"),
@@ -3417,43 +3709,193 @@ def execute_github_connector(root: Path, operation: str, params: dict[str, Any],
             "head": require_param(params, "head"),
             "base": require_param(params, "base"),
         }
-        data = run_gh_api(root, f"repos/{repo}/pulls", fields)
-        return f"github:pr:{data.get('number') or data.get('id')}", str(data.get("html_url", ""))
-    raise HarnessError(f"unsupported github connector operation: {operation}")
+        data = run_gh_api(root, f"repos/{repo}/pulls", fields, stats)
+        return ConnectorOutcome(f"github:pr:{data.get('number') or data.get('id')}", str(data.get("html_url", "")), stats)
+    raise ConnectorFailure(f"unsupported github connector operation: {operation}", stats)
 
 
-def http_json(url: str, token: str, body: dict[str, Any], *, method: str = "POST", headers: dict[str, str] | None = None) -> dict[str, Any]:
+def http_json(url: str, token: str, body: dict[str, Any] | None, *, stats: ConnectorStats, method: str = "POST", headers: dict[str, str] | None = None) -> dict[str, Any]:
     request_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}", **(headers or {})}
-    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - connector URL is explicit runtime configuration.
-            data = json.loads(response.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise HarnessError(f"connector HTTP failed: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise HarnessError(f"connector HTTP failed: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise HarnessError(f"connector returned invalid JSON: {exc.msg}") from exc
-    if not isinstance(data, dict):
-        raise HarnessError("connector returned non-object JSON")
-    return data
+    data_bytes = None if method == "GET" else json.dumps(body or {}).encode("utf-8")
+    max_attempts = connector_max_attempts()
+    for attempt_index in range(max_attempts):
+        throttle_connector(stats)
+        stats.attempt_count += 1
+        request = urllib.request.Request(url, data=data_bytes, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - connector URL is explicit runtime configuration.
+                stats.last_status_code = int(getattr(response, "status", 200))
+                note_connector_headers(stats, response.headers)
+                data = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            stats.last_status_code = exc.code
+            stats.last_error = f"{exc.code} {detail}"[:1000]
+            note_connector_headers(stats, exc.headers)
+            retry_after = parse_retry_after(str(exc.headers.get("Retry-After", "") if exc.headers else ""))
+            if is_retryable_connector_status(exc.code, detail) and attempt_index < max_attempts - 1:
+                stats.status = "degraded"
+                maybe_sleep_connector(retry_delay_seconds(stats, attempt_index, retry_after))
+                continue
+            stats.status = "blocked"
+            raise ConnectorFailure(f"connector HTTP failed: {exc.code} {detail}", stats) from exc
+        except urllib.error.URLError as exc:
+            stats.last_error = str(exc.reason)[:1000]
+            if attempt_index < max_attempts - 1:
+                stats.status = "degraded"
+                maybe_sleep_connector(retry_delay_seconds(stats, attempt_index, 0))
+                continue
+            stats.status = "blocked"
+            raise ConnectorFailure(f"connector HTTP failed: {exc.reason}", stats) from exc
+        except json.JSONDecodeError as exc:
+            raise ConnectorFailure(f"connector returned invalid JSON: {exc.msg}", stats) from exc
+        if not isinstance(data, dict):
+            raise ConnectorFailure("connector returned non-object JSON", stats)
+        stats.status = "available"
+        stats.last_error = ""
+        return data
+    stats.status = "blocked"
+    raise ConnectorFailure("connector HTTP failed: retry budget exhausted", stats)
 
 
-def env_token(name: str) -> str:
+def env_token(name: str, stats: ConnectorStats) -> str:
     value = os.environ.get(name, "")
     if not value:
-        raise HarnessError(f"connector token missing: {name}")
+        raise ConnectorFailure(f"connector token missing: {name}", stats)
     return value
 
 
-def execute_linear_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
-    token = env_token("LINEAR_API_KEY")
+def first_search_result(data: dict[str, Any]) -> dict[str, Any] | None:
+    results = data.get("results")
+    if isinstance(results, list) and results and isinstance(results[0], dict):
+        return results[0]
+    items = data.get("items")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        return items[0]
+    nodes = data.get("data", {}).get("search", {}).get("nodes")
+    if isinstance(nodes, list) and nodes and isinstance(nodes[0], dict):
+        return nodes[0]
+    matches = data.get("messages", {}).get("matches")
+    if isinstance(matches, list) and matches and isinstance(matches[0], dict):
+        return matches[0]
+    comments = data.get("comments")
+    if isinstance(comments, list):
+        for comment in comments:
+            if isinstance(comment, dict):
+                return comment
+    return None
+
+
+def find_existing_connector_object(root: Path, operation: str, params: dict[str, Any], idempotency_key: str, stats: ConnectorStats) -> tuple[str, str] | None:
+    marker = connector_marker(idempotency_key)
+    if operation == "github.issue.create":
+        repo = require_param(params, "repo")
+        data = run_gh_api(root, "search/issues", {"q": f"{marker} repo:{repo} type:issue"}, stats)
+        item = first_search_result(data)
+        if item:
+            return f"github:issue:{item.get('number') or item.get('id')}", str(item.get("html_url", ""))
+    if operation == "github.pr.create":
+        repo = require_param(params, "repo")
+        data = run_gh_api(root, "search/issues", {"q": f"{marker} repo:{repo} type:pr"}, stats)
+        item = first_search_result(data)
+        if item:
+            return f"github:pr:{item.get('number') or item.get('id')}", str(item.get("html_url", ""))
+    if operation.startswith("notion.page."):
+        token = env_token("NOTION_TOKEN", stats)
+        base = os.environ.get("HARNESS_NOTION_API_URL", "https://api.notion.com").rstrip("/")
+        path = "/notion/v1/search" if os.environ.get("HARNESS_NOTION_API_URL") else "/v1/search"
+        data = http_json(f"{base}{path}", token, {"query": marker, "page_size": 1}, stats=stats, headers={"Notion-Version": "2022-06-28"})
+        item = first_search_result(data)
+        if item:
+            return f"notion:page:{item.get('id')}", str(item.get("url", ""))
+    if operation == "figma.comment.create":
+        token = env_token("FIGMA_TOKEN", stats)
+        base = os.environ.get("HARNESS_FIGMA_API_URL", "https://api.figma.com").rstrip("/")
+        file_key = require_param(params, "file_key")
+        path = f"/figma/v1/files/{file_key}/comments" if os.environ.get("HARNESS_FIGMA_API_URL") else f"/v1/files/{file_key}/comments"
+        try:
+            data = http_json(f"{base}{path}", token, None, stats=stats, method="GET", headers={"X-Figma-Token": token})
+        except ConnectorFailure as exc:
+            if exc.stats.last_status_code in {404, 405, 501}:
+                return None
+            raise
+        comments = data.get("comments")
+        if isinstance(comments, list):
+            for comment in comments:
+                if isinstance(comment, dict) and marker in str(comment.get("message", "")):
+                    return f"figma:comment:{comment.get('id')}", f"https://www.figma.com/file/{file_key}?comment-id={comment.get('id')}"
+    if operation in {"linear.issue.create", "linear.issue.comment", "linear.issue.update"}:
+        token = env_token("LINEAR_API_KEY", stats)
+        endpoint = f"{os.environ['HARNESS_LINEAR_API_URL'].rstrip('/')}/linear/graphql" if os.environ.get("HARNESS_LINEAR_API_URL") else "https://api.linear.app/graphql"
+        data = http_json(
+            endpoint,
+            token,
+            {"query": "query Search($query: String!) { search(query: $query) { nodes { ... on Issue { id identifier url } ... on Comment { id url } } } }", "variables": {"query": marker}},
+            stats=stats,
+        )
+        item = first_search_result(data)
+        if item:
+            if item.get("identifier"):
+                return f"linear:issue:{item.get('identifier')}", str(item.get("url", ""))
+            return f"linear:comment:{item.get('id')}", str(item.get("url", ""))
+    if operation == "slack.message.post":
+        token = env_token("SLACK_BOT_TOKEN", stats)
+        base = os.environ.get("HARNESS_SLACK_API_URL", "https://slack.com").rstrip("/")
+        path = "/slack/api/search.messages" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/search.messages"
+        try:
+            data = http_json(f"{base}{path}", token, {"query": marker, "count": 1}, stats=stats)
+        except ConnectorFailure as exc:
+            if exc.stats.last_status_code in {429, 529}:
+                raise
+            return None
+        if data.get("ok") is False:
+            return None
+        item = first_search_result(data)
+        if item:
+            channel = item.get("channel", {})
+            channel_id = channel.get("id") if isinstance(channel, dict) else ""
+            return f"slack:message:{channel_id or params.get('channel', '')}:{item.get('ts', '')}", str(item.get("permalink", ""))
+    return None
+
+
+def notion_payload_for_page_create(params: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+    children = params.get("children")
+    if children is None:
+        children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key)}}]}}]
+    if not isinstance(children, list):
+        raise HarnessError("Notion payload children must be an array")
+    return {
+        "parent": {"page_id": require_param(params, "parent_page_id")},
+        "properties": {"title": {"title": [{"text": {"content": require_param(params, "title")}}]}},
+        "children": children,
+    }
+
+
+def validate_notion_payload(payload_value: dict[str, Any], stats: ConnectorStats) -> None:
+    body = json.dumps(payload_value, ensure_ascii=False, sort_keys=True)
+    children = payload_value.get("children", [])
+    if len(body.encode("utf-8")) >= 500 * 1024:
+        raise ConnectorFailure("Notion payload exceeds 500KB connector limit; use local fallback/link instead", stats)
+    if isinstance(children, list) and len(children) >= 1000:
+        raise ConnectorFailure("Notion payload children exceeds 1000 block connector limit; use local fallback/link instead", stats)
+    attachments = payload_value.get("attachments", [])
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if isinstance(attachment, dict) and int(attachment.get("size_bytes", 0) or 0) > 5 * 1024 * 1024:
+                raise ConnectorFailure("Notion attachment exceeds 5MB; record a link or local fallback path instead", stats)
+
+
+def execute_linear_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
+    stats = connector_stats("linear", operation, params)
+    token = env_token("LINEAR_API_KEY", stats)
     endpoint = f"{os.environ['HARNESS_LINEAR_API_URL'].rstrip('/')}/linear/graphql" if os.environ.get("HARNESS_LINEAR_API_URL") else "https://api.linear.app/graphql"
     if operation == "linear.probe":
-        data = http_json(endpoint, token, {"query": "query Viewer { viewer { id name } }"})
+        data = http_json(endpoint, token, {"query": "query Viewer { viewer { id name } }"}, stats=stats)
         viewer = data.get("data", {}).get("viewer", {})
-        return f"linear:probe:{viewer.get('id', 'ok')}", ""
+        return ConnectorOutcome(f"linear:probe:{viewer.get('id', 'ok')}", "", stats)
+    existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+    if existing:
+        return ConnectorOutcome(existing[0], existing[1], stats)
     if operation == "linear.issue.create":
         data = http_json(
             endpoint,
@@ -3462,9 +3904,10 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
                 "query": "mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }",
                 "variables": {"input": {"teamId": require_param(params, "team_id"), "title": require_param(params, "title"), "description": with_connector_marker(str(params.get("description", "")), idempotency_key)}},
             },
+            stats=stats,
         )
         issue = data.get("data", {}).get("issueCreate", {}).get("issue", {})
-        return f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", ""))
+        return ConnectorOutcome(f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", "")), stats)
     if operation == "linear.issue.comment":
         data = http_json(
             endpoint,
@@ -3473,9 +3916,10 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
                 "query": "mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url } } }",
                 "variables": {"input": {"issueId": require_param(params, "issue_id"), "body": with_connector_marker(require_param(params, "body"), idempotency_key)}},
             },
+            stats=stats,
         )
         comment = data.get("data", {}).get("commentCreate", {}).get("comment", {})
-        return f"linear:comment:{comment.get('id')}", str(comment.get("url", ""))
+        return ConnectorOutcome(f"linear:comment:{comment.get('id')}", str(comment.get("url", "")), stats)
     if operation == "linear.issue.update":
         update_input = {k: v for k, v in params.items() if k != "issue_id"}
         data = http_json(
@@ -3485,86 +3929,115 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
                 "query": "mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier url } } }",
                 "variables": {"id": require_param(params, "issue_id"), "input": update_input},
             },
+            stats=stats,
         )
         issue = data.get("data", {}).get("issueUpdate", {}).get("issue", {})
-        return f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", ""))
-    raise HarnessError(f"unsupported linear connector operation: {operation}")
+        return ConnectorOutcome(f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", "")), stats)
+    raise ConnectorFailure(f"unsupported linear connector operation: {operation}", stats)
 
 
-def execute_notion_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
-    token = env_token("NOTION_TOKEN")
+def execute_notion_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
+    stats = connector_stats("notion", operation, params)
+    token = env_token("NOTION_TOKEN", stats)
     base = os.environ.get("HARNESS_NOTION_API_URL", "https://api.notion.com").rstrip("/")
     headers = {"Notion-Version": "2022-06-28"}
     if operation == "notion.probe":
-        return "notion:probe:ok", ""
+        path = "/notion/v1/users/me" if os.environ.get("HARNESS_NOTION_API_URL") else "/v1/users/me"
+        data = http_json(f"{base}{path}", token, None, stats=stats, method="GET", headers=headers)
+        return ConnectorOutcome(f"notion:probe:{data.get('id', 'ok')}", "", stats)
     if operation == "notion.page.create":
         path = "/notion/v1/pages" if os.environ.get("HARNESS_NOTION_API_URL") else "/v1/pages"
+        body = notion_payload_for_page_create(params, idempotency_key)
+        validate_notion_payload(body, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        if existing:
+            return ConnectorOutcome(existing[0], existing[1], stats)
         data = http_json(
             f"{base}{path}",
             token,
-            {
-                "parent": {"page_id": require_param(params, "parent_page_id")},
-                "properties": {"title": {"title": [{"text": {"content": require_param(params, "title")}}]}},
-                "children": [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key)}}]}}],
-            },
+            body,
+            stats=stats,
             headers=headers,
         )
-        return f"notion:page:{data.get('id')}", str(data.get("url", ""))
+        return ConnectorOutcome(f"notion:page:{data.get('id')}", str(data.get("url", "")), stats)
     if operation == "notion.page.update":
         page_id = require_param(params, "page_id")
         path = f"/notion/v1/pages/{page_id}" if os.environ.get("HARNESS_NOTION_API_URL") else f"/v1/pages/{page_id}"
+        body = {"properties": {"title": {"title": [{"text": {"content": with_connector_marker(str(params.get("title", "")), idempotency_key)}}]}}}
+        validate_notion_payload(body, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        if existing:
+            return ConnectorOutcome(existing[0], existing[1], stats)
         data = http_json(
             f"{base}{path}",
             token,
-            {"properties": {"title": {"title": [{"text": {"content": with_connector_marker(str(params.get("title", "")), idempotency_key)}}]}}},
+            body,
+            stats=stats,
             method="PATCH",
             headers=headers,
         )
-        return f"notion:page:{data.get('id')}", str(data.get("url", ""))
-    raise HarnessError(f"unsupported notion connector operation: {operation}")
+        return ConnectorOutcome(f"notion:page:{data.get('id')}", str(data.get("url", "")), stats)
+    raise ConnectorFailure(f"unsupported notion connector operation: {operation}", stats)
 
 
-def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
-    token = env_token("FIGMA_TOKEN")
+def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
+    stats = connector_stats("figma", operation, params)
+    token = env_token("FIGMA_TOKEN", stats)
     base = os.environ.get("HARNESS_FIGMA_API_URL", "https://api.figma.com").rstrip("/")
     if operation == "figma.probe":
-        return "figma:probe:ok", ""
+        file_key = str(params.get("file_key", ""))
+        if file_key:
+            path = f"/figma/v1/files/{file_key}" if os.environ.get("HARNESS_FIGMA_API_URL") else f"/v1/files/{file_key}"
+            data = http_json(f"{base}{path}", token, None, stats=stats, method="GET", headers={"X-Figma-Token": token})
+            return ConnectorOutcome(f"figma:probe:{data.get('key') or file_key}", "", stats)
+        path = "/figma/v1/me" if os.environ.get("HARNESS_FIGMA_API_URL") else "/v1/me"
+        data = http_json(f"{base}{path}", token, None, stats=stats, method="GET", headers={"X-Figma-Token": token})
+        return ConnectorOutcome(f"figma:probe:{data.get('id', 'ok')}", "", stats)
     if operation == "figma.comment.create":
         file_key = require_param(params, "file_key")
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        if existing:
+            return ConnectorOutcome(existing[0], existing[1], stats)
         path = f"/figma/v1/files/{file_key}/comments" if os.environ.get("HARNESS_FIGMA_API_URL") else f"/v1/files/{file_key}/comments"
         data = http_json(
             f"{base}{path}",
             token,
             {"message": with_connector_marker(require_param(params, "message"), idempotency_key)},
+            stats=stats,
             headers={"X-Figma-Token": token},
         )
-        return f"figma:comment:{data.get('id')}", f"https://www.figma.com/file/{data.get('file_key') or file_key}?comment-id={data.get('id')}"
-    raise HarnessError(f"unsupported figma connector operation: {operation}")
+        return ConnectorOutcome(f"figma:comment:{data.get('id')}", f"https://www.figma.com/file/{data.get('file_key') or file_key}?comment-id={data.get('id')}", stats)
+    raise ConnectorFailure(f"unsupported figma connector operation: {operation}", stats)
 
 
-def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
-    token = env_token("SLACK_BOT_TOKEN")
+def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
+    stats = connector_stats("slack", operation, params)
+    token = env_token("SLACK_BOT_TOKEN", stats)
     base = os.environ.get("HARNESS_SLACK_API_URL", "https://slack.com").rstrip("/")
     if operation == "slack.probe":
         path = "/slack/api/auth.test" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/auth.test"
-        data = http_json(f"{base}{path}", token, {})
-        return f"slack:probe:{data.get('team_id', 'ok')}", ""
+        data = http_json(f"{base}{path}", token, {}, stats=stats)
+        return ConnectorOutcome(f"slack:probe:{data.get('team_id', 'ok')}", "", stats)
     if operation == "slack.message.post":
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        if existing:
+            return ConnectorOutcome(existing[0], existing[1], stats)
         path = "/slack/api/chat.postMessage" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/chat.postMessage"
         data = http_json(
             f"{base}{path}",
             token,
             {"channel": require_param(params, "channel"), "text": with_connector_marker(require_param(params, "text"), idempotency_key)},
+            stats=stats,
         )
         if data.get("ok") is False:
-            raise HarnessError(f"slack connector failed: {data.get('error', 'unknown')}")
+            raise ConnectorFailure(f"slack connector failed: {data.get('error', 'unknown')}", stats)
         channel = data.get("channel") or require_param(params, "channel")
         timestamp = data.get("ts") or ""
-        return f"slack:message:{channel}:{timestamp}", str(data.get("permalink", ""))
-    raise HarnessError(f"unsupported slack connector operation: {operation}")
+        return ConnectorOutcome(f"slack:message:{channel}:{timestamp}", str(data.get("permalink", "")), stats)
+    raise ConnectorFailure(f"unsupported slack connector operation: {operation}", stats)
 
 
-def execute_connector_action(root: Path, row: sqlite3.Row) -> tuple[str, str]:
+def execute_connector_action(root: Path, row: sqlite3.Row) -> ConnectorOutcome:
     payload_value = load_connector_payload(row)
     operation, params = validate_connector_request(row, payload_value)
     idempotency_key = str(row["idempotency_key"])
@@ -3751,11 +4224,20 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
             raise HarnessError(f"missing adapter action: {action_id}")
         if current["status"] == "completed":
             return
+        if current["status"] == "blocked":
+            reason = current["blocked_reason"] or "connector action is blocked"
+            raise HarnessError(f"connector execution failed: {reason}")
         if should_execute_connector(current):
             try:
-                external_id, external_link = execute_connector_action(root, current)
+                outcome = execute_connector_action(root, current)
+            except ConnectorFailure as exc:
+                mark_connector_blocked(root, action_id, exc.stats, str(exc))
+                raise HarnessError(f"connector execution failed: {exc}") from exc
             except HarnessError as exc:
                 raise HarnessError(f"connector execution failed: {exc}") from exc
+            external_id = outcome.external_id
+            external_link = outcome.external_link
+            stats = outcome.stats
             with transaction(root) as conn:
                 row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
                 if not row:
@@ -3765,10 +4247,12 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
                 conn.execute(
                     """
                     update adapter_actions set status = 'completed', confirmation = coalesce(nullif(?, ''), confirmation),
-                      external_id = ?, external_link = ?, updated_at = ? where id = ?
+                      external_id = ?, external_link = ?, attempt_count = ?, next_retry_at = ?,
+                      connector_status = ?, blocked_reason = '', updated_at = ? where id = ?
                     """,
-                    (confirmation, external_id, external_link, now_iso(), action_id),
+                    (confirmation, external_id, external_link, stats.attempt_count, stats.retry_after_at, stats.status, now_iso(), action_id),
                 )
+                upsert_connector_budget(conn, stats)
                 conn.execute(
                     """
                     insert into adapters
@@ -5698,6 +6182,8 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("adapters", "mode", ADAPTER_MODES, "adapter mode"),
         ("adapter_actions", "mode", ADAPTER_MODES, "adapter action mode"),
         ("adapter_actions", "status", ADAPTER_ACTION_STATUSES, "adapter action status"),
+        ("adapter_actions", "connector_status", CONNECTOR_STATUSES, "adapter action connector status"),
+        ("connector_budgets", "status", CONNECTOR_STATUSES, "connector budget status"),
         ("agents", "status", {"available", "leased", "disabled"}, "agent status"),
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
         ("dispatch_assignments", "status", DISPATCH_STATUSES, "dispatch assignment status"),
@@ -5836,6 +6322,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("finding.schema.json", "findings", [row_snapshot(row) or {} for row in conn.execute("select * from findings")]),
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
+        ("connector-budget.schema.json", "connector_budgets", [row_snapshot(row) or {} for row in conn.execute("select * from connector_budgets")]),
         ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
         ("command-log.schema.json", "command_log", [row_snapshot(row) or {} for row in conn.execute("select * from command_log")]),
         ("external-session-verification.schema.json", "external_session_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from external_session_verifications")]),

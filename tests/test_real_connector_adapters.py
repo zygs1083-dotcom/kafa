@@ -168,7 +168,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             self.assertEqual(row["status"], "completed")
             self.assertEqual(row["external_id"], "github:issue:7")
             self.assertEqual(adapter["external_link"], "https://github.example/repo/issues/7")
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
 
     def test_github_failure_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -184,7 +184,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             adapter_count = db_one(root, "select count(*) as count from adapters")["count"]
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("connector execution failed", result.stdout)
-            self.assertEqual(row["status"], "planned")
+            self.assertEqual(row["status"], "blocked")
             self.assertEqual(row["external_id"], "")
             self.assertEqual(adapter_count, 0)
 

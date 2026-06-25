@@ -222,7 +222,7 @@ class TaskFencingTest(unittest.TestCase):
                 conn.execute("alter table tasks drop column fence")
                 conn.commit()
 
-            run_harness(root, "migrate", "--from-version", "14", "--to-version", "22")
+            run_harness(root, "migrate", "--from-version", "14", "--to-version", "23")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 columns = {row[1] for row in conn.execute("pragma table_info(tasks)")}
