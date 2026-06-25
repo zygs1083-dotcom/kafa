@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.14.0-beta.1 - 2026-06-25
+
+### Added
+
+- Architecture control plane contract documentation for Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary.
+- `kafa doctor` control-plane contract check covering plugin metadata, hooks, Host Codex provider, Kernel raw-report/verification path, connector adapters, eval runner, and project-runtime skill boundaries.
+- Architecture regression tests that lock raw-report, advisory-hook, connector, eval, and Kernel trust boundaries.
+
+### Changed
+
+- Runtime implementation version is now `4.7.0`; runtime schema remains `22`.
+- README, OS runtime docs, install docs, quick start, and project-runtime skill now describe the harness as a layered architecture control plane instead of independent features.
+- CI now runs the control-plane architecture test directly before the full test discovery pass.
+
+### Boundaries
+
+- No new harness DB tables, schema files, core modules, plugin runtime scripts, Skills, hooks, runtime states, or harness CLI commands are introduced.
+- `kafa doctor` is a root-level installation/release preflight check; it does not mutate runtime state or replace Kernel gates.
+- Skill, hooks, host providers, connectors, and evals still cannot produce delivery-eligible evidence directly.
+
 ## v1.13.0-beta.1 - 2026-06-25
 
 ### Added

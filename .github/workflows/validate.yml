@@ -63,6 +63,9 @@ jobs:
       - name: Run install release tests
         run: ${{ matrix.python }} -m unittest tests/test_install_release.py
 
+      - name: Run control plane architecture tests
+        run: ${{ matrix.python }} -m unittest tests/test_control_plane_architecture.py
+
       - name: Run runtime tests
         run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'
 
