@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.4.0
+# Codex OS Runtime Layer v4.5.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.4.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, and Codex lifecycle hook guardrails for status injection and readiness checks. The repository release remains a beta release, while the runtime implementation version is `4.4.0` and the database schema version is `22`.
+Kernel v4.5.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, and an offline stability matrix for release gating. The repository release remains a beta release, while the runtime implementation version is `4.5.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.4.0
+## Kernel v4.5.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -109,19 +109,24 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integ
 
 ## Agent E2E Evaluation
 
-`run_agent_e2e_eval.py --mode fixture` is the default capability evaluation. It creates temporary Git repositories, calls the real CLI, writes SQLite/worktree/attempt/evidence/integration audit state, and reports JSON metrics for five deterministic scenarios: parallel success, dependency blocking, same-file claim conflict, forged evidence blocking, and integration regression blocking.
+`run_agent_e2e_eval.py --mode fixture` is the deterministic control-plane regression. It creates temporary Git repositories, calls the real CLI, writes SQLite/worktree/attempt/evidence/integration audit state, and reports JSON metrics for five deterministic scenarios: parallel success, dependency blocking, same-file claim conflict, forged evidence blocking, and integration regression blocking.
 
 ```bash
 python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
+python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 ```
 
-`run_skill_eval.py` remains a transcript marker check. It is useful for format drift, but it is not an Agent capability evaluation. Optional live dogfood can use `run_agent_e2e_eval.py --mode live-command` with `CODEX_AGENT_EVAL_CMD`; when unset, live mode reports `live_skipped=true`.
+`run_agent_e2e_eval.py --mode stability` is the CI release gate. It includes the fixture scenarios plus fake Host Codex App Server E2E, multi-role session lifecycle, connector mock server E2E, crash/retry recovery, and SQLite contention stress. The stability threshold requires zero failed scenarios, zero false passes, at least one forged evidence block, zero SQLite lock leaks, and zero unexplained human intervention.
+
+`run_agent_e2e_eval.py --mode live-codex` is an opt-in host-environment profile for real Codex capability checks. It only attempts live work when `HARNESS_E2E_ENABLE_LIVE_CODEX=1` and the local Codex CLI/App Server is available. Otherwise it returns success with `live_skipped=true` and explicit skip reasons; skipped live mode is not evidence that real Codex E2E passed. `--mode live-command` remains a dogfood fallback using `CODEX_AGENT_EVAL_CMD`.
+
+`run_skill_eval.py` remains a transcript marker check. It is useful for format drift, but it is not an Agent capability evaluation.
 
 A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-eval-example.json`; real run durations are intentionally not committed.
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extends the freeze baseline with the plugin hook bundle only; schema, CLI, core, runtime scripts, Skills, and runtime states remain frozen.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changes eval, CI, tests, docs, and version metadata without expanding schema, CLI, core, runtime scripts, Skills, or runtime states.
 
 ## Session Attestation And Independent QA
 

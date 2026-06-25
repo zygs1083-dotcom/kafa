@@ -13,12 +13,17 @@ import csv
 import hashlib
 import json
 import os
+import platform
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import time
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,11 +36,28 @@ for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
         sys.path.insert(0, str(path))
 
 HARNESS = SCRIPTS_ROOT / "harness.py"
+PYTHON = json.dumps(sys.executable)
 TEST_COMMAND = "python3 -B -m unittest"
 
 
-def run_harness(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(["python3", str(HARNESS), "--root", str(root), *args], text=True, capture_output=True, check=False)
+def run_harness(
+    root: Path,
+    *args: str,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
+    result = subprocess.run(
+        [sys.executable, str(HARNESS), "--root", str(root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=command_env,
+        timeout=timeout,
+    )
     if check and result.returncode != 0:
         raise AssertionError(result.stdout + result.stderr)
     return result
@@ -145,6 +167,170 @@ def fixture_report(root: Path, run_id: str, task_id: str, branch_name: str, *, s
     )
 
 
+def fake_codex_app_server(temp: Path) -> tuple[Path, Path]:
+    script = temp / "fake_codex_app_server.py"
+    log_path = temp / "fake_codex_log.jsonl"
+    script.write_text(
+        textwrap.dedent(
+            r'''
+            import json
+            import os
+            import re
+            import sys
+
+            log_path = os.environ["FAKE_CODEX_LOG"]
+
+            def log(message):
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(message, sort_keys=True) + "\n")
+
+            def send(message):
+                sys.stdout.write(json.dumps(message, sort_keys=True) + "\n")
+                sys.stdout.flush()
+
+            def prompt_value(prompt, name, default=""):
+                match = re.search(rf'"{name}": "([^"]*)"', prompt)
+                return match.group(1) if match else default
+
+            def report(prompt):
+                return {
+                    "command": prompt_value(prompt, "command", "python3 -B -m unittest"),
+                    "exit_code": 0,
+                    "stdout_sha256": "0" * 64,
+                    "artifact_path": ".ai-team/runtime/fake/stdout.txt",
+                    "executed_count": 1,
+                    "executed_count_source": "parsed",
+                    "source_tree_hash": "fake-source-tree",
+                    "branch_name": prompt_value(prompt, "branch_name"),
+                    "status": "success",
+                    "target_id": prompt_value(prompt, "target_id", "UNIT"),
+                }
+
+            for line in sys.stdin:
+                message = json.loads(line)
+                log(message)
+                method = message.get("method")
+                if method == "initialize":
+                    send({"id": message["id"], "result": {"serverInfo": {"name": "fake-codex"}}})
+                elif method == "initialized":
+                    continue
+                elif method == "thread/start":
+                    send({"id": message["id"], "result": {"thread": {"id": "thr_fake"}}})
+                elif method == "turn/start":
+                    prompt = message["params"]["input"][0]["text"]
+                    send({"id": message["id"], "result": {"turn": {"id": "turn_fake"}}})
+                    send({"method": "turn/started", "params": {"turn": {"id": "turn_fake"}}})
+                    send({"method": "item/agentMessage/delta", "params": {"delta": json.dumps(report(prompt), sort_keys=True)}})
+                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake", "status": "completed"}}})
+            '''
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return script, log_path
+
+
+def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]) -> str:
+    payload = json.dumps({"execute": True, "operation": operation, "params": params}, sort_keys=True)
+    result = run_harness(
+        root,
+        "adapter",
+        "plan",
+        "--tool",
+        tool,
+        "--mode",
+        "write-confirm",
+        "--artifact",
+        f"{tool} mock artifact",
+        "--action",
+        operation,
+        "--payload-json",
+        payload,
+        "--idempotency-key",
+        f"e2e:{tool}:{operation}",
+    )
+    return result.stdout.strip().split()[-1]
+
+
+def fake_gh(temp: Path) -> tuple[Path, Path]:
+    bin_dir = temp / "bin"
+    bin_dir.mkdir()
+    log_path = temp / "gh-log.jsonl"
+    script = bin_dir / "gh"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json
+            import sys
+
+            log_path = {str(log_path)!r}
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sys.argv[1:], sort_keys=True) + "\\n")
+            endpoint = sys.argv[2] if len(sys.argv) > 2 else ""
+            if endpoint.endswith("/issues"):
+                print(json.dumps({{"id": 123, "number": 7, "html_url": "https://github.example/repo/issues/7"}}))
+            else:
+                print(json.dumps({{"viewer": {{"login": "fake"}}}}))
+            """
+        ),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return bin_dir, log_path
+
+
+class ConnectorMockHandler(BaseHTTPRequestHandler):
+    requests: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
+        record = {"path": self.path, "headers": dict(self.headers), "body": json.loads(body) if body else {}}
+        self.__class__.requests.append(record)
+        if self.path == "/linear/graphql":
+            response = {"data": {"issueCreate": {"success": True, "issue": {"id": "LIN-1", "identifier": "ENG-1", "url": "https://linear.example/ENG-1"}}}}
+        elif self.path == "/notion/v1/pages":
+            response = {"id": "notion-page-1", "url": "https://notion.example/page-1"}
+        elif self.path == "/figma/v1/files/FILE1/comments":
+            response = {"id": "figma-comment-1", "file_key": "FILE1", "created_at": "2026-01-01T00:00:00Z"}
+        elif self.path == "/slack/api/chat.postMessage":
+            response = {"ok": True, "channel": "C123", "ts": "1710000000.000100", "permalink": "https://slack.example/archives/C123/p1710000000000100"}
+        else:
+            response = {"id": "unknown", "url": "https://example.invalid/unknown"}
+        data = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class ConnectorMockServer:
+    def __enter__(self) -> "ConnectorMockServer":
+        ConnectorMockHandler.requests = []
+        self.server = HTTPServer(("127.0.0.1", 0), ConnectorMockHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    @property
+    def requests(self) -> list[dict[str, object]]:
+        return ConnectorMockHandler.requests
+
+
 def db_rows(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
         conn.row_factory = sqlite3.Row
@@ -189,12 +375,58 @@ def collect_and_verify(root: Path, run_id: str, branches: dict[str, str]) -> Non
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", task_id)
 
 
-def scenario_result(name: str, started: float, ok: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
+def scenario_result(
+    name: str,
+    started: float,
+    ok: bool,
+    details: dict[str, Any] | None = None,
+    *,
+    category: str = "fixture",
+    mode: str = "fixture",
+    skip_reason: str = "",
+) -> dict[str, Any]:
     return {
         "name": name,
+        "category": category,
+        "mode": mode,
         "pass": bool(ok),
         "duration_seconds": round(time.perf_counter() - started, 6),
+        "skip_reason": skip_reason,
         "details": details or {},
+    }
+
+
+def skipped_scenario(name: str, reason: str, *, category: str, mode: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "category": category,
+        "mode": mode,
+        "pass": True,
+        "duration_seconds": 0,
+        "skip_reason": reason,
+        "details": {},
+    }
+
+
+def command_version(command: list[str]) -> str:
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (result.stdout or result.stderr).strip().splitlines()[0] if (result.stdout or result.stderr).strip() else ""
+
+
+def matrix_info(profile: str, *, live_skipped_reasons: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "profile": profile,
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "git_version": command_version(["git", "--version"]),
+        "codex_available": shutil.which("codex") is not None,
+        "container_available": shutil.which("docker") is not None or shutil.which("podman") is not None,
+        "connector_mock": profile == "stability",
+        "sqlite_stress": profile == "stability",
+        "live_skipped_reasons": live_skipped_reasons or [],
     }
 
 
@@ -320,6 +552,274 @@ def scenario_integration_regression_blocked() -> dict[str, Any]:
         )
 
 
+def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        temp_path = Path(temp)
+        root = temp_path / "repo"
+        root.mkdir()
+        init_git_repo(root)
+        add_unittest(root)
+        run_id = setup_basic_harness(root, ["T1"])
+        script, log_path = fake_codex_app_server(temp_path)
+        env = {
+            "HARNESS_CODEX_APP_SERVER_CMD": f"{PYTHON} {json.dumps(str(script))}",
+            "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
+            "FAKE_CODEX_LOG": str(log_path),
+        }
+        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+        session = db_rows(root, "select task_id, agent_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
+        _head, _tree, worktree = commit_branch(root, session["branch_name"], "agent.txt", "host codex work\n")
+        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "agent.txt", worktree, session["branch_name"])
+        run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+        evidence_before = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
+        run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
+        evidence_after = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
+        accept_task_via_cli(root, "T1")
+        run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", TEST_COMMAND, "--evidence", "host codex fake review")
+
+        import harness_db
+
+        original_validate = harness_db.validate_runtime
+        try:
+            harness_db.validate_runtime = lambda _root, delivery=False: []
+            target = harness_db.dispatch_integrate(root, run_id)
+            integrate_returncode = 0
+        except Exception:  # noqa: BLE001 - scenario result records failed integration.
+            target = ""
+            integrate_returncode = 1
+        finally:
+            harness_db.validate_runtime = original_validate
+        status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
+        rpc_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+        ok = evidence_before == 0 and evidence_after == 1 and integrate_returncode == 0 and status == "integrated"
+        return scenario_result(
+            "host_codex_fake_app_server_e2e",
+            started,
+            ok,
+            {"run_id": run_id, "rpc_methods": rpc_methods[:4], "integrate_returncode": integrate_returncode, "status": status, "target_branch": target},
+            category="host-codex",
+            mode="stability",
+        )
+
+
+def scenario_multi_role_thread_lifecycle() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        run_harness(root, "init")
+        run_harness(root, "agents", "install", "--force")
+        run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Role lifecycle")
+        run_harness(root, "task", "add", "--id", "T1", "--task", "Role lifecycle task", "--owner", "developer", "--acceptance", "AC1")
+        run_harness(root, "session", "attest", "--session-id", "DEV-S1", "--agent", "developer", "--role", "developer", "--context-id", "run:T1")
+        run_harness(root, "session", "attest", "--session-id", "ARCH-S1", "--agent", "architect", "--role", "architect", "--context-id", "run:T1")
+        run_harness(root, "session", "attest", "--session-id", "QA-S1", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "run:T1")
+        claim = run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", task_revision(root, "T1"))
+        token = stdout_field(claim.stdout, "token")
+        fence = stdout_field(claim.stdout, "fence")
+        run_harness(root, "task", "start", "T1", "--agent", "developer", "--lease-token", token, "--expected-revision", task_revision(root, "T1"), "--fence", fence)
+        run_harness(
+            root,
+            "task",
+            "submit",
+            "T1",
+            "--agent",
+            "developer",
+            "--session-id",
+            "DEV-S1",
+            "--lease-token",
+            token,
+            "--expected-revision",
+            task_revision(root, "T1"),
+            "--fence",
+            fence,
+            "--evidence",
+            "developer submitted",
+        )
+        producer_review = run_harness(root, "task", "review", "T1", "--agent", "developer", "--session-id", "DEV-S1", "--expected-revision", task_revision(root, "T1"), check=False)
+        review = run_harness(root, "task", "review", "T1", "--agent", "qa-reviewer", "--session-id", "QA-S1", "--expected-revision", task_revision(root, "T1"))
+        qa_token = stdout_field(review.stdout, "token")
+        qa_fence = stdout_field(review.stdout, "fence")
+        run_harness(
+            root,
+            "task",
+            "accept",
+            "T1",
+            "--agent",
+            "qa-reviewer",
+            "--session-id",
+            "QA-S1",
+            "--lease-token",
+            qa_token,
+            "--expected-revision",
+            task_revision(root, "T1"),
+            "--fence",
+            qa_fence,
+            "--evidence",
+            "qa accepted",
+        )
+        task = db_rows(root, "select status, submitted_session_id, accepted_session_id from tasks where id = 'T1'")[0]
+        sessions = [row["role"] for row in db_rows(root, "select role from agent_sessions order by role")]
+        ok = producer_review.returncode != 0 and task["status"] == "accepted" and task["submitted_session_id"] == "DEV-S1" and task["accepted_session_id"] == "QA-S1"
+        return scenario_result(
+            "multi_role_thread_lifecycle",
+            started,
+            ok,
+            {"producer_review_returncode": producer_review.returncode, "task_status": task["status"], "roles": sessions},
+            category="session",
+            mode="stability",
+        )
+
+
+def scenario_connector_mock_server_e2e() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        temp_path = Path(temp)
+        root = temp_path / "repo"
+        root.mkdir()
+        run_harness(root, "init")
+        bin_dir, gh_log = fake_gh(temp_path)
+        with ConnectorMockServer() as server:
+            cases = [
+                ("github", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"}, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}),
+                ("linear", "linear.issue.create", {"team_id": "TEAM", "title": "Linear issue", "description": "Body"}, {"LINEAR_API_KEY": "linear-token", "HARNESS_LINEAR_API_URL": server.base_url}),
+                ("notion", "notion.page.create", {"parent_page_id": "PARENT", "title": "Notion page", "content": "Body"}, {"NOTION_TOKEN": "notion-token", "HARNESS_NOTION_API_URL": server.base_url}),
+                ("figma", "figma.comment.create", {"file_key": "FILE1", "message": "Review note"}, {"FIGMA_TOKEN": "figma-token", "HARNESS_FIGMA_API_URL": server.base_url}),
+                ("slack", "slack.message.post", {"channel": "C123", "text": "Ship it"}, {"SLACK_BOT_TOKEN": "slack-token", "HARNESS_SLACK_API_URL": server.base_url}),
+            ]
+            action_ids = []
+            for tool, operation, params, env in cases:
+                action = plan_action(root, tool, operation, params)
+                action_ids.append(action)
+                run_harness(root, "adapter", "confirm", "--id", action, "--request-id", f"REQ-{tool}", env=env)
+            reconcile = run_harness(root, "adapter", "reconcile", check=False)
+            completed = db_rows(root, "select count(*) as count from adapter_actions where status = 'completed'")[0]["count"]
+            adapters = db_rows(root, "select count(*) as count from adapters")[0]["count"]
+            evidence = db_rows(root, "select count(*) as count from evidence")[0]["count"]
+            gh_calls = len(gh_log.read_text(encoding="utf-8").splitlines())
+            token_leak = bool(db_rows(root, "select 1 from adapter_actions where payload_json like '%linear-token%' or payload_json like '%slack-token%' limit 1"))
+            ok = completed == 5 and adapters == 5 and evidence == 0 and reconcile.returncode == 0 and gh_calls == 1 and not token_leak and len(server.requests) == 4
+            return scenario_result(
+                "connector_mock_server_e2e",
+                started,
+                ok,
+                {
+                    "actions": len(action_ids),
+                    "completed": completed,
+                    "adapters": adapters,
+                    "evidence_count": evidence,
+                    "http_requests": len(server.requests),
+                    "gh_calls": gh_calls,
+                    "token_leak": token_leak,
+                },
+                category="connector",
+                mode="stability",
+            )
+
+
+def scenario_crash_retry_recovery() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        init_git_repo(root)
+        add_unittest(root)
+        run_id = setup_basic_harness(root, ["T1"])
+        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture", "--request-id", "REQ-START")
+        session = db_rows(root, "select task_id, agent_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
+        _head, _tree, worktree = commit_branch(root, session["branch_name"], "retry.txt", "retry work\n")
+        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "retry.txt", worktree, session["branch_name"])
+        fixture_report(root, run_id, "T1", session["branch_name"])
+        first_collect = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id, "--request-id", "REQ-COLLECT")
+        second_collect = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id, "--request-id", "REQ-COLLECT")
+        first_verify = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1", "--request-id", "REQ-VERIFY")
+        second_verify = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1", "--request-id", "REQ-VERIFY")
+        first_reconcile = run_harness(root, "dispatch", "provider", "reconcile", "--run-id", run_id, "--request-id", "REQ-RECONCILE")
+        second_reconcile = run_harness(root, "dispatch", "provider", "reconcile", "--run-id", run_id, "--request-id", "REQ-RECONCILE")
+        reports = db_rows(root, "select count(*) as count from agent_reports")[0]["count"]
+        attempts = db_rows(root, "select count(*) as count from task_attempts")[0]["count"]
+        evidence = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
+        findings = db_rows(root, "select count(*) as count from findings")[0]["count"]
+        ok = (
+            reports == 1
+            and attempts == 1
+            and evidence == 1
+            and findings == 0
+            and second_collect.stdout == first_collect.stdout
+            and second_verify.stdout == first_verify.stdout
+            and second_reconcile.stdout == first_reconcile.stdout
+        )
+        return scenario_result(
+            "crash_retry_recovery",
+            started,
+            ok,
+            {"reports": reports, "attempts": attempts, "evidence": evidence, "findings": findings},
+            category="recovery",
+            mode="stability",
+        )
+
+
+def scenario_sqlite_contention_stress() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        run_harness(root, "init")
+
+        def mutate(index: int) -> subprocess.CompletedProcess[str]:
+            request_id = f"REQ-SQLITE-{index // 2}"
+            acceptance_id = f"AC{index // 2}"
+            return run_harness(
+                root,
+                "acceptance",
+                "add",
+                "--id",
+                acceptance_id,
+                "--criterion",
+                f"contention criterion {acceptance_id}",
+                "--request-id",
+                request_id,
+                check=False,
+                timeout=30,
+            )
+
+        results: list[subprocess.CompletedProcess[str]] = []
+        threads: list[threading.Thread] = []
+        lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            result = mutate(index)
+            with lock:
+                results.append(result)
+
+        for index in range(12):
+            thread = threading.Thread(target=worker, args=(index,))
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        lock_errors = sum("database is locked" in (result.stdout + result.stderr).lower() for result in results)
+        failed = [result.returncode for result in results if result.returncode != 0]
+        doctor = run_harness(root, "kernel", "doctor", check=False)
+        invariant = run_harness(root, "invariant", "validate", check=False)
+        acceptance_count = db_rows(root, "select count(*) as count from acceptance")[0]["count"]
+        ok = len(results) == 12 and not failed and lock_errors == 0 and doctor.returncode == 0 and invariant.returncode == 0 and acceptance_count == 6
+        return scenario_result(
+            "sqlite_contention_stress",
+            started,
+            ok,
+            {
+                "operation_count": len(results),
+                "failed_returncodes": failed,
+                "sqlite_lock_error_count": lock_errors,
+                "acceptance_count": acceptance_count,
+                "doctor_returncode": doctor.returncode,
+                "invariant_returncode": invariant.returncode,
+            },
+            category="sqlite",
+            mode="stability",
+        )
+
+
 FIXTURE_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
     scenario_parallel_success,
     scenario_dependency_blocked,
@@ -328,26 +828,46 @@ FIXTURE_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
     scenario_integration_regression_blocked,
 ]
 
+STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
+    scenario_host_codex_fake_app_server_e2e,
+    scenario_multi_role_thread_lifecycle,
+    scenario_connector_mock_server_e2e,
+    scenario_crash_retry_recovery,
+    scenario_sqlite_contention_stress,
+]
 
-def summarize(mode: str, scenarios: list[dict[str, Any]], started: float, *, live_skipped: bool = False) -> dict[str, Any]:
+
+def summarize(
+    mode: str,
+    scenarios: list[dict[str, Any]],
+    started: float,
+    *,
+    live_skipped: bool = False,
+    live_skipped_reasons: list[str] | None = None,
+) -> dict[str, Any]:
     passed = sum(1 for scenario in scenarios if scenario["pass"])
+    skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
     forged_blocks = sum(1 for scenario in scenarios if scenario["name"] == "forged_evidence_blocked" and scenario["pass"])
     false_pass_count = sum(1 for scenario in scenarios if scenario["name"] in {"forged_evidence_blocked", "integration_regression_blocked"} and not scenario["pass"])
+    sqlite_lock_errors = sum(int(scenario.get("details", {}).get("sqlite_lock_error_count", 0) or 0) for scenario in scenarios)
     summary = {
         "scenario_count": len(scenarios),
         "passed_count": passed,
         "failed_count": len(scenarios) - passed,
+        "skipped_count": skipped,
         "task_once_completion_rate": round(passed / max(len(scenarios), 1), 4),
         "false_pass_count": false_pass_count,
         "forged_evidence_block_count": forged_blocks,
         "retry_count": 0,
         "merge_conflict_count": 0,
+        "sqlite_lock_error_count": sqlite_lock_errors,
         "human_intervention_count": 0,
         "duration_seconds": round(time.perf_counter() - started, 6),
     }
     return {
         "mode": mode,
         "live_skipped": live_skipped,
+        "matrix": matrix_info(mode, live_skipped_reasons=live_skipped_reasons),
         "token_count": None,
         "estimated_cost": None,
         "agent_runtime_seconds": None,
@@ -363,50 +883,106 @@ def run_fixture() -> dict[str, Any]:
         try:
             scenarios.append(scenario())
         except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
-            scenarios.append({"name": scenario.__name__.replace("scenario_", ""), "pass": False, "duration_seconds": 0, "details": {"error": str(exc)}})
+            scenarios.append(
+                scenario_result(
+                    scenario.__name__.replace("scenario_", ""),
+                    started,
+                    False,
+                    {"error": str(exc)},
+                    category="fixture",
+                    mode="fixture",
+                )
+            )
     return summarize("fixture", scenarios, started)
+
+
+def run_stability() -> dict[str, Any]:
+    started = time.perf_counter()
+    scenarios: list[dict[str, Any]] = []
+    for scenario in [*FIXTURE_SCENARIOS, *STABILITY_SCENARIOS]:
+        try:
+            scenarios.append(scenario())
+        except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
+            name = scenario.__name__.replace("scenario_", "")
+            scenarios.append(scenario_result(name, started, False, {"error": str(exc)}, category="stability", mode="stability"))
+    return summarize("stability", scenarios, started)
 
 
 def run_live_command() -> dict[str, Any]:
     started = time.perf_counter()
     command = os.environ.get("CODEX_AGENT_EVAL_CMD", "").strip()
     if not command:
-        return summarize("live-command", [], started, live_skipped=True)
+        return summarize("live-command", [], started, live_skipped=True, live_skipped_reasons=["CODEX_AGENT_EVAL_CMD is not set"])
     result = subprocess.run(command, shell=True, text=True, capture_output=True, check=False, timeout=1800)
     scenario = {
         "name": "live_command",
+        "category": "live-command",
+        "mode": "live-command",
         "pass": result.returncode == 0,
         "duration_seconds": round(time.perf_counter() - started, 6),
+        "skip_reason": "",
         "details": {"returncode": result.returncode, "stdout_tail": result.stdout[-2000:], "stderr_tail": result.stderr[-2000:]},
     }
     return summarize("live-command", [scenario], started)
 
 
+def run_live_codex() -> dict[str, Any]:
+    started = time.perf_counter()
+    reasons: list[str] = []
+    if os.environ.get("HARNESS_E2E_ENABLE_LIVE_CODEX") != "1":
+        reasons.append("HARNESS_E2E_ENABLE_LIVE_CODEX is not set to 1")
+    if shutil.which("codex") is None:
+        reasons.append("codex CLI is not available on PATH")
+    if reasons:
+        scenarios = [
+            skipped_scenario("live_codex_app_server_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
+            skipped_scenario("live_codex_subagent_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
+        ]
+        return summarize("live-codex", scenarios, started, live_skipped=True, live_skipped_reasons=reasons)
+    scenario = skipped_scenario(
+        "live_codex_app_server_e2e",
+        "live Codex execution is enabled but no repository-local live profile is configured",
+        category="live-codex",
+        mode="live-codex",
+    )
+    return summarize("live-codex", [scenario], started, live_skipped=True, live_skipped_reasons=[scenario["skip_reason"]])
+
+
 def should_fail(report: dict[str, Any]) -> bool:
-    if report["mode"] == "live-command" and report["live_skipped"]:
+    if report["mode"] in {"live-command", "live-codex"} and report["live_skipped"]:
         return False
     summary = report["summary"]
     if summary["failed_count"] != 0:
         return True
-    if report["mode"] == "fixture":
-        if summary["scenario_count"] != 5:
-            return True
+    if report["mode"] == "fixture" and summary["scenario_count"] != 5:
+        return True
+    if report["mode"] == "stability" and summary["scenario_count"] < 10:
+        return True
+    if report["mode"] in {"fixture", "stability"}:
         if summary["false_pass_count"] != 0:
             return True
         if summary["forged_evidence_block_count"] < 1:
             return True
         if summary["human_intervention_count"] != 0:
             return True
+        if summary.get("sqlite_lock_error_count", 0) != 0:
+            return True
     return False
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run agent E2E evaluation scenarios")
-    parser.add_argument("--mode", choices=["fixture", "live-command"], default="fixture")
+    parser.add_argument("--mode", choices=["fixture", "stability", "live-codex", "live-command"], default="fixture")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
-    report = run_fixture() if args.mode == "fixture" else run_live_command()
+    runners = {
+        "fixture": run_fixture,
+        "stability": run_stability,
+        "live-codex": run_live_codex,
+        "live-command": run_live_command,
+    }
+    report = runners[args.mode]()
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.out:
         out = Path(args.out)

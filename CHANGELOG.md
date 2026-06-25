@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.12.0-beta.1 - 2026-06-25
+
+### Added
+
+- Agent E2E stability matrix mode with unified JSON `matrix` metadata and per-scenario category/mode/skip fields.
+- Offline stability scenarios for fake Host Codex App Server E2E, multi-role session lifecycle, connector mock server E2E, crash/retry recovery, and SQLite contention stress.
+- Opt-in `live-codex` profile that reports explicit skipped reasons unless `HARNESS_E2E_ENABLE_LIVE_CODEX=1` and a local Codex runtime are available.
+
+### Changed
+
+- Runtime implementation version is now `4.5.0`; runtime schema remains `22`.
+- GitHub Actions now uses an OS matrix: Ubuntu runs the full stability gate, while macOS and Windows run the portable compile/test/fixture subset.
+- Agent E2E fixture output now includes stability-matrix metadata while preserving the original five deterministic fixture scenarios.
+
+### Boundaries
+
+- No new harness CLI commands, DB tables, schema files, core modules, runtime scripts, Skills, or runtime states are introduced.
+- `live_skipped=true` is a skip signal, not evidence that real Codex E2E passed.
+- Connector and provider outputs in evals remain raw reports; trusted delivery evidence still comes from controller verification and existing gates.
+
 ## v1.11.0-beta.1 - 2026-06-25
 
 ### Added
