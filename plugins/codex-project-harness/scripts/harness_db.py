@@ -13,6 +13,8 @@ import sqlite3
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,7 +40,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 22
-RUNTIME_VERSION = "4.2.0"
+RUNTIME_VERSION = "4.3.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -3291,6 +3293,295 @@ def record_delivery(
     render_all(root)
 
 
+CONNECTOR_OPERATIONS = {
+    "github": {"github.issue.create", "github.issue.comment", "github.pr.create", "github.probe"},
+    "linear": {"linear.issue.create", "linear.issue.comment", "linear.issue.update", "linear.probe"},
+    "notion": {"notion.page.create", "notion.page.update", "notion.probe"},
+    "figma": {"figma.comment.create", "figma.probe"},
+    "slack": {"slack.message.post", "slack.probe"},
+}
+PROBE_OPERATIONS = {"github.probe", "linear.probe", "notion.probe", "figma.probe", "slack.probe"}
+WRITE_CONNECTOR_MODES = {"write-confirm", "write-auto"}
+
+
+def connector_marker(idempotency_key: str) -> str:
+    return f"codex-project-harness:idempotency-key={idempotency_key}"
+
+
+def with_connector_marker(text: str, idempotency_key: str) -> str:
+    marker = connector_marker(idempotency_key)
+    value = text or ""
+    if marker in value:
+        return value
+    return f"{value}\n\n{marker}".strip()
+
+
+def require_param(params: dict[str, Any], key: str) -> str:
+    value = params.get(key)
+    if value is None or str(value) == "":
+        raise HarnessError(f"connector payload missing param: {key}")
+    return str(value)
+
+
+def load_connector_payload(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload_value = json.loads(row["payload_json"] or "{}")
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"connector payload invalid JSON: {exc.msg}") from exc
+    if not isinstance(payload_value, dict):
+        raise HarnessError("connector payload must be a JSON object")
+    return payload_value
+
+
+def should_execute_connector(row: sqlite3.Row) -> bool:
+    return load_connector_payload(row).get("execute") is True
+
+
+def validate_connector_request(row: sqlite3.Row, payload_value: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    operation = payload_value.get("operation")
+    params = payload_value.get("params", {})
+    if not isinstance(operation, str) or not operation:
+        raise HarnessError("connector payload missing operation")
+    if not isinstance(params, dict):
+        raise HarnessError("connector payload params must be an object")
+    tool = str(row["tool"])
+    mode = str(row["mode"])
+    allowed = CONNECTOR_OPERATIONS.get(tool)
+    if not allowed:
+        raise HarnessError(f"unsupported connector tool: {tool}")
+    if operation not in allowed:
+        raise HarnessError(f"connector operation does not match tool: {operation}")
+    if mode == "disabled":
+        raise HarnessError("connector tool is disabled")
+    if operation in PROBE_OPERATIONS:
+        return operation, params
+    if mode not in WRITE_CONNECTOR_MODES:
+        raise HarnessError(f"connector write requires write-confirm or write-auto mode: {mode}")
+    return operation, params
+
+
+def infer_github_repo(root: Path) -> str:
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=root, text=True, capture_output=True, check=False)
+    if remote.returncode != 0:
+        raise HarnessError("github connector requires params.repo or git remote origin")
+    value = remote.stdout.strip()
+    if value.startswith("git@github.com:"):
+        value = value.removeprefix("git@github.com:")
+    elif "github.com/" in value:
+        value = value.split("github.com/", 1)[1]
+    value = value.removesuffix(".git").strip("/")
+    if "/" not in value:
+        raise HarnessError("could not infer GitHub repo from origin remote")
+    return value
+
+
+def run_gh_api(root: Path, endpoint: str, fields: dict[str, str]) -> dict[str, Any]:
+    if not shutil.which("gh"):
+        raise HarnessError("github connector requires gh CLI")
+    command = ["gh", "api", endpoint]
+    for key, value in fields.items():
+        command.extend(["-f", f"{key}={value}"])
+    result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise HarnessError(f"github connector failed: {result.stderr.strip() or result.stdout.strip() or result.returncode}")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"github connector returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise HarnessError("github connector returned non-object JSON")
+    return data
+
+
+def execute_github_connector(root: Path, operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+    if operation == "github.probe":
+        data = run_gh_api(root, "user", {})
+        login = data.get("login") or data.get("viewer", {}).get("login") or "ok"
+        return f"github:probe:{login}", ""
+    repo = str(params.get("repo") or infer_github_repo(root))
+    if operation == "github.issue.create":
+        data = run_gh_api(
+            root,
+            f"repos/{repo}/issues",
+            {"title": require_param(params, "title"), "body": with_connector_marker(str(params.get("body", "")), idempotency_key)},
+        )
+        return f"github:issue:{data.get('number') or data.get('id')}", str(data.get("html_url", ""))
+    if operation == "github.issue.comment":
+        issue_number = require_param(params, "issue_number")
+        data = run_gh_api(root, f"repos/{repo}/issues/{issue_number}/comments", {"body": with_connector_marker(require_param(params, "body"), idempotency_key)})
+        return f"github:comment:{data.get('id')}", str(data.get("html_url", ""))
+    if operation == "github.pr.create":
+        fields = {
+            "title": require_param(params, "title"),
+            "body": with_connector_marker(str(params.get("body", "")), idempotency_key),
+            "head": require_param(params, "head"),
+            "base": require_param(params, "base"),
+        }
+        data = run_gh_api(root, f"repos/{repo}/pulls", fields)
+        return f"github:pr:{data.get('number') or data.get('id')}", str(data.get("html_url", ""))
+    raise HarnessError(f"unsupported github connector operation: {operation}")
+
+
+def http_json(url: str, token: str, body: dict[str, Any], *, method: str = "POST", headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}", **(headers or {})}
+    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - connector URL is explicit runtime configuration.
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HarnessError(f"connector HTTP failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise HarnessError(f"connector HTTP failed: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"connector returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise HarnessError("connector returned non-object JSON")
+    return data
+
+
+def env_token(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise HarnessError(f"connector token missing: {name}")
+    return value
+
+
+def execute_linear_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+    token = env_token("LINEAR_API_KEY")
+    endpoint = f"{os.environ['HARNESS_LINEAR_API_URL'].rstrip('/')}/linear/graphql" if os.environ.get("HARNESS_LINEAR_API_URL") else "https://api.linear.app/graphql"
+    if operation == "linear.probe":
+        data = http_json(endpoint, token, {"query": "query Viewer { viewer { id name } }"})
+        viewer = data.get("data", {}).get("viewer", {})
+        return f"linear:probe:{viewer.get('id', 'ok')}", ""
+    if operation == "linear.issue.create":
+        data = http_json(
+            endpoint,
+            token,
+            {
+                "query": "mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }",
+                "variables": {"input": {"teamId": require_param(params, "team_id"), "title": require_param(params, "title"), "description": with_connector_marker(str(params.get("description", "")), idempotency_key)}},
+            },
+        )
+        issue = data.get("data", {}).get("issueCreate", {}).get("issue", {})
+        return f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", ""))
+    if operation == "linear.issue.comment":
+        data = http_json(
+            endpoint,
+            token,
+            {
+                "query": "mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url } } }",
+                "variables": {"input": {"issueId": require_param(params, "issue_id"), "body": with_connector_marker(require_param(params, "body"), idempotency_key)}},
+            },
+        )
+        comment = data.get("data", {}).get("commentCreate", {}).get("comment", {})
+        return f"linear:comment:{comment.get('id')}", str(comment.get("url", ""))
+    if operation == "linear.issue.update":
+        update_input = {k: v for k, v in params.items() if k != "issue_id"}
+        data = http_json(
+            endpoint,
+            token,
+            {
+                "query": "mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id identifier url } } }",
+                "variables": {"id": require_param(params, "issue_id"), "input": update_input},
+            },
+        )
+        issue = data.get("data", {}).get("issueUpdate", {}).get("issue", {})
+        return f"linear:issue:{issue.get('identifier') or issue.get('id')}", str(issue.get("url", ""))
+    raise HarnessError(f"unsupported linear connector operation: {operation}")
+
+
+def execute_notion_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+    token = env_token("NOTION_TOKEN")
+    base = os.environ.get("HARNESS_NOTION_API_URL", "https://api.notion.com").rstrip("/")
+    headers = {"Notion-Version": "2022-06-28"}
+    if operation == "notion.probe":
+        return "notion:probe:ok", ""
+    if operation == "notion.page.create":
+        path = "/notion/v1/pages" if os.environ.get("HARNESS_NOTION_API_URL") else "/v1/pages"
+        data = http_json(
+            f"{base}{path}",
+            token,
+            {
+                "parent": {"page_id": require_param(params, "parent_page_id")},
+                "properties": {"title": {"title": [{"text": {"content": require_param(params, "title")}}]}},
+                "children": [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key)}}]}}],
+            },
+            headers=headers,
+        )
+        return f"notion:page:{data.get('id')}", str(data.get("url", ""))
+    if operation == "notion.page.update":
+        page_id = require_param(params, "page_id")
+        path = f"/notion/v1/pages/{page_id}" if os.environ.get("HARNESS_NOTION_API_URL") else f"/v1/pages/{page_id}"
+        data = http_json(
+            f"{base}{path}",
+            token,
+            {"properties": {"title": {"title": [{"text": {"content": with_connector_marker(str(params.get("title", "")), idempotency_key)}}]}}},
+            method="PATCH",
+            headers=headers,
+        )
+        return f"notion:page:{data.get('id')}", str(data.get("url", ""))
+    raise HarnessError(f"unsupported notion connector operation: {operation}")
+
+
+def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+    token = env_token("FIGMA_TOKEN")
+    base = os.environ.get("HARNESS_FIGMA_API_URL", "https://api.figma.com").rstrip("/")
+    if operation == "figma.probe":
+        return "figma:probe:ok", ""
+    if operation == "figma.comment.create":
+        file_key = require_param(params, "file_key")
+        path = f"/figma/v1/files/{file_key}/comments" if os.environ.get("HARNESS_FIGMA_API_URL") else f"/v1/files/{file_key}/comments"
+        data = http_json(
+            f"{base}{path}",
+            token,
+            {"message": with_connector_marker(require_param(params, "message"), idempotency_key)},
+            headers={"X-Figma-Token": token},
+        )
+        return f"figma:comment:{data.get('id')}", f"https://www.figma.com/file/{data.get('file_key') or file_key}?comment-id={data.get('id')}"
+    raise HarnessError(f"unsupported figma connector operation: {operation}")
+
+
+def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> tuple[str, str]:
+    token = env_token("SLACK_BOT_TOKEN")
+    base = os.environ.get("HARNESS_SLACK_API_URL", "https://slack.com").rstrip("/")
+    if operation == "slack.probe":
+        path = "/slack/api/auth.test" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/auth.test"
+        data = http_json(f"{base}{path}", token, {})
+        return f"slack:probe:{data.get('team_id', 'ok')}", ""
+    if operation == "slack.message.post":
+        path = "/slack/api/chat.postMessage" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/chat.postMessage"
+        data = http_json(
+            f"{base}{path}",
+            token,
+            {"channel": require_param(params, "channel"), "text": with_connector_marker(require_param(params, "text"), idempotency_key)},
+        )
+        if data.get("ok") is False:
+            raise HarnessError(f"slack connector failed: {data.get('error', 'unknown')}")
+        channel = data.get("channel") or require_param(params, "channel")
+        timestamp = data.get("ts") or ""
+        return f"slack:message:{channel}:{timestamp}", str(data.get("permalink", ""))
+    raise HarnessError(f"unsupported slack connector operation: {operation}")
+
+
+def execute_connector_action(root: Path, row: sqlite3.Row) -> tuple[str, str]:
+    payload_value = load_connector_payload(row)
+    operation, params = validate_connector_request(row, payload_value)
+    idempotency_key = str(row["idempotency_key"])
+    tool = str(row["tool"])
+    if tool == "github":
+        return execute_github_connector(root, operation, params, idempotency_key)
+    if tool == "linear":
+        return execute_linear_connector(operation, params, idempotency_key)
+    if tool == "notion":
+        return execute_notion_connector(operation, params, idempotency_key)
+    if tool == "figma":
+        return execute_figma_connector(operation, params, idempotency_key)
+    if tool == "slack":
+        return execute_slack_connector(operation, params, idempotency_key)
+    raise HarnessError(f"unsupported connector tool: {tool}")
+
+
 def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id: str, idempotency_key: str, *, external_link: str = "", evidence: str = "", fallback: str = "", confirmation_needed: str = "no") -> None:
     if mode not in ADAPTER_MODES:
         raise HarnessError(f"invalid adapter mode: {mode}")
@@ -3453,6 +3744,45 @@ def adapter_plan(root: Path, tool: str, mode: str, artifact: str, action: str, *
 def adapter_transition(root: Path, action_id: str, status: str, *, confirmation: str = "", external_id: str = "", external_link: str = "") -> None:
     if status not in ADAPTER_ACTION_STATUSES:
         raise HarnessError(f"invalid adapter action status: {status}")
+    if status == "confirmed":
+        with connection(root) as conn:
+            current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not current:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if current["status"] == "completed":
+            return
+        if should_execute_connector(current):
+            try:
+                external_id, external_link = execute_connector_action(root, current)
+            except HarnessError as exc:
+                raise HarnessError(f"connector execution failed: {exc}") from exc
+            with transaction(root) as conn:
+                row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+                if not row:
+                    raise HarnessError(f"missing adapter action: {action_id}")
+                if row["status"] == "completed":
+                    return
+                conn.execute(
+                    """
+                    update adapter_actions set status = 'completed', confirmation = coalesce(nullif(?, ''), confirmation),
+                      external_id = ?, external_link = ?, updated_at = ? where id = ?
+                    """,
+                    (confirmation, external_id, external_link, now_iso(), action_id),
+                )
+                conn.execute(
+                    """
+                    insert into adapters
+                    (id, tool, mode, artifact, external_id, external_link, idempotency_key, evidence, fallback, confirmation_needed, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, '', 'no', ?)
+                    on conflict(tool, idempotency_key) do update set mode=excluded.mode, artifact=excluded.artifact,
+                      external_id=excluded.external_id, external_link=excluded.external_link, evidence=excluded.evidence,
+                      updated_at=excluded.updated_at
+                    """,
+                    (str(uuid.uuid4()), row["tool"], row["mode"], row["artifact"], external_id, external_link, row["idempotency_key"], f"connector action {action_id}", now_iso()),
+                )
+                emit_event(conn, "adapter_action_updated", payload(id=action_id, status="completed", connector=row["tool"]), idempotency_key=row["idempotency_key"])
+            render_tooling_map(root)
+            return
     with transaction(root) as conn:
         row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
         if not row:

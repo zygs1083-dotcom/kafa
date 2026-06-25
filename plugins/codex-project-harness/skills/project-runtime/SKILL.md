@@ -163,6 +163,8 @@ When an AgentProvider is available, use `dispatch provider start --run-id <run-i
 
 `--provider host-codex` uses Codex App Server over stdio to create one Codex thread/turn per assignment. By default it runs `codex app-server`; override with `HARNESS_CODEX_APP_SERVER_CMD` and bound the turn with `HARNESS_CODEX_TURN_TIMEOUT_SECONDS`. Host Codex reports are stricter than fixture/manual reports, but they are still raw reports until controller verification.
 
+For real connector adapters, keep using the existing adapter commands. `adapter confirm` executes GitHub/Linear/Notion/Figma/Slack only when the planned action payload contains `{"execute": true, "operation": "...", "params": {...}}`; otherwise it remains a manual confirmation record. GitHub uses `gh api`; Linear, Notion, Figma, and Slack read their tokens from `LINEAR_API_KEY`, `NOTION_TOKEN`, `FIGMA_TOKEN`, and `SLACK_BOT_TOKEN`. Connector results are external workflow links, not delivery evidence.
+
 `dispatch integrate` only merges active agent branches that have a verified task attempt, whose current branch head/tree still match that verified attempt, and whose changed files remain within active file claims. Unverified branches, branch drift, and file-claim violations are high findings and fail closed before merge.
 
 For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixture`. It is the deterministic Agent E2E evaluation for scheduling, provider raw reports, controller verification, file claims, and integration blocking. `run_skill_eval.py` is only a transcript marker check.

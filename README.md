@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.9.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.2.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.10.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.3.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -15,6 +15,7 @@ cat VERSION
 git tag --list
 git show v0.4.0-beta.1
 git show v1.9.0-beta.1
+git show v1.10.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -151,6 +152,8 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定当前 schema 22、CLI surface、Skill/schema/core/script 文件集合。后续 Phase 1 若为了拆分 `harness_db.py` 需要新增或移动模块，必须在对应 PR 中显式更新冻结基线并解释原因。
 
 从 v1.9.0 开始，现有 `dispatch provider start --provider host-codex` 通过 Codex App Server stdio JSON-RPC 创建真实 Codex thread/turn。每个任务映射到一个 thread/turn，最终 worker JSON 只作为 raw provider report 导入；交付资格仍必须由 `dispatch verify-attempt` 在 controller 侧重新执行目标命令后生成可信 evidence。
+
+从 v1.10.0 开始，现有 `adapter confirm` 在 `adapter_actions.payload_json` 含 `{"execute": true, "operation": "...", "params": {...}}` 时可以执行真实 connector adapter。GitHub 通过 `gh api` 执行；Linear、Notion、Figma、Slack 通过官方 HTTP API 和环境变量 token 执行。外部写入结果只进入 adapter/action 记录，不自动成为 delivery evidence，也不放宽 high/critical 的 HMAC 信任要求。
 
 信任等级按强度分为三档：
 
@@ -369,7 +372,8 @@ harness.py --root . dispatch run --agent developer --target UNIT --command "pyte
 harness.py --root . dispatch run --agent developer --runner local-process --claim-file src/app.py --command "python3 -m unittest" --allow-unlisted --reason "local agent task"
 harness.py --root . dispatch integrate --run-id <run-id>
 harness.py --root . adapter ci-verify --provider github --run-id <run-id> --conclusion success --commit-sha <sha>
-harness.py --root . adapter plan --tool github --mode write-confirm --artifact Tasks --action "create issue"
+harness.py --root . adapter plan --tool github --mode write-confirm --artifact Tasks --action "create issue" \
+  --payload-json '{"execute":true,"operation":"github.issue.create","params":{"repo":"owner/repo","title":"T1","body":"Task body"}}'
 harness.py --root . adapter confirm --id <action-id>
 harness.py --root . risk sweep-expired
 harness.py --root . delivery record --scope "Example delivery" --validation "tests passed" --quality-gate "independent_qa pass"
