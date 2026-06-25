@@ -50,7 +50,18 @@ jobs:
           find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec ${{ matrix.python }} -m json.tool {} \; >/dev/null
 
       - name: Compile Python
-        run: ${{ matrix.python }} -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
+        run: ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
+
+      - name: Install kafa package
+        run: ${{ matrix.python }} -m pip install -e .
+
+      - name: Check kafa package
+        run: |
+          kafa --version
+          kafa doctor --repo .
+
+      - name: Run install release tests
+        run: ${{ matrix.python }} -m unittest tests/test_install_release.py
 
       - name: Run runtime tests
         run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -114,8 +115,17 @@ REQUIRED_SCHEMAS = [
 ]
 
 
+def pep440_version(release_version: str) -> str:
+    marker = "-beta."
+    if marker in release_version:
+        base, beta = release_version.split(marker, 1)
+        return f"{base}b{beta}"
+    return release_version
+
+
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+    repo_root = root.parent.parent
     manifest = root / ".codex-plugin" / "plugin.json"
     if not manifest.exists():
         print(f"ERROR: missing {manifest}")
@@ -130,7 +140,7 @@ def main() -> int:
     errors: list[str] = []
     if data.get("name") != "codex-project-harness":
         errors.append("plugin name must be codex-project-harness")
-    version_file = root.parent.parent / "VERSION"
+    version_file = repo_root / "VERSION"
     if version_file.exists() and data.get("version") != version_file.read_text(encoding="utf-8").strip():
         errors.append("plugin version must match root VERSION")
     if "schema_version" in data:
@@ -141,6 +151,27 @@ def main() -> int:
         errors.append("plugin author must be an object")
     if data.get("skills") != "./skills/":
         errors.append('plugin skills must be the relative string "./skills/"')
+
+    pyproject = repo_root / "pyproject.toml"
+    release_version = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else ""
+    if not pyproject.exists():
+        errors.append("missing pyproject.toml")
+    else:
+        try:
+            package = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append(f"invalid pyproject.toml: {exc}")
+            package = {}
+        project = package.get("project", {}) if isinstance(package, dict) else {}
+        scripts = project.get("scripts", {}) if isinstance(project, dict) else {}
+        if project.get("name") != "kafa":
+            errors.append("pyproject project.name must be kafa")
+        if release_version and project.get("version") != pep440_version(release_version):
+            errors.append("pyproject version must match root VERSION")
+        if project.get("requires-python") != ">=3.11":
+            errors.append("pyproject requires-python must be >=3.11")
+        if scripts.get("kafa") != "kafa.cli:main":
+            errors.append("pyproject must expose kafa = kafa.cli:main")
 
     interface = data.get("interface")
     if not isinstance(interface, dict):

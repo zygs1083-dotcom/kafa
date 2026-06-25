@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.13.0-beta.1 - 2026-06-25
+
+### Added
+
+- Root-level `kafa` Python package with a local-only console script for Codex plugin installation and release checks.
+- `kafa plugin install|upgrade|uninstall` for repo-scope and user-scope Codex marketplace entries.
+- `kafa doctor` for Python, Git, plugin manifest, version alignment, marketplace path, and plugin structure preflight checks.
+- Editable packaging metadata in `pyproject.toml` with the `kafa = "kafa.cli:main"` console script.
+
+### Changed
+
+- Runtime implementation version is now `4.6.0`; runtime schema remains `22`.
+- Structure validation now checks `pyproject.toml`, the PEP 440 package version mapping, Python `>=3.11`, and the `kafa` console script declaration.
+- CI now includes editable package installation, `kafa --version`, `kafa doctor --repo .`, and install/release unit tests.
+
+### Boundaries
+
+- Distribution is Git/local only; this release does not publish to PyPI or any package registry.
+- `kafa` manages marketplace JSON and copied user-scope plugin files only. It does not mutate Codex plugin caches, write harness DB rows, add runtime CLI commands, or replace `harness.py`.
+- No new harness DB tables, schema files, core modules, plugin runtime scripts, Skills, hooks, runtime states, or harness CLI commands are introduced.
+
 ## v1.12.0-beta.1 - 2026-06-25
 
 ### Added
