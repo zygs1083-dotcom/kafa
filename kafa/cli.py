@@ -266,9 +266,115 @@ def doctor_report(repo: Path, scope: str) -> dict[str, Any]:
         add_check(checks, "plugin structure", completed.returncode == 0, (completed.stdout or completed.stderr).strip())
     else:
         add_check(checks, "plugin structure", False, f"missing {validate}")
+    contract_ok, contract_details = control_plane_contract(source)
+    add_check(checks, "control plane contract", contract_ok, contract_details)
     marketplace_path, _target, _source_path = marketplace_locations(repo, scope)
     add_check(checks, "marketplace path", True, str(marketplace_path))
     return {"ok": all(check["ok"] for check in checks), "scope": scope, "repo": str(repo), "checks": checks}
+
+
+def control_plane_contract(source: Path) -> tuple[bool, str]:
+    failures: list[str] = []
+    layers = [
+        "Skill Entry",
+        "Plugin Distribution",
+        "Hooks Advisory Layer",
+        "Host Bridge/Provider Layer",
+        "Kernel Trust Layer",
+        "Connector/Eval Boundary",
+    ]
+
+    manifest = source / ".codex-plugin" / "plugin.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            if data.get("skills") != "./skills/":
+                failures.append("Plugin Distribution: plugin manifest must point skills at ./skills/")
+            description = " ".join(str(data.get(key, "")) for key in ["description"])
+            long_description = str(data.get("interface", {}).get("longDescription", ""))
+            if "does not perform deployment" not in description and "不执行生产部署" not in long_description:
+                failures.append("Plugin Distribution: manifest must declare verified-handoff/deployment boundary")
+        except (OSError, json.JSONDecodeError) as exc:
+            failures.append(f"Plugin Distribution: manifest unreadable: {exc}")
+    else:
+        failures.append(f"Plugin Distribution: missing {manifest}")
+
+    expected_hooks = {"SessionStart", "SubagentStart", "PreToolUse", "PostToolUse", "Stop"}
+    hooks_json = source / "hooks" / "hooks.json"
+    if hooks_json.exists():
+        try:
+            hook_data = json.loads(hooks_json.read_text(encoding="utf-8"))
+            actual_hooks = set(hook_data.get("hooks", {}))
+            missing_hooks = sorted(expected_hooks - actual_hooks)
+            if missing_hooks:
+                failures.append(f"Hooks Advisory Layer: missing hook events {missing_hooks}")
+        except (OSError, json.JSONDecodeError) as exc:
+            failures.append(f"Hooks Advisory Layer: hooks.json unreadable: {exc}")
+    else:
+        failures.append(f"Hooks Advisory Layer: missing {hooks_json}")
+
+    required_markers = [
+        (
+            "Skill Entry",
+            source / "skills" / "project-runtime" / "SKILL.md",
+            [
+                "natural-language Skill Entry",
+                "SQLite-backed harness runtime",
+                "Markdown files are generated views, not the primary fact source",
+            ],
+        ),
+        (
+            "Hooks Advisory Layer",
+            source / "hooks" / "harness_hook.py",
+            ["Hooks are advisory lifecycle guardrails", "never create delivery evidence"],
+        ),
+        (
+            "Host Bridge/Provider Layer",
+            source / "core" / "agent_provider.py",
+            ["class HostCodexProvider", "delivery evidence"],
+        ),
+        (
+            "Kernel Trust Layer",
+            source / "scripts" / "harness_db.py",
+            [
+                "insert into agent_reports",
+                "insert into task_attempts",
+                "def dispatch_verify_attempt",
+                "status = 'verified'",
+                "def execute_connector_action",
+            ],
+        ),
+        (
+            "Connector/Eval Boundary",
+            source / "scripts" / "run_agent_e2e_eval.py",
+            [
+                "scenario_host_codex_fake_app_server_e2e",
+                "scenario_connector_mock_server_e2e",
+                "scenario_crash_retry_recovery",
+                "scenario_sqlite_contention_stress",
+                "\"stability\": run_stability",
+            ],
+        ),
+    ]
+    for layer, path, markers in required_markers:
+        text = read_text(path)
+        if not text:
+            failures.append(f"{layer}: missing {path}")
+            continue
+        for marker in markers:
+            if marker not in text:
+                failures.append(f"{layer}: missing marker {marker!r} in {path.name}")
+
+    if failures:
+        return False, "; ".join(failures[:6])
+    return True, ", ".join(layers)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def add_check(checks: list[dict[str, Any]], name: str, ok: bool, details: str) -> None:

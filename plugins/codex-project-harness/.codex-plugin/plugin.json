@@ -1,6 +1,6 @@
 {
   "name": "codex-project-harness",
-  "version": "1.13.0-beta.1",
+  "version": "1.14.0-beta.1",
   "description": "A universal Codex-native code-delivery harness for requirement baselines, executable local runtime state, implementation, QA gates, collaboration-tool mapping, and verified handoff. It stops at verified code delivery and does not perform deployment.",
   "author": {
     "name": "zygs1083-dotcom",

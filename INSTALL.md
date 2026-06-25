@@ -22,8 +22,10 @@ Expected:
 
 ```text
 OK: plugin structure is valid
-1.13.0-beta.1
+1.14.0-beta.1
 ```
+
+`kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.
 
 ## Install For This Repo
 
@@ -111,3 +113,4 @@ If you previously pointed Codex at the plugin directory manually:
 - `target plugin already exists`: use `kafa plugin upgrade --scope user --repo .` or pass `--force`.
 - Plugin does not appear in Codex: restart Codex and confirm `.agents/plugins/marketplace.json` exists.
 - Hooks do not run: review and trust plugin hooks with `/hooks`; set `CODEX_PROJECT_HARNESS_PLUGIN_ROOT` if the plugin is outside the default repo path.
+- `control plane contract` fails in `kafa doctor`: inspect the named layer and restore the boundary text or implementation path before release.

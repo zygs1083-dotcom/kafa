@@ -5,7 +5,7 @@ description: "Use during Codex Project Harness delivery to update and validate t
 
 # Project Runtime
 
-Maintain the executable project control plane. Do not rely on chat memory alone.
+Maintain the executable project control plane. This skill is a natural-language Skill Entry for humans and agents; the SQLite-backed harness runtime remains the source of truth. Do not rely on chat memory alone.
 
 ## Core Rule
 
@@ -185,6 +185,8 @@ From v1.8.1, Phase 0 freezes feature expansion. Harness runtime changes must pas
 
 From v1.13.0, installation/release changes must also pass `tests/test_install_release.py`, `python3 -m pip install -e .`, `kafa --version`, and `kafa doctor --repo .`. Keep packaging changes at the repository root; do not use install work as a reason to expand the frozen plugin runtime surface.
 
+From v1.14.0, the harness is treated as an architecture control plane. Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must stay separate. `kafa doctor --repo .` includes a control-plane contract check; if it fails, restore the named boundary instead of weakening Kernel verification or delivery gates.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:
@@ -279,5 +281,6 @@ Before claiming delivery readiness:
 7. For harness runtime changes, run `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture` and `python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability`.
 8. For harness runtime surface changes, run `python3 -m unittest tests/test_feature_freeze.py`.
 9. For install/release changes, run `python3 -m unittest tests/test_install_release.py`, `python3 -m pip install -e .`, `kafa --version`, and `kafa doctor --repo .`.
-10. Confirm delivery record includes local or external collaboration links.
-11. State any warnings or residual risk.
+10. For control-plane boundary changes, run `python3 -m unittest tests/test_control_plane_architecture.py` and confirm `kafa doctor --repo . --json` includes a passing `control plane contract` check.
+11. Confirm delivery record includes local or external collaboration links.
+12. State any warnings or residual risk.

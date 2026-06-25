@@ -12,6 +12,8 @@ kafa doctor --repo .
 
 This creates the repo-scoped Codex marketplace entry at `.agents/plugins/marketplace.json` without copying plugin files. Restart Codex, open the plugin directory, choose the `kafa-local` marketplace, and install `codex-project-harness`.
 
+`kafa doctor --repo .` also verifies the control-plane contract so installation does not drift from the Skill/Plugin/Hooks/Host/Kernel/Connector/Eval boundary model.
+
 For user-scope installation:
 
 ```bash

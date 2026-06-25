@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.6.0
+# Codex OS Runtime Layer v4.7.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.6.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, an offline stability matrix for release gating, and a local installation/release helper. The repository release remains a beta release, while the runtime implementation version is `4.6.0` and the database schema version is `22`.
+Kernel v4.7.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, and a verified architecture control plane contract. The repository release remains a beta release, while the runtime implementation version is `4.7.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.6.0
+## Kernel v4.7.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -33,6 +33,14 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `projections.py` is the only Markdown projection writer.
 
 SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
+
+## Architecture Control Plane
+
+The harness is organized as a control plane rather than a pile of features. Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary have distinct responsibilities and trust levels. The full contract is documented in `docs/runtime/CONTROL_PLANE.md`.
+
+Only the Kernel Trust Layer can decide delivery readiness. Skills guide humans and agents; plugin metadata distributes the bundle; hooks are advisory; Host Codex and native fan-out produce raw reports; connectors synchronize external workflow records; evals gate harness releases. Trusted delivery evidence still requires controller verification, current code identity, target mapping, HMAC/session attestation where required, and integration/delivery gate checks.
+
+`kafa doctor --repo .` includes a `control plane contract` check to catch accidental drift in these boundaries without adding harness runtime commands or database state.
 
 ## Codex Lifecycle Hooks
 
@@ -126,7 +134,7 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 adds only root-level packaging and the `kafa` installer/release helper; it does not add harness runtime commands, DB tables, schema files, core modules, plugin scripts, Skills, hooks, or runtime states.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs; it does not add harness runtime commands, DB tables, schema files, core modules, plugin scripts, Skills, hooks, or runtime states.
 
 ## Installation And Release Helper
 

@@ -51,7 +51,7 @@ class CodexHooksTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
-        self.assertIn("runtime_version: 4.6.0", result.stdout)
+        self.assertIn("runtime_version: 4.7.0", result.stdout)
         self.assertIn("Harness Status", result.stdout)
         self.assertEqual(before, after)
 
