@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Advisory Fallback",
+  "type": "object",
+  "required": [
+    "id",
+    "action_id",
+    "tool",
+    "operation",
+    "scope_key",
+    "source_status",
+    "fallback_kind",
+    "official_capability",
+    "artifact_path",
+    "summary",
+    "status",
+    "delivery_eligible",
+    "generated_at",
+    "updated_at"
+  ],
+  "properties": {
+    "id": { "type": "string" },
+    "action_id": { "type": "string" },
+    "tool": { "type": "string" },
+    "operation": { "type": "string" },
+    "scope_key": { "type": "string" },
+    "source_status": { "type": "string" },
+    "fallback_kind": { "type": "string" },
+    "official_capability": { "type": "string" },
+    "artifact_path": { "type": "string" },
+    "summary": { "type": "string" },
+    "status": { "type": "string", "enum": ["generated", "superseded", "stale"] },
+    "delivery_eligible": { "type": "integer", "enum": [0] },
+    "generated_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

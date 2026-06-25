@@ -29,6 +29,7 @@ def render_all(root: Path) -> None:
     render_deliveries(root)
     render_decisions(root)
     render_tooling_map(root)
+    render_advisory_fallbacks(root)
 
 
 def render_project_state(root: Path) -> None:
@@ -355,3 +356,37 @@ def render_tooling_map(root: Path) -> None:
             for row in rows
         )
     write_view(root, ".ai-team/control/tooling-map.md", "\n".join(lines))
+
+
+def render_advisory_fallbacks(root: Path) -> None:
+    runtime = _runtime()
+    with runtime.connection(root) as conn:
+        exists = conn.execute("select 1 from sqlite_master where type='table' and name='advisory_fallbacks'").fetchone()
+        rows = []
+        if exists:
+            rows = conn.execute("select * from advisory_fallbacks order by generated_at, action_id").fetchall()
+    lines = [
+        "# Advisory Fallbacks",
+        "",
+        "These records are local advisory drafts only. They are not delivery evidence.",
+        "",
+        "| Action | Connector | Operation | Kind | Official Capability | Status | Delivery Eligible | Artifact | Summary |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    lines.extend(
+        markdown_row(
+            [
+                row["action_id"],
+                row["tool"],
+                row["operation"],
+                row["fallback_kind"],
+                row["official_capability"],
+                row["status"],
+                row["delivery_eligible"],
+                row["artifact_path"],
+                row["summary"],
+            ]
+        )
+        for row in rows
+    )
+    write_view(root, ".ai-team/control/advisory-fallbacks.md", "\n".join(lines))

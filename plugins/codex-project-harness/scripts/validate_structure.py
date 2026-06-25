@@ -95,6 +95,7 @@ REQUIRED_SCHEMAS = [
     "adapter.schema.json",
     "adapter-action.schema.json",
     "connector-budget.schema.json",
+    "advisory-fallback.schema.json",
     "ci-verification.schema.json",
     "command-log.schema.json",
     "codex-fanout-export.schema.json",

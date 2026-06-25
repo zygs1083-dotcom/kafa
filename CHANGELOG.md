@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.16.0-beta.1 - 2026-06-25
+
+### Added
+
+- Schema 24 advisory fallback state in `advisory_fallbacks`, with `delivery_eligible=0` enforced for local second-level fallback artifacts.
+- Automatic local fallback artifact generation when GitHub, Linear, Notion, Figma, or Slack connector actions become blocked after retry/budget handling.
+- Human-readable fallback projection at `.ai-team/control/advisory-fallbacks.md` and copy-ready Markdown artifacts under `docs/harness/advisory-fallbacks/`.
+
+### Changed
+
+- Runtime implementation version is now `4.9.0`; runtime schema is now `24`.
+- Connector blocked paths now leave an advisory draft for the relevant official capability, such as GitHub drafts, Linear task fallback, Notion document fallback, Product Design fallback, or Slack handoff fallback.
+- Request-id retries for blocked connector confirms preserve exactly-once local blocked/fallback/finding facts and still report `idempotency-conflict` for changed arguments.
+
+### Boundaries
+
+- Advisory fallback artifacts are local planning and handoff aids only; they do not create evidence, validation, external writes, HMAC attestations, or delivery eligibility.
+- No real Product Design, Documents, Slack, Notion, Linear, or GitHub plugin call is made by the fallback layer.
+- Harness CLI, core modules, plugin runtime scripts, Skills, hooks, and delivery trust semantics remain unchanged.
+
 ## v1.15.0-beta.1 - 2026-06-25
 
 ### Added

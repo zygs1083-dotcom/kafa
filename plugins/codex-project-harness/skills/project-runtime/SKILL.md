@@ -189,6 +189,8 @@ From v1.14.0, the harness is treated as an architecture control plane. Skill Ent
 
 From v1.15.0, connector adapters have retry/budget/fallback governance. If GitHub, Linear, Notion, Figma, or Slack is rate-limited or unavailable, inspect `adapter_actions.connector_status`, `blocked_reason`, and `connector_budgets`; keep using local `.ai-team/` facts for delivery progress. Connector records still cannot satisfy delivery evidence or replace controller verification.
 
+From v1.16.0, blocked connector actions also generate Advisory Fallback Layer artifacts. Inspect `.ai-team/control/advisory-fallbacks.md` and `docs/harness/advisory-fallbacks/<action-id>.md` for copy-ready GitHub, Linear, Notion, Product Design, or Slack handoff drafts. These are advisory local facts only; do not cite them as delivery evidence, validation, external writes, or HMAC/session trust anchors.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:

@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.15.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.8.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.16.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.9.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -20,7 +20,7 @@ git show v1.11.0-beta.1
 git show v1.12.0-beta.1
 git show v1.13.0-beta.1
 git show v1.14.0-beta.1
-git show v1.15.0-beta.1
+git show v1.16.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -166,7 +166,9 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 从 v1.15.0 开始，真实 connector adapter 增加韧性和兜底治理。GitHub、Linear、Notion、Figma、Slack 的 probe/write 都会记录 `connector_budgets`，处理 `Retry-After`、429/529 和常见 rate limit 信号；超过 retry budget 的 action 会标记 `blocked` 并写 finding，但本地 `.ai-team/` 事实源仍可继续支持交付流程。写入前会按 idempotency marker 尝试复用已有外部对象，降低外部成功但本地事务未提交后的重复写风险。Connector 结果仍只是 workflow sync，不是 delivery-eligible evidence。
 
-从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，只允许新增 connector budget 表、adapter action retry/block 字段和对应 schema 文件；CLI surface、Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
+从 v1.16.0 开始，blocked connector 会自动进入 Advisory Fallback Layer：Harness 在本地生成 `docs/harness/advisory-fallbacks/<action-id>.md` 和 `.ai-team/control/advisory-fallbacks.md`，给出 GitHub 草稿、Linear 任务兜底、Notion 文档草稿、Product Design brief/visual QA checklist、Slack handoff summary 等二级替代分析。它只辅助人和 agent 继续推进，不调用真实官方插件，不冒充外部写入，也永远不能满足 delivery evidence。
+
+从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。CLI surface、Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
 
 从 v1.11.0 开始，插件自带 Codex lifecycle hooks。安装或更新插件后，用 `/hooks` 审核并信任它们；也可以用 `[features] hooks = false` 关闭 Codex hooks。默认 hooks 只做辅助护栏：`SessionStart` 注入项目状态，`SubagentStart` 提醒角色/任务/验收边界，`PreToolUse` 在需求未确认或无 active task 时提示写入风险，`PostToolUse` 汇总变更，`Stop` 运行 readiness 检查。若插件不在项目默认 `plugins/codex-project-harness` 路径下，设置 `CODEX_PROJECT_HARNESS_PLUGIN_ROOT`。Hooks 不生成可信 evidence，也不能替代 controller verification、integration gate、HMAC/session attestation 或 CI。
 

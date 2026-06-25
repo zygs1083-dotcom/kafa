@@ -42,8 +42,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 23
-RUNTIME_VERSION = "4.8.0"
+SCHEMA_VERSION = 24
+RUNTIME_VERSION = "4.9.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -82,6 +82,7 @@ PHASE_TRANSITIONS = {
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 CONNECTOR_STATUSES = {"available", "degraded", "blocked"}
+ADVISORY_FALLBACK_STATUSES = {"generated", "superseded", "stale"}
 DISPATCH_STATUSES = {"planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
 SESSION_ROLES = {"developer", "qa-reviewer", "reviewer", "architect", "product", "security"}
 REVIEWER_SESSION_ROLES = {"qa-reviewer", "reviewer", "architect", "security"}
@@ -187,6 +188,7 @@ SNAPSHOT_TABLES = [
     "adapters",
     "adapter_actions",
     "connector_budgets",
+    "advisory_fallbacks",
     "ci_verifications",
     "external_session_verifications",
     "invalidations",
@@ -703,6 +705,23 @@ def create_schema(conn: sqlite3.Connection) -> None:
             free_plan_risk text not null default '',
             updated_at text not null,
             unique(tool, operation, scope_key)
+        );
+        create table if not exists advisory_fallbacks (
+            id text primary key,
+            action_id text not null,
+            tool text not null,
+            operation text not null,
+            scope_key text not null default '',
+            source_status text not null default '',
+            fallback_kind text not null,
+            official_capability text not null,
+            artifact_path text not null,
+            summary text not null,
+            status text not null,
+            delivery_eligible integer not null default 0,
+            generated_at text not null,
+            updated_at text not null,
+            unique(action_id)
         );
         create table if not exists invalidations (
             id text primary key,
@@ -3556,11 +3575,228 @@ def upsert_connector_budget(conn: sqlite3.Connection, stats: ConnectorStats) -> 
     )
 
 
+def advisory_fallback_id(action_id: str) -> str:
+    return f"advisory-fallback:{action_id}"
+
+
+def sanitize_advisory_text(value: str) -> str:
+    text = str(value or "").strip()
+    replacements = [
+        (r"HARNESS_CONNECTOR_KEY", "connector credential"),
+        (r"[A-Z0-9_]*TOKEN[A-Z0-9_]*", "connector credential"),
+        (r"[A-Z0-9_]*API_KEY[A-Z0-9_]*", "connector credential"),
+        (r"token", "credential"),
+        (r"key", "credential"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text[:1000] or "connector unavailable"
+
+
+def fallback_policy(tool: str, operation: str) -> tuple[str, str, str, str]:
+    if tool == "github":
+        return (
+            "GitHub draft",
+            "GitHub plugin or gh CLI when available",
+            "Prepare a PR/issue/comment draft, review checklist, and local delivery record.",
+            "Use this as a copy-ready GitHub issue, PR, or review comment body once GitHub is available.",
+        )
+    if tool == "linear":
+        return (
+            "Linear task fallback",
+            "Linear plugin task workflow when available",
+            "Prepare task breakdown, priority, dependency, and risk notes for .ai-team/planning/task-board.md.",
+            "Use this as a copy-ready Linear issue/update draft once Linear is available.",
+        )
+    if tool == "notion":
+        return (
+            "Notion document fallback",
+            "Documents or Notion documentation workflow when available",
+            "Prepare a structured PRD/spec/ADR/handoff draft under docs/harness/.",
+            "Use this as a copy-ready Notion page/update draft once Notion is available.",
+        )
+    if tool == "figma":
+        return (
+            "Product Design fallback",
+            "Product Design plugin for design brief, audit, and visual QA",
+            "Prepare a Product Design brief, audit prompt, and visual QA checklist without claiming a Figma file/comment exists.",
+            "Use this as a copy-ready Product Design or Figma comment brief once Figma is available.",
+        )
+    if tool == "slack":
+        return (
+            "Slack handoff fallback",
+            "Slack plugin for post-ready summaries when available",
+            "Prepare a post-ready summary and local handoff note without claiming it was sent.",
+            "Use this as a copy-ready Slack message, email, or document handoff once Slack is available.",
+        )
+    return (
+        "Connector advisory fallback",
+        "Official connector workflow when available",
+        "Prepare a local advisory draft while the external connector is unavailable.",
+        "Use this as a copy-ready external update once the connector is available.",
+    )
+
+
+def fallback_draft(tool: str, operation: str, params: dict[str, Any], action_row: sqlite3.Row) -> str:
+    title = str(params.get("title") or params.get("summary") or action_row["artifact"] or operation)
+    body = str(params.get("body") or params.get("description") or params.get("content") or params.get("message") or params.get("text") or "")
+    if tool == "github":
+        return "\n".join(
+            [
+                f"Title: {title}",
+                "",
+                body or "Describe the change, verification, and reviewer asks here.",
+                "",
+                "Review checklist:",
+                "- Link the local delivery record.",
+                "- Confirm controller verification evidence before requesting merge.",
+                "- Keep this draft separate from delivery evidence.",
+            ]
+        )
+    if tool == "linear":
+        return "\n".join(
+            [
+                f"Task: {title}",
+                f"Priority: {params.get('priority', 'needs triage')}",
+                f"Dependency: {params.get('depends_on', 'none recorded')}",
+                f"Risk: {params.get('risk', 'needs review')}",
+                "",
+                body or "Break the task into acceptance, implementation, verification, and handoff steps.",
+                "",
+                "Local board target: .ai-team/planning/task-board.md",
+            ]
+        )
+    if tool == "notion":
+        return "\n".join(
+            [
+                f"# {title}",
+                "",
+                "## Context",
+                body or "Capture the spec, decision, or handoff context here.",
+                "",
+                "## Acceptance",
+                "- Link local harness acceptance criteria.",
+                "- Link controller verification once available.",
+                "",
+                "## Decision / Handoff",
+                "- Note owners, risks, and next steps.",
+            ]
+        )
+    if tool == "figma":
+        return "\n".join(
+            [
+                f"Design brief: {title}",
+                "",
+                body or "Describe the screen, state, or visual decision to review.",
+                "",
+                "Audit prompt:",
+                "- Check hierarchy, interaction states, spacing, accessibility, and copy clarity.",
+                "- Compare against implemented UI and acceptance criteria.",
+                "",
+                "Visual QA checklist:",
+                "- No claim is made that a Figma comment or file was created.",
+            ]
+        )
+    if tool == "slack":
+        return "\n".join(
+            [
+                f"Subject: {title}",
+                "",
+                body or "Summarize status, blockers, verification, and asks.",
+                "",
+                "Handoff note:",
+                "- Ready to paste into Slack when available.",
+                "- This local note does not mean a message was sent.",
+            ]
+        )
+    return body or f"Local advisory draft for {operation}."
+
+
+def render_advisory_fallback_artifact(root: Path, fallback: dict[str, Any], action_row: sqlite3.Row, params: dict[str, Any]) -> None:
+    artifact = root / str(fallback["artifact_path"])
+    ensure_parent(artifact)
+    reason = sanitize_advisory_text(str(fallback["source_status"]))
+    draft = fallback_draft(str(fallback["tool"]), str(fallback["operation"]), params, action_row)
+    lines = [
+        f"# Advisory Fallback: {fallback['operation']}",
+        "",
+        "Not delivery evidence.",
+        "",
+        f"- Action: `{fallback['action_id']}`",
+        f"- Connector: `{fallback['tool']}`",
+        f"- Operation: `{fallback['operation']}`",
+        f"- Fallback kind: {fallback['fallback_kind']}",
+        f"- Official capability: {fallback['official_capability']}",
+        f"- Source status: {reason}",
+        "",
+        "## Why This Exists",
+        "",
+        "The external connector is blocked or unavailable. This local artifact is an advisory draft so people and agents can continue planning, handoff, and review work without pretending an external write happened.",
+        "",
+        "## Local Guidance",
+        "",
+        str(fallback["summary"]),
+        "",
+        "## Copy-ready draft",
+        "",
+        draft,
+        "",
+        "## Boundary",
+        "",
+        "This artifact is advisory only. It cannot satisfy controller verification, HMAC or session attestation, integration hardening, or the delivery gate.",
+    ]
+    artifact.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def upsert_advisory_fallback(conn: sqlite3.Connection, root: Path, action_row: sqlite3.Row, stats: ConnectorStats, reason: str) -> dict[str, Any]:
+    payload_value = load_connector_payload(action_row)
+    operation = str(payload_value.get("operation") or stats.operation or action_row["action"])
+    params = payload_value.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+    scope_key = stats.scope_key or connector_scope_key(str(action_row["tool"]), operation, params)
+    fallback_kind, official_capability, summary, _draft_hint = fallback_policy(str(action_row["tool"]), operation)
+    now = now_iso()
+    artifact_path = f"docs/harness/advisory-fallbacks/{action_row['id']}.md"
+    row_id = advisory_fallback_id(str(action_row["id"]))
+    source_status = sanitize_advisory_text(reason or stats.last_error)
+    conn.execute(
+        """
+        insert into advisory_fallbacks
+        (id, action_id, tool, operation, scope_key, source_status, fallback_kind, official_capability,
+         artifact_path, summary, status, delivery_eligible, generated_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generated', 0, ?, ?)
+        on conflict(action_id) do update set source_status=excluded.source_status,
+          scope_key=excluded.scope_key, summary=excluded.summary, status='generated',
+          delivery_eligible=0, updated_at=excluded.updated_at
+        """,
+        (
+            row_id,
+            action_row["id"],
+            action_row["tool"],
+            operation,
+            scope_key,
+            source_status,
+            fallback_kind,
+            official_capability,
+            artifact_path,
+            summary,
+            now,
+            now,
+        ),
+    )
+    row = conn.execute("select * from advisory_fallbacks where action_id = ?", (action_row["id"],)).fetchone()
+    data = row_snapshot(row) or {}
+    render_advisory_fallback_artifact(root, data, action_row, params)
+    return data
+
+
 def mark_connector_blocked(root: Path, action_id: str, stats: ConnectorStats, reason: str) -> None:
     stats.status = "blocked"
     stats.last_error = reason[:1000]
     finding_id = f"connector:{action_id}:blocked"
     with get_store(root).transaction() as conn:
+        insert_active_command_log(conn)
         row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
         if not row:
             raise HarnessError(f"missing adapter action: {action_id}")
@@ -3585,8 +3821,22 @@ def mark_connector_blocked(root: Path, action_id: str, stats: ConnectorStats, re
                 ),
             )
             emit_event(conn, "connector_action_blocked", payload(id=action_id, tool=stats.tool, operation=stats.operation, reason=stats.last_error), idempotency_key=row["idempotency_key"])
+        fallback = upsert_advisory_fallback(conn, root, row, stats, reason)
+        emit_event(
+            conn,
+            "advisory_fallback_generated",
+            payload(id=fallback["id"], action_id=action_id, tool=fallback["tool"], operation=fallback["operation"]),
+            idempotency_key=f"advisory-fallback:{row['idempotency_key']}",
+        )
         upsert_connector_budget(conn, stats)
+        req = _active_request.get()
+        if req and req.get("request_id"):
+            conn.execute(
+                "update command_log set result_json = ? where request_id = ?",
+                (f"ERROR: connector execution failed: {reason}", req["request_id"]),
+            )
     render_tooling_map(root)
+    render_all(root)
 
 
 def load_connector_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -6184,6 +6434,7 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("adapter_actions", "status", ADAPTER_ACTION_STATUSES, "adapter action status"),
         ("adapter_actions", "connector_status", CONNECTOR_STATUSES, "adapter action connector status"),
         ("connector_budgets", "status", CONNECTOR_STATUSES, "connector budget status"),
+        ("advisory_fallbacks", "status", ADVISORY_FALLBACK_STATUSES, "advisory fallback status"),
         ("agents", "status", {"available", "leased", "disabled"}, "agent status"),
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
         ("dispatch_assignments", "status", DISPATCH_STATUSES, "dispatch assignment status"),
@@ -6323,6 +6574,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
         ("connector-budget.schema.json", "connector_budgets", [row_snapshot(row) or {} for row in conn.execute("select * from connector_budgets")]),
+        ("advisory-fallback.schema.json", "advisory_fallbacks", [row_snapshot(row) or {} for row in conn.execute("select * from advisory_fallbacks")]),
         ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
         ("command-log.schema.json", "command_log", [row_snapshot(row) or {} for row in conn.execute("select * from command_log")]),
         ("external-session-verification.schema.json", "external_session_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from external_session_verifications")]),
