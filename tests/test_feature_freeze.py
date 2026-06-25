@@ -23,11 +23,11 @@ for path in [PLUGIN_ROOT, SCRIPTS]:
 import harness  # noqa: E402
 import harness_db  # noqa: E402
 from core import KERNEL_VERSION  # noqa: E402
-from validate_structure import REQUIRED_CORE, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
+from validate_structure import REQUIRED_CORE, REQUIRED_HOOKS, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
 
 
-EXPECTED_PLUGIN_VERSION = "1.10.0-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.3.0"
+EXPECTED_PLUGIN_VERSION = "1.11.0-beta.1"
+EXPECTED_RUNTIME_VERSION = "4.4.0"
 EXPECTED_SCHEMA_VERSION = 22
 
 EXPECTED_TABLES = {
@@ -201,7 +201,7 @@ EXPECTED_CLI_SURFACE = {
 
 
 class FeatureFreezeTest(unittest.TestCase):
-    def test_versions_are_consistent_for_v1100(self) -> None:
+    def test_versions_are_consistent_for_v1110(self) -> None:
         plugin = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
         self.assertEqual((REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(), EXPECTED_PLUGIN_VERSION)
@@ -232,16 +232,18 @@ class FeatureFreezeTest(unittest.TestCase):
     def test_feature_freeze_rejects_cli_surface_growth(self) -> None:
         self.assertEqual(_cli_surface(harness.build_parser()), EXPECTED_CLI_SURFACE)
 
-    def test_feature_freeze_rejects_extra_skill_schema_core_script_files(self) -> None:
+    def test_feature_freeze_rejects_extra_skill_schema_core_script_hook_files(self) -> None:
         skill_dirs = {path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()}
         schema_files = {path.name for path in (PLUGIN_ROOT / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
         core_files = {path.name for path in (PLUGIN_ROOT / "core").iterdir() if path.is_file() and path.suffix == ".py"}
         script_files = {path.name for path in (PLUGIN_ROOT / "scripts").iterdir() if path.is_file() and path.suffix == ".py"}
+        hook_files = {path.name for path in (PLUGIN_ROOT / "hooks").iterdir() if path.is_file()}
 
         self.assertEqual(skill_dirs, set(REQUIRED_SKILLS))
         self.assertEqual(schema_files, set(REQUIRED_SCHEMAS))
         self.assertEqual(core_files, set(REQUIRED_CORE))
         self.assertEqual(script_files, set(REQUIRED_SCRIPTS))
+        self.assertEqual(hook_files, set(REQUIRED_HOOKS))
 
     def test_validate_structure_rejects_extra_schema_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -261,6 +263,25 @@ class FeatureFreezeTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected schema file", result.stdout)
+
+    def test_validate_structure_rejects_extra_hook_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            plugin_copy = temp_root / "plugins" / "codex-project-harness"
+            plugin_copy.parent.mkdir(parents=True)
+            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
+            (temp_root / "VERSION").write_text(EXPECTED_PLUGIN_VERSION + "\n", encoding="utf-8")
+            (plugin_copy / "hooks" / "unexpected.py").write_text("print('unexpected')\n", encoding="utf-8")
+
+            result = subprocess.run(
+                ["python3", str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected hook file", result.stdout)
 
 
 def _cli_surface(parser: argparse.ArgumentParser) -> set[str]:

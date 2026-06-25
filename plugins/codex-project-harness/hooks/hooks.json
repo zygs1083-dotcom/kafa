@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PROJECT_HARNESS_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)/plugins/codex-project-harness}/hooks/harness_hook.py\" SessionStart",
+            "timeout": 30,
+            "statusMessage": "Loading harness project status"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PROJECT_HARNESS_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)/plugins/codex-project-harness}/hooks/harness_hook.py\" SubagentStart",
+            "timeout": 30,
+            "statusMessage": "Loading harness subagent boundaries"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PROJECT_HARNESS_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)/plugins/codex-project-harness}/hooks/harness_hook.py\" PreToolUse",
+            "timeout": 30,
+            "statusMessage": "Checking harness write guardrails"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PROJECT_HARNESS_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)/plugins/codex-project-harness}/hooks/harness_hook.py\" PostToolUse",
+            "timeout": 30,
+            "statusMessage": "Summarizing harness change state"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_PROJECT_HARNESS_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)/plugins/codex-project-harness}/hooks/harness_hook.py\" Stop",
+            "timeout": 60,
+            "statusMessage": "Checking harness readiness"
+          }
+        ]
+      }
+    ]
+  }
+}

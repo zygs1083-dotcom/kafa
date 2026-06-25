@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.11.0-beta.1 - 2026-06-25
+
+### Added
+
+- Plugin-bundled Codex lifecycle hooks for `SessionStart`, `SubagentStart`, `PreToolUse`, `PostToolUse`, and `Stop`.
+- A standard-library hook dispatcher that injects read-only harness status, subagent boundaries, write guardrail warnings, change summaries, and readiness checks.
+- Feature-freeze validation for the new hook bundle so extra hook files fail structure checks.
+
+### Changed
+
+- Runtime implementation version is now `4.4.0`; runtime schema remains `22`.
+- Hook strictness is opt-in with `HARNESS_HOOK_STRICT=1`; delivery readiness checks run only when `HARNESS_HOOK_DELIVERY=1`.
+
+### Boundaries
+
+- Hooks are advisory lifecycle guardrails, not trusted delivery evidence or security boundaries.
+- Controller verification, integration hardening, HMAC/session attestation, and delivery gates remain the authoritative enforcement layer.
+
 ## v1.10.0-beta.1 - 2026-06-25
 
 ### Added

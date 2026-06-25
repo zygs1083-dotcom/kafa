@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.3.0
+# Codex OS Runtime Layer v4.4.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.3.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, and real connector adapter execution for external workflow synchronization. The repository release remains a beta release, while the runtime implementation version is `4.3.0` and the database schema version is `22`.
+Kernel v4.4.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, and Codex lifecycle hook guardrails for status injection and readiness checks. The repository release remains a beta release, while the runtime implementation version is `4.4.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.3.0
+## Kernel v4.4.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -33,6 +33,20 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `projections.py` is the only Markdown projection writer.
 
 SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
+
+## Codex Lifecycle Hooks
+
+The plugin bundles Codex command hooks at `plugins/codex-project-harness/hooks/hooks.json`. Codex discovers plugin-bundled hooks after the plugin is enabled, and non-managed hooks must be reviewed and trusted with `/hooks` before they run. Hooks can be disabled globally with `[features] hooks = false`.
+
+The harness hooks are advisory lifecycle guardrails:
+
+- `SessionStart` prints read-only project status and dispatch summary.
+- `SubagentStart` reminds worker sessions of role, task, acceptance, claim, and evidence boundaries.
+- `PreToolUse` warns before broad writes when scope is not confirmed, no active task exists, or the worktree is already dirty.
+- `PostToolUse` summarizes git status and reminds the agent to record validation/evidence through trusted runtime commands.
+- `Stop` runs `validate`, or `validate --delivery` when `HARNESS_HOOK_DELIVERY=1`.
+
+Set `CODEX_PROJECT_HARNESS_PLUGIN_ROOT` when the plugin is installed outside the source-tree default `plugins/codex-project-harness`. Hooks are warn-only by default. `HARNESS_HOOK_STRICT=1` makes clear hook guardrail failures return nonzero, but these hooks still do not create delivery evidence and do not replace Kernel/DB constraints, controller verification, integration hardening, HMAC/session attestation, or CI.
 
 ## Task Lease Fencing
 
@@ -107,7 +121,7 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.10 implements real connector adapter execution through the existing adapter surface without expanding schema or CLI.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extends the freeze baseline with the plugin hook bundle only; schema, CLI, core, runtime scripts, Skills, and runtime states remain frozen.
 
 ## Session Attestation And Independent QA
 
@@ -547,7 +561,7 @@ Runtime behavior is covered by:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
-python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py
+python3 -m py_compile plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
 python3 plugins/codex-project-harness/scripts/run_forward_eval.py
