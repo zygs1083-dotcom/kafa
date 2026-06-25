@@ -4,6 +4,25 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.10.0-beta.1 - 2026-06-25
+
+### Added
+
+- Real connector adapter execution through the existing `adapter confirm` surface when `payload_json.execute` is `true`.
+- GitHub connector execution via `gh api` for issue creation, issue comments, pull requests, and probe checks.
+- Linear, Notion, Figma, and Slack connector execution via standard-library HTTP clients with token environment variables.
+- Stable idempotency markers are appended to external write bodies so completed external artifacts can be reconciled to local adapter actions.
+
+### Changed
+
+- Runtime implementation version is now `4.3.0`; runtime schema remains `22`.
+- Adapter connector writes fail closed when credentials, operations, modes, payload fields, or external responses are invalid.
+
+### Boundaries
+
+- No new CLI commands, DB tables, schema files, runtime states, or core files are introduced.
+- External connector results remain workflow synchronization records; they do not satisfy delivery gates or high-risk trust anchors without existing HMAC/CI/session evidence.
+
 ## v1.9.0-beta.1 - 2026-06-25
 
 ### Added

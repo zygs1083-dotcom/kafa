@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.2.0
+# Codex OS Runtime Layer v4.3.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.2.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, and a real Codex Host Bridge over App Server stdio. The repository release remains a beta release, while the runtime implementation version is `4.2.0` and the database schema version is `22`.
+Kernel v4.3.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, and real connector adapter execution for external workflow synchronization. The repository release remains a beta release, while the runtime implementation version is `4.3.0` and the database schema version is `22`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.2.0
+## Kernel v4.3.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -107,7 +107,7 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.9 implements the existing `host-codex` provider surface without expanding schema or CLI.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.10 implements real connector adapter execution through the existing adapter surface without expanding schema or CLI.
 
 ## Session Attestation And Independent QA
 
@@ -511,14 +511,17 @@ write-auto
 Adapter actions model external work before and after the Codex host or connector performs it:
 
 ```bash
-harness.py --root . adapter plan --tool github --mode write-confirm --artifact "Issue R1" --action "create issue"
+harness.py --root . adapter plan --tool github --mode write-confirm --artifact "Issue R1" --action "create issue" \
+  --payload-json '{"execute":true,"operation":"github.issue.create","params":{"repo":"owner/repo","title":"R1","body":"Requirement body"}}'
 harness.py --root . adapter draft --id <action-id>
 harness.py --root . adapter confirm --id <action-id>
 harness.py --root . adapter complete --id <action-id> --external-id GH-1 --external-link https://example.invalid/GH-1
 harness.py --root . adapter reconcile
 ```
 
-External tools remain adapters. Local SQLite state is still sufficient for code delivery. The runtime does not import GitHub/Linear/Notion/Figma/Slack SDKs or perform direct external writes.
+When `payload_json.execute` is `true`, `adapter confirm` can execute a real connector action. GitHub uses `gh api`; Linear uses `LINEAR_API_KEY`; Notion uses `NOTION_TOKEN`; Figma uses `FIGMA_TOKEN`; Slack uses `SLACK_BOT_TOKEN`. Connector tokens are read from the environment only and are not written to SQLite, events, Markdown, or logs.
+
+External tools remain adapters. Local SQLite state is still sufficient for code delivery. Connector results are workflow synchronization records, not trusted delivery evidence.
 
 ## Delivery
 
