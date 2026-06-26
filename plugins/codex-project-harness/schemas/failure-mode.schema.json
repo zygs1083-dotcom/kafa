@@ -5,6 +5,7 @@
   "required": ["id", "feature", "scenario", "trigger", "expected_behavior", "risk", "status"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "feature": { "type": "string" },
     "scenario": { "type": "string" },
     "trigger": { "type": "string" },

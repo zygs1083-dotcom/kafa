@@ -28,7 +28,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from harness_lib import ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
+from harness_lib import content_source_tree_hash, ensure_parent, git_base_commit, git_dirty, git_head_sha, git_source_tree_hash, git_tracked_diff_hash, markdown_row, now_iso, source_tree_hash_for_mode
 from core.connector_trust import (
     ConnectorTrustError,
     agent_session_payload,
@@ -42,8 +42,10 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 24
-RUNTIME_VERSION = "4.11.0"
+SCHEMA_VERSION = 25
+RUNTIME_VERSION = "4.12.0"
+DEFAULT_CYCLE_ID = "CYCLE-current"
+LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -83,6 +85,8 @@ PHASE_TRANSITIONS = {
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
 CONNECTOR_STATUSES = {"available", "degraded", "blocked"}
 ADVISORY_FALLBACK_STATUSES = {"generated", "superseded", "stale"}
+DELIVERY_CYCLE_STATUSES = {"active", "delivered", "archived"}
+VALIDATION_STATUSES = {"active", "superseded", "invalidated"}
 DISPATCH_STATUSES = {"planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"}
 SESSION_ROLES = {"developer", "qa-reviewer", "reviewer", "architect", "product", "security"}
 REVIEWER_SESSION_ROLES = {"qa-reviewer", "reviewer", "architect", "security"}
@@ -161,6 +165,7 @@ DUMB_COMMAND_PREFIXES = ["echo", "true", "false", "cat", "pwd", "ls", "printf"]
 
 SNAPSHOT_TABLES = [
     "project",
+    "delivery_cycles",
     "requirements",
     "acceptance",
     "requirement_acceptance",
@@ -373,14 +378,29 @@ def create_schema(conn: sqlite3.Connection) -> None:
             schema_version integer not null,
             runtime_version text not null,
             phase text not null,
+            current_cycle_id text not null default '',
             status text not null,
             scope_status text not null,
             current_owner text not null,
             revision integer not null,
             updated_at text not null
         );
+        create table if not exists delivery_cycles (
+            id text primary key,
+            name text not null,
+            goal text not null,
+            status text not null,
+            phase text not null,
+            base_ref text not null default '',
+            candidate_sha text not null default '',
+            started_at text not null,
+            closed_at text not null default '',
+            created_at text not null,
+            updated_at text not null
+        );
         create table if not exists acceptance (
             id text primary key,
+            cycle_id text not null default '',
             criterion text not null,
             priority text not null default '',
             tool_link text not null default '',
@@ -389,6 +409,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists requirements (
             id text primary key,
+            cycle_id text not null default '',
             kind text not null,
             body text not null,
             priority text not null default '',
@@ -399,6 +420,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists failure_modes (
             id text primary key,
+            cycle_id text not null default '',
             feature text not null,
             scenario text not null,
             trigger text not null,
@@ -435,6 +457,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists tasks (
             id text primary key,
+            cycle_id text not null default '',
             task text not null,
             owner text not null,
             status text not null,
@@ -496,6 +519,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists validations (
             id text primary key,
+            cycle_id text not null default '',
+            candidate_sha text not null default '',
+            validation_status text not null default 'active',
+            superseded_by text not null default '',
             surface text not null,
             acceptance_id text not null default '',
             commands text not null default '',
@@ -558,6 +585,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists quality_gates (
             id text primary key,
+            cycle_id text not null default '',
+            candidate_sha text not null default '',
             gate text not null,
             reviewed_commit text not null,
             evidence_commit text not null default '',
@@ -584,6 +613,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists deliveries (
             id text primary key,
+            cycle_id text not null default '',
+            candidate_sha text not null default '',
             scope text not null,
             acceptance text not null default '',
             changed_files text not null default '',
@@ -725,6 +756,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists invalidations (
             id text primary key,
+            cycle_id text not null default '',
             source_type text not null,
             source_id text not null,
             target_type text not null,
@@ -810,6 +842,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists dispatch_runs (
             id text primary key,
+            cycle_id text not null default '',
             scope text not null,
             status text not null,
             created_at text not null,
@@ -980,6 +1013,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_column(conn, "project", "current_cycle_id", "text not null default ''")
+    ensure_column(conn, "acceptance", "cycle_id", "text not null default ''")
+    ensure_column(conn, "requirements", "cycle_id", "text not null default ''")
+    ensure_column(conn, "failure_modes", "cycle_id", "text not null default ''")
+    ensure_column(conn, "tasks", "cycle_id", "text not null default ''")
+    ensure_column(conn, "invalidations", "cycle_id", "text not null default ''")
+    ensure_column(conn, "dispatch_runs", "cycle_id", "text not null default ''")
     ensure_column(conn, "failure_modes", "acceptance_scope", "text not null default ''")
     ensure_column(conn, "failure_modes", "accepted_revision", "integer")
     ensure_column(conn, "tasks", "submitted_by", "text not null default ''")
@@ -990,6 +1030,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "tasks", "lease_expires_at", "text")
     ensure_column(conn, "tasks", "fence", "integer not null default 0")
     ensure_column(conn, "quality_gates", "base_commit", "text not null default ''")
+    ensure_column(conn, "quality_gates", "cycle_id", "text not null default ''")
+    ensure_column(conn, "quality_gates", "candidate_sha", "text not null default ''")
     ensure_column(conn, "quality_gates", "head_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
@@ -997,6 +1039,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "reviewer_attestation_id", "text not null default ''")
     ensure_column(conn, "quality_gates", "review_trust_level", "text not null default 'local-only'")
     ensure_column(conn, "validations", "head_commit", "text not null default ''")
+    ensure_column(conn, "validations", "cycle_id", "text not null default ''")
+    ensure_column(conn, "validations", "candidate_sha", "text not null default ''")
+    ensure_column(conn, "validations", "validation_status", "text not null default 'active'")
+    ensure_column(conn, "validations", "superseded_by", "text not null default ''")
     ensure_column(conn, "validations", "source_tree_hash", "text not null default ''")
     ensure_column(conn, "validations", "attempt_id", "text not null default ''")
     ensure_column(conn, "validations", "tree_sha", "text not null default ''")
@@ -1049,6 +1095,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "evidence", "policy_status", "text not null default ''")
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
+    ensure_column(conn, "deliveries", "cycle_id", "text not null default ''")
+    ensure_column(conn, "deliveries", "candidate_sha", "text not null default ''")
     ensure_column(conn, "ci_verifications", "origin", "text not null default 'manual'")
     ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
     ensure_column(conn, "ci_verifications", "token_status", "text not null default 'unchecked'")
@@ -1160,18 +1208,77 @@ def ensure_default_executor_allowlist(conn: sqlite3.Connection) -> None:
         )
 
 
+def current_candidate_sha(root: Path) -> str:
+    return git_source_tree_hash(root) or content_source_tree_hash(root)
+
+
+def ensure_delivery_cycles(conn: sqlite3.Connection) -> None:
+    now = now_iso()
+    project = conn.execute("select * from project where id = 1").fetchone()
+    existing_cycle = conn.execute("select 1 from delivery_cycles limit 1").fetchone()
+    if not existing_cycle:
+        has_audit_rows = any(
+            conn.execute(f"select 1 from {table} limit 1").fetchone()
+            for table in [
+                "requirements",
+                "acceptance",
+                "tasks",
+                "failure_modes",
+                "validations",
+                "quality_gates",
+                "deliveries",
+                "invalidations",
+                "dispatch_runs",
+            ]
+        )
+        if has_audit_rows:
+            conn.execute(
+                """
+                insert into delivery_cycles
+                (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+                values (?, 'Legacy Audit Cycle', 'Imported schema 24 runtime records for audit only.', 'archived', 'archived', '', '', ?, ?, ?, ?)
+                """,
+                (LEGACY_CYCLE_ID, now, now, now, now),
+            )
+        conn.execute(
+            """
+            insert into delivery_cycles
+            (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+            values (?, 'Current Delivery Cycle', 'Current active delivery candidate.', 'active', 'intake', '', '', ?, '', ?, ?)
+            on conflict(id) do nothing
+            """,
+            (DEFAULT_CYCLE_ID, now, now, now),
+        )
+        legacy_target = LEGACY_CYCLE_ID if has_audit_rows else DEFAULT_CYCLE_ID
+        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations", "dispatch_runs"]:
+            conn.execute(f"update {table} set cycle_id = ? where cycle_id = ''", (legacy_target,))
+    if project:
+        current_cycle_id = project["current_cycle_id"] if "current_cycle_id" in project.keys() else ""
+        if not current_cycle_id or not conn.execute("select 1 from delivery_cycles where id = ?", (current_cycle_id,)).fetchone():
+            current_cycle_id = DEFAULT_CYCLE_ID
+            conn.execute(
+                "update project set current_cycle_id = ?, phase = coalesce(nullif(phase, ''), 'intake'), updated_at = ? where id = 1",
+                (DEFAULT_CYCLE_ID, now),
+            )
+        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations", "dispatch_runs"]:
+            conn.execute(f"update {table} set cycle_id = ? where cycle_id = ''", (current_cycle_id,))
+
+
 def initialize_project(conn: sqlite3.Connection) -> None:
     existing = conn.execute("select id from project where id = 1").fetchone()
     if existing:
+        ensure_delivery_cycles(conn)
         return
+    now = now_iso()
     conn.execute(
         """
         insert into project
-        (id, project_id, schema_version, runtime_version, phase, status, scope_status, current_owner, revision, updated_at)
-        values (1, ?, ?, ?, 'intake', 'draft', 'unconfirmed', 'project-manager', 1, ?)
+        (id, project_id, schema_version, runtime_version, phase, current_cycle_id, status, scope_status, current_owner, revision, updated_at)
+        values (1, ?, ?, ?, 'intake', ?, 'draft', 'unconfirmed', 'project-manager', 1, ?)
         """,
-        (str(uuid.uuid4()), SCHEMA_VERSION, RUNTIME_VERSION, now_iso()),
+        (str(uuid.uuid4()), SCHEMA_VERSION, RUNTIME_VERSION, DEFAULT_CYCLE_ID, now),
     )
+    ensure_delivery_cycles(conn)
 
 
 def emit_event(
@@ -1264,12 +1371,35 @@ def restore_snapshot(conn: sqlite3.Connection, snapshot: dict[str, Any]) -> None
 
 
 def baseline_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    cycle_id = current_cycle_id(conn)
     return {
-        "requirements": table_rows(conn, "requirements"),
-        "acceptance": table_rows(conn, "acceptance"),
-        "requirement_acceptance": table_rows(conn, "requirement_acceptance"),
-        "failure_modes": table_rows(conn, "failure_modes"),
-        "failure_mode_acceptance": table_rows(conn, "failure_mode_acceptance"),
+        "requirements": [row_snapshot(row) or {} for row in conn.execute("select * from requirements where cycle_id = ? order by id", (cycle_id,))],
+        "acceptance": [row_snapshot(row) or {} for row in conn.execute("select * from acceptance where cycle_id = ? order by id", (cycle_id,))],
+        "requirement_acceptance": [
+            row_snapshot(row) or {}
+            for row in conn.execute(
+                """
+                select ra.* from requirement_acceptance ra
+                join requirements r on r.id = ra.requirement_id
+                where r.cycle_id = ?
+                order by ra.requirement_id, ra.acceptance_id
+                """,
+                (cycle_id,),
+            )
+        ],
+        "failure_modes": [row_snapshot(row) or {} for row in conn.execute("select * from failure_modes where cycle_id = ? order by id", (cycle_id,))],
+        "failure_mode_acceptance": [
+            row_snapshot(row) or {}
+            for row in conn.execute(
+                """
+                select fma.* from failure_mode_acceptance fma
+                join failure_modes fm on fm.id = fma.failure_mode_id
+                where fm.cycle_id = ?
+                order by fma.failure_mode_id, fma.acceptance_id
+                """,
+                (cycle_id,),
+            )
+        ],
     }
 
 
@@ -1451,50 +1581,88 @@ def bump_project(conn: sqlite3.Connection, **updates: str) -> None:
 
 
 def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id: str, reason: str) -> None:
+    cycle_id = current_cycle_id(conn)
     targets: list[tuple[str, str]] = []
     if source_type == "acceptance":
-        targets.extend(("task", row["task_id"]) for row in conn.execute("select task_id from task_acceptance where acceptance_id = ?", (source_id,)))
-        targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ?", (source_id,)))
-        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates"))
+        targets.extend(
+            ("task", row["task_id"])
+            for row in conn.execute(
+                "select ta.task_id from task_acceptance ta join tasks t on t.id = ta.task_id where ta.acceptance_id = ? and t.cycle_id = ?",
+                (source_id, cycle_id),
+            )
+        )
+        targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ? and cycle_id = ?", (source_id, cycle_id)))
+        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates where cycle_id = ?", (cycle_id,)))
     elif source_type == "failure_mode":
-        targets.extend(("task", row["task_id"]) for row in conn.execute("select task_id from task_failure_modes where failure_mode_id = ?", (source_id,)))
+        targets.extend(
+            ("task", row["task_id"])
+            for row in conn.execute(
+                "select tfm.task_id from task_failure_modes tfm join tasks t on t.id = tfm.task_id where tfm.failure_mode_id = ? and t.cycle_id = ?",
+                (source_id, cycle_id),
+            )
+        )
         targets.extend(
             ("validation", row["validation_id"])
-            for row in conn.execute("select validation_id from validation_failure_modes where failure_mode_id = ?", (source_id,))
+            for row in conn.execute(
+                """
+                select vfm.validation_id from validation_failure_modes vfm
+                join validations v on v.id = vfm.validation_id
+                where vfm.failure_mode_id = ? and v.cycle_id = ?
+                """,
+                (source_id, cycle_id),
+            )
         )
-        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates"))
+        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates where cycle_id = ?", (cycle_id,)))
     elif source_type == "requirement":
         acceptance_ids = [
             row["acceptance_id"]
-            for row in conn.execute("select acceptance_id from requirement_acceptance where requirement_id = ?", (source_id,))
+            for row in conn.execute(
+                """
+                select ra.acceptance_id from requirement_acceptance ra
+                join acceptance a on a.id = ra.acceptance_id
+                where ra.requirement_id = ? and a.cycle_id = ?
+                """,
+                (source_id, cycle_id),
+            )
         ]
         for acceptance_id in acceptance_ids:
             targets.append(("acceptance", acceptance_id))
-            targets.extend(("task", row["task_id"]) for row in conn.execute("select task_id from task_acceptance where acceptance_id = ?", (acceptance_id,)))
-            targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ?", (acceptance_id,)))
-        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates"))
+            targets.extend(
+                ("task", row["task_id"])
+                for row in conn.execute(
+                    "select ta.task_id from task_acceptance ta join tasks t on t.id = ta.task_id where ta.acceptance_id = ? and t.cycle_id = ?",
+                    (acceptance_id, cycle_id),
+                )
+            )
+            targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ? and cycle_id = ?", (acceptance_id, cycle_id)))
+        targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates where cycle_id = ?", (cycle_id,)))
     for target_type, target_id in targets:
         exists = conn.execute(
             """
             select 1 from invalidations
-            where source_type = ? and source_id = ? and target_type = ? and target_id = ? and resolved_at is null
+            where cycle_id = ? and source_type = ? and source_id = ? and target_type = ? and target_id = ? and resolved_at is null
             """,
-            (source_type, source_id, target_type, target_id),
+            (cycle_id, source_type, source_id, target_type, target_id),
         ).fetchone()
         if exists:
             continue
         conn.execute(
             """
-            insert into invalidations (id, source_type, source_id, target_type, target_id, reason, created_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into invalidations (id, cycle_id, source_type, source_id, target_type, target_id, reason, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (str(uuid.uuid4()), source_type, source_id, target_type, target_id, reason, now_iso()),
+            (str(uuid.uuid4()), cycle_id, source_type, source_id, target_type, target_id, reason, now_iso()),
         )
 
 
 def resolve_invalidations(conn: sqlite3.Connection, *, source_type: str | None = None, source_id: str | None = None, target_type: str | None = None) -> None:
     clauses = ["resolved_at is null"]
     values: list[object] = []
+    try:
+        clauses.append("cycle_id = ?")
+        values.append(current_cycle_id(conn))
+    except HarnessError:
+        pass
     if source_type:
         clauses.append("source_type = ?")
         values.append(source_type)
@@ -1849,6 +2017,7 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
                 (1, SCHEMA_VERSION, now_iso()),
             )
+            ensure_delivery_cycles(conn)
             emit_event(conn, "markdown_v1_migrated", payload(to=SCHEMA_VERSION))
             require_full_invariants(conn, root, "migration")
     except Exception:
@@ -1911,9 +2080,80 @@ def project_row(conn: sqlite3.Connection) -> sqlite3.Row:
     return row
 
 
+def current_cycle_row(conn: sqlite3.Connection) -> sqlite3.Row:
+    project = project_row(conn)
+    cycle_id = project["current_cycle_id"]
+    if not cycle_id:
+        raise HarnessError("current delivery cycle is not configured")
+    cycle = conn.execute("select * from delivery_cycles where id = ?", (cycle_id,)).fetchone()
+    if not cycle:
+        raise HarnessError(f"current delivery cycle is missing: {cycle_id}")
+    return cycle
+
+
+def current_cycle_id(conn: sqlite3.Connection) -> str:
+    return current_cycle_row(conn)["id"]
+
+
+def cycle_status(root: Path) -> dict[str, Any]:
+    with connection(root) as conn:
+        cycle = current_cycle_row(conn)
+        return row_snapshot(cycle) or {}
+
+
+def cycle_start(root: Path, cycle_id: str, name: str, goal: str, *, base_ref: str = "") -> None:
+    if not cycle_id or not name or not goal:
+        raise HarnessError("cycle start requires id, name, and goal")
+    with transaction(root, touched=[("project", "1"), ("delivery_cycle", cycle_id)]) as conn:
+        current = current_cycle_row(conn)
+        if current["status"] not in {"delivered", "archived"}:
+            raise HarnessError(f"current cycle is not closed: {current['id']} status={current['status']}")
+        if conn.execute("select 1 from delivery_cycles where id = ?", (cycle_id,)).fetchone():
+            raise HarnessError(f"duplicate cycle id: {cycle_id}")
+        now = now_iso()
+        conn.execute(
+            """
+            insert into delivery_cycles
+            (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+            values (?, ?, ?, 'active', 'intake', ?, '', ?, '', ?, ?)
+            """,
+            (cycle_id, name, goal, base_ref, now, now, now),
+        )
+        bump_project(conn, current_cycle_id=cycle_id, phase="intake", status="draft")
+        emit_event(conn, "delivery_cycle_started", payload(id=cycle_id, name=name, base_ref=base_ref))
+    render_all(root)
+
+
+def cycle_close(root: Path, status: str) -> None:
+    if status not in {"delivered", "archived"}:
+        raise HarnessError("cycle close status must be delivered or archived")
+    with transaction(root, touched=[("project", "1")]) as conn:
+        cycle = current_cycle_row(conn)
+        if cycle["status"] != "active":
+            raise HarnessError(f"current cycle is already closed: {cycle['id']} status={cycle['status']}")
+        now = now_iso()
+        candidate_sha = cycle["candidate_sha"] or current_candidate_sha(root)
+        conn.execute(
+            """
+            update delivery_cycles
+            set status = ?, phase = case when ? = 'archived' then 'archived' else phase end,
+                candidate_sha = ?, closed_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (status, status, candidate_sha, now, now, cycle["id"]),
+        )
+        if status == "archived":
+            bump_project(conn, phase="archived", status="archived")
+        emit_event(conn, "delivery_cycle_closed", payload(id=cycle["id"], status=status))
+    render_all(root)
+
+
 def transition_phase(root: Path, phase: str, *, status: str | None = None, owner: str | None = None) -> None:
     with transaction(root, touched=[("project", "1")]) as conn:
         row = project_row(conn)
+        cycle = current_cycle_row(conn)
+        if cycle["status"] != "active" and phase != row["phase"]:
+            raise HarnessError(f"current cycle is not active: {cycle['id']} status={cycle['status']}")
         current = row["phase"]
         if phase not in PHASES:
             raise HarnessError(f"unknown phase: {phase}")
@@ -1932,6 +2172,7 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
         if owner:
             updates["current_owner"] = owner
         bump_project(conn, **updates)
+        conn.execute("update delivery_cycles set phase = ?, updated_at = ? where id = ?", (phase, now_iso(), cycle["id"]))
         after = project_row(conn)
         emit_audit_event(
             conn,
@@ -1950,9 +2191,10 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
 def phase_prerequisite_issues(conn: sqlite3.Connection, phase: str) -> list[str]:
     issues: list[str] = []
     project = project_row(conn)
-    requirement_count = conn.execute("select count(*) from requirements where status != 'cancelled'").fetchone()[0]
-    acceptance_count = conn.execute("select count(*) from acceptance").fetchone()[0]
-    task_count = conn.execute("select count(*) from tasks").fetchone()[0]
+    cycle_id = project["current_cycle_id"]
+    requirement_count = conn.execute("select count(*) from requirements where cycle_id = ? and status != 'cancelled'", (cycle_id,)).fetchone()[0]
+    acceptance_count = conn.execute("select count(*) from acceptance where cycle_id = ?", (cycle_id,)).fetchone()[0]
+    task_count = conn.execute("select count(*) from tasks where cycle_id = ?", (cycle_id,)).fetchone()[0]
     if phase in {"confirmation", "team_architecture", "planning"} and requirement_count == 0:
         issues.append(f"{phase} requires at least one requirement baseline record")
     if phase in {"confirmation", "team_architecture", "planning"} and acceptance_count == 0:
@@ -2043,15 +2285,17 @@ def baseline_diff(root: Path, from_id: str, to: str = "current") -> list[str]:
 def add_requirement(root: Path, requirement_id: str, kind: str, body: str, priority: str = "", status: str = "active", tool_link: str = "") -> None:
     guard_schema("validate_requirement", requirement_id, kind, body, status)
     with transaction(root, touched=[("requirement", requirement_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         existing = conn.execute("select * from requirements where id = ?", (requirement_id,)).fetchone()
         conn.execute(
             """
-            insert into requirements (id, kind, body, priority, status, tool_link, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into requirements (id, cycle_id, kind, body, priority, status, tool_link, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, body=excluded.body, priority=excluded.priority,
-              status=excluded.status, tool_link=excluded.tool_link, revision=requirements.revision+1, updated_at=excluded.updated_at
+              cycle_id=excluded.cycle_id, status=excluded.status, tool_link=excluded.tool_link,
+              revision=requirements.revision+1, updated_at=excluded.updated_at
             """,
-            (requirement_id, kind, body, priority, status, tool_link, now_iso()),
+            (requirement_id, cycle_id, kind, body, priority, status, tool_link, now_iso()),
         )
         if existing and (existing["kind"], existing["body"], existing["priority"], existing["status"], existing["tool_link"]) != (kind, body, priority, status, tool_link):
             invalidate_downstream(conn, "requirement", requirement_id, "requirement changed")
@@ -2072,15 +2316,16 @@ def add_requirement(root: Path, requirement_id: str, kind: str, body: str, prior
 def add_acceptance(root: Path, acceptance_id: str, criterion: str, priority: str = "", tool_link: str = "") -> None:
     guard_schema("validate_acceptance", acceptance_id, criterion)
     with transaction(root, touched=[("acceptance", acceptance_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         existing = conn.execute("select * from acceptance where id = ?", (acceptance_id,)).fetchone()
         conn.execute(
             """
-            insert into acceptance (id, criterion, priority, tool_link)
-            values (?, ?, ?, ?)
+            insert into acceptance (id, cycle_id, criterion, priority, tool_link)
+            values (?, ?, ?, ?, ?)
             on conflict(id) do update set criterion=excluded.criterion, priority=excluded.priority, tool_link=excluded.tool_link,
-                revision=acceptance.revision+1
+                cycle_id=excluded.cycle_id, revision=acceptance.revision+1
             """,
-            (acceptance_id, criterion, priority, tool_link),
+            (acceptance_id, cycle_id, criterion, priority, tool_link),
         )
         if existing and (existing["criterion"], existing["priority"], existing["tool_link"]) != (criterion, priority, tool_link):
             invalidate_downstream(conn, "acceptance", acceptance_id, "acceptance criterion changed")
@@ -2117,6 +2362,7 @@ def add_failure_mode(
 ) -> None:
     guard_schema("validate_failure_mode", fm_id, risk, status)
     with transaction(root, touched=[("failure_mode", fm_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         existing = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
         accepted_revision = None
         if status not in FAILURE_MODE_STATUSES:
@@ -2128,17 +2374,18 @@ def add_failure_mode(
         conn.execute(
             """
             insert into failure_modes
-            (id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status,
+            (id, cycle_id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status,
              accepted_by, acceptance_reason, acceptance_scope, accepted_revision, expires_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set feature=excluded.feature, scenario=excluded.scenario, trigger=excluded.trigger,
               expected_behavior=excluded.expected_behavior, recovery=excluded.recovery, data_safety=excluded.data_safety,
-              risk=excluded.risk, status=excluded.status, accepted_by=excluded.accepted_by,
+              cycle_id=excluded.cycle_id, risk=excluded.risk, status=excluded.status, accepted_by=excluded.accepted_by,
               acceptance_reason=excluded.acceptance_reason, acceptance_scope=excluded.acceptance_scope,
               accepted_revision=excluded.accepted_revision, expires_at=excluded.expires_at, revision=failure_modes.revision+1
             """,
             (
                 fm_id,
+                cycle_id,
                 feature,
                 scenario,
                 trigger,
@@ -2407,6 +2654,7 @@ def add_task(
 ) -> None:
     guard_schema("validate_task", task_id, task, status)
     with transaction(root, touched=[("task", task_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         if status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
         if status == "accepted":
@@ -2415,10 +2663,10 @@ def add_task(
             raise HarnessError(f"duplicate task id: {task_id}")
         conn.execute(
             """
-            insert into tasks (id, task, owner, status, evidence, tool_link, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into tasks (id, cycle_id, task, owner, status, evidence, tool_link, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, task, owner, status, evidence, tool_link, now_iso()),
+            (task_id, cycle_id, task, owner, status, evidence, tool_link, now_iso()),
         )
         conn.execute("delete from task_acceptance where task_id = ?", (task_id,))
         for acceptance_id in parse_ids(acceptance):
@@ -2946,6 +3194,8 @@ def record_validation(
         allow_unlisted_reason=allow_unlisted_reason,
     )
     with transaction(root, touched=[("validation", "")]) as conn:
+        cycle_id = current_cycle_id(conn)
+        candidate_sha = source_hash or current_candidate_sha(root)
         if target_id:
             test_target_command(conn, target_id)
         evidence_ids = parse_ids(evidence)
@@ -2974,15 +3224,17 @@ def record_validation(
         conn.execute(
             """
             insert into validations
-            (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
+            (id, cycle_id, candidate_sha, validation_status, superseded_by, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
              target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
              policy_reason, sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              findings, result, residual_risk, head_commit, source_tree_hash, tracked_diff_hash,
              project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 validation_id,
+                cycle_id,
+                candidate_sha,
                 surface,
                 acceptance,
                 commands,
@@ -3011,6 +3263,14 @@ def record_validation(
                 project_revision,
                 now_iso(),
             ),
+        )
+        conn.execute(
+            """
+            update validations
+            set validation_status = 'superseded', superseded_by = ?
+            where id != ? and cycle_id = ? and acceptance_id = ? and candidate_sha = ? and validation_status = 'active'
+            """,
+            (validation_id, validation_id, cycle_id, acceptance, candidate_sha),
         )
         if acceptance:
             resolve_invalidations(conn, source_type="acceptance", source_id=acceptance)
@@ -3229,6 +3489,8 @@ def record_gate(
     if result == "pass" and git_dirty(root):
         raise HarnessError("cannot record a passing quality gate with a dirty git worktree")
     with transaction(root) as conn:
+        cycle_id = current_cycle_id(conn)
+        candidate_sha = source_hash or current_candidate_sha(root)
         project_revision = int(project_row(conn)["revision"])
         review_trust_level = "local-only"
         if reviewer_session_id:
@@ -3255,13 +3517,15 @@ def record_gate(
         conn.execute(
             """
             insert into quality_gates
-            (id, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
+            (id, cycle_id, candidate_sha, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
              project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk,
              reviewer_session_id, reviewer_attestation_id, review_trust_level, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 gate_id,
+                cycle_id,
+                candidate_sha,
                 gate,
                 current_sha,
                 current_sha,
@@ -3320,21 +3584,27 @@ def record_delivery(
     guard_schema("validate_delivery", scope)
     with transaction(root) as conn:
         project = project_row(conn)
+        cycle = current_cycle_row(conn)
+        if cycle["status"] not in {"active", "delivered"}:
+            raise HarnessError(f"delivery record requires active current cycle, current={cycle['status']}")
         if project["phase"] not in {"delivery_readiness", "retrospective"}:
             raise HarnessError(f"delivery record requires phase delivery_readiness or retrospective, current={project['phase']}")
         issues = validate_delivery(conn, root)
         if issues:
             raise HarnessError("delivery record blocked: " + "; ".join(issues))
         delivery_id = str(uuid.uuid4())
+        candidate_sha = current_candidate_sha(root)
         conn.execute(
             """
             insert into deliveries
-            (id, scope, acceptance, changed_files, validation, qa, failure_mode_coverage, quality_gate,
+            (id, cycle_id, candidate_sha, scope, acceptance, changed_files, validation, qa, failure_mode_coverage, quality_gate,
              data_config_notes, collaboration_links, known_gaps, handoff, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 delivery_id,
+                cycle["id"],
+                candidate_sha,
                 scope,
                 acceptance,
                 changed_files,
@@ -3357,6 +3627,11 @@ def record_delivery(
                 (delivery_id, acceptance_id),
             )
         after = conn.execute("select * from deliveries where id = ?", (delivery_id,)).fetchone()
+        now = now_iso()
+        conn.execute(
+            "update delivery_cycles set status = 'delivered', candidate_sha = ?, closed_at = coalesce(nullif(closed_at, ''), ?), updated_at = ? where id = ?",
+            (candidate_sha, now, now, cycle["id"]),
+        )
         emit_audit_event(
             conn,
             "delivery_recorded",
@@ -4651,9 +4926,10 @@ def dispatch_plan(root: Path, scope: str) -> str:
 
     run_id = str(uuid.uuid4())
     with transaction(root) as conn:
+        cycle_id = current_cycle_id(conn)
         conn.execute(
-            "insert into dispatch_runs (id, scope, status, created_at, updated_at) values (?, ?, 'planned', ?, ?)",
-            (run_id, scope, now_iso(), now_iso()),
+            "insert into dispatch_runs (id, cycle_id, scope, status, created_at, updated_at) values (?, ?, ?, 'planned', ?, ?)",
+            (run_id, cycle_id, scope, now_iso(), now_iso()),
         )
         ready_ids = ready_queue(conn)
         for task_id in ready_ids:
@@ -6557,10 +6833,13 @@ def doctor(root: Path) -> list[str]:
 def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
     issues: list[str] = []
     enum_checks = [
+        ("delivery_cycles", "status", DELIVERY_CYCLE_STATUSES, "delivery cycle status"),
+        ("delivery_cycles", "phase", set(PHASES), "delivery cycle phase"),
         ("tasks", "status", TASK_STATUSES, "task status"),
         ("failure_modes", "risk", {"low", "medium", "high", "critical"}, "failure mode risk"),
         ("failure_modes", "status", FAILURE_MODE_STATUSES, "failure mode status"),
         ("validations", "result", {"pass", "fail", "blocked", "partial"}, "validation result"),
+        ("validations", "validation_status", VALIDATION_STATUSES, "validation status"),
         ("quality_gates", "reviewer_context", {"fresh", "same-context-degraded", "external"}, "quality gate reviewer context"),
         ("quality_gates", "result", {"pass", "fail", "conditional", "blocked"}, "quality gate result"),
         ("adapters", "mode", ADAPTER_MODES, "adapter mode"),
@@ -6685,13 +6964,14 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
 
     project = conn.execute(
         """
-        select status, phase, scope_status, current_owner, schema_version, runtime_version, project_id, revision, updated_at
+        select status, phase, current_cycle_id, scope_status, current_owner, schema_version, runtime_version, project_id, revision, updated_at
         from project where id = 1
         """
     ).fetchall()
 
     return [
         ("project-state.schema.json", "project", [row_snapshot(row) or {} for row in project]),
+        ("delivery-cycle.schema.json", "delivery_cycles", [row_snapshot(row) or {} for row in conn.execute("select * from delivery_cycles")]),
         ("acceptance.schema.json", "acceptance", [row_snapshot(row) or {} for row in conn.execute("select * from acceptance")]),
         ("requirement.schema.json", "requirements", [row_snapshot(row) or {} for row in conn.execute("select * from requirements")]),
         ("failure-mode.schema.json", "failure_modes", [row_snapshot(row) or {} for row in conn.execute("select * from failure_modes")]),
@@ -6743,8 +7023,9 @@ def schema_contract_issues(conn: sqlite3.Connection) -> list[str]:
 
 
 def trace_rows(conn: sqlite3.Connection, requirement_id: str | None = None) -> list[dict[str, str]]:
-    clauses = ["r.status != 'cancelled'"]
-    values: list[object] = []
+    cycle_id = current_cycle_id(conn)
+    clauses = ["r.status != 'cancelled'", "r.cycle_id = ?"]
+    values: list[object] = [cycle_id]
     if requirement_id:
         clauses.append("r.id = ?")
         values.append(requirement_id)
@@ -6756,17 +7037,19 @@ def trace_rows(conn: sqlite3.Connection, requirement_id: str | None = None) -> l
           r.body as requirement_body,
           ra.acceptance_id,
           a.criterion as acceptance_criterion,
-          group_concat(distinct ta.task_id) as task_ids,
+          group_concat(distinct t.id) as task_ids,
           group_concat(distinct v.id) as validation_ids,
           group_concat(distinct vfm.failure_mode_id) as failure_mode_ids,
-          group_concat(distinct da.delivery_id) as delivery_ids
+          group_concat(distinct d.id) as delivery_ids
         from requirements r
         left join requirement_acceptance ra on ra.requirement_id = r.id
         left join acceptance a on a.id = ra.acceptance_id
         left join task_acceptance ta on ta.acceptance_id = ra.acceptance_id
-        left join validations v on v.acceptance_id = ra.acceptance_id and v.result = 'pass'
+        left join tasks t on t.id = ta.task_id and t.cycle_id = r.cycle_id
+        left join validations v on v.acceptance_id = ra.acceptance_id and v.cycle_id = r.cycle_id and v.result = 'pass'
         left join validation_failure_modes vfm on vfm.validation_id = v.id
         left join delivery_acceptance da on da.acceptance_id = ra.acceptance_id
+        left join deliveries d on d.id = da.delivery_id and d.cycle_id = r.cycle_id
         where {' and '.join(clauses)}
         group by r.id, ra.acceptance_id
         order by r.id, ra.acceptance_id
@@ -6778,8 +7061,9 @@ def trace_rows(conn: sqlite3.Connection, requirement_id: str | None = None) -> l
 
 def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = None) -> list[str]:
     issues: list[str] = []
-    req_clause = "where status != 'cancelled'"
-    values: list[object] = []
+    cycle_id = current_cycle_id(conn)
+    req_clause = "where cycle_id = ? and status != 'cancelled'"
+    values: list[object] = [cycle_id]
     if requirement_id:
         req_clause += " and id = ?"
         values.append(requirement_id)
@@ -6798,16 +7082,16 @@ def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = N
                 """
                 select 1 from task_acceptance ta
                 join tasks t on t.id = ta.task_id
-                where ta.acceptance_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
+                where ta.acceptance_id = ? and t.cycle_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
                 limit 1
                 """,
-                (acceptance_id,),
+                (acceptance_id, cycle_id),
             ).fetchone()
             if not accepted_task:
                 issues.append(f"acceptance has no completed task in trace: {requirement['id']} -> {acceptance_id}")
             passing_validation = conn.execute(
-                "select 1 from validations where acceptance_id = ? and result = 'pass' limit 1",
-                (acceptance_id,),
+                "select 1 from validations where acceptance_id = ? and cycle_id = ? and validation_status = 'active' and result = 'pass' limit 1",
+                (acceptance_id, cycle_id),
             ).fetchone()
             if not passing_validation:
                 issues.append(f"acceptance has no passing validation in trace: {requirement['id']} -> {acceptance_id}")

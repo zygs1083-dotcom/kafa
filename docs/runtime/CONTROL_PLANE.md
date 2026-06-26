@@ -17,6 +17,7 @@ Codex Project Harness is an architecture control plane for verified code deliver
 
 - Skill, Hooks, Host Bridge, Connectors, and Evals must not produce delivery-eligible evidence directly.
 - Trusted evidence must bind to Kernel-controlled verification: parsed execution evidence, current code identity, target mapping, HMAC/session attestation where required, and integration/delivery gate checks.
+- Delivery Cycles are Kernel facts. Skills and hooks may prompt `cycle start/status/close`, but only Kernel schema 25 state determines which cycle and candidate are delivery-relevant.
 - Host Codex and native fan-out worker output always enters as `agent_reports` plus `task_attempts(status=reported)` before controller verification.
 - Connector writes are external workflow synchronization records. They can attach links but cannot satisfy high/critical delivery gates without existing connector(HMAC) trust anchors.
 - Evals are release gates for the harness itself. They do not prove an arbitrary project task is ready to deliver.
@@ -28,6 +29,7 @@ User intent
   -> Skill Entry
   -> Plugin-distributed runtime CLI
   -> Kernel task/requirement/scheduler state
+  -> Current Delivery Cycle and candidate identity
   -> Host Bridge or local runner produces raw attempt
   -> Kernel controller verification produces trusted evidence
   -> Integration gate verifies branch identity and file claims

@@ -5,6 +5,10 @@
   "required": ["id", "surface", "findings", "result", "created_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
+    "candidate_sha": { "type": "string" },
+    "validation_status": { "type": "string", "enum": ["active", "superseded", "invalidated"] },
+    "superseded_by": { "type": "string" },
     "surface": { "type": "string" },
     "acceptance_id": { "type": "string" },
     "commands": { "type": "string" },

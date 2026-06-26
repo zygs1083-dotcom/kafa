@@ -5,6 +5,7 @@
   "required": ["id", "criterion", "status"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "criterion": { "type": "string" },
     "priority": { "type": "string" },
     "tool_link": { "type": "string" },

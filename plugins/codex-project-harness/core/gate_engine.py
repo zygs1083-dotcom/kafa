@@ -6,7 +6,7 @@ import sqlite3
 import hashlib
 from pathlib import Path
 
-from harness_lib import content_source_tree_hash, git_dirty, git_head_sha, git_source_tree_hash
+from harness_lib import git_dirty, git_head_sha
 from .connector_trust import agent_session_payload, ci_payload, external_session_payload, verify_connector_record
 from .executor import command_matches_template
 
@@ -163,15 +163,32 @@ def validation_trusted_command_issues(
 
 
 def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[str]:
-    from harness_db import baseline_issues, is_expired, traceability_issues, validation_has_test_or_evidence
+    from harness_db import baseline_issues, current_candidate_sha, current_cycle_row, is_expired, traceability_issues, validation_has_test_or_evidence
 
     issues: list[str] = []
-    if conn.execute("select 1 from requirements where status != 'cancelled' limit 1").fetchone():
+    try:
+        cycle = current_cycle_row(conn)
+    except Exception as exc:
+        return [str(exc)]
+    cycle_id = cycle["id"]
+    if cycle["status"] not in {"active", "delivered"}:
+        issues.append(f"current cycle is not active or delivered: {cycle_id} status={cycle['status']}")
+
+    current_sha = git_head_sha(root)
+    current_source_hash = current_candidate_sha(root)
+
+    if conn.execute("select 1 from requirements where cycle_id = ? and status != 'cancelled' limit 1", (cycle_id,)).fetchone():
         issues.extend(traceability_issues(conn))
         issues.extend(baseline_issues(conn))
 
     stale_rows = conn.execute(
-        "select source_type, source_id, target_type, target_id, reason from invalidations where resolved_at is null order by created_at, id"
+        """
+        select source_type, source_id, target_type, target_id, reason
+        from invalidations
+        where cycle_id = ? and resolved_at is null
+        order by created_at, id
+        """,
+        (cycle_id,),
     ).fetchall()
     for stale in stale_rows:
         issues.append(
@@ -179,17 +196,21 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
         )
 
     active_tasks = conn.execute(
-        "select id, status from tasks where status not in ('accepted', 'cancelled', 'skipped') order by id"
+        "select id, status from tasks where cycle_id = ? and status not in ('accepted', 'cancelled', 'skipped') order by id",
+        (cycle_id,),
     ).fetchall()
     for task in active_tasks:
         issues.append(f"task is not accepted: {task['id']} status={task['status']}")
 
-    current_sha = git_head_sha(root)
-    if current_sha:
-        current_source_hash = git_source_tree_hash(root) or ""
-    else:
-        current_source_hash = content_source_tree_hash(root)
-    validations = conn.execute("select id, surface, result, source_tree_hash from validations order by created_at, id").fetchall()
+    validations = conn.execute(
+        """
+        select id, surface, result, source_tree_hash
+        from validations
+        where cycle_id = ? and candidate_sha = ? and validation_status = 'active'
+        order by created_at, id
+        """,
+        (cycle_id, current_source_hash),
+    ).fetchall()
     if not validations:
         issues.append("delivery requires validation evidence")
     has_content_identity = False
@@ -208,18 +229,19 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
     if not current_sha and not has_content_identity:
         issues.append("delivery requires a committed code identity")
 
-    active_acceptance = conn.execute("select id from acceptance where status != 'cancelled' order by id").fetchall()
+    active_acceptance = conn.execute("select id from acceptance where cycle_id = ? and status != 'cancelled' order by id", (cycle_id,)).fetchall()
     for acceptance in active_acceptance:
         candidates = conn.execute(
             """
             select * from validations
-            where acceptance_id = ? and result = 'pass'
+            where cycle_id = ? and candidate_sha = ? and validation_status = 'active'
+              and acceptance_id = ? and result = 'pass'
             order by created_at desc, id desc
             """,
-            (acceptance["id"],),
+            (cycle_id, current_source_hash, acceptance["id"]),
         ).fetchall()
         if not candidates:
-            issues.append(f"acceptance has no passing validation: {acceptance['id']}")
+            issues.append(f"acceptance has no passing validation for current candidate: {acceptance['id']}")
         else:
             candidate_issues: list[str] = []
             trusted = False
@@ -241,9 +263,10 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
     risky_failure_modes = conn.execute(
         """
         select id, risk, status, accepted_by, acceptance_reason, acceptance_scope, accepted_revision, expires_at from failure_modes
-        where risk in ('high', 'critical')
+        where cycle_id = ? and risk in ('high', 'critical')
         order by id
-        """
+        """,
+        (cycle_id,),
     ).fetchall()
     for failure_mode in risky_failure_modes:
         if failure_mode["status"] in {"accepted", "exempt"}:
@@ -256,10 +279,11 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             """
             select v.* from validation_failure_modes vfm
             join validations v on v.id = vfm.validation_id
-            where vfm.failure_mode_id = ? and v.result = 'pass'
+            where vfm.failure_mode_id = ? and v.cycle_id = ? and v.candidate_sha = ?
+              and v.validation_status = 'active' and v.result = 'pass'
             order by v.created_at desc, v.id desc
             """,
-            (failure_mode["id"],),
+            (failure_mode["id"], cycle_id, current_source_hash),
         ).fetchall()
         coverage_issues: list[str] = []
         covered_with_evidence = False
@@ -279,15 +303,22 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
                 f"{failure_mode['risk']} failure mode is not covered by passing validation with linked test/evidence: {failure_mode['id']} status={failure_mode['status']}{suffix}"
             )
 
-    latest_gate = conn.execute("select * from quality_gates order by created_at desc, id desc limit 1").fetchone()
+    latest_gate = conn.execute(
+        """
+        select * from quality_gates
+        where cycle_id = ? and candidate_sha = ?
+        order by created_at desc, id desc limit 1
+        """,
+        (cycle_id, current_source_hash),
+    ).fetchone()
     if not latest_gate:
-        issues.append("delivery requires a quality gate record")
+        issues.append("delivery requires a quality gate record for current candidate")
     else:
         if latest_gate["result"] != "pass":
             issues.append(f"latest quality gate is not pass: {latest_gate['gate']}={latest_gate['result']}")
         if latest_gate["blocking_findings"]:
             issues.append(f"latest quality gate has blocking findings: {latest_gate['blocking_findings']}")
-        high_risk_present = conn.execute("select 1 from failure_modes where risk in ('high', 'critical') limit 1").fetchone()
+        high_risk_present = conn.execute("select 1 from failure_modes where cycle_id = ? and risk in ('high', 'critical') limit 1", (cycle_id,)).fetchone()
         if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
             issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")
         if high_risk_present:

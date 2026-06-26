@@ -14,6 +14,12 @@ This creates the repo-scoped Codex marketplace entry at `.agents/plugins/marketp
 
 `kafa doctor --repo .` also verifies the control-plane contract so installation does not drift from the Skill/Plugin/Hooks/Host/Kernel/Connector/Eval boundary model.
 
+For long-running projects, check the current Delivery Cycle before recording new delivery evidence:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
+```
+
 For user-scope installation:
 
 ```bash

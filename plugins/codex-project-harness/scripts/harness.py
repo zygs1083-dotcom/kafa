@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -32,6 +33,9 @@ from core.api import (
     confirm_scope,
     connection,
     create_checkpoint,
+    cycle_close,
+    cycle_start,
+    cycle_status,
     dispatch_claim_next,
     dispatch_file_claim_add,
     dispatch_file_claim_list,
@@ -110,6 +114,19 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--dry-run", action="store_true")
     sub.add_parser("status")
     sub.add_parser("doctor")
+
+    cycle = sub.add_parser("cycle")
+    cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
+    cycle_start_parser = cycle_sub.add_parser("start")
+    cycle_start_parser.add_argument("--id", required=True)
+    cycle_start_parser.add_argument("--name", required=True)
+    cycle_start_parser.add_argument("--goal", required=True)
+    cycle_start_parser.add_argument("--base-ref", default="")
+    cycle_status_parser = cycle_sub.add_parser("status")
+    cycle_status_parser.add_argument("--json", action="store_true")
+    cycle_close_parser = cycle_sub.add_parser("close")
+    cycle_close_parser.add_argument("--status", required=True, choices=["delivered", "archived"])
+
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--delivery", action="store_true")
     repair_parser = sub.add_parser("repair")
@@ -661,6 +678,22 @@ def main() -> int:
                     print(f"ERROR: {issue}")
                 return 1
             print("OK: harness doctor passed")
+        elif args.command == "cycle" and args.cycle_command == "start":
+            mutate(
+                "cycle.start",
+                lambda: (
+                    cycle_start(root, args.id, args.name, args.goal, base_ref=args.base_ref),
+                    f"OK: cycle started {args.id}",
+                )[1],
+            )
+        elif args.command == "cycle" and args.cycle_command == "status":
+            row = cycle_status(root)
+            if args.json:
+                print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"cycle={row['id']} status={row['status']} phase={row['phase']} candidate={row.get('candidate_sha', '')}")
+        elif args.command == "cycle" and args.cycle_command == "close":
+            mutate("cycle.close", lambda: (cycle_close(root, args.status), f"OK: cycle closed {args.status}")[1])
         elif args.command == "validate":
             issues = validate_runtime(root, delivery=args.delivery)
             if issues:

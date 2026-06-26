@@ -5,6 +5,8 @@
   "required": ["id", "scope", "created_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
+    "candidate_sha": { "type": "string" },
     "scope": { "type": "string" },
     "acceptance": { "type": "string" },
     "changed_files": { "type": "string" },
