@@ -39,16 +39,39 @@ from core.connector_trust import (
     prepare_connector_record,
     verify_connector_record,
 )
-from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXTERNAL_SESSION_CONCLUSIONS, FAILURE_MODE_STATUSES, TASK_STATUSES, TEST_TARGET_KINDS
+from core.schema_guard import (
+    ADAPTER_MODES,
+    ANCHOR_ORIGINS,
+    CI_CONCLUSIONS,
+    EXECUTED_COUNT_SOURCES,
+    EXTERNAL_SESSION_CONCLUSIONS,
+    FAILURE_MODE_STATUSES,
+    RESULT_FORMATS,
+    SANDBOX_PROFILES,
+    SANDBOX_STATUSES,
+    SEMANTIC_STATUSES,
+    STACK_PROFILES,
+    TASK_STATUSES,
+    TEST_TARGET_KINDS,
+)
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 26
-RUNTIME_VERSION = "4.13.0"
+SCHEMA_VERSION = 27
+RUNTIME_VERSION = "4.14.0"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
+STACK_PROFILE_IMAGES = {
+    "python": DEFAULT_CONTAINER_IMAGE,
+    "node": "node:22-bookworm-slim",
+    "go": "golang:1.23-bookworm",
+    "rust": "rust:1.83-bookworm",
+    "java": "eclipse-temurin:21-jdk",
+    "browser-e2e": "mcr.microsoft.com/playwright:v1.49.0-noble",
+    "data-integration": DEFAULT_CONTAINER_IMAGE,
+}
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
     ".ai-team/backups/",
@@ -535,6 +558,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             target_id text not null default '',
             executed_count integer not null default 0,
             executed_count_source text not null default '',
+            result_format text not null default 'regex',
+            result_path text not null default '',
+            semantic_status text not null default '',
             allow_unlisted integer not null default 0,
             no_network integer not null default 0,
             sandbox_profile text not null default 'none',
@@ -582,6 +608,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             description text not null default '',
             gateable integer not null default 1,
             gate_block_reason text not null default '',
+            stack_profile text not null default 'python',
+            container_image text not null default '',
+            requires_sandbox integer not null default 0,
+            requires_no_network integer not null default 0,
+            result_format text not null default 'regex',
+            result_path text not null default '',
             created_at text not null,
             updated_at text not null
         );
@@ -649,6 +681,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             target_id text not null default '',
             executed_count integer not null default 0,
             executed_count_source text not null default '',
+            result_format text not null default 'regex',
+            result_path text not null default '',
+            semantic_status text not null default '',
             allow_unlisted integer not null default 0,
             no_network integer not null default 0,
             sandbox_profile text not null default 'none',
@@ -1064,6 +1099,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "target_id", "text not null default ''")
     ensure_column(conn, "validations", "executed_count", "integer not null default 0")
     ensure_column(conn, "validations", "executed_count_source", "text not null default ''")
+    ensure_column(conn, "validations", "result_format", "text not null default 'regex'")
+    ensure_column(conn, "validations", "result_path", "text not null default ''")
+    ensure_column(conn, "validations", "semantic_status", "text not null default ''")
     ensure_column(conn, "validations", "allow_unlisted", "integer not null default 0")
     ensure_column(conn, "validations", "no_network", "integer not null default 0")
     ensure_column(conn, "validations", "sandbox_profile", "text not null default 'none'")
@@ -1078,6 +1116,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "policy_reason", "text not null default ''")
     ensure_column(conn, "test_targets", "gateable", "integer not null default 1")
     ensure_column(conn, "test_targets", "gate_block_reason", "text not null default ''")
+    ensure_column(conn, "test_targets", "stack_profile", "text not null default 'python'")
+    ensure_column(conn, "test_targets", "container_image", "text not null default ''")
+    ensure_column(conn, "test_targets", "requires_sandbox", "integer not null default 0")
+    ensure_column(conn, "test_targets", "requires_no_network", "integer not null default 0")
+    ensure_column(conn, "test_targets", "result_format", "text not null default 'regex'")
+    ensure_column(conn, "test_targets", "result_path", "text not null default ''")
     ensure_column(conn, "evidence", "command", "text not null default ''")
     ensure_column(conn, "evidence", "exit_code", "integer")
     ensure_column(conn, "evidence", "stdout_sha256", "text not null default ''")
@@ -1090,6 +1134,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "target_id", "text not null default ''")
     ensure_column(conn, "evidence", "executed_count", "integer not null default 0")
     ensure_column(conn, "evidence", "executed_count_source", "text not null default ''")
+    ensure_column(conn, "evidence", "result_format", "text not null default 'regex'")
+    ensure_column(conn, "evidence", "result_path", "text not null default ''")
+    ensure_column(conn, "evidence", "semantic_status", "text not null default ''")
     ensure_column(conn, "evidence", "allow_unlisted", "integer not null default 0")
     ensure_column(conn, "evidence", "no_network", "integer not null default 0")
     ensure_column(conn, "evidence", "sandbox_profile", "text not null default 'none'")
@@ -3084,21 +3131,66 @@ def record_decision(root: Path, decision: str, reason: str) -> None:
     render_all(root)
 
 
-def add_test_target(root: Path, target_id: str, kind: str, command_template: str, description: str = "") -> None:
-    guard_schema("validate_test_target", target_id, kind, command_template)
+def add_test_target(
+    root: Path,
+    target_id: str,
+    kind: str,
+    command_template: str,
+    description: str = "",
+    *,
+    stack_profile: str = "python",
+    container_image: str = "",
+    requires_sandbox: bool = False,
+    requires_no_network: bool = False,
+    result_format: str = "regex",
+    result_path: str = "",
+) -> None:
+    guard_schema("validate_test_target", target_id, kind, command_template, stack_profile, result_format)
     gateable, gate_block_reason = target_gateability(kind, command_template)
     with transaction(root, touched=[("test_target", target_id)]) as conn:
         conn.execute(
             """
-            insert into test_targets (id, kind, command_template, description, gateable, gate_block_reason, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            insert into test_targets
+            (id, kind, command_template, description, gateable, gate_block_reason, stack_profile, container_image,
+             requires_sandbox, requires_no_network, result_format, result_path, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set kind=excluded.kind, command_template=excluded.command_template,
               description=excluded.description, gateable=excluded.gateable, gate_block_reason=excluded.gate_block_reason,
+              stack_profile=excluded.stack_profile, container_image=excluded.container_image,
+              requires_sandbox=excluded.requires_sandbox, requires_no_network=excluded.requires_no_network,
+              result_format=excluded.result_format, result_path=excluded.result_path,
               updated_at=excluded.updated_at
             """,
-            (target_id, kind, command_template, description, gateable, gate_block_reason, now_iso(), now_iso()),
+            (
+                target_id,
+                kind,
+                command_template,
+                description,
+                gateable,
+                gate_block_reason,
+                stack_profile,
+                container_image,
+                bool_int(requires_sandbox),
+                bool_int(requires_no_network),
+                result_format,
+                result_path,
+                now_iso(),
+                now_iso(),
+            ),
         )
-        emit_event(conn, "test_target_recorded", payload(id=target_id, kind=kind, gateable=gateable))
+        emit_event(
+            conn,
+            "test_target_recorded",
+            payload(
+                id=target_id,
+                kind=kind,
+                gateable=gateable,
+                stack_profile=stack_profile,
+                requires_sandbox=bool(requires_sandbox),
+                requires_no_network=bool(requires_no_network),
+                result_format=result_format,
+            ),
+        )
     render_all(root)
 
 
@@ -3126,10 +3218,59 @@ def task_target(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def refresh_dispatch_run_status(conn: sqlite3.Connection, run_id: str) -> str:
+    rows = conn.execute("select status from dispatch_assignments where run_id = ?", (run_id,)).fetchall()
+    statuses = [str(row["status"]) for row in rows]
+    if not statuses:
+        aggregate = "planned"
+    elif "verification_failed" in statuses:
+        aggregate = "verification_failed"
+    elif "integration_conflict" in statuses:
+        aggregate = "integration_conflict"
+    elif "failed" in statuses:
+        aggregate = "failed"
+    elif all(status == "integrated" for status in statuses):
+        aggregate = "integrated"
+    elif all(status in {"completed", "integrated"} for status in statuses):
+        aggregate = "completed"
+    elif any(status == "reported" for status in statuses):
+        aggregate = "reported"
+    elif any(status in {"claimed", "spawning", "running", "stale"} for status in statuses):
+        aggregate = "claimed"
+    else:
+        aggregate = "planned"
+    conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (aggregate, now_iso(), run_id))
+    return aggregate
+
+
 def list_test_targets(root: Path) -> list[str]:
     with connection(root) as conn:
-        rows = conn.execute("select id, kind, command_template, description, gateable, gate_block_reason from test_targets order by id").fetchall()
-    return [markdown_row([row["id"], row["kind"], row["command_template"], row["description"], str(row["gateable"]), row["gate_block_reason"]]) for row in rows]
+        rows = conn.execute(
+            """
+            select id, kind, command_template, description, gateable, gate_block_reason, stack_profile,
+                   container_image, requires_sandbox, requires_no_network, result_format, result_path
+            from test_targets order by id
+            """
+        ).fetchall()
+    return [
+        markdown_row(
+            [
+                row["id"],
+                row["kind"],
+                row["command_template"],
+                row["description"],
+                str(row["gateable"]),
+                row["gate_block_reason"],
+                row["stack_profile"],
+                row["container_image"],
+                str(row["requires_sandbox"]),
+                str(row["requires_no_network"]),
+                row["result_format"],
+                row["result_path"],
+            ]
+        )
+        for row in rows
+    ]
 
 
 def add_executor_prefix(root: Path, prefix: str, reason: str) -> None:
@@ -5463,7 +5604,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
             emit_event(conn, "agent_provider_session_spawning", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, provider_session_id=provider_session_id))
             pending.append(request)
         if pending:
-            conn.execute("update dispatch_runs set status = 'claimed', updated_at = ? where id = ?", (now_iso(), run_id))
+            refresh_dispatch_run_status(conn, run_id)
     started = 0
     for request in pending:
         spawn_request = request
@@ -5874,8 +6015,13 @@ def dispatch_run(
         dispatch_file_claim_add(root, task_id, agent, claim_file, run_id=run_id, worktree_path=worktree_path, branch_name=branch_name)
 
     with connection(root) as conn:
-        target_command = test_target_command(conn, target_id) if target_id else ""
+        target = conn.execute("select * from test_targets where id = ?", (target_id,)).fetchone() if target_id else None
+        if target_id and not target:
+            raise HarnessError(f"missing test target: {target_id}")
+        target_command = target["command_template"] if target else ""
         prefixes = executor_prefixes(conn)
+    result_format = str(target["result_format"] or "regex") if target else "regex"
+    result_path = str(target["result_path"] or "") if target else ""
 
     runner_result = runner_for(runner).run(RunnerRequest(
         root=root,
@@ -5890,6 +6036,8 @@ def dispatch_run(
         sandbox_profile="no-network" if no_network else sandbox_profile,
         allow_unlisted_reason=allow_unlisted_reason,
         executed_count=executed_count,
+        result_format=result_format,
+        result_path=result_path,
     ))
     result = runner_result.evidence
     normalized_claims = [normalize_claim_path(path) for path in (claim_files or [])]
@@ -5900,7 +6048,7 @@ def dispatch_run(
             if run_id:
                 with transaction(root, touched=[("dispatch_assignment", task_id)]) as conn:
                     conn.execute("update dispatch_assignments set status = 'failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
-                    conn.execute("update dispatch_runs set status = 'failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                    refresh_dispatch_run_status(conn, run_id)
                     emit_event(conn, "dispatch_command_failed", payload(run_id=run_id, task_id=task_id, agent=agent, reason="file-claim-violation"))
             raise
     if runner == "local-process":
@@ -5920,11 +6068,12 @@ def dispatch_run(
             """
             insert into evidence
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
-             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             target_id, executed_count, executed_count_source, result_format, result_path, semantic_status,
+             allow_unlisted, no_network, policy_status, policy_reason,
              sandbox_profile, sandbox_status, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              attempt_id, tree_sha, code_ref, verified_by,
              created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-only', '', ?, ?, ?, 'controller-local', ?)
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-only', '', ?, ?, ?, 'controller-local', ?)
             """,
             (
                 evidence_id,
@@ -5939,6 +6088,9 @@ def dispatch_run(
                 result.target_id,
                 result.executed_count,
                 result.executed_count_source,
+                result.result_format,
+                result_path,
+                result.semantic_status,
                 bool_int(result.allow_unlisted),
                 bool_int(result.no_network),
                 result.policy_status,
@@ -5961,7 +6113,7 @@ def dispatch_run(
                 """,
                 (status, evidence_id, now_iso(), run_id, task_id),
             )
-            conn.execute("update dispatch_runs set status = ?, updated_at = ? where id = ?", (status, now_iso(), run_id))
+            refresh_dispatch_run_status(conn, run_id)
             if result.exit_code == 0:
                 task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
                 if task and task["status"] in {"ready", "claimed", "in_progress"}:
@@ -6091,8 +6243,8 @@ def fail_integration_precheck(root: Path, run_id: str, attempt_id: str, status: 
     with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
         finding_id = record_integration_finding(conn, run_id, message)
         finish_integration_attempt(conn, attempt_id, status, validation_result=message, finding_id=finding_id)
-        conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
         conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
+        refresh_dispatch_run_status(conn, run_id)
         emit_event(conn, "dispatch_integration_precheck_failed", payload(run_id=run_id, status=status, message=message[:500]))
 
 
@@ -6177,8 +6329,8 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
                 with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
                     finding_id = record_integration_finding(conn, run_id, summary)
                     finish_integration_attempt(conn, integration_attempt_id, "integration_conflict", merged_branches=[r["branch_name"] for r in rows], validation_result=summary, finding_id=finding_id)
-                    conn.execute("update dispatch_runs set status = 'integration_conflict', updated_at = ? where id = ?", (now_iso(), run_id))
                     conn.execute("update dispatch_assignments set status = 'integration_conflict', updated_at = ? where run_id = ?", (now_iso(), run_id))
+                    refresh_dispatch_run_status(conn, run_id)
                     emit_event(conn, "dispatch_integration_conflict", payload(run_id=run_id, branch=row["branch_name"]))
                 raise HarnessError(f"integration conflict: {row['task_id']}")
         issues = validate_runtime(integration_worktree, delivery=True)
@@ -6188,14 +6340,14 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
             with transaction(root, touched=[("dispatch_run", run_id), ("finding", run_id)]) as conn:
                 finding_id = record_integration_finding(conn, run_id, f"delivery validation failed after integration: {summary}")
                 finish_integration_attempt(conn, integration_attempt_id, "verification_failed", merged_branches=[r["branch_name"] for r in rows], validation_result=summary, finding_id=finding_id)
-                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ?", (now_iso(), run_id))
+                refresh_dispatch_run_status(conn, run_id)
                 emit_event(conn, "dispatch_integration_verification_failed", payload(run_id=run_id, issues=issue_text[:10]))
             raise HarnessError(f"integration verification failed: {summary}")
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
             finish_integration_attempt(conn, integration_attempt_id, "integrated", merged_branches=[r["branch_name"] for r in rows], validation_result="pass")
-            conn.execute("update dispatch_runs set status = 'integrated', updated_at = ? where id = ?", (now_iso(), run_id))
             conn.execute("update dispatch_assignments set status = 'integrated', updated_at = ? where run_id = ?", (now_iso(), run_id))
+            refresh_dispatch_run_status(conn, run_id)
             for row in rows:
                 if row["worktree_path"]:
                     worktree = root / row["worktree_path"]
@@ -6214,15 +6366,22 @@ def resolve_runtime_path(root: Path, value: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
-def resolve_container_image(root: Path, container_image: str = "") -> str:
+def resolve_container_image(root: Path, container_image: str = "", *, target_id: str = "", stack_profile: str = "python") -> str:
     if container_image.strip():
         return container_image.strip()
+    if target_id:
+        with connection(root) as conn:
+            target = conn.execute("select container_image, stack_profile from test_targets where id = ?", (target_id,)).fetchone()
+        if target:
+            if str(target["container_image"] or "").strip():
+                return str(target["container_image"]).strip()
+            stack_profile = str(target["stack_profile"] or stack_profile or "python")
     config = root / ".ai-team" / "control" / "container-image.txt"
     if config.exists():
         configured = config.read_text(encoding="utf-8").strip()
         if configured:
             return configured
-    return DEFAULT_CONTAINER_IMAGE
+    return STACK_PROFILE_IMAGES.get(stack_profile, DEFAULT_CONTAINER_IMAGE)
 
 
 def read_csv_dicts(path: Path) -> list[dict[str, str]]:
@@ -6242,8 +6401,8 @@ def latest_fanout_export(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row:
 
 def codex_import_failure(conn: sqlite3.Connection, run_id: str, task_id: str, message: str) -> None:
     record_integration_finding(conn, run_id, f"codex fanout import failed for {task_id}: {message}")
-    conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
     conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
+    refresh_dispatch_run_status(conn, run_id)
 
 
 def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str, str], result: dict[str, Any], *, strict_evidence_fields: bool = False) -> list[str]:
@@ -6390,7 +6549,7 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
             ("verification_failed" if failed else "imported", now_iso(), run_id),
         )
         if not failed:
-            conn.execute("update dispatch_runs set status = 'reported', updated_at = ? where id = ?", (now_iso(), run_id))
+            refresh_dispatch_run_status(conn, run_id)
     if failed:
         raise HarnessError(f"codex fanout import failed: {run_id}")
     return f"imported {imported} report(s)"
@@ -6454,7 +6613,7 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                     (report.last_error or report.status, now_iso(), now_iso(), session["id"]),
                 )
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
-                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                refresh_dispatch_run_status(conn, run_id)
                 provider_event(conn, session, "collect_failed", {"status": report.status, "last_error": report.last_error})
             if session["provider"] == "host-codex":
                 cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
@@ -6466,7 +6625,7 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 record_integration_finding(conn, run_id, f"provider report invalid for {session['task_id']}: {exc.msg}")
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", (exc.msg, now_iso(), session["id"]))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
-                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                refresh_dispatch_run_status(conn, run_id)
             if session["provider"] == "host-codex":
                 cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
             continue
@@ -6477,7 +6636,7 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 record_integration_finding(conn, run_id, f"provider report rejected for {session['task_id']}: {'; '.join(issues[:5])}")
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", ("; ".join(issues[:5]), now_iso(), session["id"]))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
-                conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+                refresh_dispatch_run_status(conn, run_id)
                 provider_event(conn, session, "collect_rejected", {"issues": issues[:5]})
             if session["provider"] == "host-codex":
                 cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
@@ -6551,7 +6710,7 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
         collected += 1
     if collected:
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
-            conn.execute("update dispatch_runs set status = 'reported', updated_at = ? where id = ?", (now_iso(), run_id))
+            refresh_dispatch_run_status(conn, run_id)
     return collected
 
 
@@ -6660,7 +6819,7 @@ def record_attempt_failure(conn: sqlite3.Connection, run_id: str, task_id: str, 
     record_integration_finding(conn, run_id, f"dispatch attempt verification failed for {task_id}: {message}")
     conn.execute("update task_attempts set status = 'verification_failed', finished_at = ? where id = ?", (now_iso(), attempt_id))
     conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
-    conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+    refresh_dispatch_run_status(conn, run_id)
 
 
 def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: str = "local", container_image: str = "") -> str:
@@ -6699,12 +6858,21 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
         raise HarnessError(f"missing test target: {attempt['target_id']}")
     if not int(target["gateable"]):
         raise HarnessError(f"test target is not gateable: {attempt['target_id']}")
+    target_requires_sandbox = bool(int(target["requires_sandbox"] or 0))
+    target_requires_no_network = bool(int(target["requires_no_network"] or 0))
+    target_result_format = str(target["result_format"] or "regex")
+    target_result_path = str(target["result_path"] or "")
+    if runner != "container" and (target_requires_sandbox or target_requires_no_network):
+        reason = "target requires sandbox"
+        if target_requires_no_network:
+            reason += "; target requires no-network sandbox"
+        raise HarnessError(reason)
 
     worktree = ensure_verification_worktree(root, attempt["branch_name"], run_id, task_id)
     with connection(root) as conn:
         prefixes = executor_prefixes(conn)
     if runner == "container":
-        image = resolve_container_image(root, container_image)
+        image = resolve_container_image(root, container_image, target_id=target["id"], stack_profile=str(target["stack_profile"] or "python"))
         try:
             runner_result = runner_for("container").run(
                 RunnerRequest(
@@ -6717,6 +6885,8 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                     no_network=True,
                     sandbox_profile="no-network",
                     container_image=image,
+                    result_format=target_result_format,
+                    result_path=target_result_path,
                 )
             )
         except RuntimeError as exc:
@@ -6731,6 +6901,8 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             target_id=target["id"],
             target_command_template=target["command_template"],
             allowed_prefixes=prefixes,
+            result_format=target_result_format,
+            result_path=target_result_path,
         )
         runner_result = None
     if runner == "container" and result.sandbox_status == "available":
@@ -6759,9 +6931,16 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
     if result.exit_code != 0:
         issues.append(f"exit_code={result.exit_code}")
     if result.executed_count_source != "parsed":
-        issues.append(f"executed_count_source={result.executed_count_source}")
+        if not (target_result_format != "regex" and result.executed_count_source == "structured"):
+            issues.append(f"executed_count_source={result.executed_count_source}")
+    if target_result_format != "regex" and result.semantic_status != "pass":
+        issues.append(f"semantic_status={result.semantic_status or 'empty'}")
     if result.executed_count <= 0:
         issues.append("executed_count must be > 0")
+    if target_requires_sandbox and result.sandbox_status != "available":
+        issues.append("target requires sandbox")
+    if target_requires_no_network and (not result.no_network or result.sandbox_status != "available"):
+        issues.append("target requires no-network sandbox")
     if result.policy_status == "rejected":
         issues.append(f"policy rejected: {result.policy_reason}")
     if not source_hash:
@@ -6807,10 +6986,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             """
             insert into evidence
             (id, kind, summary, uri, hash, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
-             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status, policy_reason,
+             target_id, executed_count, executed_count_source, result_format, result_path, semantic_status,
+             allow_unlisted, no_network, policy_status, policy_reason,
              sandbox_profile, sandbox_status, sandbox_execution_id, sandbox_engine, container_image, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              attempt_id, tree_sha, code_ref, verified_by, created_at)
-            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
+            values (?, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
                     ?, ?, ?, ?, ?)
             """,
             (
@@ -6826,6 +7006,9 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 target["id"],
                 result.executed_count,
                 result.executed_count_source,
+                result.result_format,
+                target_result_path,
+                result.semantic_status,
                 bool_int(runner == "container"),
                 result.policy_status,
                 result.policy_reason,
@@ -6846,11 +7029,12 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             """
             insert into validations
             (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
-             target_id, executed_count, executed_count_source, allow_unlisted, no_network, policy_status,
+             target_id, executed_count, executed_count_source, result_format, result_path, semantic_status,
+             allow_unlisted, no_network, policy_status,
              policy_reason, sandbox_profile, sandbox_status, sandbox_execution_id, sandbox_engine, container_image, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              findings, result, residual_risk, head_commit, source_tree_hash, attempt_id, tree_sha, code_ref,
              verified_by, tracked_diff_hash, project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
                     'controller verification passed', 'pass', '', ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
@@ -6865,6 +7049,9 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 target["id"],
                 result.executed_count,
                 result.executed_count_source,
+                result.result_format,
+                target_result_path,
+                result.semantic_status,
                 bool_int(runner == "container"),
                 result.policy_status,
                 result.policy_reason,
@@ -6930,7 +7117,7 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             "update dispatch_assignments set status = 'completed', evidence = ?, updated_at = ? where run_id = ? and task_id = ?",
             (evidence_id, now_iso(), run_id, task_id),
         )
-        conn.execute("update dispatch_runs set status = 'completed', updated_at = ? where id = ?", (now_iso(), run_id))
+        refresh_dispatch_run_status(conn, run_id)
         task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
         if task and task["status"] in {"ready", "claimed", "in_progress"}:
             conn.execute(
@@ -7051,10 +7238,20 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
         ("dispatch_assignments", "status", DISPATCH_STATUSES, "dispatch assignment status"),
         ("test_targets", "kind", TEST_TARGET_KINDS, "test target kind"),
+        ("test_targets", "stack_profile", STACK_PROFILES, "test target stack profile"),
+        ("test_targets", "result_format", RESULT_FORMATS, "test target result format"),
         ("validations", "trust_anchor", {"local-only", "human-confirmed", "external-session", "ci"}, "validation trust anchor"),
         ("evidence", "trust_anchor", {"local-only", "human-confirmed", "external-session", "ci"}, "evidence trust anchor"),
-        ("validations", "sandbox_profile", {"none", "no-network"}, "validation sandbox profile"),
-        ("evidence", "sandbox_profile", {"none", "no-network"}, "evidence sandbox profile"),
+        ("validations", "sandbox_profile", SANDBOX_PROFILES, "validation sandbox profile"),
+        ("evidence", "sandbox_profile", SANDBOX_PROFILES, "evidence sandbox profile"),
+        ("validations", "sandbox_status", SANDBOX_STATUSES, "validation sandbox status"),
+        ("evidence", "sandbox_status", SANDBOX_STATUSES, "evidence sandbox status"),
+        ("validations", "executed_count_source", EXECUTED_COUNT_SOURCES, "validation executed count source"),
+        ("evidence", "executed_count_source", EXECUTED_COUNT_SOURCES, "evidence executed count source"),
+        ("validations", "result_format", RESULT_FORMATS, "validation result format"),
+        ("evidence", "result_format", RESULT_FORMATS, "evidence result format"),
+        ("validations", "semantic_status", SEMANTIC_STATUSES, "validation semantic status"),
+        ("evidence", "semantic_status", SEMANTIC_STATUSES, "evidence semantic status"),
         ("ci_verifications", "conclusion", CI_CONCLUSIONS, "ci conclusion"),
         ("ci_verifications", "origin", ANCHOR_ORIGINS, "ci origin"),
         ("external_session_verifications", "conclusion", EXTERNAL_SESSION_CONCLUSIONS, "external session conclusion"),

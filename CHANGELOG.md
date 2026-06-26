@@ -4,6 +4,27 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.21.0-beta.1 - 2026-06-26
+
+### Added
+
+- Schema 27 target execution policy fields for stack profile, target container image, sandbox/no-network requirements, and structured result format/path.
+- Structured test result parsing for JUnit, pytest JSON, Jest JSON, go test JSON, cargo nextest JSON, and Playwright JSON.
+- Dispatch run status aggregation tests and sandbox/structured-result regression coverage.
+
+### Changed
+
+- Runtime implementation version is now `4.14.0`; runtime schema is now `27`.
+- Dispatch run status is now derived from assignment status priority instead of being overwritten by the latest single assignment update.
+- Container verification now mounts source at `/src:ro`, copies it into a writable `/workspace`, keeps network disabled, and records sandbox metadata.
+- Delivery gates accept structured result evidence as semantic command evidence while continuing to reject manual/policy execution counts.
+
+### Boundaries
+
+- Targets marked `requires_sandbox` or `requires_no_network` must be verified through the container runner with available no-network sandbox metadata.
+- Structured result evidence strengthens test semantics but does not relax HMAC/session attestation, integration, or delivery gate requirements.
+- No new harness top-level command, DB table, core file, runtime script, Skill, or Hook is added.
+
 ## v1.20.0-beta.1 - 2026-06-26
 
 ### Added

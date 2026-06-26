@@ -348,6 +348,12 @@ def build_parser() -> argparse.ArgumentParser:
     test_target_add.add_argument("--kind", required=True, choices=["unit", "integration", "lint", "build"])
     test_target_add.add_argument("--command-template", required=True)
     test_target_add.add_argument("--description", default="")
+    test_target_add.add_argument("--stack-profile", default="python", choices=["python", "node", "go", "rust", "java", "browser-e2e", "data-integration"])
+    test_target_add.add_argument("--container-image", default="")
+    test_target_add.add_argument("--requires-sandbox", action="store_true")
+    test_target_add.add_argument("--requires-no-network", action="store_true")
+    test_target_add.add_argument("--result-format", default="regex", choices=["regex", "junit", "pytest-json", "jest-json", "go-json", "cargo-nextest-json", "playwright-json"])
+    test_target_add.add_argument("--result-path", default="")
     add_request_id(test_target_add)
     test_target_link = test_target_sub.add_parser("link")
     test_target_link.add_argument("--task", required=True)
@@ -864,7 +870,25 @@ def main() -> int:
                 )[1],
             )
         elif args.command == "test-target" and args.test_target_command == "add":
-            mutate("test-target.add", lambda: (add_test_target(root, args.id, args.kind, args.command_template, args.description), f"OK: test target recorded {args.id}")[1])
+            mutate(
+                "test-target.add",
+                lambda: (
+                    add_test_target(
+                        root,
+                        args.id,
+                        args.kind,
+                        args.command_template,
+                        args.description,
+                        stack_profile=args.stack_profile,
+                        container_image=args.container_image,
+                        requires_sandbox=args.requires_sandbox,
+                        requires_no_network=args.requires_no_network,
+                        result_format=args.result_format,
+                        result_path=args.result_path,
+                    ),
+                    f"OK: test target recorded {args.id}",
+                )[1],
+            )
         elif args.command == "test-target" and args.test_target_command == "link":
             mutate("test-target.link", lambda: (link_task_test_target(root, args.task, args.target), f"OK: test target linked {args.task}->{args.target}")[1])
         elif args.command == "test-target" and args.test_target_command == "list":

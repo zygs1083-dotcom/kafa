@@ -10,6 +10,12 @@
     "description": { "type": "string" },
     "gateable": { "type": "integer" },
     "gate_block_reason": { "type": "string" },
+    "stack_profile": { "type": "string", "enum": ["python", "node", "go", "rust", "java", "browser-e2e", "data-integration"] },
+    "container_image": { "type": "string" },
+    "requires_sandbox": { "type": "integer" },
+    "requires_no_network": { "type": "integer" },
+    "result_format": { "type": "string", "enum": ["regex", "junit", "pytest-json", "jest-json", "go-json", "cargo-nextest-json", "playwright-json"] },
+    "result_path": { "type": "string" },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }
   },
