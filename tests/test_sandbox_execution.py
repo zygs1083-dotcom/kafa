@@ -121,7 +121,7 @@ class SandboxExecutionTest(unittest.TestCase):
                 conn.execute("update project set schema_version = 21, runtime_version = '3.9.0'")
                 conn.commit()
 
-            run_harness(root, "migrate", "--from-version", "21", "--to-version", "22")
+            run_harness(root, "migrate", "--from-version", "21", "--to-version", "24")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}

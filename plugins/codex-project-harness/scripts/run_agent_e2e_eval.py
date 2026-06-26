@@ -698,7 +698,7 @@ def scenario_connector_mock_server_e2e() -> dict[str, Any]:
             evidence = db_rows(root, "select count(*) as count from evidence")[0]["count"]
             gh_calls = len(gh_log.read_text(encoding="utf-8").splitlines())
             token_leak = bool(db_rows(root, "select 1 from adapter_actions where payload_json like '%linear-token%' or payload_json like '%slack-token%' limit 1"))
-            ok = completed == 5 and adapters == 5 and evidence == 0 and reconcile.returncode == 0 and gh_calls == 1 and not token_leak and len(server.requests) == 4
+            ok = completed == 5 and adapters == 5 and evidence == 0 and reconcile.returncode == 0 and gh_calls == 2 and not token_leak and len(server.requests) == 7
             return scenario_result(
                 "connector_mock_server_e2e",
                 started,

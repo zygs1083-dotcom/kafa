@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.7.0
+# Codex OS Runtime Layer v4.9.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.7.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, and a verified architecture control plane contract. The repository release remains a beta release, while the runtime implementation version is `4.7.0` and the database schema version is `22`.
+Kernel v4.9.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, and a local advisory fallback layer. The repository release remains a beta release, while the runtime implementation version is `4.9.0` and the database schema version is `24`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.7.0
+## Kernel v4.9.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -132,9 +132,19 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stabi
 
 A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-eval-example.json`; real run durations are intentionally not committed.
 
+## Connector Resilience And Fallback
+
+Real connector adapters remain workflow synchronization only. `adapter confirm` can execute GitHub, Linear, Notion, Figma, and Slack operations when `payload_json.execute` is true, but connector results do not create delivery-eligible evidence and do not satisfy controller verification, HMAC/session attestation, integration, or delivery gates.
+
+Schema 24 records connector health in `connector_budgets`, adds `attempt_count`, `next_retry_at`, `connector_status`, and `blocked_reason` to `adapter_actions`, and records local second-level fallback artifacts in `advisory_fallbacks`. GitHub `gh api` calls and HTTP connectors share retry-aware handling for 429/529, common 5xx failures, GitHub rate-limit stderr/header signals, and `Retry-After`. Notion calls are throttled toward 2 req/s, Slack posting is throttled per channel, and Figma plan/tier headers are recorded as free-plan risk when present.
+
+Before external writes, the adapter searches for the stable marker `codex-project-harness:idempotency-key=<key>` and reuses a matching external object when the connector API exposes one. This reduces duplicate writes after an external success followed by a local crash. When retries are exhausted or a payload is unsafe, the action is marked `blocked`, a connector finding is written, and the local `.ai-team/` fact source remains the fallback for continuing verified code delivery.
+
+When a connector action is blocked, the Advisory Fallback Layer writes a local Markdown artifact under `docs/harness/advisory-fallbacks/` and a projection at `.ai-team/control/advisory-fallbacks.md`. GitHub fallbacks are PR/issue/comment drafts, Linear fallbacks are task and risk breakdowns, Notion fallbacks are structured spec/ADR/handoff drafts, Figma fallbacks are Product Design briefs and visual QA checklists, and Slack fallbacks are post-ready handoff summaries. Each row is explicitly `delivery_eligible=0`; these artifacts help people continue work but cannot satisfy evidence, validation, HMAC/session attestation, integration, or delivery gates.
+
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs; it does not add harness runtime commands, DB tables, schema files, core modules, plugin scripts, Skills, hooks, or runtime states.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. It still does not add harness runtime commands, core modules, plugin scripts, Skills, hooks, or delivery trust shortcuts.
 
 ## Installation And Release Helper
 
