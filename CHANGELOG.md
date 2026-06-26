@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.20.0-beta.1 - 2026-06-26
+
+### Added
+
+- Schema 26 transactional outbox audit fields on `adapter_actions`: execution fence, claim lease, last recovery time, and remote recovery count.
+- Connector exactly-once regression tests for concurrent confirm, unknown outcome recovery, ambiguous transport failure, and request-id replay.
+
+### Changed
+
+- Runtime implementation version is now `4.13.0`; runtime schema is now `26`.
+- `adapter confirm` now claims connector actions with a short SQLite transaction before external writes, completes them with a fence CAS, and marks ambiguous write outcomes as `unknown`.
+- `adapter reconcile` now attempts marker-based recovery for `unknown` and expired `executing` connector actions before reporting unresolved issues.
+
+### Boundaries
+
+- Connector outputs and advisory fallbacks remain workflow synchronization records only; they do not create delivery-eligible evidence or relax controller verification, HMAC/session attestation, integration, or delivery gates.
+- No harness CLI commands, DB tables, core files, runtime scripts, Skills, or hooks are added.
+
 ## v1.19.0-beta.1 - 2026-06-26
 
 ### Added

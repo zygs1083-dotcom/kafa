@@ -265,7 +265,7 @@ def fake_codex_sdk(temp: Path) -> tuple[Path, Path]:
     return package_root, log_path
 
 
-def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]) -> str:
+def plan_action(root: Path, tool: str, operation: str, params: dict[str, object], *, key: str = "") -> str:
     payload = json.dumps({"execute": True, "operation": operation, "params": params}, sort_keys=True)
     result = run_harness(
         root,
@@ -282,7 +282,7 @@ def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]
         "--payload-json",
         payload,
         "--idempotency-key",
-        f"e2e:{tool}:{operation}",
+        key or f"e2e:{tool}:{operation}",
     )
     return result.stdout.strip().split()[-1]
 
@@ -317,12 +317,16 @@ def fake_gh(temp: Path) -> tuple[Path, Path]:
 
 class ConnectorMockHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
+    marker: str = ""
 
     def do_POST(self) -> None:  # noqa: N802
         body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
         record = {"path": self.path, "headers": dict(self.headers), "body": json.loads(body) if body else {}}
         self.__class__.requests.append(record)
-        if self.path == "/linear/graphql":
+        if self.path == "/slack/api/search.messages":
+            matches = [{"ts": "1710000000.000123", "channel": {"id": "C123"}, "permalink": "https://slack.example/existing"}] if self.__class__.marker else []
+            response = {"ok": True, "messages": {"matches": matches}}
+        elif self.path == "/linear/graphql":
             response = {"data": {"issueCreate": {"success": True, "issue": {"id": "LIN-1", "identifier": "ENG-1", "url": "https://linear.example/ENG-1"}}}}
         elif self.path == "/notion/v1/pages":
             response = {"id": "notion-page-1", "url": "https://notion.example/page-1"}
@@ -344,8 +348,12 @@ class ConnectorMockHandler(BaseHTTPRequestHandler):
 
 
 class ConnectorMockServer:
+    def __init__(self, *, marker: str = "") -> None:
+        self.marker = marker
+
     def __enter__(self) -> "ConnectorMockServer":
         ConnectorMockHandler.requests = []
+        ConnectorMockHandler.marker = self.marker
         self.server = HTTPServer(("127.0.0.1", 0), ConnectorMockHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -762,6 +770,55 @@ def scenario_connector_mock_server_e2e() -> dict[str, Any]:
             )
 
 
+def scenario_connector_exactly_once_recovery() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / "repo"
+        root.mkdir()
+        run_harness(root, "init")
+        key = "e2e:slack:exactly-once-recovery"
+        marker = f"codex-project-harness:idempotency-key={key}"
+        with ConnectorMockServer(marker=marker) as server:
+            action = plan_action(root, "slack", "slack.message.post", {"channel": "C123", "text": "Ship it"}, key=key)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    "update adapter_actions set status = 'unknown', connector_status = 'degraded', blocked_reason = 'remote success local commit unknown' where id = ?",
+                    (action,),
+                )
+                conn.commit()
+            confirm = run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "slack-token", "HARNESS_SLACK_API_URL": server.base_url}, check=False)
+            row = db_rows(root, "select status, external_id, remote_recovery_count from adapter_actions where id = ?", (action,))[0]
+            adapter_count = db_rows(root, "select count(*) as count from adapters where idempotency_key = ?", (key,))[0]["count"]
+            evidence_count = db_rows(root, "select count(*) as count from evidence")[0]["count"]
+            writes = [request for request in server.requests if request["path"] == "/slack/api/chat.postMessage"]
+            searches = [request for request in server.requests if request["path"] == "/slack/api/search.messages"]
+            ok = (
+                confirm.returncode == 0
+                and row["status"] == "completed"
+                and row["external_id"] == "slack:message:C123:1710000000.000123"
+                and row["remote_recovery_count"] == 1
+                and adapter_count == 1
+                and evidence_count == 0
+                and len(writes) == 0
+                and len(searches) >= 1
+            )
+            return scenario_result(
+                "connector_exactly_once_recovery",
+                started,
+                ok,
+                {
+                    "status": row["status"],
+                    "remote_recovery_count": row["remote_recovery_count"],
+                    "adapter_count": adapter_count,
+                    "evidence_count": evidence_count,
+                    "writes": len(writes),
+                    "searches": len(searches),
+                },
+                category="connector",
+                mode="stability",
+            )
+
+
 def scenario_crash_retry_recovery() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
@@ -877,6 +934,7 @@ STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
     scenario_host_codex_fake_sdk_e2e,
     scenario_multi_role_thread_lifecycle,
     scenario_connector_mock_server_e2e,
+    scenario_connector_exactly_once_recovery,
     scenario_crash_retry_recovery,
     scenario_sqlite_contention_stress,
 ]

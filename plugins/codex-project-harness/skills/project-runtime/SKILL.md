@@ -204,6 +204,8 @@ From v1.15.0, connector adapters have retry/budget/fallback governance. If GitHu
 
 From v1.16.0, blocked connector actions also generate Advisory Fallback Layer artifacts. Inspect `.ai-team/control/advisory-fallbacks.md` and `docs/harness/advisory-fallbacks/<action-id>.md` for copy-ready GitHub, Linear, Notion, Product Design, or Slack handoff drafts. These are advisory local facts only; do not cite them as delivery evidence, validation, external writes, or HMAC/session trust anchors.
 
+From v1.20.0, connector writes are protected by a transactional outbox. `adapter confirm` must claim `adapter_actions.execution_fence` before calling external APIs, and `unknown` actions must recover by idempotency marker before retrying. Treat `unknown` as unresolved, not successful; connector records still cannot satisfy delivery evidence or replace controller verification.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:
