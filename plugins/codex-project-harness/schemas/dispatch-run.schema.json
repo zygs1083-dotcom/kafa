@@ -4,6 +4,7 @@
   "required": ["id", "scope", "status", "created_at", "updated_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "scope": { "type": "string" },
     "status": { "type": "string", "enum": ["planned", "claimed", "reported", "completed", "failed", "stale", "integration_conflict", "verification_failed", "integrated"] },
     "created_at": { "type": "string" },

@@ -5,6 +5,7 @@
   "required": ["id", "kind", "body", "status", "revision", "updated_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "kind": {
       "type": "string",
       "enum": ["goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"]

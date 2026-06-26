@@ -4,6 +4,9 @@
   "type": "object",
   "required": ["gate", "reviewed_commit", "reviewer_context", "result"],
   "properties": {
+    "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
+    "candidate_sha": { "type": "string" },
     "gate": { "type": "string" },
     "reviewed_commit": { "type": "string" },
     "evidence_commit": { "type": "string" },

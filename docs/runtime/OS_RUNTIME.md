@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.11.0
+# Codex OS Runtime Layer v4.12.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.11.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, and Host Codex worktree isolation. The repository release remains a beta release, while the runtime implementation version is `4.11.0` and the database schema version is `24`.
+Kernel v4.12.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, and iterative Delivery Cycles. The repository release remains a beta release, while the runtime implementation version is `4.12.0` and the database schema version is `25`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.11.0
+## Kernel v4.12.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -33,6 +33,20 @@ The executable runtime is organized around `plugins/codex-project-harness/core/`
 - `projections.py` is the only Markdown projection writer.
 
 SQLite state tables remain the primary runtime fact source. Events are audit support, not the primary source of truth. Checkpoint snapshot export/import is the supported restore path.
+
+## Delivery Cycles
+
+Schema 25 adds first-class Delivery Cycles so long-lived projects can iterate without turning old validations into permanent blockers.
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle close --status delivered
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle start --id CYCLE-next --name "Next release" --goal "Ship the next candidate"
+```
+
+Fresh projects start with active `CYCLE-current`. Migrated schema 24 projects keep old runtime rows in archived `CYCLE-legacy` and receive a fresh active current cycle. Old validations, quality gates, deliveries, invalidations, and source tree hashes remain auditable, but delivery readiness only checks the current cycle and current candidate.
+
+The gate remains fail-closed. A new cycle must record current acceptance/task state, validation with trusted evidence, a current-candidate quality gate, and high/critical failure-mode coverage where applicable. A current fail validation supersedes the older active validation for the same acceptance and candidate, so old pass records cannot rescue a failing current candidate.
 
 ## Architecture Control Plane
 
@@ -146,7 +160,7 @@ When a connector action is blocked, the Advisory Fallback Layer writes a local M
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. Schema remains 24 and no harness runtime commands, core files, plugin scripts, Skills, hooks, or delivery trust shortcuts are added.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
 
 ## Installation And Release Helper
 

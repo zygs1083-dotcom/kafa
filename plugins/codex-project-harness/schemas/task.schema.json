@@ -5,6 +5,7 @@
   "required": ["id", "task", "owner", "status", "acceptance_ids"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "task": { "type": "string" },
     "owner": { "type": "string" },
     "status": {

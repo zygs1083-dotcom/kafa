@@ -42,7 +42,8 @@ kafa doctor --repo .
 | --- | --- |
 | Show current state | `harness.py --root . status` |
 | Doctor / repair | `harness.py --root . doctor`, `harness.py --root . repair`, `harness.py --root . repair --dry-run` |
-| Migrate state | `harness.py --root . migrate --from-version 6 --to-version 22`, `harness.py --root . migrate --from-version markdown-v1 --to-version 22 --dry-run` |
+| Migrate state | `harness.py --root . migrate --from-version 24 --to-version 25`, `harness.py --root . migrate --from-version markdown-v1 --to-version 25 --dry-run` |
+| Manage delivery cycles | `harness.py --root . cycle status --json`, `harness.py --root . cycle close --status delivered`, `harness.py --root . cycle start --id CYCLE-next --name "Next" --goal "..."` |
 | Move phase | `harness.py --root . phase project_bootstrap` |
 | Confirm scope / freeze baseline | `harness.py --root . scope confirm --by project-manager --summary "..."`, `harness.py --root . baseline freeze --id B1 --summary "..."` |
 | Diff / validate baseline | `harness.py --root . baseline diff --from B1`, `harness.py --root . baseline validate` |
@@ -71,6 +72,18 @@ kafa doctor --repo .
 | Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
 
 ## Phase Protocol
+
+Delivery work belongs to the current Kernel Delivery Cycle. Use `cycle status --json` before major delivery work. When a candidate is delivered or intentionally archived, close the current cycle before starting the next one:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle close --status delivered
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle start \
+  --id CYCLE-next \
+  --name "Next release" \
+  --goal "Validate and deliver the next candidate"
+```
+
+Old cycle validations, gates, deliveries, and invalidations are audit records. They do not block a new cycle, but they also do not satisfy the new cycle's delivery gate. Record current candidate validation, trusted evidence, quality gate, and risk coverage again.
 
 Use this phase sequence:
 

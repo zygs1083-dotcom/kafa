@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Project State",
   "type": "object",
-  "required": ["status", "phase", "scope_status", "current_owner", "schema_version", "runtime_version", "project_id", "revision"],
+  "required": ["status", "phase", "current_cycle_id", "scope_status", "current_owner", "schema_version", "runtime_version", "project_id", "revision"],
   "properties": {
     "status": { "type": "string" },
     "phase": {
@@ -21,6 +21,7 @@
         "archived"
       ]
     },
+    "current_cycle_id": { "type": "string" },
     "scope_status": { "type": "string" },
     "current_owner": { "type": "string" },
     "schema_version": { "type": "integer" },

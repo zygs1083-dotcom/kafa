@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Delivery Cycle",
+  "type": "object",
+  "required": ["id", "name", "goal", "status", "phase", "started_at", "created_at", "updated_at"],
+  "properties": {
+    "id": { "type": "string" },
+    "name": { "type": "string" },
+    "goal": { "type": "string" },
+    "status": { "type": "string", "enum": ["active", "delivered", "archived"] },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "intake",
+        "project_bootstrap",
+        "requirement_baseline",
+        "confirmation",
+        "team_architecture",
+        "planning",
+        "implementation",
+        "qa",
+        "delivery_readiness",
+        "retrospective",
+        "archived"
+      ]
+    },
+    "base_ref": { "type": "string" },
+    "candidate_sha": { "type": "string" },
+    "started_at": { "type": "string" },
+    "closed_at": { "type": "string" },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": true
+}

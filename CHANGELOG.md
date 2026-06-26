@@ -4,6 +4,25 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.19.0-beta.1 - 2026-06-26
+
+### Added
+
+- Schema 25 `delivery_cycles` state and first-class `cycle start/status/close` CLI commands for long-running iterative delivery.
+- Current-cycle and current-candidate fields on requirements, acceptance, tasks, failure modes, validations, quality gates, deliveries, invalidations, and dispatch runs.
+- Migration from schema 24 into archived `CYCLE-legacy` audit records plus a fresh active `CYCLE-current`.
+
+### Changed
+
+- Runtime implementation version is now `4.12.0`; runtime schema is now `25`.
+- Delivery readiness now checks only the current cycle and current candidate. Historical validations, invalidations, gates, and deliveries remain auditable but no longer permanently block future iterations.
+- Recording a validation supersedes older active validations for the same cycle, acceptance, and candidate, so a current fail or untrusted latest validation blocks delivery instead of falling back to an old pass.
+
+### Boundaries
+
+- The delivery gate remains fail-closed: each new cycle must re-establish current candidate validation, trusted evidence, quality gate, and high/critical risk coverage.
+- No core files, runtime scripts, Skills, hooks, or delivery trust shortcuts are added; the schema/CLI expansion is intentional for P0-3 iterative governance.
+
 ## v1.18.0-beta.1 - 2026-06-26
 
 ### Changed

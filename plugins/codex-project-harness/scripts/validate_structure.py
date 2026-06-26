@@ -77,6 +77,7 @@ REQUIRED_HOOKS = [
 
 REQUIRED_SCHEMAS = [
     "project-state.schema.json",
+    "delivery-cycle.schema.json",
     "requirement.schema.json",
     "acceptance.schema.json",
     "task.schema.json",

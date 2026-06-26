@@ -291,7 +291,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     row[0]
                     for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
                 }
-            self.assertEqual(project[0], 24)
+            self.assertEqual(project[0], 25)
             self.assertIn("tasks", tables)
             self.assertIn("events", tables)
             self.assertIn("test_targets", tables)
@@ -490,7 +490,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "24")
+            run_harness(root, "migrate", "--from-version", "6", "--to-version", "25")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -901,7 +901,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             validate = run_harness(root, "validate", "--delivery", check=False)
 
             self.assertNotEqual(validate.returncode, 0)
-            self.assertIn("validation source tree hash does not match current code", validate.stdout)
+            self.assertIn("acceptance has no passing validation for current candidate", validate.stdout)
 
     def test_evidence_test_and_finding_records_are_structured(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1683,7 +1683,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertNotEqual(tampered_session.returncode, 0)
             self.assertIn("connector HMAC", tampered_session.stdout)
 
-    def test_acceptance_gate_uses_any_trusted_validation_candidate(self) -> None:
+    def test_current_candidate_latest_validation_must_be_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             prepare_basic_delivery_project(root)
@@ -1695,9 +1695,10 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "manual latest", "--result", "pass", "--test", "BAD-TEST", "--evidence", "BAD-EV", "--target", "BAD", "--code-identity", "content-hash")
             run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
 
-            validate = run_harness(root, "validate", "--delivery")
+            validate = run_harness(root, "validate", "--delivery", check=False)
 
-            self.assertEqual(validate.returncode, 0, validate.stdout + validate.stderr)
+            self.assertNotEqual(validate.returncode, 0)
+            self.assertIn("validation executed_count_source=manual", validate.stdout)
 
     def test_dispatch_allow_unlisted_requires_reason_and_records_sandbox_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
