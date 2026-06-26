@@ -17,7 +17,8 @@ Codex Project Harness is an architecture control plane for verified code deliver
 
 - Skill, Hooks, Host Bridge, Connectors, and Evals must not produce delivery-eligible evidence directly.
 - Trusted evidence must bind to Kernel-controlled verification: parsed execution evidence, current code identity, target mapping, HMAC/session attestation where required, and integration/delivery gate checks.
-- Delivery Cycles and Connector outbox recovery state are Kernel facts. Skills and hooks may prompt `cycle start/status/close`, but only Kernel schema 26 state determines which cycle, candidate, connector claim, or recovered external marker is delivery-relevant.
+- Delivery Cycles and Connector outbox recovery state are Kernel facts. Skills and hooks may prompt `cycle start/status/close`, but only Kernel schema 27 state determines which cycle, candidate, connector claim, or recovered external marker is delivery-relevant.
+- Target sandbox policy, stack profile, and structured test semantic status are Kernel facts. Local runner output cannot satisfy targets that require sandbox or no-network, and regex output cannot impersonate structured result evidence.
 - Host Codex and native fan-out worker output always enters as `agent_reports` plus `task_attempts(status=reported)` before controller verification.
 - Connector writes are external workflow synchronization records governed by transactional outbox claim/recovery. They can attach links but cannot satisfy high/critical delivery gates without existing connector(HMAC) trust anchors.
 - Evals are release gates for the harness itself. They do not prove an arbitrary project task is ready to deliver.

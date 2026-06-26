@@ -30,10 +30,13 @@ ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "executing", "comple
 REQUIREMENT_KINDS = {"goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"}
 TEST_TARGET_KINDS = {"unit", "integration", "lint", "build"}
 POLICY_STATUSES = {"allowed", "rejected", "manual", ""}
-EXECUTED_COUNT_SOURCES = {"", "parsed", "manual", "policy"}
+EXECUTED_COUNT_SOURCES = {"", "parsed", "structured", "manual", "policy"}
 TRUST_ANCHORS = {"local-only", "human-confirmed", "external-session", "ci"}
 SANDBOX_PROFILES = {"none", "no-network"}
 SANDBOX_STATUSES = {"", "available", "unavailable"}
+STACK_PROFILES = {"python", "node", "go", "rust", "java", "browser-e2e", "data-integration"}
+RESULT_FORMATS = {"regex", "junit", "pytest-json", "jest-json", "go-json", "cargo-nextest-json", "playwright-json"}
+SEMANTIC_STATUSES = {"", "pass", "fail", "unknown"}
 CI_CONCLUSIONS = {"success", "failure", "cancelled", "skipped"}
 EXTERNAL_SESSION_CONCLUSIONS = {"verified", "failed"}
 ANCHOR_ORIGINS = {"manual", "connector"}
@@ -102,10 +105,18 @@ def validate_adapter_action(tool: str, mode: str, artifact: str, action: str, pa
         raise SchemaGuardError(f"adapter action payload must be valid JSON: {exc.msg}") from exc
 
 
-def validate_test_target(target_id: str, kind: str, command_template: str) -> None:
+def validate_test_target(
+    target_id: str,
+    kind: str,
+    command_template: str,
+    stack_profile: str = "python",
+    result_format: str = "regex",
+) -> None:
     require_text("test target id", target_id)
     require_choice("test target kind", kind, TEST_TARGET_KINDS)
     require_text("test target command template", command_template)
+    require_choice("test target stack profile", stack_profile, STACK_PROFILES)
+    require_choice("test target result format", result_format, RESULT_FORMATS)
 
 
 def validate_trust_anchor(trust_anchor: str) -> None:
@@ -114,6 +125,14 @@ def validate_trust_anchor(trust_anchor: str) -> None:
 
 def validate_sandbox_profile(sandbox_profile: str) -> None:
     require_choice("sandbox profile", sandbox_profile, SANDBOX_PROFILES)
+
+
+def validate_result_format(result_format: str) -> None:
+    require_choice("result format", result_format, RESULT_FORMATS)
+
+
+def validate_semantic_status(semantic_status: str) -> None:
+    require_choice("semantic status", semantic_status, SEMANTIC_STATUSES)
 
 
 def validate_ci_verification(provider: str, run_id: str, conclusion: str, commit_sha: str, origin: str = "manual") -> None:

@@ -26,9 +26,9 @@ from core import KERNEL_VERSION  # noqa: E402
 from validate_structure import REQUIRED_CORE, REQUIRED_HOOKS, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
 
 
-EXPECTED_PLUGIN_VERSION = "1.20.0-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.13.0"
-EXPECTED_SCHEMA_VERSION = 26
+EXPECTED_PLUGIN_VERSION = "1.21.0-beta.1"
+EXPECTED_RUNTIME_VERSION = "4.14.0"
+EXPECTED_SCHEMA_VERSION = 27
 
 EXPECTED_TABLES = {
     "acceptance",
@@ -216,11 +216,11 @@ class FeatureFreezeTest(unittest.TestCase):
         self.assertEqual(harness_db.RUNTIME_VERSION, EXPECTED_RUNTIME_VERSION)
         self.assertEqual(KERNEL_VERSION, EXPECTED_RUNTIME_VERSION)
 
-    def test_schema_version_is_26(self) -> None:
+    def test_schema_version_is_27(self) -> None:
         self.assertEqual(harness_db.SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION)
         with tempfile.TemporaryDirectory() as temp:
             repair_plan = harness_db.repair(Path(temp), dry_run=True)
-        self.assertIn("repair action: migrate schema to 26", repair_plan)
+        self.assertIn("repair action: migrate schema to 27", repair_plan)
 
     def test_feature_freeze_rejects_schema_growth(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

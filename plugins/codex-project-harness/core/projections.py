@@ -169,8 +169,33 @@ def render_test_targets(root: Path) -> None:
     with runtime.connection(root) as conn:
         targets = conn.execute("select * from test_targets order by id").fetchall()
         prefixes = conn.execute("select prefix, reason from executor_allowlist order by prefix").fetchall()
-    lines = ["# Test Targets", "", "## Registered Targets", "", "| ID | Kind | Command Template | Gateable | Block Reason | Description |", "| --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["id"], row["kind"], row["command_template"], row["gateable"] if "gateable" in row.keys() else "", row["gate_block_reason"] if "gate_block_reason" in row.keys() else "", row["description"]]) for row in targets)
+    lines = [
+        "# Test Targets",
+        "",
+        "## Registered Targets",
+        "",
+        "| ID | Kind | Command Template | Stack | Image | Requires Sandbox | Requires No Network | Result Format | Result Path | Gateable | Block Reason | Description |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    lines.extend(
+        markdown_row(
+            [
+                row["id"],
+                row["kind"],
+                row["command_template"],
+                row["stack_profile"] if "stack_profile" in row.keys() else "python",
+                row["container_image"] if "container_image" in row.keys() else "",
+                row["requires_sandbox"] if "requires_sandbox" in row.keys() else "",
+                row["requires_no_network"] if "requires_no_network" in row.keys() else "",
+                row["result_format"] if "result_format" in row.keys() else "regex",
+                row["result_path"] if "result_path" in row.keys() else "",
+                row["gateable"] if "gateable" in row.keys() else "",
+                row["gate_block_reason"] if "gate_block_reason" in row.keys() else "",
+                row["description"],
+            ]
+        )
+        for row in targets
+    )
     lines.extend(["", "## Executor Allow Prefixes", "", "| Prefix | Reason |", "| --- | --- |"])
     lines.extend(markdown_row([row["prefix"], row["reason"]]) for row in prefixes)
     write_view(root, ".ai-team/control/test-targets.md", "\n".join(lines))

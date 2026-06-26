@@ -178,7 +178,7 @@ Session attestation proves an independent context/session identity, not reasonin
 
 For isolated local agent execution, explicitly use `dispatch run --runner local-process --claim-file <path> ...`; then run `dispatch integrate --run-id <id>` to merge agent branches through a staging integration branch and rerun delivery validation. LocalProcessRunner is not an OS sandbox or a real Codex sub-session.
 
-For controller-side sandbox verification, explicitly use `dispatch verify-attempt --runner container [--container-image <image>]`. The runtime uses Docker/Podman with no network and a read-only code mount, records `sandbox_executions`, and links sandbox metadata to evidence and validations. If Docker/Podman is unavailable, container verification fails closed with `sandbox-unavailable`; do not treat that as local verification.
+For controller-side sandbox verification, explicitly use `dispatch verify-attempt --runner container [--container-image <image>]`. The runtime uses Docker/Podman with no network, mounts source at `/src:ro`, copies it into writable `/workspace`, records `sandbox_executions`, and links sandbox metadata to evidence and validations. If Docker/Podman is unavailable, container verification fails closed with `sandbox-unavailable`; do not treat that as local verification.
 
 For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, let the host/user run `spawn_agents_on_csv` with the generated `spawn_config.json`, then run `dispatch import-csv <run-id> --result <output.csv>`. Import records raw worker reports only; run `dispatch verify-attempt --run-id <run-id> --task <task-id>` for each reported task before `dispatch integrate --run-id <run-id>`.
 
@@ -205,6 +205,8 @@ From v1.15.0, connector adapters have retry/budget/fallback governance. If GitHu
 From v1.16.0, blocked connector actions also generate Advisory Fallback Layer artifacts. Inspect `.ai-team/control/advisory-fallbacks.md` and `docs/harness/advisory-fallbacks/<action-id>.md` for copy-ready GitHub, Linear, Notion, Product Design, or Slack handoff drafts. These are advisory local facts only; do not cite them as delivery evidence, validation, external writes, or HMAC/session trust anchors.
 
 From v1.20.0, connector writes are protected by a transactional outbox. `adapter confirm` must claim `adapter_actions.execution_fence` before calling external APIs, and `unknown` actions must recover by idempotency marker before retrying. Treat `unknown` as unresolved, not successful; connector records still cannot satisfy delivery evidence or replace controller verification.
+
+From v1.21.0, target execution policy is a Kernel fact. Use `test-target add --stack-profile ... --requires-sandbox --requires-no-network --result-format ... --result-path ...` when a target needs a specific stack, no-network container verification, or structured test semantics. Structured result formats must parse as pass with more than zero tests; local runner evidence cannot satisfy sandbox/no-network targets.
 
 ## Evidence Protocol
 

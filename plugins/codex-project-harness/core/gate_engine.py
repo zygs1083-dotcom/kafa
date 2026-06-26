@@ -40,6 +40,8 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
     target_id = str(_value(row, "target_id") or "")
     executed_count = int(_value(row, "executed_count") or 0)
     executed_count_source = str(_value(row, "executed_count_source") or "")
+    result_format = str(_value(row, "result_format") or "regex")
+    semantic_status = str(_value(row, "semantic_status") or "")
     policy_status = str(_value(row, "policy_status") or "")
     issues: list[str] = []
     if not command:
@@ -70,8 +72,13 @@ def _command_row_issues(root: Path, row: sqlite3.Row, current_source_hash: str, 
         issues.append(f"{label} missing target")
     if executed_count <= 0:
         issues.append(f"{label} executed_count={executed_count}")
-    if executed_count_source != "parsed":
+    if executed_count_source not in {"parsed", "structured"}:
         issues.append(f"{label} executed_count_source={executed_count_source or 'empty'}")
+    if result_format != "regex":
+        if executed_count_source != "structured":
+            issues.append(f"{label} structured result is not authoritative: executed_count_source={executed_count_source or 'empty'}")
+        if semantic_status != "pass":
+            issues.append(f"{label} semantic_status={semantic_status or 'empty'}")
     if policy_status == "rejected":
         issues.append(f"{label} command policy rejected")
     return issues
@@ -151,13 +158,33 @@ def validation_trusted_command_issues(
     target_id = str(_value(validation, "target_id") or "")
     command = str(_value(validation, "command") or "")
     if target_id:
-        target = conn.execute("select command_template, gateable, gate_block_reason from test_targets where id = ?", (target_id,)).fetchone()
+        target = conn.execute(
+            """
+            select command_template, gateable, gate_block_reason, requires_sandbox, requires_no_network, result_format
+            from test_targets where id = ?
+            """,
+            (target_id,),
+        ).fetchone()
         if not target:
             issues.append(f"validation unknown target: {target_id}")
         elif command and not command_matches_template(command, target["command_template"]):
             issues.append(f"validation command does not match target {target_id}")
         elif int(target["gateable"] or 0) != 1:
             issues.append(f"validation target is not gateable: {target_id} {target['gate_block_reason']}")
+        else:
+            sandbox_status = str(_value(validation, "sandbox_status") or "")
+            no_network = int(_value(validation, "no_network") or 0)
+            row_result_format = str(_value(validation, "result_format") or "regex")
+            row_count_source = str(_value(validation, "executed_count_source") or "")
+            if int(target["requires_sandbox"] or 0) and sandbox_status != "available":
+                issues.append("target requires sandbox")
+            if int(target["requires_no_network"] or 0) and (sandbox_status != "available" or no_network != 1):
+                issues.append("target requires no-network sandbox")
+            if str(target["result_format"] or "regex") != "regex":
+                if row_result_format != str(target["result_format"]):
+                    issues.append(f"validation result_format does not match target {target_id}")
+                if row_count_source != "structured":
+                    issues.append("target requires structured result")
     issues.extend(_trust_anchor_issues(conn, validation, root, current_sha, require_external=require_external_anchor))
     return issues
 

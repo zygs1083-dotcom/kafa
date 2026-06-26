@@ -11,7 +11,7 @@ import shutil
 from typing import Any
 from typing import Protocol
 
-from core.executor import CommandResult, LocalExecutor, MAX_STDOUT_BYTES, parse_executed_count
+from core.executor import CommandResult, LocalExecutor, MAX_STDOUT_BYTES, parse_executed_count, parse_structured_result
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,8 @@ class RunnerRequest:
     allow_unlisted_reason: str = ""
     executed_count: int | None = None
     container_image: str = "python:3.12-slim"
+    result_format: str = "regex"
+    result_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,8 @@ class NullRunner:
             sandbox_profile=request.sandbox_profile,
             allow_unlisted_reason=request.allow_unlisted_reason,
             executed_count=request.executed_count,
+            result_format=request.result_format,
+            result_path=request.result_path,
         )
         return RunnerResult(evidence=result, work_dir=request.root, runner=self.name)
 
@@ -80,6 +84,8 @@ class LocalProcessRunner:
             sandbox_profile=request.sandbox_profile,
             allow_unlisted_reason=request.allow_unlisted_reason,
             executed_count=request.executed_count,
+            result_format=request.result_format,
+            result_path=request.result_path,
         )
         return RunnerResult(evidence=result, work_dir=request.work_dir, runner=self.name)
 
@@ -119,6 +125,9 @@ class ContainerRunner:
                 allow_unlisted_reason=request.allow_unlisted_reason,
                 policy_status=policy_status,
                 policy_reason=policy_reason,
+                result_format=request.result_format,
+                result_path=request.result_path,
+                semantic_status="fail" if request.result_format != "regex" else "",
             )
             return RunnerResult(
                 evidence=result,
@@ -135,7 +144,14 @@ class ContainerRunner:
             )
 
         container_name = f"codex-harness-{uuid.uuid4().hex[:12]}"
-        script = f"cd /workspace && {request.command} > /artifacts/stdout.txt 2>&1"
+        result_copy = ""
+        if request.result_path:
+            result_copy = f"; if [ -f {request.result_path!r} ]; then cp {request.result_path!r} /artifacts/structured-result; fi"
+        script = (
+            "rm -rf /workspace/* /workspace/.[!.]* /workspace/..?* 2>/dev/null || true; "
+            "cp -a /src/. /workspace/; "
+            f"cd /workspace && ({request.command}) > /artifacts/stdout.txt 2>&1; rc=$?{result_copy}; exit $rc"
+        )
         command = [
             engine,
             "run",
@@ -153,8 +169,10 @@ class ContainerRunner:
             "--read-only",
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=64m",
+            "--tmpfs",
+            "/workspace:rw,exec,nosuid,size=512m",
             "-v",
-            f"{request.work_dir.resolve()}:/workspace:ro",
+            f"{request.work_dir.resolve()}:/src:ro",
             "-v",
             f"{artifact.parent.resolve()}:/artifacts:rw",
             "-w",
@@ -180,8 +198,20 @@ class ContainerRunner:
         stdout_bytes = artifact.read_bytes()[:MAX_STDOUT_BYTES]
         if len(stdout_bytes) != artifact.stat().st_size:
             artifact.write_bytes(stdout_bytes)
-        count_source = "manual" if request.executed_count is not None else "parsed"
-        count = int(request.executed_count) if request.executed_count is not None else parse_executed_count(stdout_bytes)
+        semantic_status = ""
+        stored_result_path = request.result_path
+        if request.result_format != "regex":
+            structured_artifact = artifact.parent / "structured-result"
+            structured_payload = structured_artifact.read_bytes() if structured_artifact.exists() else stdout_bytes
+            parsed = parse_structured_result(request.result_format, structured_payload)
+            count = parsed.executed_count
+            count_source = parsed.executed_count_source
+            semantic_status = parsed.semantic_status
+            if structured_artifact.exists():
+                stored_result_path = structured_artifact.relative_to(request.root).as_posix()
+        else:
+            count_source = "manual" if request.executed_count is not None else "parsed"
+            count = int(request.executed_count) if request.executed_count is not None else parse_executed_count(stdout_bytes)
         result = CommandResult(
             command=request.command,
             exit_code=exit_code,
@@ -191,6 +221,9 @@ class ContainerRunner:
             target_id=request.target_id,
             executed_count=count,
             executed_count_source=count_source,
+            result_format=request.result_format,
+            result_path=stored_result_path,
+            semantic_status=semantic_status,
             allow_unlisted=request.allow_unlisted,
             no_network=True,
             sandbox_profile="no-network",
