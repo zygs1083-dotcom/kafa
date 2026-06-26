@@ -375,6 +375,17 @@ def collect_and_verify(root: Path, run_id: str, branches: dict[str, str]) -> Non
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", task_id)
 
 
+def wait_for_provider_collect(root: Path, run_id: str, *, expected: str = "collected 1 provider report", timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    deadline = time.perf_counter() + timeout
+    result = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+    while time.perf_counter() < deadline:
+        if expected in result.stdout:
+            return result
+        time.sleep(0.1)
+        result = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+    return result
+
+
 def scenario_result(
     name: str,
     started: float,
@@ -571,7 +582,7 @@ def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
         session = db_rows(root, "select task_id, agent_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
         _head, _tree, worktree = commit_branch(root, session["branch_name"], "agent.txt", "host codex work\n")
         add_file_claim(root, run_id, session["task_id"], session["agent_id"], "agent.txt", worktree, session["branch_name"])
-        run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+        collect = wait_for_provider_collect(root, run_id)
         evidence_before = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
         evidence_after = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
@@ -592,7 +603,7 @@ def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
             harness_db.validate_runtime = original_validate
         status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
         rpc_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
-        ok = evidence_before == 0 and evidence_after == 1 and integrate_returncode == 0 and status == "integrated"
+        ok = "collected 1 provider report" in collect.stdout and evidence_before == 0 and evidence_after == 1 and integrate_returncode == 0 and status == "integrated"
         return scenario_result(
             "host_codex_fake_app_server_e2e",
             started,

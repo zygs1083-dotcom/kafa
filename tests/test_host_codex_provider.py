@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -72,6 +73,17 @@ def db_all(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sqli
         return conn.execute(query, params).fetchall()
 
 
+def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    deadline = time.monotonic() + timeout
+    last = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+    while time.monotonic() < deadline:
+        if expected in last.stdout:
+            return last
+        time.sleep(0.1)
+        last = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+    return last
+
+
 def fake_app_server(temp: Path) -> tuple[Path, Path]:
     script = temp / "fake_codex_app_server.py"
     log_path = temp / "fake_codex_log.jsonl"
@@ -81,10 +93,12 @@ def fake_app_server(temp: Path) -> tuple[Path, Path]:
             import json
             import os
             import re
+            import select
             import sys
             import time
 
             mode = os.environ.get("FAKE_CODEX_MODE", "success")
+            delay_seconds = float(os.environ.get("FAKE_CODEX_DELAY_SECONDS", "0"))
             log_path = os.environ["FAKE_CODEX_LOG"]
 
             def log(message):
@@ -138,6 +152,16 @@ def fake_app_server(temp: Path) -> tuple[Path, Path]:
                     prompt = message["params"]["input"][0]["text"]
                     send({"id": message["id"], "result": {"turn": {"id": "turn_fake"}}})
                     send({"method": "turn/started", "params": {"turn": {"id": "turn_fake"}}})
+                    if delay_seconds:
+                        deadline = time.time() + delay_seconds
+                        while time.time() < deadline:
+                            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                            if not ready:
+                                continue
+                            interrupt = json.loads(sys.stdin.readline())
+                            log(interrupt)
+                            if interrupt.get("method") == "turn/interrupt":
+                                raise SystemExit(0)
                     if mode == "invalid-json":
                         text = "not a json result"
                     else:
@@ -161,7 +185,64 @@ class HostCodexProviderTest(unittest.TestCase):
             "FAKE_CODEX_MODE": mode,
         }
 
-    def test_host_codex_start_records_thread_turn_metadata_and_rpc_sequence(self) -> None:
+    def test_host_codex_start_returns_before_turn_completion_and_releases_db_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            script, log_path = fake_app_server(temp_path)
+            env = self.host_env(script, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "2"
+
+            started_at = time.monotonic()
+            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            duration = time.monotonic() - started_at
+            other_write = run_harness(root, "acceptance", "add", "--id", "AC-LOCK", "--criterion", "DB writes are not blocked")
+            early_collect = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+
+            self.assertLess(duration, 1.0)
+            self.assertIn("started 1 provider session", started.stdout)
+            self.assertIn("OK: acceptance added", other_write.stdout)
+            self.assertIn("collected 0 provider report", early_collect.stdout)
+            session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
+            metadata = json.loads(session["input_json"])["provider_metadata"]
+            self.assertEqual(session["provider"], "host-codex")
+            self.assertEqual(session["status"], "running")
+            self.assertTrue(session["provider_session_id"].startswith("host-codex:"))
+            self.assertTrue(metadata["worker_pid"])
+            self.assertTrue(metadata["report_path"].endswith("/T1.json"))
+
+    def test_host_codex_start_honors_max_concurrency_without_waiting_for_first_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
+            for task_id in ["T1", "T2"]:
+                run_harness(root, "task", "add", "--id", task_id, "--task", f"Example {task_id}", "--owner", "developer", "--acceptance", "AC1")
+                run_harness(root, "test-target", "link", "--task", task_id, "--target", "UNIT")
+            run_id = run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
+            script, log_path = fake_app_server(temp_path)
+            env = self.host_env(script, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "2"
+
+            started_at = time.monotonic()
+            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", "--max-concurrency", "2", env=env)
+            duration = time.monotonic() - started_at
+
+            sessions = db_all(root, "select task_id, status, provider_session_id from agent_provider_sessions where run_id = ? order by task_id", (run_id,))
+            self.assertLess(duration, 1.5)
+            self.assertIn("started 2 provider session", started.stdout)
+            self.assertEqual([row["task_id"] for row in sessions], ["T1", "T2"])
+            self.assertEqual([row["status"] for row in sessions], ["running", "running"])
+            self.assertTrue(all(row["provider_session_id"].startswith("host-codex:") for row in sessions))
+
+    def test_host_codex_start_records_worker_metadata_and_rpc_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "repo"
@@ -175,13 +256,15 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertIn("started 1 provider session", started.stdout)
             session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
             metadata = json.loads(session["input_json"])["provider_metadata"]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and (not log_path.exists() or len(log_path.read_text(encoding="utf-8").splitlines()) < 4):
+                time.sleep(0.05)
             events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(session["provider"], "host-codex")
             self.assertEqual(session["status"], "running")
-            self.assertEqual(session["provider_session_id"], "host-codex:thr_fake")
-            self.assertEqual(session["provider_job_id"], "turn_fake")
-            self.assertEqual(metadata["thread_id"], "thr_fake")
-            self.assertEqual(metadata["turn_id"], "turn_fake")
+            self.assertTrue(session["provider_session_id"].startswith("host-codex:"))
+            self.assertTrue(metadata["worker_pid"])
+            self.assertTrue(metadata["report_path"].endswith("/T1.json"))
             self.assertEqual([event["method"] for event in events[:4]], ["initialize", "initialized", "thread/start", "turn/start"])
             self.assertEqual(events[0]["params"]["clientInfo"]["name"], "codex_project_harness")
             self.assertIn("Expected report shape", events[3]["params"]["input"][0]["text"])
@@ -260,15 +343,17 @@ class HostCodexProviderTest(unittest.TestCase):
                 "host-codex",
                 env={"HARNESS_CODEX_APP_SERVER_CMD": f"python3 {missing}", "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "1"},
             )
+            collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
-            self.assertIn("started 0 provider session", started.stdout)
+            self.assertIn("started 1 provider session", started.stdout)
+            self.assertIn("collected 0 provider report", collected.stdout)
             session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
             assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
-            self.assertEqual(session["status"], "spawn_failed")
+            self.assertEqual(session["status"], "verification_failed")
             self.assertIn("No such file", session["last_error"])
-            self.assertEqual(assignment["status"], "planned")
-            self.assertEqual(assignment["provider_session_id"], "")
+            self.assertEqual(assignment["status"], "verification_failed")
+            self.assertTrue(assignment["provider_session_id"].startswith("host-codex:"))
             self.assertEqual(evidence_count, 0)
 
     def test_host_codex_invalid_final_json_fails_closed(self) -> None:
@@ -281,11 +366,13 @@ class HostCodexProviderTest(unittest.TestCase):
             script, log_path = fake_app_server(temp_path)
 
             started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path, mode="invalid-json"))
+            collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
-            self.assertIn("started 0 provider session", started.stdout)
+            self.assertIn("started 1 provider session", started.stdout)
+            self.assertIn("collected 0 provider report", collected.stdout)
             session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
-            self.assertEqual(session["status"], "spawn_failed")
+            self.assertEqual(session["status"], "verification_failed")
             self.assertIn("missing final JSON object", session["last_error"])
             self.assertEqual(evidence_count, 0)
 
@@ -324,6 +411,46 @@ class HostCodexProviderTest(unittest.TestCase):
             reports = db_one(root, "select count(*) as count from agent_reports where run_id = ?", (run_id,))["count"]
             attempts = db_one(root, "select count(*) as count from task_attempts where run_id = ?", (run_id,))["count"]
             self.assertIn("collected 0 provider report", collected.stdout)
+            self.assertEqual(reports, 0)
+            self.assertEqual(attempts, 0)
+
+    def test_host_codex_cancel_interrupts_running_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            script, log_path = fake_app_server(temp_path)
+            env = self.host_env(script, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            deadline = time.monotonic() + 5
+            methods: list[str] = []
+            while time.monotonic() < deadline:
+                if log_path.exists():
+                    methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+                    if "turn/start" in methods:
+                        break
+                time.sleep(0.05)
+
+            cancelled = run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+                if "turn/interrupt" in methods:
+                    break
+                time.sleep(0.05)
+
+            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
+            reports = db_one(root, "select count(*) as count from agent_reports where run_id = ?", (run_id,))["count"]
+            attempts = db_one(root, "select count(*) as count from task_attempts where run_id = ?", (run_id,))["count"]
+            self.assertIn("cancelled 1 provider session", cancelled.stdout)
+            self.assertIn("turn/interrupt", methods)
+            self.assertIn("collected 0 provider report", collected.stdout)
+            self.assertEqual(assignment["status"], "planned")
+            self.assertEqual(assignment["provider_session_id"], "")
             self.assertEqual(reports, 0)
             self.assertEqual(attempts, 0)
 
