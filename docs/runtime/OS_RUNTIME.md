@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.10.0
+# Codex OS Runtime Layer v4.11.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.10.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge over App Server stdio, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, and a nonblocking Host Codex provider lifecycle. The repository release remains a beta release, while the runtime implementation version is `4.10.0` and the database schema version is `24`.
+Kernel v4.11.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, and Host Codex worktree isolation. The repository release remains a beta release, while the runtime implementation version is `4.11.0` and the database schema version is `24`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.10.0
+## Kernel v4.11.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -107,7 +107,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integ
 
 `--provider host-codex` now uses a nonblocking two-phase start. A short transaction registers `agent_provider_sessions(status='spawning')`, the corresponding `agent_sessions`, assignment claim, lease, and provider session id. The Codex worker process is spawned outside the SQLite write transaction. A second short transaction uses session id, provider session id, fence, and `status='spawning'` as a CAS guard before marking the session `running` or `spawn_failed`; cancelled or timed-out sessions are not overwritten.
 
-The Host Codex background worker starts Codex App Server over stdio, initializes JSON-RPC, creates one Codex thread/turn per assignment, and atomically writes `.ai-team/runtime/host-codex/<run-id>/<task-id>.json` with `running`, `success`, `failed`, or `cancelled` state. `dispatch provider collect` polls that artifact: running workers collect zero reports, successful workers become raw provider reports, and failures fail closed through the existing provider verification-failed path. The worker must return a final JSON report matching the provider output contract. That report is still raw input: use `dispatch verify-attempt` to produce trusted controller evidence before integration or delivery.
+The Host Codex background worker uses the mandatory `openai-codex>=0.1.0b3` Python SDK. Before spawning the worker, Harness creates an assignment-specific git worktree under `.ai-team/runtime/worktrees/<run>/<task>/<agent>` and persists that path in `agent_provider_sessions.worktree_path` plus `dispatch_worktrees.worktree_path`. The SDK thread/run cwd is fixed to that worktree with `Sandbox.workspace_write` and `ApprovalMode.deny_all`; Harness does not rely on prompt self-discipline for branch isolation. When the SDK turn finishes, the worker commits non-`.ai-team/` changes from the isolated worktree to the assignment agent branch, writes `.ai-team/runtime/host-codex/<run-id>/<task-id>.json`, and `dispatch provider collect` imports only the final JSON as a raw provider report. Use `dispatch verify-attempt` to produce trusted controller evidence before integration or delivery.
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider start --run-id <run-id> --provider manual-csv
@@ -126,7 +126,7 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixtu
 python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 ```
 
-`run_agent_e2e_eval.py --mode stability` is the CI release gate. It includes the fixture scenarios plus fake Host Codex App Server E2E, multi-role session lifecycle, connector mock server E2E, crash/retry recovery, and SQLite contention stress. The stability threshold requires zero failed scenarios, zero false passes, at least one forged evidence block, zero SQLite lock leaks, and zero unexplained human intervention.
+`run_agent_e2e_eval.py --mode stability` is the CI release gate. It includes the fixture scenarios plus fake Host Codex SDK E2E, multi-role session lifecycle, connector mock server E2E, crash/retry recovery, and SQLite contention stress. The stability threshold requires zero failed scenarios, zero false passes, at least one forged evidence block, zero SQLite lock leaks, and zero unexplained human intervention.
 
 `run_agent_e2e_eval.py --mode live-codex` is an opt-in host-environment profile for real Codex capability checks. It only attempts live work when `HARNESS_E2E_ENABLE_LIVE_CODEX=1` and the local Codex CLI/App Server is available. Otherwise it returns success with `live_skipped=true` and explicit skip reasons; skipped live mode is not evidence that real Codex E2E passed. `--mode live-command` remains a dogfood fallback using `CODEX_AGENT_EVAL_CMD`.
 
@@ -146,7 +146,7 @@ When a connector action is blocked, the Advisory Fallback Layer writes a local M
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals only: schema remains 24 and no harness runtime commands, core files, plugin scripts, Skills, hooks, or delivery trust shortcuts are added.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. Schema remains 24 and no harness runtime commands, core files, plugin scripts, Skills, hooks, or delivery trust shortcuts are added.
 
 ## Installation And Release Helper
 

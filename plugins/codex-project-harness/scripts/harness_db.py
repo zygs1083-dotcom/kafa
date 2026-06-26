@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
@@ -43,7 +43,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 24
-RUNTIME_VERSION = "4.10.0"
+RUNTIME_VERSION = "4.11.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -4991,31 +4991,44 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
             conn.execute("update dispatch_runs set status = 'claimed', updated_at = ? where id = ?", (now_iso(), run_id))
     started = 0
     for request in pending:
+        spawn_request = request
+        prepared_worktree_path = ""
         try:
-            handle = provider.spawn(request)
+            if provider.name == "host-codex":
+                branch_name, prepared_worktree_path = ensure_dispatch_worktree(root, request.run_id, request.task_id, request.agent_id)
+                spawn_request = replace(
+                    request,
+                    branch_name=branch_name,
+                    worktree_path=prepared_worktree_path,
+                    input_json={**request.input_json, "branch_name": branch_name, "worktree_path": prepared_worktree_path},
+                )
+            handle = provider.spawn(spawn_request)
         except Exception as exc:  # noqa: BLE001 - provider errors are recorded as session failures.
             from core.agent_provider import AgentJobHandle
 
-            handle = AgentJobHandle(provider.name, request.provider_session_id, request.task_id, "spawn_failed", str(exc))
+            handle = AgentJobHandle(provider.name, spawn_request.provider_session_id, spawn_request.task_id, "spawn_failed", str(exc))
         handle_meta: dict[str, Any] = {}
         if handle.message:
             try:
                 handle_meta = json.loads(handle.message)
             except json.JSONDecodeError:
                 handle_meta = {"message": handle.message}
-        with transaction(root, touched=[("agent_provider_session", request.session_id)]) as conn:
+        with transaction(root, touched=[("agent_provider_session", spawn_request.session_id)]) as conn:
             session = conn.execute(
                 """
                 select * from agent_provider_sessions
                 where id = ? and provider_session_id = ? and fence = ?
                 """,
-                (request.session_id, request.provider_session_id, request.fence),
+                (spawn_request.session_id, spawn_request.provider_session_id, spawn_request.fence),
             ).fetchone()
             if not session or session["status"] != "spawning":
                 if handle.status == "running":
                     provider.cancel(handle, "provider session no longer active")
                 continue
             provider_input_json = json.loads(session["input_json"] or "{}")
+            provider_input_json["branch_name"] = spawn_request.branch_name
+            if spawn_request.worktree_path:
+                provider_input_json["worktree_path"] = spawn_request.worktree_path
             if handle_meta:
                 provider_input_json["provider_metadata"] = handle_meta
             now = now_iso()
@@ -5023,11 +5036,11 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                 conn.execute(
                     """
                     update agent_provider_sessions
-                    set status = 'spawn_failed', provider_job_id = ?, input_json = ?, last_error = ?,
+                    set status = 'spawn_failed', provider_job_id = ?, branch_name = ?, worktree_path = ?, input_json = ?, last_error = ?,
                         heartbeat_at = '', lease_expires_at = '', finished_at = ?
                     where id = ? and status = 'spawning'
                     """,
-                    (handle.provider_job_id, stable_json(provider_input_json), handle.message, now, request.session_id),
+                    (handle.provider_job_id, spawn_request.branch_name, spawn_request.worktree_path, stable_json(provider_input_json), handle.message, now, spawn_request.session_id),
                 )
                 if session["agent_session_id"]:
                     conn.execute(
@@ -5041,16 +5054,16 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                         lease_expires_at = null, updated_at = ?
                     where run_id = ? and task_id = ? and status != 'completed'
                     """,
-                    (now, run_id, request.task_id),
+                    (now, run_id, spawn_request.task_id),
                 )
-                updated = conn.execute("select * from agent_provider_sessions where id = ?", (request.session_id,)).fetchone()
+                updated = conn.execute("select * from agent_provider_sessions where id = ?", (spawn_request.session_id,)).fetchone()
                 provider_event(conn, updated, "spawn_failed", handle_meta)
-                emit_event(conn, "agent_provider_session_spawn_failed", payload(run_id=run_id, task_id=request.task_id, provider=provider.name, error=handle.message))
+                emit_event(conn, "agent_provider_session_spawn_failed", payload(run_id=run_id, task_id=spawn_request.task_id, provider=provider.name, error=handle.message))
                 continue
             conn.execute(
                 """
                 update agent_provider_sessions
-                set status = ?, provider_session_id = ?, provider_job_id = ?, input_json = ?, last_error = ?,
+                set status = ?, provider_session_id = ?, provider_job_id = ?, branch_name = ?, worktree_path = ?, input_json = ?, last_error = ?,
                     heartbeat_at = ?, lease_expires_at = ?
                 where id = ? and status = 'spawning'
                 """,
@@ -5058,11 +5071,13 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     handle.status,
                     handle.provider_session_id,
                     handle.provider_job_id,
+                    spawn_request.branch_name,
+                    spawn_request.worktree_path,
                     stable_json(provider_input_json),
                     handle.message,
                     now,
                     lease_deadline(),
-                    request.session_id,
+                    spawn_request.session_id,
                 ),
             )
             if session["agent_session_id"] and handle.provider_session_id != session["provider_session_id"]:
@@ -5076,12 +5091,14 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                 set provider_session_id = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
                 where run_id = ? and task_id = ?
                 """,
-                (handle.provider_session_id, now, lease_deadline(), now, run_id, request.task_id),
+                (handle.provider_session_id, now, lease_deadline(), now, run_id, spawn_request.task_id),
             )
-            updated = conn.execute("select * from agent_provider_sessions where id = ?", (request.session_id,)).fetchone()
+            updated = conn.execute("select * from agent_provider_sessions where id = ?", (spawn_request.session_id,)).fetchone()
             provider_event(conn, updated, "started", {"provider_status": handle.status, **handle_meta})
-            emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=request.task_id, provider=provider.name, provider_session_id=handle.provider_session_id))
+            emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=spawn_request.task_id, provider=provider.name, provider_session_id=handle.provider_session_id))
             started += 1
+        if handle.status == "spawn_failed" and prepared_worktree_path:
+            cleanup_dispatch_worktrees(root, run_id, spawn_request.task_id, spawn_request.agent_id)
     return started
 
 
@@ -5193,6 +5210,34 @@ def ensure_dispatch_worktree(root: Path, run_id: str, task_id: str, agent: str) 
         )
         emit_event(conn, "dispatch_worktree_created", payload(run_id=run_id, task_id=task_id, agent=agent, branch=branch, worktree_path=rel))
     return branch, rel
+
+
+def cleanup_dispatch_worktrees(root: Path, run_id: str, task_id: str, agent: str = "") -> None:
+    clauses = ["run_id = ?", "task_id = ?", "status = 'active'"]
+    params: list[str] = [run_id, task_id]
+    if agent:
+        clauses.append("agent_id = ?")
+        params.append(agent)
+    with connection(root) as conn:
+        rows = conn.execute(f"select * from dispatch_worktrees where {' and '.join(clauses)}", tuple(params)).fetchall()
+    for row in rows:
+        if row["worktree_path"]:
+            worktree = root / row["worktree_path"]
+            if worktree.exists():
+                subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
+                shutil.rmtree(worktree, ignore_errors=True)
+        with transaction(root, touched=[("dispatch_worktree", row["task_id"])]) as conn:
+            conn.execute("update dispatch_worktrees set status = 'cleaned', cleaned_at = ? where id = ?", (now_iso(), row["id"]))
+            emit_event(conn, "dispatch_worktree_cleaned", payload(run_id=run_id, task_id=row["task_id"], agent=row["agent_id"], worktree_path=row["worktree_path"]))
+
+
+def remove_worktree_checkout(root: Path, worktree_path: str) -> None:
+    if not worktree_path:
+        return
+    worktree = root / worktree_path
+    if worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
+        shutil.rmtree(worktree, ignore_errors=True)
 
 
 def changed_worktree_files(work_dir: Path) -> list[str]:
@@ -5936,6 +5981,8 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
                 conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
                 provider_event(conn, session, "collect_failed", {"status": report.status, "last_error": report.last_error})
+            if session["provider"] == "host-codex":
+                cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
             continue
         try:
             result = json.loads(report.result_json)
@@ -5945,6 +5992,8 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", (exc.msg, now_iso(), session["id"]))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
                 conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
+            if session["provider"] == "host-codex":
+                cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
             continue
         with connection(root) as conn:
             issues = codex_report_issues(root, conn, expected_from_provider_session(session), result, strict_evidence_fields=session["provider"] == "host-codex")
@@ -5955,6 +6004,8 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
                 conn.execute("update dispatch_runs set status = 'verification_failed', updated_at = ? where id = ?", (now_iso(), run_id))
                 provider_event(conn, session, "collect_rejected", {"issues": issues[:5]})
+            if session["provider"] == "host-codex":
+                cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
             continue
         report_id = f"REPORT-{uuid.uuid4().hex[:12]}"
         attempt_id = f"ATTEMPT-{uuid.uuid4().hex[:12]}"
@@ -6001,16 +6052,27 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 "update dispatch_assignments set status = 'reported', provider_session_id = ?, updated_at = ? where run_id = ? and task_id = ?",
                 (session["provider_session_id"], now_iso(), run_id, session["task_id"]),
             )
-            conn.execute(
+            existing_worktree = conn.execute(
                 """
-                insert into dispatch_worktrees
-                (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
-                values (?, ?, ?, ?, ?, '', 'active', ?, '')
+                select id from dispatch_worktrees
+                where run_id = ? and task_id = ? and agent_id = ? and branch_name = ? and status = 'active'
+                order by created_at desc limit 1
                 """,
-                (str(uuid.uuid4()), run_id, session["task_id"], session["agent_id"], result["branch_name"], now_iso()),
-            )
+                (run_id, session["task_id"], session["agent_id"], result["branch_name"]),
+            ).fetchone()
+            if not existing_worktree:
+                conn.execute(
+                    """
+                    insert into dispatch_worktrees
+                    (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
+                    values (?, ?, ?, ?, ?, ?, 'active', ?, '')
+                    """,
+                    (str(uuid.uuid4()), run_id, session["task_id"], session["agent_id"], result["branch_name"], session["worktree_path"], now_iso()),
+                )
             provider_event(conn, session, "collected", {"report_id": report_id, "attempt_id": attempt_id})
             emit_event(conn, "agent_provider_report_collected", payload(run_id=run_id, task_id=session["task_id"], provider=session["provider"], report_id=report_id, attempt_id=attempt_id))
+        if session["provider"] == "host-codex":
+            remove_worktree_checkout(root, session["worktree_path"])
         collected += 1
     if collected:
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
@@ -6032,6 +6094,8 @@ def dispatch_provider_cancel(root: Path, run_id: str, *, task_id: str = "", reas
     for session in sessions:
         provider = provider_for(session["provider"])
         provider.cancel(provider_handle_from_row(session), reason)
+        if session["provider"] == "host-codex":
+            cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
         with transaction(root, touched=[("agent_provider_session", session["id"])]) as conn:
             if reason:
                 record_integration_finding(conn, run_id, f"provider session cancelled for {session['task_id']}: {reason}")
@@ -6059,7 +6123,9 @@ def dispatch_provider_cancel(root: Path, run_id: str, *, task_id: str = "", reas
 
 
 def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
-    with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+    from core.agent_provider import provider_for
+
+    with connection(root) as conn:
         rows = conn.execute(
             """
             select * from agent_provider_sessions
@@ -6068,7 +6134,14 @@ def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
             """,
             (run_id, now_iso()),
         ).fetchall()
-        for row in rows:
+    for row in rows:
+        try:
+            provider_for(row["provider"]).cancel(provider_handle_from_row(row), "provider session timed out")
+        except Exception:
+            pass
+        if row["provider"] == "host-codex":
+            cleanup_dispatch_worktrees(root, run_id, row["task_id"], row["agent_id"])
+        with transaction(root, touched=[("dispatch_run", run_id), ("agent_provider_session", row["id"])]) as conn:
             conn.execute(
                 "update agent_provider_sessions set status = 'timed_out', last_error = 'provider session timed out', finished_at = ? where id = ?",
                 (now_iso(), row["id"]),
@@ -6088,9 +6161,10 @@ def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
                 (now_iso(), run_id, row["task_id"]),
             )
             provider_event(conn, row, "timed_out", {})
-        if rows:
+    if rows:
+        with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
             emit_event(conn, "agent_provider_sessions_reconciled", payload(run_id=run_id, count=len(rows)))
-        return len(rows)
+    return len(rows)
 
 
 def dispatch_provider_status(root: Path, run_id: str) -> list[str]:

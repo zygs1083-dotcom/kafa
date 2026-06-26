@@ -84,7 +84,7 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(summary["sqlite_lock_error_count"], 0)
         self.assertEqual(summary["human_intervention_count"], 0)
         for name in {
-            "host_codex_fake_app_server_e2e",
+            "host_codex_fake_sdk_e2e",
             "multi_role_thread_lifecycle",
             "connector_mock_server_e2e",
             "crash_retry_recovery",

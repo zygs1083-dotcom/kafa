@@ -167,30 +167,51 @@ def fixture_report(root: Path, run_id: str, task_id: str, branch_name: str, *, s
     )
 
 
-def fake_codex_app_server(temp: Path) -> tuple[Path, Path]:
-    script = temp / "fake_codex_app_server.py"
-    log_path = temp / "fake_codex_log.jsonl"
-    script.write_text(
+def fake_codex_sdk(temp: Path) -> tuple[Path, Path]:
+    package_root = temp / "fake_sdk"
+    package_dir = package_root / "openai_codex"
+    package_dir.mkdir(parents=True)
+    log_path = temp / "fake_codex_sdk_log.jsonl"
+    package_dir.joinpath("__init__.py").write_text(
         textwrap.dedent(
             r'''
             import json
             import os
             import re
-            import sys
+            from pathlib import Path
 
-            log_path = os.environ["FAKE_CODEX_LOG"]
+            class ApprovalMode:
+                deny_all = "deny_all"
+                auto_review = "auto_review"
+
+            class Sandbox:
+                read_only = "read_only"
+                workspace_write = "workspace_write"
+                full_access = "full_access"
+
+            class CodexConfig:
+                def __init__(self, codex_bin=None, client_name="", client_title="", client_version="", **kwargs):
+                    self.codex_bin = codex_bin
+                    self.client_name = client_name
+                    self.client_title = client_title
+                    self.client_version = client_version
+
+            class TurnResult:
+                def __init__(self, final_response):
+                    self.final_response = final_response
 
             def log(message):
+                log_path = os.environ["FAKE_CODEX_SDK_LOG"]
                 with open(log_path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps(message, sort_keys=True) + "\n")
-
-            def send(message):
-                sys.stdout.write(json.dumps(message, sort_keys=True) + "\n")
-                sys.stdout.flush()
 
             def prompt_value(prompt, name, default=""):
                 match = re.search(rf'"{name}": "([^"]*)"', prompt)
                 return match.group(1) if match else default
+
+            def prompt_int(prompt, name, default=0):
+                match = re.search(rf'"{name}": ([0-9]+)', prompt)
+                return int(match.group(1)) if match else default
 
             def report(prompt):
                 return {
@@ -204,30 +225,44 @@ def fake_codex_app_server(temp: Path) -> tuple[Path, Path]:
                     "branch_name": prompt_value(prompt, "branch_name"),
                     "status": "success",
                     "target_id": prompt_value(prompt, "target_id", "UNIT"),
+                    "fence": prompt_int(prompt, "fence", 0),
+                    "agent_id": prompt_value(prompt, "agent_id", "agent-t1"),
                 }
 
-            for line in sys.stdin:
-                message = json.loads(line)
-                log(message)
-                method = message.get("method")
-                if method == "initialize":
-                    send({"id": message["id"], "result": {"serverInfo": {"name": "fake-codex"}}})
-                elif method == "initialized":
-                    continue
-                elif method == "thread/start":
-                    send({"id": message["id"], "result": {"thread": {"id": "thr_fake"}}})
-                elif method == "turn/start":
-                    prompt = message["params"]["input"][0]["text"]
-                    send({"id": message["id"], "result": {"turn": {"id": "turn_fake"}}})
-                    send({"method": "turn/started", "params": {"turn": {"id": "turn_fake"}}})
-                    send({"method": "item/agentMessage/delta", "params": {"delta": json.dumps(report(prompt), sort_keys=True)}})
-                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake", "status": "completed"}}})
+            class Thread:
+                id = "thr_fake"
+
+                def run(self, input, *, cwd=None, sandbox=None, approval_mode=None, output_schema=None, model=None, **kwargs):
+                    log({
+                        "method": "thread.run",
+                        "cwd": str(cwd),
+                        "sandbox": str(sandbox),
+                        "approval_mode": str(approval_mode),
+                        "output_schema_required": sorted((output_schema or {}).get("required", [])),
+                    })
+                    Path(str(cwd)).joinpath("agent.txt").write_text("host codex sdk work\n", encoding="utf-8")
+                    return TurnResult(report(input))
+
+            class Codex:
+                def __init__(self, config=None):
+                    self.config = config
+
+                def __enter__(self):
+                    log({"method": "codex.__enter__", "client_name": getattr(self.config, "client_name", "")})
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    log({"method": "codex.__exit__"})
+
+                def thread_start(self, *, cwd=None, sandbox=None, approval_mode=None, model=None, **kwargs):
+                    log({"method": "thread_start", "cwd": str(cwd), "sandbox": str(sandbox), "approval_mode": str(approval_mode)})
+                    return Thread()
             '''
         ).strip()
         + "\n",
         encoding="utf-8",
     )
-    return script, log_path
+    return package_root, log_path
 
 
 def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]) -> str:
@@ -563,7 +598,7 @@ def scenario_integration_regression_blocked() -> dict[str, Any]:
         )
 
 
-def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
+def scenario_host_codex_fake_sdk_e2e() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         temp_path = Path(temp)
@@ -572,17 +607,16 @@ def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
         init_git_repo(root)
         add_unittest(root)
         run_id = setup_basic_harness(root, ["T1"])
-        script, log_path = fake_codex_app_server(temp_path)
+        package_root, log_path = fake_codex_sdk(temp_path)
         env = {
-            "HARNESS_CODEX_APP_SERVER_CMD": f"{PYTHON} {json.dumps(str(script))}",
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
-            "FAKE_CODEX_LOG": str(log_path),
+            "FAKE_CODEX_SDK_LOG": str(log_path),
+            "PYTHONPATH": str(package_root),
         }
         run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
-        session = db_rows(root, "select task_id, agent_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
-        _head, _tree, worktree = commit_branch(root, session["branch_name"], "agent.txt", "host codex work\n")
-        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "agent.txt", worktree, session["branch_name"])
         collect = wait_for_provider_collect(root, run_id)
+        session = db_rows(root, "select task_id, agent_id, branch_name, worktree_path from agent_provider_sessions where run_id = ?", (run_id,))[0]
+        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "agent.txt", session["worktree_path"], session["branch_name"])
         evidence_before = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
         evidence_after = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
@@ -602,13 +636,13 @@ def scenario_host_codex_fake_app_server_e2e() -> dict[str, Any]:
         finally:
             harness_db.validate_runtime = original_validate
         status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        rpc_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+        sdk_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
         ok = "collected 1 provider report" in collect.stdout and evidence_before == 0 and evidence_after == 1 and integrate_returncode == 0 and status == "integrated"
         return scenario_result(
-            "host_codex_fake_app_server_e2e",
+            "host_codex_fake_sdk_e2e",
             started,
             ok,
-            {"run_id": run_id, "rpc_methods": rpc_methods[:4], "integrate_returncode": integrate_returncode, "status": status, "target_branch": target},
+            {"run_id": run_id, "sdk_methods": sdk_methods[:4], "integrate_returncode": integrate_returncode, "status": status, "target_branch": target},
             category="host-codex",
             mode="stability",
         )
@@ -840,7 +874,7 @@ FIXTURE_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
 ]
 
 STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
-    scenario_host_codex_fake_app_server_e2e,
+    scenario_host_codex_fake_sdk_e2e,
     scenario_multi_role_thread_lifecycle,
     scenario_connector_mock_server_e2e,
     scenario_crash_retry_recovery,

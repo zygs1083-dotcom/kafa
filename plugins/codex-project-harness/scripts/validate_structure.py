@@ -172,6 +172,9 @@ def main() -> int:
             errors.append("pyproject version must match root VERSION")
         if project.get("requires-python") != ">=3.11":
             errors.append("pyproject requires-python must be >=3.11")
+        dependencies = project.get("dependencies", [])
+        if not isinstance(dependencies, list) or "openai-codex>=0.1.0b3" not in dependencies:
+            errors.append("pyproject dependencies must include openai-codex>=0.1.0b3")
         if scripts.get("kafa") != "kafa.cli:main":
             errors.append("pyproject must expose kafa = kafa.cli:main")
 

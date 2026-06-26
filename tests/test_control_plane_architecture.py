@@ -68,7 +68,7 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
         eval_runner = self.read(PLUGIN_ROOT / "scripts" / "run_agent_e2e_eval.py")
 
         for scenario in [
-            "scenario_host_codex_fake_app_server_e2e",
+            "scenario_host_codex_fake_sdk_e2e",
             "scenario_connector_mock_server_e2e",
             "scenario_crash_retry_recovery",
             "scenario_sqlite_contention_stress",

@@ -348,7 +348,7 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
             "Connector/Eval Boundary",
             source / "scripts" / "run_agent_e2e_eval.py",
             [
-                "scenario_host_codex_fake_app_server_e2e",
+                "scenario_host_codex_fake_sdk_e2e",
                 "scenario_connector_mock_server_e2e",
                 "scenario_crash_retry_recovery",
                 "scenario_sqlite_contention_stress",

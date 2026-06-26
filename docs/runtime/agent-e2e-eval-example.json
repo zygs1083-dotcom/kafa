@@ -67,7 +67,7 @@
       "details": {},
       "duration_seconds": 0.0,
       "mode": "stability",
-      "name": "host_codex_fake_app_server_e2e",
+      "name": "host_codex_fake_sdk_e2e",
       "pass": true,
       "skip_reason": ""
     },
