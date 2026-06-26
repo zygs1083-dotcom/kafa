@@ -43,7 +43,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 24
-RUNTIME_VERSION = "4.9.0"
+RUNTIME_VERSION = "4.10.0"
 LEASE_TTL_SECONDS = 3600
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 RUNTIME_GITIGNORE_PATTERNS = [
@@ -4896,7 +4896,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
     if max_concurrency < 1 or max_concurrency > 6:
         raise HarnessError("max concurrency must be between 1 and 6")
     provider = provider_for(provider_name)
-    started = 0
+    pending: list[AgentJobRequest] = []
     with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
         run = conn.execute("select * from dispatch_runs where id = ?", (run_id,)).fetchone()
         if not run:
@@ -4915,6 +4915,11 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
             agent_id = row["agent_id"] or row["capability"] or row["owner"] or "developer"
             branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(row['task_id'])}/{safe_branch_part(agent_id)}"
             target = task_target(conn, row["task_id"])
+            session_id = str(uuid.uuid4())
+            provider_session_id = f"{provider.name}:{run_id}:{row['task_id']}:{session_id}"
+            agent_session_id = f"AGENT-SESSION-{uuid.uuid4().hex[:12]}"
+            role = agent_id if agent_id in SESSION_ROLES else "developer"
+            context_id = f"{run_id}:{row['task_id']}"
             request = AgentJobRequest(
                 root=root,
                 run_id=run_id,
@@ -4933,51 +4938,9 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     "target_id": target["id"] if target else "",
                     "command_template": target["command_template"] if target else "",
                 },
+                session_id=session_id,
+                provider_session_id=provider_session_id,
             )
-            handle = provider.spawn(request)
-            session_id = str(uuid.uuid4())
-            handle_meta: dict[str, Any] = {}
-            if handle.message:
-                try:
-                    handle_meta = json.loads(handle.message)
-                except json.JSONDecodeError:
-                    handle_meta = {"message": handle.message}
-            provider_input_json = dict(request.input_json)
-            if handle_meta:
-                provider_input_json["provider_metadata"] = handle_meta
-            if handle.status == "spawn_failed":
-                now = now_iso()
-                conn.execute(
-                    """
-                    insert into agent_provider_sessions
-                    (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
-                     agent_session_id, branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
-                     heartbeat_at, lease_expires_at, collected_at, cancelled_at, finished_at)
-                    values (?, ?, ?, ?, ?, ?, ?, 'spawn_failed', ?, '', ?, '', ?, '', '', ?, ?, '', '', '', '', ?)
-                    """,
-                    (
-                        session_id,
-                        run_id,
-                        row["task_id"],
-                        provider.name,
-                        handle.provider_session_id,
-                        handle.provider_job_id,
-                        agent_id,
-                        int(row["fence"]),
-                        branch_name,
-                        stable_json(provider_input_json),
-                        handle.message,
-                        now,
-                        now,
-                    ),
-                )
-                session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
-                provider_event(conn, session, "spawn_failed", handle_meta)
-                emit_event(conn, "agent_provider_session_spawn_failed", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, error=handle.message))
-                continue
-            agent_session_id = f"AGENT-SESSION-{uuid.uuid4().hex[:12]}"
-            role = agent_id if agent_id in SESSION_ROLES else "developer"
-            context_id = f"{run_id}:{row['task_id']}"
             now = now_iso()
             conn.execute(
                 """
@@ -4985,7 +4948,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                 (session_id, agent_id, role, context_id, provider_session_id, origin, trust_level, status, started_at, ended_at)
                 values (?, ?, ?, ?, ?, 'manual', 'local-only', 'running', ?, '')
                 """,
-                (agent_session_id, agent_id, role, context_id, handle.provider_session_id, now),
+                (agent_session_id, agent_id, role, context_id, provider_session_id, now),
             )
             conn.execute(
                 """
@@ -4993,22 +4956,19 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                 (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
                  agent_session_id, branch_name, worktree_path, input_json, report_id, attempt_id, last_error, spawned_at,
                  heartbeat_at, lease_expires_at, collected_at, cancelled_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', '', ?, ?, ?, ?, '', '', '')
+                values (?, ?, ?, ?, ?, '', ?, 'spawning', ?, ?, ?, '', ?, '', '', '', ?, ?, ?, '', '', '')
                 """,
                 (
                     session_id,
                     run_id,
                     row["task_id"],
                     provider.name,
-                    handle.provider_session_id,
-                    handle.provider_job_id,
+                    provider_session_id,
                     agent_id,
-                    handle.status,
                     int(row["fence"]),
                     agent_session_id,
                     branch_name,
-                    stable_json(provider_input_json),
-                    handle.message,
+                    stable_json(request.input_json),
                     now,
                     now,
                     lease_deadline(),
@@ -5021,14 +4981,107 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
                 where run_id = ? and task_id = ?
                 """,
-                (agent_id, handle.provider_session_id, now, now, lease_deadline(), now, run_id, row["task_id"]),
+                (agent_id, provider_session_id, now, now, lease_deadline(), now, run_id, row["task_id"]),
             )
             session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
-            provider_event(conn, session, "started", {"provider_status": handle.status, **handle_meta})
-            emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, provider_session_id=handle.provider_session_id))
-            started += 1
-        if started:
+            provider_event(conn, session, "spawning", {"provider_status": "spawning"})
+            emit_event(conn, "agent_provider_session_spawning", payload(run_id=run_id, task_id=row["task_id"], provider=provider.name, provider_session_id=provider_session_id))
+            pending.append(request)
+        if pending:
             conn.execute("update dispatch_runs set status = 'claimed', updated_at = ? where id = ?", (now_iso(), run_id))
+    started = 0
+    for request in pending:
+        try:
+            handle = provider.spawn(request)
+        except Exception as exc:  # noqa: BLE001 - provider errors are recorded as session failures.
+            from core.agent_provider import AgentJobHandle
+
+            handle = AgentJobHandle(provider.name, request.provider_session_id, request.task_id, "spawn_failed", str(exc))
+        handle_meta: dict[str, Any] = {}
+        if handle.message:
+            try:
+                handle_meta = json.loads(handle.message)
+            except json.JSONDecodeError:
+                handle_meta = {"message": handle.message}
+        with transaction(root, touched=[("agent_provider_session", request.session_id)]) as conn:
+            session = conn.execute(
+                """
+                select * from agent_provider_sessions
+                where id = ? and provider_session_id = ? and fence = ?
+                """,
+                (request.session_id, request.provider_session_id, request.fence),
+            ).fetchone()
+            if not session or session["status"] != "spawning":
+                if handle.status == "running":
+                    provider.cancel(handle, "provider session no longer active")
+                continue
+            provider_input_json = json.loads(session["input_json"] or "{}")
+            if handle_meta:
+                provider_input_json["provider_metadata"] = handle_meta
+            now = now_iso()
+            if handle.status == "spawn_failed":
+                conn.execute(
+                    """
+                    update agent_provider_sessions
+                    set status = 'spawn_failed', provider_job_id = ?, input_json = ?, last_error = ?,
+                        heartbeat_at = '', lease_expires_at = '', finished_at = ?
+                    where id = ? and status = 'spawning'
+                    """,
+                    (handle.provider_job_id, stable_json(provider_input_json), handle.message, now, request.session_id),
+                )
+                if session["agent_session_id"]:
+                    conn.execute(
+                        "update agent_sessions set status = 'verification_failed', ended_at = ? where session_id = ?",
+                        (now, session["agent_session_id"]),
+                    )
+                conn.execute(
+                    """
+                    update dispatch_assignments
+                    set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                        lease_expires_at = null, updated_at = ?
+                    where run_id = ? and task_id = ? and status != 'completed'
+                    """,
+                    (now, run_id, request.task_id),
+                )
+                updated = conn.execute("select * from agent_provider_sessions where id = ?", (request.session_id,)).fetchone()
+                provider_event(conn, updated, "spawn_failed", handle_meta)
+                emit_event(conn, "agent_provider_session_spawn_failed", payload(run_id=run_id, task_id=request.task_id, provider=provider.name, error=handle.message))
+                continue
+            conn.execute(
+                """
+                update agent_provider_sessions
+                set status = ?, provider_session_id = ?, provider_job_id = ?, input_json = ?, last_error = ?,
+                    heartbeat_at = ?, lease_expires_at = ?
+                where id = ? and status = 'spawning'
+                """,
+                (
+                    handle.status,
+                    handle.provider_session_id,
+                    handle.provider_job_id,
+                    stable_json(provider_input_json),
+                    handle.message,
+                    now,
+                    lease_deadline(),
+                    request.session_id,
+                ),
+            )
+            if session["agent_session_id"] and handle.provider_session_id != session["provider_session_id"]:
+                conn.execute(
+                    "update agent_sessions set provider_session_id = ? where session_id = ?",
+                    (handle.provider_session_id, session["agent_session_id"]),
+                )
+            conn.execute(
+                """
+                update dispatch_assignments
+                set provider_session_id = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                where run_id = ? and task_id = ?
+                """,
+                (handle.provider_session_id, now, lease_deadline(), now, run_id, request.task_id),
+            )
+            updated = conn.execute("select * from agent_provider_sessions where id = ?", (request.session_id,)).fetchone()
+            provider_event(conn, updated, "started", {"provider_status": handle.status, **handle_meta})
+            emit_event(conn, "agent_provider_session_started", payload(run_id=run_id, task_id=request.task_id, provider=provider.name, provider_session_id=handle.provider_session_id))
+            started += 1
     return started
 
 
@@ -5826,12 +5879,19 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
 def provider_handle_from_row(row: sqlite3.Row) -> Any:
     from core.agent_provider import AgentJobHandle
 
+    message = row["last_error"]
+    try:
+        data = json.loads(row["input_json"] or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if isinstance(data, dict) and isinstance(data.get("provider_metadata"), dict):
+        message = stable_json(data["provider_metadata"])
     return AgentJobHandle(
         provider=row["provider"],
         provider_session_id=row["provider_session_id"],
         provider_job_id=row["provider_job_id"],
         status=row["status"],
-        message=row["last_error"],
+        message=message,
     )
 
 
