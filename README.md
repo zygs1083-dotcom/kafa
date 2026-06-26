@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.17.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.10.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.18.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.11.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -21,7 +21,7 @@ git show v1.12.0-beta.1
 git show v1.13.0-beta.1
 git show v1.14.0-beta.1
 git show v1.16.0-beta.1
-git show v1.17.0-beta.1
+git show v1.18.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -159,7 +159,7 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 从 v1.8.0 开始，仓库新增真实 Agent E2E 评测脚本。`run_agent_e2e_eval.py --mode fixture` 会在临时 Git repo 中调用真实 CLI，覆盖并行成功、依赖阻塞、同文件 claim 冲突、伪造 worker evidence 阻断、集成后回归阻断五个场景，并输出稳定 JSON 指标。`run_skill_eval.py` 仍保留为 transcript marker 检查，但不再代表 Agent 能力评测。
 
-从 v1.12.0 开始，Agent E2E 升级为稳定性矩阵 runner。`--mode stability` 是 CI 发布闸，包含 fixture 五场景、fake Host Codex App Server、三角色 session lifecycle、connector mock server、crash/retry recovery 和 SQLite contention stress；`--mode live-codex` 是 opt-in 宿主真实 Codex profile，只有设置 `HARNESS_E2E_ENABLE_LIVE_CODEX=1` 且本机 Codex 可用时才进入真实 live 路径。未启用 live 时会明确输出 `live_skipped=true` 和 skip reason，这不代表真实 Codex E2E 通过。
+从 v1.12.0 开始，Agent E2E 升级为稳定性矩阵 runner。`--mode stability` 是 CI 发布闸，包含 fixture 五场景、fake Host Codex SDK、三角色 session lifecycle、connector mock server、crash/retry recovery 和 SQLite contention stress；`--mode live-codex` 是 opt-in 宿主真实 Codex profile，只有设置 `HARNESS_E2E_ENABLE_LIVE_CODEX=1` 且本机 Codex 可用时才进入真实 live 路径。未启用 live 时会明确输出 `live_skipped=true` 和 skip reason，这不代表真实 Codex E2E 通过。
 
 从 v1.13.0 开始，仓库新增根级 `kafa` 安装发行助手。`python3 -m pip install -e .` 会安装 `kafa` console script；`kafa plugin install|upgrade|uninstall` 管理 Codex 官方 marketplace JSON，`kafa doctor` 做 Python/Git/manifest/structure 预检。该助手只管理本地安装入口，不发布 PyPI，不直接改 Codex cache，也不替代 runtime `harness.py`。
 
@@ -169,11 +169,11 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 从 v1.16.0 开始，blocked connector 会自动进入 Advisory Fallback Layer：Harness 在本地生成 `docs/harness/advisory-fallbacks/<action-id>.md` 和 `.ai-team/control/advisory-fallbacks.md`，给出 GitHub 草稿、Linear 任务兜底、Notion 文档草稿、Product Design brief/visual QA checklist、Slack handoff summary 等二级替代分析。它只辅助人和 agent 继续推进，不调用真实官方插件，不冒充外部写入，也永远不能满足 delivery evidence。
 
-从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。v1.17 只修复 Host Codex Provider 非阻塞生命周期，schema 仍为 24，CLI surface、Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
+从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。v1.17 修复 Host Codex Provider 非阻塞生命周期；v1.18 在 schema 24 内把 Host Codex 执行固定到独立 git worktree 并迁移到 mandatory Codex SDK。CLI surface、Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
 
 从 v1.11.0 开始，插件自带 Codex lifecycle hooks。安装或更新插件后，用 `/hooks` 审核并信任它们；也可以用 `[features] hooks = false` 关闭 Codex hooks。默认 hooks 只做辅助护栏：`SessionStart` 注入项目状态，`SubagentStart` 提醒角色/任务/验收边界，`PreToolUse` 在需求未确认或无 active task 时提示写入风险，`PostToolUse` 汇总变更，`Stop` 运行 readiness 检查。若插件不在项目默认 `plugins/codex-project-harness` 路径下，设置 `CODEX_PROJECT_HARNESS_PLUGIN_ROOT`。Hooks 不生成可信 evidence，也不能替代 controller verification、integration gate、HMAC/session attestation 或 CI。
 
-从 v1.17.0 开始，现有 `dispatch provider start --provider host-codex` 是非阻塞生命周期入口：它在短事务中登记 provider session 和 agent session，事务外启动后台 worker，然后通过短事务 CAS 标记 running 或 spawn_failed。成功返回只表示“provider session 已登记且后台 worker 已启动”，不表示 Codex turn 已完成。后台 worker 通过 Codex App Server stdio JSON-RPC 创建一个 thread/turn，最终 JSON 只作为 raw provider report 导入；交付资格仍必须由 `dispatch verify-attempt` 在 controller 侧重新执行目标命令后生成可信 evidence。
+从 v1.18.0 开始，现有 `dispatch provider start --provider host-codex` 是非阻塞、worktree-isolated 的 Host Codex SDK 入口：它在短事务中登记 provider session 和 agent session，事务外为每个 assignment 创建 `.ai-team/runtime/worktrees/<run>/<task>/<agent>` 独立 git worktree，再启动后台 worker。Worker 使用 `openai-codex>=0.1.0b3`，以 `Sandbox.workspace_write` 和 `ApprovalMode.deny_all` 在该 worktree cwd 内运行，完成后把非 `.ai-team/` 变更提交到 assignment 的 agent branch；用户主工作区不会被切换或污染。最终 JSON 仍只作为 raw provider report 导入；交付资格仍必须由 `dispatch verify-attempt` 在 controller 侧重新执行目标命令后生成可信 evidence。
 
 从 v1.10.0 开始，现有 `adapter confirm` 在 `adapter_actions.payload_json` 含 `{"execute": true, "operation": "...", "params": {...}}` 时可以执行真实 connector adapter。GitHub 通过 `gh api` 执行；Linear、Notion、Figma、Slack 通过官方 HTTP API 和环境变量 token 执行。外部写入结果只进入 adapter/action 记录，不自动成为 delivery evidence，也不放宽 high/critical 的 HMAC 信任要求。
 

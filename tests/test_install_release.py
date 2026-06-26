@@ -35,7 +35,7 @@ def copy_release_repo(target: Path) -> Path:
 class InstallReleaseTest(unittest.TestCase):
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
-        self.assertEqual(result.stdout.strip(), "1.17.0-beta.1")
+        self.assertEqual(result.stdout.strip(), "1.18.0-beta.1")
 
     def test_doctor_reports_repo_health_as_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -124,7 +124,7 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.17.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
+            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.18.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
 
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 
@@ -162,6 +162,17 @@ class InstallReleaseTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pyproject requires-python must be >=3.11", result.stdout)
+
+    def test_validate_structure_requires_codex_sdk_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp))
+            pyproject = root / "pyproject.toml"
+            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('  "openai-codex>=0.1.0b3"\n', ""), encoding="utf-8")
+
+            result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pyproject dependencies must include openai-codex>=0.1.0b3", result.stdout)
 
 
 if __name__ == "__main__":

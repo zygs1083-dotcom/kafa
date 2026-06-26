@@ -8,6 +8,7 @@ Codex Project Harness is distributed as a local Git/Codex plugin bundle. Phase 6
 - Git on `PATH`.
 - Codex with plugin marketplace support.
 - A checkout of this repository.
+- `python3 -m pip install -e .` installs the mandatory Host Codex SDK dependency `openai-codex>=0.1.0b3`.
 
 Check the repository:
 
@@ -22,7 +23,7 @@ Expected:
 
 ```text
 OK: plugin structure is valid
-1.17.0-beta.1
+1.18.0-beta.1
 ```
 
 `kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.

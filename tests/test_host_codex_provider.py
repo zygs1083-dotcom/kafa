@@ -51,16 +51,6 @@ def bootstrap(root: Path) -> str:
     return run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
 
 
-def create_branch(root: Path, branch_name: str) -> str:
-    subprocess.run(["git", "switch", "-c", branch_name], cwd=root, check=True, capture_output=True)
-    (root / "agent.txt").write_text("agent work\n", encoding="utf-8")
-    subprocess.run(["git", "add", "agent.txt"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "agent work"], cwd=root, check=True, capture_output=True)
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
-    subprocess.run(["git", "switch", "master"], cwd=root, check=True, capture_output=True)
-    return head
-
-
 def db_one(root: Path, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
         conn.row_factory = sqlite3.Row
@@ -84,36 +74,57 @@ def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float =
     return last
 
 
-def fake_app_server(temp: Path) -> tuple[Path, Path]:
-    script = temp / "fake_codex_app_server.py"
-    log_path = temp / "fake_codex_log.jsonl"
-    script.write_text(
+def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, Path]:
+    package_root = temp / "fake_sdk"
+    package_dir = package_root / "openai_codex"
+    package_dir.mkdir(parents=True)
+    log_path = temp / "fake_codex_sdk_log.jsonl"
+    if import_error:
+        package_dir.joinpath("__init__.py").write_text("raise ImportError('fake sdk missing')\n", encoding="utf-8")
+        return package_root, log_path
+    package_dir.joinpath("__init__.py").write_text(
         textwrap.dedent(
             r'''
             import json
             import os
             import re
-            import select
-            import sys
             import time
+            from pathlib import Path
 
-            mode = os.environ.get("FAKE_CODEX_MODE", "success")
-            delay_seconds = float(os.environ.get("FAKE_CODEX_DELAY_SECONDS", "0"))
-            log_path = os.environ["FAKE_CODEX_LOG"]
+            class ApprovalMode:
+                deny_all = "deny_all"
+                auto_review = "auto_review"
+
+            class Sandbox:
+                read_only = "read_only"
+                workspace_write = "workspace_write"
+                full_access = "full_access"
+
+            class CodexConfig:
+                def __init__(self, codex_bin=None, client_name="", client_title="", client_version="", **kwargs):
+                    self.codex_bin = codex_bin
+                    self.client_name = client_name
+                    self.client_title = client_title
+                    self.client_version = client_version
+
+            class TurnResult:
+                def __init__(self, final_response):
+                    self.final_response = final_response
+
+            def value_name(value):
+                return getattr(value, "value", value)
 
             def log(message):
-                with open(log_path, "a", encoding="utf-8") as handle:
+                path = os.environ["FAKE_CODEX_SDK_LOG"]
+                with open(path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps(message, sort_keys=True) + "\n")
-
-            def send(message):
-                sys.stdout.write(json.dumps(message, sort_keys=True) + "\n")
-                sys.stdout.flush()
 
             def prompt_value(prompt, name, default=""):
                 match = re.search(rf'"{name}": "([^"]*)"', prompt)
                 return match.group(1) if match else default
 
             def report_from_prompt(prompt):
+                mode = os.environ.get("FAKE_CODEX_MODE", "success")
                 expected = {
                     "command": prompt_value(prompt, "command", "python3 -m unittest"),
                     "exit_code": 0,
@@ -125,6 +136,8 @@ def fake_app_server(temp: Path) -> tuple[Path, Path]:
                     "branch_name": prompt_value(prompt, "branch_name"),
                     "status": "success",
                     "target_id": prompt_value(prompt, "target_id", "UNIT"),
+                    "fence": int(prompt_value(prompt, "fence", "0")),
+                    "agent_id": prompt_value(prompt, "agent_id", "developer"),
                 }
                 if mode == "manual":
                     expected["executed_count_source"] = "manual"
@@ -132,57 +145,71 @@ def fake_app_server(temp: Path) -> tuple[Path, Path]:
                     expected["branch_name"] = "agent/wrong/branch"
                 return expected
 
-            if mode == "sleep":
-                time.sleep(10)
+            class Thread:
+                id = "thr_fake"
 
-            for line in sys.stdin:
-                message = json.loads(line)
-                log(message)
-                method = message.get("method")
-                if method == "initialize":
-                    send({"id": message["id"], "result": {"serverInfo": {"name": "fake-codex"}}})
-                elif method == "initialized":
-                    continue
-                elif method == "thread/start":
-                    if mode == "rpc-error":
-                        send({"id": message["id"], "error": {"code": 123, "message": "fake rpc boom"}})
-                    else:
-                        send({"id": message["id"], "result": {"thread": {"id": "thr_fake"}}})
-                elif method == "turn/start":
-                    prompt = message["params"]["input"][0]["text"]
-                    send({"id": message["id"], "result": {"turn": {"id": "turn_fake"}}})
-                    send({"method": "turn/started", "params": {"turn": {"id": "turn_fake"}}})
+                def run(self, input, *, cwd=None, sandbox=None, approval_mode=None, output_schema=None, model=None, **kwargs):
+                    mode = os.environ.get("FAKE_CODEX_MODE", "success")
+                    delay_seconds = float(os.environ.get("FAKE_CODEX_DELAY_SECONDS", "0"))
+                    prompt = input
                     if delay_seconds:
-                        deadline = time.time() + delay_seconds
-                        while time.time() < deadline:
-                            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                            if not ready:
-                                continue
-                            interrupt = json.loads(sys.stdin.readline())
-                            log(interrupt)
-                            if interrupt.get("method") == "turn/interrupt":
-                                raise SystemExit(0)
+                        time.sleep(delay_seconds)
+                    log({
+                        "method": "thread.run",
+                        "cwd": str(cwd),
+                        "sandbox": value_name(sandbox),
+                        "approval_mode": value_name(approval_mode),
+                        "model": model,
+                        "output_schema_required": sorted((output_schema or {}).get("required", [])),
+                    })
+                    if mode == "exception":
+                        raise RuntimeError("fake sdk boom")
+                    if mode != "no-write":
+                        Path(str(cwd)).joinpath("agent.txt").write_text("agent work from fake sdk\n", encoding="utf-8")
                     if mode == "invalid-json":
-                        text = "not a json result"
-                    else:
-                        text = json.dumps(report_from_prompt(prompt), sort_keys=True)
-                    send({"method": "item/agentMessage/delta", "params": {"delta": text}})
-                    send({"method": "turn/completed", "params": {"turn": {"id": "turn_fake", "status": "completed"}}})
+                        return TurnResult("not a json result")
+                    return TurnResult(report_from_prompt(prompt))
+
+            class Codex:
+                def __init__(self, config=None):
+                    self.config = config
+
+                def __enter__(self):
+                    log({
+                        "method": "codex.__enter__",
+                        "codex_bin": getattr(self.config, "codex_bin", None),
+                        "client_name": getattr(self.config, "client_name", ""),
+                        "client_version": getattr(self.config, "client_version", ""),
+                    })
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    log({"method": "codex.__exit__"})
+
+                def thread_start(self, *, cwd=None, sandbox=None, approval_mode=None, model=None, **kwargs):
+                    log({
+                        "method": "thread_start",
+                        "cwd": str(cwd),
+                        "sandbox": value_name(sandbox),
+                        "approval_mode": value_name(approval_mode),
+                        "model": model,
+                    })
+                    return Thread()
             '''
         ).strip()
         + "\n",
         encoding="utf-8",
     )
-    return script, log_path
+    return package_root, log_path
 
 
 class HostCodexProviderTest(unittest.TestCase):
-    def host_env(self, script: Path, log_path: Path, *, mode: str = "success", timeout: str = "5") -> dict[str, str]:
+    def host_env(self, package_root: Path, log_path: Path, *, mode: str = "success", timeout: str = "5") -> dict[str, str]:
         return {
-            "HARNESS_CODEX_APP_SERVER_CMD": f"python3 {script}",
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": timeout,
-            "FAKE_CODEX_LOG": str(log_path),
+            "FAKE_CODEX_SDK_LOG": str(log_path),
             "FAKE_CODEX_MODE": mode,
+            "PYTHONPATH": str(package_root),
         }
 
     def test_host_codex_start_returns_before_turn_completion_and_releases_db_lock(self) -> None:
@@ -192,8 +219,8 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            env = self.host_env(script, log_path)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
             env["FAKE_CODEX_DELAY_SECONDS"] = "2"
 
             started_at = time.monotonic()
@@ -210,9 +237,11 @@ class HostCodexProviderTest(unittest.TestCase):
             metadata = json.loads(session["input_json"])["provider_metadata"]
             self.assertEqual(session["provider"], "host-codex")
             self.assertEqual(session["status"], "running")
+            self.assertTrue(session["worktree_path"])
             self.assertTrue(session["provider_session_id"].startswith("host-codex:"))
             self.assertTrue(metadata["worker_pid"])
             self.assertTrue(metadata["report_path"].endswith("/T1.json"))
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
 
     def test_host_codex_start_honors_max_concurrency_without_waiting_for_first_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -227,8 +256,8 @@ class HostCodexProviderTest(unittest.TestCase):
                 run_harness(root, "task", "add", "--id", task_id, "--task", f"Example {task_id}", "--owner", "developer", "--acceptance", "AC1")
                 run_harness(root, "test-target", "link", "--task", task_id, "--target", "UNIT")
             run_id = run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
-            script, log_path = fake_app_server(temp_path)
-            env = self.host_env(script, log_path)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
             env["FAKE_CODEX_DELAY_SECONDS"] = "2"
 
             started_at = time.monotonic()
@@ -241,51 +270,72 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertEqual([row["task_id"] for row in sessions], ["T1", "T2"])
             self.assertEqual([row["status"] for row in sessions], ["running", "running"])
             self.assertTrue(all(row["provider_session_id"].startswith("host-codex:") for row in sessions))
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
 
-    def test_host_codex_start_records_worker_metadata_and_rpc_sequence(self) -> None:
+    def test_host_codex_start_records_worker_metadata_and_sdk_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "repo"
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
+            package_root, log_path = fake_sdk_package(temp_path)
 
-            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path))
+            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path))
 
             self.assertIn("started 1 provider session", started.stdout)
             session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
             metadata = json.loads(session["input_json"])["provider_metadata"]
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and (not log_path.exists() or len(log_path.read_text(encoding="utf-8").splitlines()) < 4):
+            while time.monotonic() < deadline and (not log_path.exists() or "thread.run" not in log_path.read_text(encoding="utf-8")):
                 time.sleep(0.05)
             events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            by_method = {event["method"]: event for event in events}
+            worktree_path = root / session["worktree_path"]
+            worktree_row = db_one(root, "select * from dispatch_worktrees where run_id = ? and task_id = 'T1'", (run_id,))
             self.assertEqual(session["provider"], "host-codex")
             self.assertEqual(session["status"], "running")
+            self.assertEqual(session["worktree_path"], worktree_row["worktree_path"])
+            self.assertTrue(worktree_path.exists())
             self.assertTrue(session["provider_session_id"].startswith("host-codex:"))
             self.assertTrue(metadata["worker_pid"])
+            self.assertEqual(metadata["sdk"], "openai-codex")
             self.assertTrue(metadata["report_path"].endswith("/T1.json"))
-            self.assertEqual([event["method"] for event in events[:4]], ["initialize", "initialized", "thread/start", "turn/start"])
-            self.assertEqual(events[0]["params"]["clientInfo"]["name"], "codex_project_harness")
-            self.assertIn("Expected report shape", events[3]["params"]["input"][0]["text"])
+            self.assertEqual(by_method["thread_start"]["cwd"], str(worktree_path.resolve()))
+            self.assertEqual(by_method["thread_start"]["sandbox"], "workspace_write")
+            self.assertEqual(by_method["thread_start"]["approval_mode"], "deny_all")
+            self.assertEqual(by_method["thread.run"]["cwd"], str(worktree_path.resolve()))
+            self.assertEqual(by_method["thread.run"]["sandbox"], "workspace_write")
+            self.assertEqual(by_method["thread.run"]["approval_mode"], "deny_all")
+            self.assertIn("branch_name", by_method["thread.run"]["output_schema_required"])
+            self.assertIn("fence", by_method["thread.run"]["output_schema_required"])
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
 
-    def test_host_codex_collects_raw_report_and_controller_verify_creates_evidence(self) -> None:
+    def test_host_codex_worker_commits_in_isolated_worktree_and_controller_verify_creates_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "repo"
             root.mkdir()
             git_repo(root)
+            main_branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            (root / "main-only.txt").write_text("dirty main worktree\n", encoding="utf-8")
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path))
-            branch = db_one(root, "select branch_name from agent_provider_sessions where run_id = ?", (run_id,))["branch_name"]
-            head = create_branch(root, branch)
+            package_root, log_path = fake_sdk_package(temp_path)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path))
 
-            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            collected = wait_for_collect(root, run_id, expected="collected 1 provider report")
 
             self.assertIn("collected 1 provider report", collected.stdout)
+            session = db_one(root, "select branch_name, worktree_path from agent_provider_sessions where run_id = ?", (run_id,))
+            branch = session["branch_name"]
+            head = subprocess.run(["git", "rev-parse", branch], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            committed_content = subprocess.run(["git", "show", f"{branch}:agent.txt"], cwd=root, text=True, capture_output=True, check=True).stdout
+            current_branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
             attempt = db_one(root, "select status, head_commit_sha, provider_session_id from task_attempts where run_id = ?", (run_id,))
             evidence_before = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
+            self.assertEqual(current_branch, main_branch)
+            self.assertTrue((root / "main-only.txt").exists())
+            self.assertEqual(committed_content, "agent work from fake sdk\n")
             self.assertEqual(attempt["status"], "reported")
             self.assertEqual(attempt["head_commit_sha"], head)
             self.assertTrue(attempt["provider_session_id"].startswith("host-codex:"))
@@ -307,12 +357,10 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path, mode="manual"))
-            branch = db_one(root, "select branch_name from agent_provider_sessions where run_id = ?", (run_id,))["branch_name"]
-            create_branch(root, branch)
+            package_root, log_path = fake_sdk_package(temp_path)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path, mode="manual"))
 
-            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
             self.assertIn("collected 0 provider report", collected.stdout)
             session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
@@ -330,7 +378,7 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            missing = temp_path / "missing_app_server.py"
+            package_root, log_path = fake_sdk_package(temp_path, import_error=True)
 
             started = run_harness(
                 root,
@@ -341,7 +389,7 @@ class HostCodexProviderTest(unittest.TestCase):
                 run_id,
                 "--provider",
                 "host-codex",
-                env={"HARNESS_CODEX_APP_SERVER_CMD": f"python3 {missing}", "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "1"},
+                env=self.host_env(package_root, log_path, timeout="1"),
             )
             collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
@@ -351,7 +399,7 @@ class HostCodexProviderTest(unittest.TestCase):
             assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
             self.assertEqual(session["status"], "verification_failed")
-            self.assertIn("No such file", session["last_error"])
+            self.assertIn("fake sdk missing", session["last_error"])
             self.assertEqual(assignment["status"], "verification_failed")
             self.assertTrue(assignment["provider_session_id"].startswith("host-codex:"))
             self.assertEqual(evidence_count, 0)
@@ -363,17 +411,20 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
+            package_root, log_path = fake_sdk_package(temp_path)
 
-            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path, mode="invalid-json"))
+            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path, mode="invalid-json"))
             collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
             self.assertIn("started 1 provider session", started.stdout)
             self.assertIn("collected 0 provider report", collected.stdout)
             session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            branch = db_one(root, "select branch_name from agent_provider_sessions where run_id = ?", (run_id,))["branch_name"]
+            extra_commits = subprocess.run(["git", "rev-list", "--count", f"master..{branch}"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
             self.assertEqual(session["status"], "verification_failed")
             self.assertIn("missing final JSON object", session["last_error"])
+            self.assertEqual(extra_commits, "0")
             self.assertEqual(evidence_count, 0)
 
     def test_host_codex_branch_mismatch_is_rejected_on_collect(self) -> None:
@@ -383,12 +434,10 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path, mode="branch-mismatch"))
-            branch = db_one(root, "select branch_name from agent_provider_sessions where run_id = ?", (run_id,))["branch_name"]
-            create_branch(root, branch)
+            package_root, log_path = fake_sdk_package(temp_path)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path, mode="branch-mismatch"))
 
-            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
             self.assertIn("collected 0 provider report", collected.stdout)
             session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
@@ -402,8 +451,8 @@ class HostCodexProviderTest(unittest.TestCase):
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(script, log_path))
+            package_root, log_path = fake_sdk_package(temp_path)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path))
             run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
 
             collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
@@ -414,43 +463,35 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertEqual(reports, 0)
             self.assertEqual(attempts, 0)
 
-    def test_host_codex_cancel_interrupts_running_worker(self) -> None:
+    def test_host_codex_cancel_terminates_running_worker_and_cleans_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "repo"
             root.mkdir()
             git_repo(root)
             run_id = bootstrap(root)
-            script, log_path = fake_app_server(temp_path)
-            env = self.host_env(script, log_path)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
             env["FAKE_CODEX_DELAY_SECONDS"] = "5"
             run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
-            deadline = time.monotonic() + 5
-            methods: list[str] = []
-            while time.monotonic() < deadline:
-                if log_path.exists():
-                    methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
-                    if "turn/start" in methods:
-                        break
-                time.sleep(0.05)
+            session_before = db_one(root, "select worktree_path from agent_provider_sessions where run_id = ?", (run_id,))
+            worktree_path = root / session_before["worktree_path"]
+            self.assertTrue(worktree_path.exists())
 
             cancelled = run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
-                if "turn/interrupt" in methods:
-                    break
-                time.sleep(0.05)
 
             collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
             assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
+            worktree = db_one(root, "select status, cleaned_at from dispatch_worktrees where run_id = ?", (run_id,))
             reports = db_one(root, "select count(*) as count from agent_reports where run_id = ?", (run_id,))["count"]
             attempts = db_one(root, "select count(*) as count from task_attempts where run_id = ?", (run_id,))["count"]
             self.assertIn("cancelled 1 provider session", cancelled.stdout)
-            self.assertIn("turn/interrupt", methods)
             self.assertIn("collected 0 provider report", collected.stdout)
             self.assertEqual(assignment["status"], "planned")
             self.assertEqual(assignment["provider_session_id"], "")
+            self.assertFalse(worktree_path.exists())
+            self.assertEqual(worktree["status"], "cleaned")
+            self.assertTrue(worktree["cleaned_at"])
             self.assertEqual(reports, 0)
             self.assertEqual(attempts, 0)
 

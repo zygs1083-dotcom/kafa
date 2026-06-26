@@ -4,25 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
-## v1.17.0-beta.1 - 2026-06-26
+## v1.18.0-beta.1 - 2026-06-26
 
 ### Changed
 
-- `dispatch provider start --provider host-codex` now uses a nonblocking two-phase lifecycle: short transaction registration, worker spawn outside the SQLite write transaction, then CAS-based status promotion.
-- Host Codex work now runs in a background Python worker that drives Codex App Server stdio JSON-RPC and atomically writes a local runtime status artifact for `collect` to poll.
-- `--max-concurrency` for Host Codex starts multiple provider sessions without waiting for the first Codex turn to complete.
-- Runtime implementation version is now `4.10.0`; runtime schema remains `24`.
+- Host Codex now uses the mandatory Python Codex SDK dependency `openai-codex>=0.1.0b3` instead of the raw App Server stdio JSON-RPC loop.
+- `dispatch provider start --provider host-codex` keeps the v1.17 nonblocking two-phase lifecycle, but now prepares an assignment-specific git worktree before spawning the SDK worker.
+- Host Codex SDK runs with cwd fixed to `.ai-team/runtime/worktrees/<run>/<task>/<agent>`, `Sandbox.workspace_write`, and `ApprovalMode.deny_all`.
+- Host Codex workers commit non-`.ai-team/` changes from the isolated worktree to the assignment agent branch before `collect` imports the raw provider report.
+- Runtime implementation version is now `4.11.0`; runtime schema remains `24`.
 
 ### Fixed
 
-- P0-1: Host Codex provider no longer waits for an entire agent turn inside a database write transaction.
-- Running Host Codex sessions can be cancelled through the provider lifecycle; late worker output is ignored after cancellation.
-- App-server startup failures, RPC errors, timeouts, invalid final JSON, and early collect all fail closed without creating trusted evidence.
+- P0-2: Host Codex no longer relies on prompt self-discipline to use the target branch; runtime worktree isolation enforces the execution cwd and branch.
+- Cancellation and timeout paths clean up host-codex worktree checkouts while preserving the agent branch and audit records.
+- SDK import failures, `thread.run` exceptions, invalid final JSON, and strict provider report mismatches all fail closed without creating trusted evidence.
 
 ### Boundaries
 
 - Provider reports remain raw reports only; controller `dispatch verify-attempt` is still required for delivery-eligible evidence.
-- This release does not implement P0-2 worktree branch isolation and does not add schema, CLI commands, core files, runtime scripts, Skills, hooks, or delivery trust shortcuts.
+- This release does not add schema, CLI commands, core files, runtime scripts, Skills, hooks, or delivery trust shortcuts.
 
 ## v1.16.0-beta.1 - 2026-06-25
 
