@@ -87,12 +87,15 @@ class AgentE2EEvalTest(unittest.TestCase):
             "host_codex_fake_sdk_e2e",
             "multi_role_thread_lifecycle",
             "connector_mock_server_e2e",
+            "connector_exactly_once_recovery",
             "crash_retry_recovery",
             "sqlite_contention_stress",
         }:
             self.assertIn(name, scenarios)
             self.assertTrue(scenarios[name]["pass"], scenarios[name]["details"])
         self.assertEqual(scenarios["connector_mock_server_e2e"]["details"]["evidence_count"], 0)
+        self.assertEqual(scenarios["connector_exactly_once_recovery"]["details"]["writes"], 0)
+        self.assertEqual(scenarios["connector_exactly_once_recovery"]["details"]["remote_recovery_count"], 1)
         self.assertEqual(scenarios["crash_retry_recovery"]["details"]["reports"], 1)
         self.assertEqual(scenarios["sqlite_contention_stress"]["details"]["sqlite_lock_error_count"], 0)
 

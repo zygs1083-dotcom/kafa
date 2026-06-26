@@ -7,6 +7,7 @@ import json
 import contextvars
 import csv
 import hashlib
+import http.client
 import os
 import re
 import shutil
@@ -42,8 +43,8 @@ from core.schema_guard import ADAPTER_MODES, ANCHOR_ORIGINS, CI_CONCLUSIONS, EXT
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 25
-RUNTIME_VERSION = "4.12.0"
+SCHEMA_VERSION = 26
+RUNTIME_VERSION = "4.13.0"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -82,7 +83,7 @@ PHASE_TRANSITIONS = {
     "archived": set(),
 }
 
-ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "completed", "blocked"}
+ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "executing", "completed", "retryable_failed", "unknown", "blocked"}
 CONNECTOR_STATUSES = {"available", "degraded", "blocked"}
 ADVISORY_FALLBACK_STATUSES = {"generated", "superseded", "stale"}
 DELIVERY_CYCLE_STATUSES = {"active", "delivered", "archived"}
@@ -241,9 +242,10 @@ class ConnectorStats:
 class ConnectorFailure(HarnessError):
     """Connector failure with budget/retry metadata."""
 
-    def __init__(self, message: str, stats: ConnectorStats) -> None:
+    def __init__(self, message: str, stats: ConnectorStats, *, ambiguous: bool = False) -> None:
         super().__init__(message)
         self.stats = stats
+        self.ambiguous = ambiguous
 
 
 @dataclass
@@ -718,6 +720,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             next_retry_at text not null default '',
             connector_status text not null default 'available',
             blocked_reason text not null default '',
+            execution_fence integer not null default 0,
+            claimed_at text not null default '',
+            claim_expires_at text not null default '',
+            last_recovery_at text not null default '',
+            remote_recovery_count integer not null default 0,
             created_at text not null,
             updated_at text not null,
             unique(tool, idempotency_key)
@@ -1116,6 +1123,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "adapter_actions", "next_retry_at", "text not null default ''")
     ensure_column(conn, "adapter_actions", "connector_status", "text not null default 'available'")
     ensure_column(conn, "adapter_actions", "blocked_reason", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "execution_fence", "integer not null default 0")
+    ensure_column(conn, "adapter_actions", "claimed_at", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "claim_expires_at", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "last_recovery_at", "text not null default ''")
+    ensure_column(conn, "adapter_actions", "remote_recovery_count", "integer not null default 0")
     ensure_default_executor_allowlist(conn)
 
 
@@ -4264,16 +4276,20 @@ def http_json(url: str, token: str, body: dict[str, Any] | None, *, stats: Conne
                 continue
             stats.status = "blocked"
             raise ConnectorFailure(f"connector HTTP failed: {exc.code} {detail}", stats) from exc
-        except urllib.error.URLError as exc:
-            stats.last_error = str(exc.reason)[:1000]
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            stats.last_error = str(reason)[:1000]
+            if method != "GET":
+                stats.status = "degraded"
+                raise ConnectorFailure(f"connector HTTP failed: {reason}", stats, ambiguous=True) from exc
             if attempt_index < max_attempts - 1:
                 stats.status = "degraded"
                 maybe_sleep_connector(retry_delay_seconds(stats, attempt_index, 0))
                 continue
             stats.status = "blocked"
-            raise ConnectorFailure(f"connector HTTP failed: {exc.reason}", stats) from exc
+            raise ConnectorFailure(f"connector HTTP failed: {reason}", stats) from exc
         except json.JSONDecodeError as exc:
-            raise ConnectorFailure(f"connector returned invalid JSON: {exc.msg}", stats) from exc
+            raise ConnectorFailure(f"connector returned invalid JSON: {exc.msg}", stats, ambiguous=method != "GET") from exc
         if not isinstance(data, dict):
             raise ConnectorFailure("connector returned non-object JSON", stats)
         stats.status = "available"
@@ -4580,6 +4596,190 @@ def execute_connector_action(root: Path, row: sqlite3.Row) -> ConnectorOutcome:
     raise HarnessError(f"unsupported connector tool: {tool}")
 
 
+def connector_execution_deadline() -> str:
+    try:
+        ttl_seconds = int(os.environ.get("HARNESS_CONNECTOR_EXECUTION_TTL_SECONDS", "300"))
+    except ValueError:
+        ttl_seconds = 300
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(1, ttl_seconds))).replace(microsecond=0).isoformat()
+
+
+def connector_action_is_claimable(row: sqlite3.Row) -> bool:
+    status = str(row["status"])
+    if status in {"planned", "draft", "confirmed", "retryable_failed", "unknown"}:
+        return True
+    return status == "executing" and is_expired(row["claim_expires_at"])
+
+
+def connector_stats_for_row(row: sqlite3.Row) -> tuple[str, dict[str, Any], ConnectorStats]:
+    payload_value = load_connector_payload(row)
+    operation, params = validate_connector_request(row, payload_value)
+    return operation, params, connector_stats(str(row["tool"]), operation, params)
+
+
+def upsert_completed_adapter(conn: sqlite3.Connection, row: sqlite3.Row, external_id: str, external_link: str, evidence: str) -> None:
+    conn.execute(
+        """
+        insert into adapters
+        (id, tool, mode, artifact, external_id, external_link, idempotency_key, evidence, fallback, confirmation_needed, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, '', 'no', ?)
+        on conflict(tool, idempotency_key) do update set mode=excluded.mode, artifact=excluded.artifact,
+          external_id=excluded.external_id, external_link=excluded.external_link, evidence=excluded.evidence,
+          updated_at=excluded.updated_at
+        """,
+        (str(uuid.uuid4()), row["tool"], row["mode"], row["artifact"], external_id, external_link, row["idempotency_key"], evidence, now_iso()),
+    )
+
+
+def mark_connector_unknown(root: Path, action_id: str, fence: int | None, stats: ConnectorStats, reason: str) -> None:
+    stats.status = "degraded"
+    stats.last_error = reason[:1000]
+    with transaction(root) as conn:
+        row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not row:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if row["status"] == "completed":
+            return
+        where = "id = ?"
+        params: list[object] = [action_id]
+        if fence is not None:
+            where += " and execution_fence = ?"
+            params.append(fence)
+        conn.execute(
+            f"""
+            update adapter_actions set status = 'unknown', connector_status = 'degraded',
+              blocked_reason = ?, attempt_count = ?, next_retry_at = ?, claimed_at = '',
+              claim_expires_at = '', updated_at = ? where {where}
+            """,
+            (stats.last_error, stats.attempt_count, stats.retry_after_at, now_iso(), *params),
+        )
+        upsert_connector_budget(conn, stats)
+        emit_event(conn, "connector_action_unknown", payload(id=action_id, tool=stats.tool, operation=stats.operation, reason=stats.last_error), idempotency_key=row["idempotency_key"])
+
+
+def recover_connector_action(root: Path, action_id: str, reason: str = "") -> bool:
+    with connection(root) as conn:
+        row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+    if not row:
+        raise HarnessError(f"missing adapter action: {action_id}")
+    if row["status"] == "completed":
+        return True
+    operation, params, stats = connector_stats_for_row(row)
+    stats.last_error = reason[:1000]
+    try:
+        existing = find_existing_connector_object(root, operation, params, str(row["idempotency_key"]), stats)
+    except ConnectorFailure as exc:
+        mark_connector_blocked(root, action_id, exc.stats, str(exc))
+        raise HarnessError(f"connector recovery failed: {exc}") from exc
+    now = now_iso()
+    if not existing:
+        with transaction(root) as conn:
+            current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+            if current and current["status"] != "completed":
+                conn.execute(
+                    """
+                    update adapter_actions set last_recovery_at = ?, attempt_count = ?,
+                      next_retry_at = ?, connector_status = ?, updated_at = ? where id = ?
+                    """,
+                    (now, stats.attempt_count, stats.retry_after_at, stats.status, now, action_id),
+                )
+                upsert_connector_budget(conn, stats)
+        return False
+    external_id, external_link = existing
+    with transaction(root) as conn:
+        current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not current:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if current["status"] == "completed":
+            return True
+        cursor = conn.execute(
+            """
+            update adapter_actions set status = 'completed',
+              external_id = ?, external_link = ?, attempt_count = ?, next_retry_at = ?,
+              connector_status = ?, blocked_reason = '', claimed_at = '', claim_expires_at = '',
+              last_recovery_at = ?, remote_recovery_count = remote_recovery_count + 1, updated_at = ?
+            where id = ? and status != 'blocked'
+            """,
+            (external_id, external_link, stats.attempt_count, stats.retry_after_at, stats.status, now, now, action_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+        upsert_connector_budget(conn, stats)
+        upsert_completed_adapter(conn, current, external_id, external_link, f"connector recovery {action_id}")
+        emit_event(conn, "adapter_action_recovered", payload(id=action_id, status="completed", connector=current["tool"]), idempotency_key=current["idempotency_key"])
+    render_tooling_map(root)
+    return True
+
+
+def claim_connector_action(root: Path, action_id: str, confirmation: str) -> sqlite3.Row | None:
+    with transaction(root) as conn:
+        row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not row:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if row["status"] == "completed":
+            return None
+        if row["status"] == "blocked":
+            reason = row["blocked_reason"] or "connector action is blocked"
+            raise HarnessError(f"connector execution failed: {reason}")
+        if row["status"] == "executing" and not is_expired(row["claim_expires_at"]):
+            raise HarnessError(f"connector action already executing: {action_id}")
+        if not connector_action_is_claimable(row):
+            raise HarnessError(f"connector action cannot be confirmed from status {row['status']}: {action_id}")
+        fence = int(row["execution_fence"] or 0) + 1
+        now = now_iso()
+        cursor = conn.execute(
+            """
+            update adapter_actions set status = 'executing', confirmation = coalesce(nullif(?, ''), confirmation),
+              execution_fence = ?, claimed_at = ?, claim_expires_at = ?, connector_status = 'degraded',
+              blocked_reason = '', updated_at = ?
+            where id = ? and status = ? and execution_fence = ?
+            """,
+            (confirmation, fence, now, connector_execution_deadline(), now, action_id, row["status"], row["execution_fence"]),
+        )
+        if cursor.rowcount != 1:
+            raise HarnessError(f"connector action claim lost race: {action_id}")
+        claimed = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        emit_event(conn, "adapter_action_claimed", payload(id=action_id, status="executing", fence=fence), idempotency_key=row["idempotency_key"])
+        return claimed
+
+
+def complete_connector_action(root: Path, action_id: str, fence: int, confirmation: str, outcome: ConnectorOutcome) -> None:
+    stats = outcome.stats
+    with transaction(root) as conn:
+        row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+        if not row:
+            raise HarnessError(f"missing adapter action: {action_id}")
+        if row["status"] == "completed":
+            return
+        if row["status"] != "executing" or int(row["execution_fence"] or 0) != fence:
+            conn.execute(
+                """
+                update adapter_actions set status = 'unknown', connector_status = 'degraded',
+                  blocked_reason = ?, attempt_count = ?, next_retry_at = ?, claimed_at = '',
+                  claim_expires_at = '', updated_at = ? where id = ? and status != 'completed'
+                """,
+                ("connector completion fence mismatch; remote outcome must be recovered by marker", stats.attempt_count, stats.retry_after_at, now_iso(), action_id),
+            )
+            upsert_connector_budget(conn, stats)
+            emit_event(conn, "connector_action_unknown", payload(id=action_id, tool=stats.tool, operation=stats.operation, reason="completion fence mismatch"), idempotency_key=row["idempotency_key"])
+            raise HarnessError(f"connector completion fence mismatch: {action_id}")
+        cursor = conn.execute(
+            """
+            update adapter_actions set status = 'completed', confirmation = coalesce(nullif(?, ''), confirmation),
+              external_id = ?, external_link = ?, attempt_count = ?, next_retry_at = ?,
+              connector_status = ?, blocked_reason = '', claimed_at = '', claim_expires_at = '',
+              updated_at = ? where id = ? and status = 'executing' and execution_fence = ?
+            """,
+            (confirmation, outcome.external_id, outcome.external_link, stats.attempt_count, stats.retry_after_at, stats.status, now_iso(), action_id, fence),
+        )
+        if cursor.rowcount != 1:
+            raise HarnessError(f"connector completion failed: {action_id}")
+        upsert_connector_budget(conn, stats)
+        upsert_completed_adapter(conn, row, outcome.external_id, outcome.external_link, f"connector action {action_id}")
+        emit_event(conn, "adapter_action_updated", payload(id=action_id, status="completed", connector=row["tool"]), idempotency_key=row["idempotency_key"])
+    render_tooling_map(root)
+
+
 def record_adapter(root: Path, tool: str, mode: str, artifact: str, external_id: str, idempotency_key: str, *, external_link: str = "", evidence: str = "", fallback: str = "", confirmation_needed: str = "no") -> None:
     if mode not in ADAPTER_MODES:
         raise HarnessError(f"invalid adapter mode: {mode}")
@@ -4753,44 +4953,32 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
             reason = current["blocked_reason"] or "connector action is blocked"
             raise HarnessError(f"connector execution failed: {reason}")
         if should_execute_connector(current):
+            if current["status"] == "unknown" or (current["status"] == "executing" and is_expired(current["claim_expires_at"])):
+                if recover_connector_action(root, action_id, current["blocked_reason"] or "recovering connector action before retry"):
+                    return
+                with connection(root) as conn:
+                    current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+                    if not current:
+                        raise HarnessError(f"missing adapter action: {action_id}")
+            if current["status"] == "executing" and not is_expired(current["claim_expires_at"]):
+                raise HarnessError(f"connector action already executing: {action_id}")
+            claimed = claim_connector_action(root, action_id, confirmation)
+            if claimed is None:
+                return
+            fence = int(claimed["execution_fence"])
             try:
-                outcome = execute_connector_action(root, current)
+                outcome = execute_connector_action(root, claimed)
             except ConnectorFailure as exc:
-                mark_connector_blocked(root, action_id, exc.stats, str(exc))
+                if exc.ambiguous:
+                    mark_connector_unknown(root, action_id, fence, exc.stats, str(exc))
+                else:
+                    mark_connector_blocked(root, action_id, exc.stats, str(exc))
                 raise HarnessError(f"connector execution failed: {exc}") from exc
             except HarnessError as exc:
+                stats = connector_stats_for_row(claimed)[2]
+                mark_connector_unknown(root, action_id, fence, stats, str(exc))
                 raise HarnessError(f"connector execution failed: {exc}") from exc
-            external_id = outcome.external_id
-            external_link = outcome.external_link
-            stats = outcome.stats
-            with transaction(root) as conn:
-                row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
-                if not row:
-                    raise HarnessError(f"missing adapter action: {action_id}")
-                if row["status"] == "completed":
-                    return
-                conn.execute(
-                    """
-                    update adapter_actions set status = 'completed', confirmation = coalesce(nullif(?, ''), confirmation),
-                      external_id = ?, external_link = ?, attempt_count = ?, next_retry_at = ?,
-                      connector_status = ?, blocked_reason = '', updated_at = ? where id = ?
-                    """,
-                    (confirmation, external_id, external_link, stats.attempt_count, stats.retry_after_at, stats.status, now_iso(), action_id),
-                )
-                upsert_connector_budget(conn, stats)
-                conn.execute(
-                    """
-                    insert into adapters
-                    (id, tool, mode, artifact, external_id, external_link, idempotency_key, evidence, fallback, confirmation_needed, updated_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?, '', 'no', ?)
-                    on conflict(tool, idempotency_key) do update set mode=excluded.mode, artifact=excluded.artifact,
-                      external_id=excluded.external_id, external_link=excluded.external_link, evidence=excluded.evidence,
-                      updated_at=excluded.updated_at
-                    """,
-                    (str(uuid.uuid4()), row["tool"], row["mode"], row["artifact"], external_id, external_link, row["idempotency_key"], f"connector action {action_id}", now_iso()),
-                )
-                emit_event(conn, "adapter_action_updated", payload(id=action_id, status="completed", connector=row["tool"]), idempotency_key=row["idempotency_key"])
-            render_tooling_map(root)
+            complete_connector_action(root, action_id, fence, confirmation, outcome)
             return
     with transaction(root) as conn:
         row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
@@ -4833,6 +5021,17 @@ def adapter_reconcile(root: Path) -> list[str]:
                 issues.append(f"completed adapter action has no adapter record: {action['id']}")
             elif adapter["external_id"] != action["external_id"] or adapter["external_link"] != action["external_link"]:
                 issues.append(f"adapter action drift: {action['id']}")
+        candidates = conn.execute("select * from adapter_actions where status in ('unknown', 'executing') order by tool, artifact").fetchall()
+    for action in candidates:
+        if action["status"] == "executing" and not is_expired(action["claim_expires_at"]):
+            continue
+        try:
+            recovered = recover_connector_action(root, action["id"], action["blocked_reason"] or "adapter reconcile recovery")
+        except HarnessError as exc:
+            issues.append(str(exc))
+            continue
+        if not recovered:
+            issues.append(f"adapter action remains unconfirmed after remote recovery search: {action['id']}")
     return issues
 
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["id", "tool", "mode", "artifact", "action", "payload_json", "status", "idempotency_key", "attempt_count", "next_retry_at", "connector_status", "blocked_reason", "created_at", "updated_at"],
+  "required": ["id", "tool", "mode", "artifact", "action", "payload_json", "status", "idempotency_key", "attempt_count", "next_retry_at", "connector_status", "blocked_reason", "execution_fence", "claimed_at", "claim_expires_at", "last_recovery_at", "remote_recovery_count", "created_at", "updated_at"],
   "properties": {
     "id": { "type": "string" },
     "tool": { "type": "string" },
@@ -9,7 +9,7 @@
     "artifact": { "type": "string" },
     "action": { "type": "string" },
     "payload_json": { "type": "string" },
-    "status": { "type": "string", "enum": ["planned", "draft", "confirmed", "completed", "blocked"] },
+    "status": { "type": "string", "enum": ["planned", "draft", "confirmed", "executing", "completed", "retryable_failed", "unknown", "blocked"] },
     "confirmation": { "type": "string" },
     "external_id": { "type": "string" },
     "external_link": { "type": "string" },
@@ -18,6 +18,11 @@
     "next_retry_at": { "type": "string" },
     "connector_status": { "type": "string", "enum": ["available", "degraded", "blocked"] },
     "blocked_reason": { "type": "string" },
+    "execution_fence": { "type": "integer" },
+    "claimed_at": { "type": "string" },
+    "claim_expires_at": { "type": "string" },
+    "last_recovery_at": { "type": "string" },
+    "remote_recovery_count": { "type": "integer" },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }
   }
