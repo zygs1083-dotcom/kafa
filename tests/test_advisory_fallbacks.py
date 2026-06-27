@@ -81,6 +81,7 @@ def fake_rate_limited_gh(temp: Path) -> Path:
         encoding="utf-8",
     )
     script.chmod(0o755)
+    (bin_dir / "gh.cmd").write_text("@echo off\r\npython \"%~dp0gh\" %*\r\n", encoding="utf-8")
     return bin_dir
 
 
@@ -100,7 +101,7 @@ class AdvisoryFallbacksTest(unittest.TestCase):
             gh_bin = fake_rate_limited_gh(Path(temp))
             for tool, operation, params, expected_kind in cases:
                 action = plan_action(root, tool, operation, params)
-                env = {"PATH": f"{gh_bin}:{os.environ['PATH']}"} if tool == "github" else {}
+                env = {"PATH": f"{gh_bin}{os.pathsep}{os.environ['PATH']}"} if tool == "github" else {}
 
                 result = run_harness(root, "adapter", "confirm", "--id", action, env=env, check=False)
 

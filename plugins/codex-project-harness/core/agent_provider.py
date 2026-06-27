@@ -431,7 +431,7 @@ class HostCodexProvider:
             codex_bin=codex_bin or None,
             client_name="codex_project_harness",
             client_title="Codex Project Harness",
-            client_version="1.21.0-beta.1",
+            client_version="1.21.1-beta.1",
         )
         kwargs: dict[str, Any] = {
             "cwd": str(worktree),

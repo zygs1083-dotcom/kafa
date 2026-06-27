@@ -222,6 +222,7 @@ def fake_gh(temp: Path, *, first_rate_limited: bool = False, existing_marker: bo
         encoding="utf-8",
     )
     script.chmod(0o755)
+    (bin_dir / "gh.cmd").write_text("@echo off\r\npython \"%~dp0gh\" %*\r\n", encoding="utf-8")
     return bin_dir, log_path
 
 
@@ -291,8 +292,8 @@ class ConnectorResilienceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeHttpServer() as server:
             root = Path(temp)
             run_harness(root, "init")
-            huge_content = "x" * (501 * 1024)
-            action = plan_action(root, "notion", "write-confirm", "notion.page.create", {"parent_page_id": "PARENT", "title": "Huge", "content": huge_content})
+            children = [{} for _ in range(1000)]
+            action = plan_action(root, "notion", "write-confirm", "notion.page.create", {"parent_page_id": "PARENT", "title": "Huge", "children": children})
 
             result = run_harness(root, "adapter", "confirm", "--id", action, env={"NOTION_TOKEN": "notion-token", "HARNESS_NOTION_API_URL": server.base_url}, check=False)
 
@@ -311,7 +312,7 @@ class ConnectorResilienceTest(unittest.TestCase):
             bin_dir, log_path = fake_gh(Path(temp), existing_marker=True)
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
 
-            run_harness(root, "adapter", "confirm", "--id", action, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+            run_harness(root, "adapter", "confirm", "--id", action, env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
 
             row = db_one(root, "select status, external_id, external_link, attempt_count from adapter_actions where id = ?", (action,))
             calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]

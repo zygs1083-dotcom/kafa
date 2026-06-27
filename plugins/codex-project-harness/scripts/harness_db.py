@@ -58,7 +58,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 27
-RUNTIME_VERSION = "4.14.0"
+RUNTIME_VERSION = "4.14.1"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -5722,6 +5722,8 @@ def normalize_claim_path(path: str) -> str:
     value = path.strip()
     if not value:
         raise HarnessError("file claim path is required")
+    if value.startswith(("/", "\\")):
+        raise HarnessError(f"invalid file claim path: {path}")
     candidate = Path(value)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise HarnessError(f"invalid file claim path: {path}")

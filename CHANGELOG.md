@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.21.1-beta.1 - 2026-06-27
+
+### Fixed
+
+- Fixed CI portability for GitHub connector tests by using platform-specific PATH separators and Windows `gh.cmd` fake CLI shims.
+- Avoided OS command-line length limits in Notion payload-limit tests by exercising the children-count limit instead of passing a 500KB payload through argv.
+- Made file-claim path validation reject leading slash/backslash paths consistently across POSIX and Windows.
+- Added retry tolerance for Windows temporary harness cleanup when SQLite file handles are released slightly later.
+- Increased Host Codex fake SDK collect wait budget for slower CI workers.
+
+### Changed
+
+- Runtime implementation version is now `4.14.1`; runtime schema remains `27`.
+
+### Boundaries
+
+- This is a CI compatibility hotfix. It does not add harness top-level commands, DB tables, schema files, core files, runtime scripts, Skills, Hooks, or delivery trust shortcuts.
+
 ## v1.21.0-beta.1 - 2026-06-26
 
 ### Added

@@ -6,6 +6,7 @@ import py_compile
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -51,7 +52,7 @@ class CodexHooksTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
-        self.assertIn("runtime_version: 4.14.0", result.stdout)
+        self.assertIn("runtime_version: 4.14.1", result.stdout)
         self.assertIn("Harness Status", result.stdout)
         self.assertEqual(before, after)
 
@@ -180,7 +181,14 @@ class _TempHarnessRoot:
         return root
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self._tmp.cleanup()
+        for attempt in range(5):
+            try:
+                self._tmp.cleanup()
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
 
 
 if __name__ == "__main__":

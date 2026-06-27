@@ -63,7 +63,7 @@ def db_all(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sqli
         return conn.execute(query, params).fetchall()
 
 
-def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
     deadline = time.monotonic() + timeout
     last = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
     while time.monotonic() < deadline:
