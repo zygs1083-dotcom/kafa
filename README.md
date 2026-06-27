@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.21.2-beta.1**，架构代际定位为 **Codex Harness Kernel v4.14.2**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.21.3-beta.1**，架构代际定位为 **Codex Harness Kernel v4.14.3**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -24,7 +24,7 @@ git show v1.16.0-beta.1
 git show v1.18.0-beta.1
 git show v1.19.0-beta.1
 git show v1.20.0-beta.1
-git show v1.21.2-beta.1
+git show v1.21.3-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 

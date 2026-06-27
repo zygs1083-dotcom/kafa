@@ -102,7 +102,7 @@ class AdvisoryFallbacksTest(unittest.TestCase):
             gh_bin = fake_rate_limited_gh(Path(temp))
             for tool, operation, params, expected_kind in cases:
                 action = plan_action(root, tool, operation, params)
-                env = {"PATH": f"{gh_bin}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {gh_bin / 'gh'}"} if tool == "github" else {}
+                env = {"PATH": f"{gh_bin}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(gh_bin / "gh")])} if tool == "github" else {}
 
                 result = run_harness(root, "adapter", "confirm", "--id", action, env=env, check=False)
 

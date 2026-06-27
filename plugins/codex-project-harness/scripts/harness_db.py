@@ -59,7 +59,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 27
-RUNTIME_VERSION = "4.14.2"
+RUNTIME_VERSION = "4.14.3"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -4322,7 +4322,7 @@ def infer_github_repo(root: Path) -> str:
 
 def run_gh_api(root: Path, endpoint: str, fields: dict[str, str], stats: ConnectorStats) -> dict[str, Any]:
     gh_override = os.environ.get("HARNESS_GH_BIN", "").strip()
-    gh_command = shlex.split(gh_override) if gh_override else ["gh"]
+    gh_command = shlex.split(gh_override, posix=(os.name != "nt")) if gh_override else ["gh"]
     if not gh_override and not shutil.which("gh"):
         raise ConnectorFailure("github connector requires gh CLI", stats)
     command = [*gh_command, "api", endpoint]
@@ -4332,7 +4332,13 @@ def run_gh_api(root: Path, endpoint: str, fields: dict[str, str], stats: Connect
     for attempt_index in range(max_attempts):
         throttle_connector(stats)
         stats.attempt_count += 1
-        result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+        try:
+            result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+        except OSError as exc:
+            stats.status = "blocked"
+            stats.last_status_code = 500
+            stats.last_error = str(exc)[:1000]
+            raise ConnectorFailure(f"github connector failed to start: {exc}", stats) from exc
         if result.returncode == 0:
             stats.status = "available"
             stats.last_status_code = 200

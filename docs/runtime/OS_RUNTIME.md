@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.14.2
+# Codex OS Runtime Layer v4.14.3
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.14.2 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, and P1 reliability hardening for dispatch aggregation, structured test semantics, and target sandbox policy. The repository release remains a beta release, while the runtime implementation version is `4.14.2` and the database schema version is `27`.
+Kernel v4.14.3 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, and P1 reliability hardening for dispatch aggregation, structured test semantics, and target sandbox policy. The repository release remains a beta release, while the runtime implementation version is `4.14.3` and the database schema version is `27`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.14.2
+## Kernel v4.14.3
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 

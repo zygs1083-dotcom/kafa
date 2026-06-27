@@ -735,7 +735,7 @@ def scenario_connector_mock_server_e2e() -> dict[str, Any]:
         bin_dir, gh_log = fake_gh(temp_path)
         with ConnectorMockServer() as server:
             cases = [
-                ("github", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"}, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"}),
+                ("github", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"}, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(bin_dir / "gh")])}),
                 ("linear", "linear.issue.create", {"team_id": "TEAM", "title": "Linear issue", "description": "Body"}, {"LINEAR_API_KEY": "linear-token", "HARNESS_LINEAR_API_URL": server.base_url}),
                 ("notion", "notion.page.create", {"parent_page_id": "PARENT", "title": "Notion page", "content": "Body"}, {"NOTION_TOKEN": "notion-token", "HARNESS_NOTION_API_URL": server.base_url}),
                 ("figma", "figma.comment.create", {"file_key": "FILE1", "message": "Review note"}, {"FIGMA_TOKEN": "figma-token", "HARNESS_FIGMA_API_URL": server.base_url}),

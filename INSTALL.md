@@ -23,7 +23,7 @@ Expected:
 
 ```text
 OK: plugin structure is valid
-1.21.2-beta.1
+1.21.3-beta.1
 ```
 
 `kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.

@@ -157,7 +157,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             run_harness(root, "init")
             bin_dir, log_path = fake_gh(Path(temp))
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
-            env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"}
+            env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(bin_dir / "gh")])}
 
             first = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-GH-1", env=env)
             second = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-GH-1", env=env)
@@ -186,7 +186,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
                 "confirm",
                 "--id",
                 action,
-                env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"},
+                env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(bin_dir / "gh")])},
                 check=False,
             )
 

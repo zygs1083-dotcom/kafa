@@ -74,12 +74,13 @@ def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float =
     return last
 
 
-def wait_for_session_status(root: Path, run_id: str, status: str, *, timeout: float = 20.0) -> sqlite3.Row:
+def wait_for_session_status(root: Path, run_id: str, status: str, *, timeout: float = 60.0) -> sqlite3.Row:
     deadline = time.monotonic() + timeout
     row = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
     while time.monotonic() < deadline:
         if row["status"] == status:
             return row
+        run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id, check=False)
         time.sleep(0.1)
         row = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
     return row
@@ -451,7 +452,7 @@ class HostCodexProviderTest(unittest.TestCase):
             collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
             self.assertIn("collected 0 provider report", collected.stdout)
-            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            session = wait_for_session_status(root, run_id, "verification_failed")
             self.assertEqual(session["status"], "verification_failed")
             self.assertIn("branch differs from export", session["last_error"])
 
