@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -312,7 +313,7 @@ class ConnectorResilienceTest(unittest.TestCase):
             bin_dir, log_path = fake_gh(Path(temp), existing_marker=True)
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
 
-            run_harness(root, "adapter", "confirm", "--id", action, env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+            run_harness(root, "adapter", "confirm", "--id", action, env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"})
 
             row = db_one(root, "select status, external_id, external_link, attempt_count from adapter_actions where id = ?", (action,))
             calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]

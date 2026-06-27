@@ -10,6 +10,7 @@ import hashlib
 import http.client
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -58,7 +59,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 27
-RUNTIME_VERSION = "4.14.1"
+RUNTIME_VERSION = "4.14.2"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -4320,9 +4321,11 @@ def infer_github_repo(root: Path) -> str:
 
 
 def run_gh_api(root: Path, endpoint: str, fields: dict[str, str], stats: ConnectorStats) -> dict[str, Any]:
-    if not shutil.which("gh"):
+    gh_override = os.environ.get("HARNESS_GH_BIN", "").strip()
+    gh_command = shlex.split(gh_override) if gh_override else ["gh"]
+    if not gh_override and not shutil.which("gh"):
         raise ConnectorFailure("github connector requires gh CLI", stats)
-    command = ["gh", "api", endpoint]
+    command = [*gh_command, "api", endpoint]
     for key, value in fields.items():
         command.extend(["-f", f"{key}={value}"])
     max_attempts = connector_max_attempts()

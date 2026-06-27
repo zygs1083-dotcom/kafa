@@ -4,6 +4,23 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.21.2-beta.1 - 2026-06-27
+
+### Fixed
+
+- Added `HARNESS_GH_BIN` support for GitHub connector execution so CI and tests can force a fake `gh` command on Windows where `subprocess` may otherwise resolve the real `gh.exe`.
+- Updated connector tests and the stability matrix fake GitHub connector to use `HARNESS_GH_BIN` instead of relying on PATH command-extension resolution.
+- Made Host Codex failure-path tests wait for the provider session terminal status instead of treating an early `collected 0` poll as final.
+- Made hook temp cleanup tolerate Windows SQLite/worktree handle release timing.
+
+### Changed
+
+- Runtime implementation version is now `4.14.2`; runtime schema remains `27`.
+
+### Boundaries
+
+- This is a Windows CI compatibility hotfix. It does not add harness top-level commands, DB tables, schema files, core files, runtime scripts, Skills, Hooks, or delivery trust shortcuts.
+
 ## v1.21.1-beta.1 - 2026-06-27
 
 ### Fixed

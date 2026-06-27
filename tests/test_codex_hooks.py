@@ -52,7 +52,7 @@ class CodexHooksTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
-        self.assertIn("runtime_version: 4.14.1", result.stdout)
+        self.assertIn("runtime_version: 4.14.2", result.stdout)
         self.assertIn("Harness Status", result.stdout)
         self.assertEqual(before, after)
 
@@ -170,7 +170,7 @@ class CodexHooksTest(unittest.TestCase):
 
 class _TempHarnessRoot:
     def __enter__(self) -> Path:
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         root = Path(self._tmp.name)
         subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)

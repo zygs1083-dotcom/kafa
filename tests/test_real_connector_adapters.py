@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -156,7 +157,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             run_harness(root, "init")
             bin_dir, log_path = fake_gh(Path(temp))
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
-            env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+            env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"}
 
             first = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-GH-1", env=env)
             second = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-GH-1", env=env)
@@ -179,7 +180,15 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             bin_dir, _log_path = fake_gh(Path(temp), fail=True)
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title"})
 
-            result = run_harness(root, "adapter", "confirm", "--id", action, env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}, check=False)
+            result = run_harness(
+                root,
+                "adapter",
+                "confirm",
+                "--id",
+                action,
+                env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": f"{sys.executable} {bin_dir / 'gh'}"},
+                check=False,
+            )
 
             row = db_one(root, "select status, external_id from adapter_actions where id = ?", (action,))
             adapter_count = db_one(root, "select count(*) as count from adapters")["count"]

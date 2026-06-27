@@ -74,6 +74,17 @@ def wait_for_collect(root: Path, run_id: str, *, expected: str, timeout: float =
     return last
 
 
+def wait_for_session_status(root: Path, run_id: str, status: str, *, timeout: float = 20.0) -> sqlite3.Row:
+    deadline = time.monotonic() + timeout
+    row = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+    while time.monotonic() < deadline:
+        if row["status"] == status:
+            return row
+        time.sleep(0.1)
+        row = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+    return row
+
+
 def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, Path]:
     package_root = temp / "fake_sdk"
     package_dir = package_root / "openai_codex"
@@ -363,7 +374,7 @@ class HostCodexProviderTest(unittest.TestCase):
             collected = wait_for_collect(root, run_id, expected="collected 0 provider report")
 
             self.assertIn("collected 0 provider report", collected.stdout)
-            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            session = wait_for_session_status(root, run_id, "verification_failed")
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
             finding = db_one(root, "select summary from findings where surface = 'dispatch-integration' order by created_at desc limit 1")
             self.assertEqual(session["status"], "verification_failed")
