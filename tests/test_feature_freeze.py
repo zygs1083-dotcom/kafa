@@ -26,9 +26,9 @@ from core import KERNEL_VERSION  # noqa: E402
 from validate_structure import REQUIRED_CORE, REQUIRED_HOOKS, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
 
 
-EXPECTED_PLUGIN_VERSION = "1.21.3-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.14.3"
-EXPECTED_SCHEMA_VERSION = 27
+EXPECTED_PLUGIN_VERSION = "1.22.0-beta.1"
+EXPECTED_RUNTIME_VERSION = "4.15.0"
+EXPECTED_SCHEMA_VERSION = 28
 
 EXPECTED_TABLES = {
     "acceptance",
@@ -46,6 +46,7 @@ EXPECTED_TABLES = {
     "codex_fanout_exports",
     "command_log",
     "connector_budgets",
+    "connector_profiles",
     "decisions",
     "deliveries",
     "delivery_acceptance",
@@ -112,6 +113,11 @@ EXPECTED_CLI_SURFACE = {
     "checkpoint.export",
     "checkpoint.import",
     "checkpoint.list",
+    "connector",
+    "connector.profile",
+    "connector.profile.set",
+    "connector.profile.status",
+    "connector.profile.unset",
     "cycle",
     "cycle.close",
     "cycle.start",
@@ -216,11 +222,11 @@ class FeatureFreezeTest(unittest.TestCase):
         self.assertEqual(harness_db.RUNTIME_VERSION, EXPECTED_RUNTIME_VERSION)
         self.assertEqual(KERNEL_VERSION, EXPECTED_RUNTIME_VERSION)
 
-    def test_schema_version_is_27(self) -> None:
+    def test_schema_version_is_28(self) -> None:
         self.assertEqual(harness_db.SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION)
         with tempfile.TemporaryDirectory() as temp:
             repair_plan = harness_db.repair(Path(temp), dry_run=True)
-        self.assertIn("repair action: migrate schema to 27", repair_plan)
+        self.assertIn("repair action: migrate schema to 28", repair_plan)
 
     def test_feature_freeze_rejects_schema_growth(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -67,6 +67,27 @@ def plan_action(root: Path, tool: str, mode: str, operation: str, params: dict[s
     return action_id(result.stdout)
 
 
+def set_profiles(root: Path) -> None:
+    run_harness(
+        root,
+        "connector",
+        "profile",
+        "set",
+        "--project-key",
+        "connector-resilience",
+        "--github-repo",
+        "owner/repo",
+        "--linear-team",
+        "TEAM",
+        "--notion-parent",
+        "PARENT",
+        "--slack-channel",
+        "C123",
+        "--figma-file",
+        "FILE1",
+    )
+
+
 class SequencedHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     counts: dict[str, int] = {}
@@ -233,6 +254,7 @@ class ConnectorResilienceTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             action = plan_action(root, "slack", "write-confirm", "slack.message.post", {"channel": "C123", "text": "Ship it"})
 
             run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url})
@@ -253,6 +275,7 @@ class ConnectorResilienceTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             action = plan_action(root, "slack", "write-confirm", "slack.message.post", {"channel": "C123", "text": "Nope"})
 
             result = run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url}, check=False)
@@ -275,6 +298,7 @@ class ConnectorResilienceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeHttpServer() as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_profiles(root)
             notion = plan_action(root, "notion", "read-only", "notion.probe", {}, key="probe:notion")
             figma = plan_action(root, "figma", "read-only", "figma.probe", {"file_key": "FILE1"}, key="probe:figma")
 
@@ -293,6 +317,7 @@ class ConnectorResilienceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeHttpServer() as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_profiles(root)
             children = [{} for _ in range(1000)]
             action = plan_action(root, "notion", "write-confirm", "notion.page.create", {"parent_page_id": "PARENT", "title": "Huge", "children": children})
 
@@ -310,6 +335,7 @@ class ConnectorResilienceTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             bin_dir, log_path = fake_gh(Path(temp), existing_marker=True)
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
 
@@ -327,7 +353,7 @@ class ConnectorResilienceTest(unittest.TestCase):
 
     def test_marker_search_reuses_existing_http_connector_objects_without_duplicate_create(self) -> None:
         key = "reuse-http-marker"
-        marker = f"codex-project-harness:idempotency-key={key}"
+        marker = f"codex-project-harness:project-key=connector-resilience\ncodex-project-harness:idempotency-key={key}"
         cases = [
             ("linear", "linear.issue.create", {"team_id": "TEAM", "title": "Linear issue", "description": "Body"}, "LINEAR_API_KEY", "HARNESS_LINEAR_API_URL", "linear:issue:ENG-9"),
             ("notion", "notion.page.create", {"parent_page_id": "PARENT", "title": "Notion page", "content": "Body"}, "NOTION_TOKEN", "HARNESS_NOTION_API_URL", "notion:page:notion-existing"),
@@ -337,6 +363,7 @@ class ConnectorResilienceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeHttpServer(marker=marker) as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_profiles(root)
             for index, (tool, operation, params, token_env, url_env, expected_external_id) in enumerate(cases):
                 action = plan_action(root, tool, "write-confirm", operation, params, key=key)
                 run_harness(root, "adapter", "confirm", "--id", action, env={token_env: f"token-{index}", url_env: server.base_url})
@@ -355,6 +382,7 @@ class ConnectorResilienceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeHttpServer(mode="always-429") as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_profiles(root)
             action = plan_action(root, "slack", "write-confirm", "slack.message.post", {"channel": "C123", "text": "Retry idempotently"})
             env = {"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url}
 

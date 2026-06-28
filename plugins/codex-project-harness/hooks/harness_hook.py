@@ -94,6 +94,12 @@ def session_start(plugin_root: Path, repo_root: Path) -> int:
     print("purpose: inject read-only project status; delivery gates remain in the harness runtime.")
     version = read_text(plugin_root / "../../VERSION").strip() or "unknown"
     print(f"version: {version}")
+    if not harness_db_exists(repo_root):
+        print("harness status:")
+        print("- not initialized in this project")
+        print("dispatch status:")
+        print("- not initialized in this project")
+        return 0
     status = run_harness(plugin_root, repo_root, ["status"])
     print_block("harness status", status)
     dispatch = run_harness(plugin_root, repo_root, ["dispatch", "status"])
@@ -153,6 +159,11 @@ def post_tool_use(repo_root: Path) -> int:
 
 
 def stop(plugin_root: Path, repo_root: Path, strict: bool) -> int:
+    if not harness_db_exists(repo_root):
+        print("readiness command: skipped")
+        print("readiness result:")
+        print("- harness is not initialized in this project")
+        return 0
     delivery = os.environ.get("HARNESS_HOOK_DELIVERY") == "1"
     args = ["validate", "--delivery"] if delivery else ["validate"]
     print(f"readiness command: harness {' '.join(args)}")
@@ -174,6 +185,10 @@ def run_harness(plugin_root: Path, repo_root: Path, args: list[str], *, check: b
         capture_output=True,
         check=check,
     )
+
+
+def harness_db_exists(repo_root: Path) -> bool:
+    return (repo_root / ".ai-team" / "state" / "harness.db").exists()
 
 
 def print_block(title: str, result: subprocess.CompletedProcess[str], *, max_lines: int = MAX_LINES) -> None:

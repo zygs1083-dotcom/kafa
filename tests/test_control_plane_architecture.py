@@ -93,6 +93,9 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
         self.assertTrue(checks["control plane contract"]["ok"], checks["control plane contract"])
         self.assertIn("Skill Entry", checks["control plane contract"]["details"])
         self.assertIn("Kernel Trust Layer", checks["control plane contract"]["details"])
+        self.assertIn("connector namespace boundary", checks)
+        self.assertTrue(checks["connector namespace boundary"]["ok"], checks["connector namespace boundary"])
+        self.assertIn("does not create external workspaces", checks["connector namespace boundary"]["details"])
 
 
 if __name__ == "__main__":

@@ -66,6 +66,27 @@ def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]
     return action_id(result.stdout)
 
 
+def set_profiles(root: Path) -> None:
+    run_harness(
+        root,
+        "connector",
+        "profile",
+        "set",
+        "--project-key",
+        "advisory-fallback",
+        "--github-repo",
+        "owner/repo",
+        "--linear-team",
+        "TEAM",
+        "--notion-parent",
+        "PARENT",
+        "--slack-channel",
+        "C123",
+        "--figma-file",
+        "FILE1",
+    )
+
+
 def fake_rate_limited_gh(temp: Path) -> Path:
     bin_dir = temp / "bin"
     bin_dir.mkdir()
@@ -99,6 +120,7 @@ class AdvisoryFallbacksTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             gh_bin = fake_rate_limited_gh(Path(temp))
             for tool, operation, params, expected_kind in cases:
                 action = plan_action(root, tool, operation, params)
@@ -136,6 +158,7 @@ class AdvisoryFallbacksTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             action = plan_action(root, "slack", "slack.message.post", {"channel": "C123", "text": "Send me"})
 
             first = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-ADVISORY-1", check=False)
@@ -154,6 +177,7 @@ class AdvisoryFallbacksTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Works")
             action = plan_action(root, "notion", "notion.page.create", {"parent_page_id": "PARENT", "title": "Spec", "content": "Body"})
             blocked = run_harness(root, "adapter", "confirm", "--id", action, check=False)

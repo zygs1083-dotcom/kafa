@@ -199,7 +199,7 @@ class DeliveryCyclesTest(unittest.TestCase):
 
             project = one(root, "select schema_version, current_cycle_id, phase from project where id = 1")
             cycle = one(root, "select id, status, phase, name, goal from delivery_cycles where id = ?", ("CYCLE-current",))
-        self.assertEqual(project["schema_version"], 27)
+        self.assertEqual(project["schema_version"], 28)
         self.assertEqual(project["current_cycle_id"], "CYCLE-current")
         self.assertEqual(project["phase"], "intake")
         self.assertEqual(cycle["status"], "active")
@@ -295,7 +295,7 @@ class DeliveryCyclesTest(unittest.TestCase):
                 conn.execute("update project set schema_version = 24")
                 conn.commit()
 
-            run_harness(root, "migrate", "--from-version", "24", "--to-version", "27")
+            run_harness(root, "migrate", "--from-version", "24", "--to-version", "28")
             legacy_count = one(root, "select count(*) as count from validations where cycle_id = 'CYCLE-legacy'")["count"]
             run_harness(root, "requirement", "add", "--id", "R2", "--kind", "functional", "--body", "Fresh")
             run_harness(root, "acceptance", "add", "--id", "AC2", "--criterion", "Fresh acceptance")

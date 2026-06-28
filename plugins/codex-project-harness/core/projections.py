@@ -41,6 +41,7 @@ def render_project_state(root: Path) -> None:
         {
             "status": row["status"],
             "phase": row["phase"],
+            "connector_project_key": row["connector_project_key"],
             "scope_status": row["scope_status"],
             "current_owner": row["current_owner"],
             "schema_version": row["schema_version"],

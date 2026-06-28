@@ -268,6 +268,7 @@ def doctor_report(repo: Path, scope: str) -> dict[str, Any]:
         add_check(checks, "plugin structure", False, f"missing {validate}")
     contract_ok, contract_details = control_plane_contract(source)
     add_check(checks, "control plane contract", contract_ok, contract_details)
+    add_check(checks, "connector namespace boundary", True, "installer does not create external workspaces; per-project connector profile lives in harness runtime state")
     marketplace_path, _target, _source_path = marketplace_locations(repo, scope)
     add_check(checks, "marketplace path", True, str(marketplace_path))
     return {"ok": all(check["ok"] for check in checks), "scope": scope, "repo": str(repo), "checks": checks}

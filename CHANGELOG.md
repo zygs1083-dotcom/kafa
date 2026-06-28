@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.22.0-beta.1 - 2026-06-27
+
+### Added
+
+- Schema 28 connector namespace state: `project.connector_project_key` plus per-project `connector_profiles` for GitHub, Linear, Notion, Figma, and Slack scope bindings.
+- `connector profile status|set|unset` CLI surface for binding the current project to existing external targets without creating external workspaces, projects, channels, files, or repositories.
+- Connector namespace isolation tests covering missing profile fail-closed behavior, scope mismatch, write-confirm override auditing, double-marker writes, and cross-project marker recovery isolation.
+
+### Changed
+
+- Runtime implementation version is now `4.15.0`; runtime schema is now `28`.
+- Connector writes now require a matching project profile before any external API request when `payload_json.execute=true`.
+- External idempotency markers now include both `codex-project-harness:project-key=<key>` and `codex-project-harness:idempotency-key=<key>`, and recovery must match both markers.
+- Connector budget, advisory fallback, and recovery scope keys are project-key qualified so multiple projects can share the same external account without recovering or updating each other's objects.
+
+### Boundaries
+
+- Harness still never creates Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories. It only binds a project to existing external targets selected by the user or host.
+- Connector results remain workflow synchronization records only; namespace isolation does not create delivery evidence or relax controller verification, HMAC/session attestation, integration, or delivery gates.
+
 ## v1.21.3-beta.1 - 2026-06-27
 
 ### Fixed

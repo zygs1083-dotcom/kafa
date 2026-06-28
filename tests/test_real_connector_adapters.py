@@ -60,6 +60,27 @@ def plan_action(root: Path, tool: str, mode: str, operation: str, params: dict[s
     return action_id(result.stdout)
 
 
+def set_profiles(root: Path) -> None:
+    run_harness(
+        root,
+        "connector",
+        "profile",
+        "set",
+        "--project-key",
+        "connector-test",
+        "--github-repo",
+        "owner/repo",
+        "--linear-team",
+        "TEAM",
+        "--notion-parent",
+        "PARENT",
+        "--slack-channel",
+        "C123",
+        "--figma-file",
+        "FILE1",
+    )
+
+
 def fake_gh(temp: Path, *, fail: bool = False) -> tuple[Path, Path]:
     bin_dir = temp / "bin"
     bin_dir.mkdir()
@@ -155,6 +176,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             bin_dir, log_path = fake_gh(Path(temp))
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"})
             env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(bin_dir / "gh")])}
@@ -177,6 +199,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             root = Path(temp) / "repo"
             root.mkdir()
             run_harness(root, "init")
+            set_profiles(root)
             bin_dir, _log_path = fake_gh(Path(temp), fail=True)
             action = plan_action(root, "github", "write-confirm", "github.issue.create", {"repo": "owner/repo", "title": "Issue title"})
 
@@ -210,6 +233,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)
                     run_harness(root, "init")
+                    set_profiles(root)
                     action = plan_action(root, tool, "write-confirm", operation, params)
                     env = {token_env: f"token-{index}", url_env: server.base_url}
 
@@ -226,6 +250,7 @@ class RealConnectorAdaptersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
+            set_profiles(root)
             draft = plan_action(root, "github", "draft-write", "github.issue.create", {"repo": "owner/repo", "title": "Issue title"})
             read_only = plan_action(root, "github", "read-only", "github.issue.create", {"repo": "owner/repo", "title": "Issue title"})
             mismatch = plan_action(root, "github", "write-confirm", "slack.message.post", {"channel": "C123", "text": "Nope"})

@@ -58,8 +58,8 @@ from core.schema_guard import (
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 27
-RUNTIME_VERSION = "4.14.3"
+SCHEMA_VERSION = 28
+RUNTIME_VERSION = "4.15.0"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -109,6 +109,7 @@ PHASE_TRANSITIONS = {
 
 ADAPTER_ACTION_STATUSES = {"planned", "draft", "confirmed", "executing", "completed", "retryable_failed", "unknown", "blocked"}
 CONNECTOR_STATUSES = {"available", "degraded", "blocked"}
+CONNECTOR_PROFILE_STATUSES = {"bound", "disabled"}
 ADVISORY_FALLBACK_STATUSES = {"generated", "superseded", "stale"}
 DELIVERY_CYCLE_STATUSES = {"active", "delivered", "archived"}
 VALIDATION_STATUSES = {"active", "superseded", "invalidated"}
@@ -405,6 +406,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             runtime_version text not null,
             phase text not null,
             current_cycle_id text not null default '',
+            connector_project_key text not null default '',
             status text not null,
             scope_status text not null,
             current_owner text not null,
@@ -780,6 +782,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
             updated_at text not null,
             unique(tool, operation, scope_key)
         );
+        create table if not exists connector_profiles (
+            id text primary key,
+            tool text not null,
+            project_key text not null,
+            status text not null,
+            scope_json text not null default '{}',
+            created_at text not null,
+            updated_at text not null,
+            unique(tool)
+        );
         create table if not exists advisory_fallbacks (
             id text primary key,
             action_id text not null,
@@ -1152,6 +1164,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
     ensure_column(conn, "deliveries", "cycle_id", "text not null default ''")
     ensure_column(conn, "deliveries", "candidate_sha", "text not null default ''")
+    ensure_column(conn, "project", "connector_project_key", "text not null default ''")
     ensure_column(conn, "ci_verifications", "origin", "text not null default 'manual'")
     ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
     ensure_column(conn, "ci_verifications", "token_status", "text not null default 'unchecked'")
@@ -1324,6 +1337,35 @@ def ensure_delivery_cycles(conn: sqlite3.Connection) -> None:
             conn.execute(f"update {table} set cycle_id = ? where cycle_id = ''", (current_cycle_id,))
 
 
+def slugify_project_key(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:80] or "project"
+
+
+def infer_connector_project_key(root: Path) -> str:
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=root, text=True, capture_output=True, check=False)
+    if remote.returncode == 0:
+        value = remote.stdout.strip()
+        if value.startswith("git@github.com:"):
+            value = value.removeprefix("git@github.com:")
+        elif "github.com/" in value:
+            value = value.split("github.com/", 1)[1]
+        value = value.removesuffix(".git").strip("/")
+        if value:
+            return slugify_project_key(value)
+    return slugify_project_key(root.name)
+
+
+def ensure_connector_project_key(conn: sqlite3.Connection, root: Path) -> str:
+    row = conn.execute("select connector_project_key from project where id = 1").fetchone()
+    current = str(row["connector_project_key"] or "") if row else ""
+    if current:
+        return current
+    project_key = infer_connector_project_key(root)
+    conn.execute("update project set connector_project_key = ?, updated_at = ? where id = 1", (project_key, now_iso()))
+    return project_key
+
+
 def initialize_project(conn: sqlite3.Connection) -> None:
     existing = conn.execute("select id from project where id = 1").fetchone()
     if existing:
@@ -1333,8 +1375,8 @@ def initialize_project(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         insert into project
-        (id, project_id, schema_version, runtime_version, phase, current_cycle_id, status, scope_status, current_owner, revision, updated_at)
-        values (1, ?, ?, ?, 'intake', ?, 'draft', 'unconfirmed', 'project-manager', 1, ?)
+        (id, project_id, schema_version, runtime_version, phase, current_cycle_id, connector_project_key, status, scope_status, current_owner, revision, updated_at)
+        values (1, ?, ?, ?, 'intake', ?, '', 'draft', 'unconfirmed', 'project-manager', 1, ?)
         """,
         (str(uuid.uuid4()), SCHEMA_VERSION, RUNTIME_VERSION, DEFAULT_CYCLE_ID, now),
     )
@@ -1744,6 +1786,7 @@ def init_runtime(root: Path) -> None:
     with transaction(root, validate_invariants=False) as conn:
         create_schema(conn)
         initialize_project(conn)
+        ensure_connector_project_key(conn, root)
         emit_event(conn, "runtime_initialized", payload())
         require_full_invariants(conn, root, "init")
     render_all(root)
@@ -3811,14 +3854,31 @@ WRITE_CONNECTOR_MODES = {"write-confirm", "write-auto"}
 DEFAULT_CONNECTOR_MAX_ATTEMPTS = 3
 RETRYABLE_CONNECTOR_CODES = {403, 429, 500, 502, 503, 504, 529}
 _CONNECTOR_THROTTLE_LAST: dict[str, float] = {}
+CONNECTOR_PROFILE_FIELDS = {
+    "github": {"repo"},
+    "linear": {"team_id", "project_id"},
+    "notion": {"parent_page_id", "page_id"},
+    "figma": {"file_key"},
+    "slack": {"channel"},
+}
 
 
-def connector_marker(idempotency_key: str) -> str:
+def connector_project_marker(project_key: str) -> str:
+    return f"codex-project-harness:project-key={project_key}"
+
+
+def connector_idempotency_marker(idempotency_key: str) -> str:
     return f"codex-project-harness:idempotency-key={idempotency_key}"
 
 
-def with_connector_marker(text: str, idempotency_key: str) -> str:
-    marker = connector_marker(idempotency_key)
+def connector_marker(idempotency_key: str, project_key: str = "") -> str:
+    if project_key:
+        return f"{connector_project_marker(project_key)}\n{connector_idempotency_marker(idempotency_key)}"
+    return connector_idempotency_marker(idempotency_key)
+
+
+def with_connector_marker(text: str, idempotency_key: str, project_key: str = "") -> str:
+    marker = connector_marker(idempotency_key, project_key)
     value = text or ""
     if marker in value:
         return value
@@ -3832,22 +3892,24 @@ def require_param(params: dict[str, Any], key: str) -> str:
     return str(value)
 
 
-def connector_scope_key(tool: str, operation: str, params: dict[str, Any]) -> str:
+def connector_scope_key(tool: str, operation: str, params: dict[str, Any], project_key: str = "") -> str:
     if tool == "github":
-        return str(params.get("repo", ""))
-    if tool == "slack":
-        return str(params.get("channel", ""))
-    if tool == "figma":
-        return str(params.get("file_key", ""))
-    if tool == "notion":
-        return str(params.get("page_id") or params.get("parent_page_id") or "")
-    if tool == "linear":
-        return str(params.get("team_id") or params.get("issue_id") or "")
-    return operation
+        scope = str(params.get("repo", ""))
+    elif tool == "slack":
+        scope = str(params.get("channel", ""))
+    elif tool == "figma":
+        scope = str(params.get("file_key", ""))
+    elif tool == "notion":
+        scope = str(params.get("page_id") or params.get("parent_page_id") or "")
+    elif tool == "linear":
+        scope = str(params.get("team_id") or params.get("project_id") or params.get("issue_id") or "")
+    else:
+        scope = operation
+    return f"{project_key}:{scope}" if project_key else scope
 
 
-def connector_stats(tool: str, operation: str, params: dict[str, Any]) -> ConnectorStats:
-    return ConnectorStats(tool=tool, operation=operation, scope_key=connector_scope_key(tool, operation, params))
+def connector_stats(tool: str, operation: str, params: dict[str, Any], project_key: str = "") -> ConnectorStats:
+    return ConnectorStats(tool=tool, operation=operation, scope_key=connector_scope_key(tool, operation, params, project_key))
 
 
 def connector_budget_id(stats: ConnectorStats) -> str:
@@ -3861,6 +3923,117 @@ def connector_max_attempts() -> int:
     except ValueError:
         value = DEFAULT_CONNECTOR_MAX_ATTEMPTS
     return max(1, min(value, 10))
+
+
+def parse_scope_json(value: str) -> dict[str, Any]:
+    try:
+        data = json.loads(value or "{}")
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"connector profile scope invalid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise HarnessError("connector profile scope must be a JSON object")
+    return data
+
+
+def connector_profile_issues_for_row(tool: str, project_key: str, status: str, scope_json: str) -> list[str]:
+    issues: list[str] = []
+    if tool not in CONNECTOR_PROFILE_FIELDS:
+        issues.append(f"invalid connector profile tool: {tool}")
+    if status not in CONNECTOR_PROFILE_STATUSES:
+        issues.append(f"invalid connector profile status: {status}")
+    if project_key != slugify_project_key(project_key):
+        issues.append(f"invalid connector profile project_key: {project_key}")
+    try:
+        scope = parse_scope_json(scope_json)
+    except HarnessError as exc:
+        return [str(exc)]
+    allowed = CONNECTOR_PROFILE_FIELDS.get(tool, set())
+    for key, value in scope.items():
+        if key not in allowed:
+            issues.append(f"connector profile {tool} uses unsupported scope field: {key}")
+        if not isinstance(value, str):
+            issues.append(f"connector profile {tool}.{key} must be a string")
+    return issues
+
+
+def connector_profile_status(root: Path) -> dict[str, Any]:
+    with transaction(root, validate_invariants=False) as conn:
+        create_schema(conn)
+        initialize_project(conn)
+        project_key = ensure_connector_project_key(conn, root)
+        rows = conn.execute("select tool, project_key, status, scope_json, updated_at from connector_profiles order by tool").fetchall()
+    profiles = {
+        tool: {"tool": tool, "project_key": project_key, "status": "unbound", "scope": {}, "updated_at": ""}
+        for tool in sorted(CONNECTOR_PROFILE_FIELDS)
+    }
+    for row in rows:
+        profiles[row["tool"]] = {
+            "tool": row["tool"],
+            "project_key": row["project_key"],
+            "status": row["status"],
+            "scope": parse_scope_json(row["scope_json"]),
+            "updated_at": row["updated_at"],
+        }
+    return {"project_key": project_key, "profiles": profiles}
+
+
+def set_connector_profile(root: Path, *, project_key: str, scopes: dict[str, dict[str, str]]) -> None:
+    normalized_project_key = slugify_project_key(project_key)
+    if not normalized_project_key:
+        raise HarnessError("connector profile requires project key")
+    now = now_iso()
+    with transaction(root) as conn:
+        create_schema(conn)
+        initialize_project(conn)
+        conn.execute("update project set connector_project_key = ?, updated_at = ? where id = 1", (normalized_project_key, now))
+        for tool, scope in scopes.items():
+            scope = {key: value for key, value in scope.items() if value}
+            if not scope:
+                continue
+            scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
+            issues = connector_profile_issues_for_row(tool, normalized_project_key, "bound", scope_json)
+            if issues:
+                raise HarnessError("; ".join(issues))
+            conn.execute(
+                """
+                insert into connector_profiles (id, tool, project_key, status, scope_json, created_at, updated_at)
+                values (?, ?, ?, 'bound', ?, ?, ?)
+                on conflict(tool) do update set project_key=excluded.project_key, status='bound',
+                  scope_json=excluded.scope_json, updated_at=excluded.updated_at
+                """,
+                (str(uuid.uuid4()), tool, normalized_project_key, scope_json, now, now),
+            )
+        emit_event(conn, "connector_profile_updated", payload(project_key=normalized_project_key, tools=sorted(scopes)), idempotency_key=f"connector-profile:{normalized_project_key}:{now}")
+    render_all(root)
+
+
+def unset_connector_profile(root: Path, tool: str) -> None:
+    if tool not in CONNECTOR_PROFILE_FIELDS:
+        raise HarnessError(f"unsupported connector profile tool: {tool}")
+    now = now_iso()
+    with transaction(root) as conn:
+        create_schema(conn)
+        initialize_project(conn)
+        project_key = ensure_connector_project_key(conn, root)
+        conn.execute(
+            """
+            insert into connector_profiles (id, tool, project_key, status, scope_json, created_at, updated_at)
+            values (?, ?, ?, 'disabled', '{}', ?, ?)
+            on conflict(tool) do update set project_key=excluded.project_key, status='disabled',
+              scope_json='{}', updated_at=excluded.updated_at
+            """,
+            (str(uuid.uuid4()), tool, project_key, now, now),
+        )
+        emit_event(conn, "connector_profile_updated", payload(project_key=project_key, tool=tool, status="disabled"), idempotency_key=f"connector-profile:{project_key}:{tool}:disabled:{now}")
+    render_all(root)
+
+
+def connector_profile_for_tool(conn: sqlite3.Connection, root: Path, tool: str) -> tuple[str, sqlite3.Row | None, dict[str, Any]]:
+    project_key = ensure_connector_project_key(conn, root)
+    row = conn.execute("select * from connector_profiles where tool = ?", (tool,)).fetchone()
+    if not row:
+        return project_key, None, {}
+    return project_key, row, parse_scope_json(row["scope_json"])
 
 
 def parse_retry_after(value: str) -> int:
@@ -4305,6 +4478,85 @@ def validate_connector_request(row: sqlite3.Row, payload_value: dict[str, Any]) 
     return operation, params
 
 
+def connector_scope_mismatch(tool: str, operation: str, params: dict[str, Any], scope: dict[str, Any]) -> str:
+    if tool == "github":
+        expected = str(scope.get("repo", ""))
+        actual = str(params.get("repo", ""))
+        return "" if expected and actual == expected else f"github repo mismatch: expected {expected or '<unbound>'}, got {actual or '<missing>'}"
+    if tool == "slack":
+        expected = str(scope.get("channel", ""))
+        actual = str(params.get("channel", ""))
+        return "" if expected and actual == expected else f"slack channel mismatch: expected {expected or '<unbound>'}, got {actual or '<missing>'}"
+    if tool == "figma":
+        expected = str(scope.get("file_key", ""))
+        actual = str(params.get("file_key", ""))
+        return "" if expected and actual == expected else f"figma file mismatch: expected {expected or '<unbound>'}, got {actual or '<missing>'}"
+    if tool == "notion":
+        if operation == "notion.page.create":
+            expected = str(scope.get("parent_page_id", ""))
+            actual = str(params.get("parent_page_id", ""))
+            return "" if expected and actual == expected else f"notion parent mismatch: expected {expected or '<unbound>'}, got {actual or '<missing>'}"
+        expected = str(scope.get("page_id") or scope.get("parent_page_id") or "")
+        actual = str(params.get("page_id") or params.get("parent_page_id") or "")
+        return "" if expected and actual == expected else f"notion page mismatch: expected {expected or '<unbound>'}, got {actual or '<missing>'}"
+    if tool == "linear":
+        expected_team = str(scope.get("team_id", ""))
+        expected_project = str(scope.get("project_id", ""))
+        actual_team = str(params.get("team_id", ""))
+        actual_project = str(params.get("project_id", ""))
+        if expected_team and actual_team == expected_team:
+            return ""
+        if expected_project and actual_project == expected_project:
+            return ""
+        if operation in {"linear.issue.comment", "linear.issue.update"} and (expected_team or expected_project):
+            return ""
+        expected = expected_team or expected_project or "<unbound>"
+        actual = actual_team or actual_project or str(params.get("issue_id", "")) or "<missing>"
+        return f"linear scope mismatch: expected {expected}, got {actual}"
+    return ""
+
+
+def audit_connector_scope_override(root: Path, row: sqlite3.Row, project_key: str, reason: str) -> None:
+    with transaction(root) as conn:
+        finding_id = f"connector-scope-override:{row['id']}"
+        conn.execute(
+            """
+            insert into findings (id, surface, severity, status, summary, evidence_id, created_at)
+            values (?, 'connector', 'medium', 'open', ?, '', ?)
+            on conflict(id) do update set summary=excluded.summary, created_at=excluded.created_at
+            """,
+            (finding_id, f"connector scope override for project {project_key}: {reason}", now_iso()),
+        )
+        emit_event(conn, "connector_scope_override", payload(id=row["id"], tool=row["tool"], project_key=project_key, reason=reason), idempotency_key=f"connector-scope-override:{row['id']}")
+
+
+def validate_connector_namespace(root: Path, row: sqlite3.Row, payload_value: dict[str, Any], operation: str, params: dict[str, Any]) -> str:
+    if operation in PROBE_OPERATIONS:
+        with transaction(root, validate_invariants=False) as conn:
+            create_schema(conn)
+            initialize_project(conn)
+            return ensure_connector_project_key(conn, root)
+    tool = str(row["tool"])
+    with transaction(root, validate_invariants=False) as conn:
+        create_schema(conn)
+        initialize_project(conn)
+        project_key, profile, scope = connector_profile_for_tool(conn, root, tool)
+    if not profile:
+        raise HarnessError(f"connector profile missing for {tool}; run connector profile set before external writes")
+    if profile["status"] != "bound":
+        raise HarnessError(f"connector profile is {profile['status']} for {tool}")
+    mismatch = connector_scope_mismatch(tool, operation, params, scope)
+    if not mismatch:
+        return project_key
+    if payload_value.get("scope_override") is True:
+        if row["mode"] != "write-confirm":
+            raise HarnessError("connector scope_override requires write-confirm mode")
+        audit_connector_scope_override(root, row, project_key, mismatch)
+        return project_key
+    audit_connector_scope_override(root, row, project_key, f"blocked mismatch: {mismatch}")
+    raise HarnessError(f"connector scope mismatch: {mismatch}")
+
+
 def infer_github_repo(root: Path) -> str:
     remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=root, text=True, capture_output=True, check=False)
     if remote.returncode != 0:
@@ -4365,34 +4617,34 @@ def run_gh_api(root: Path, endpoint: str, fields: dict[str, str], stats: Connect
     raise ConnectorFailure("github connector failed: retry budget exhausted", stats)
 
 
-def execute_github_connector(root: Path, operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
-    stats = connector_stats("github", operation, params)
+def execute_github_connector(root: Path, operation: str, params: dict[str, Any], idempotency_key: str, project_key: str = "") -> ConnectorOutcome:
+    stats = connector_stats("github", operation, params, project_key)
     if operation == "github.probe":
         data = run_gh_api(root, "user", {}, stats)
         login = data.get("login") or data.get("viewer", {}).get("login") or "ok"
         return ConnectorOutcome(f"github:probe:{login}", "", stats)
     repo = str(params.get("repo") or infer_github_repo(root))
     params = {**params, "repo": repo}
-    stats.scope_key = connector_scope_key("github", operation, params)
-    existing = find_existing_connector_object(root, operation, params, idempotency_key, stats)
+    stats.scope_key = connector_scope_key("github", operation, params, project_key)
+    existing = find_existing_connector_object(root, operation, params, idempotency_key, stats, project_key)
     if existing:
         return ConnectorOutcome(existing[0], existing[1], stats)
     if operation == "github.issue.create":
         data = run_gh_api(
             root,
             f"repos/{repo}/issues",
-            {"title": require_param(params, "title"), "body": with_connector_marker(str(params.get("body", "")), idempotency_key)},
+            {"title": require_param(params, "title"), "body": with_connector_marker(str(params.get("body", "")), idempotency_key, project_key)},
             stats,
         )
         return ConnectorOutcome(f"github:issue:{data.get('number') or data.get('id')}", str(data.get("html_url", "")), stats)
     if operation == "github.issue.comment":
         issue_number = require_param(params, "issue_number")
-        data = run_gh_api(root, f"repos/{repo}/issues/{issue_number}/comments", {"body": with_connector_marker(require_param(params, "body"), idempotency_key)}, stats)
+        data = run_gh_api(root, f"repos/{repo}/issues/{issue_number}/comments", {"body": with_connector_marker(require_param(params, "body"), idempotency_key, project_key)}, stats)
         return ConnectorOutcome(f"github:comment:{data.get('id')}", str(data.get("html_url", "")), stats)
     if operation == "github.pr.create":
         fields = {
             "title": require_param(params, "title"),
-            "body": with_connector_marker(str(params.get("body", "")), idempotency_key),
+            "body": with_connector_marker(str(params.get("body", "")), idempotency_key, project_key),
             "head": require_param(params, "head"),
             "base": require_param(params, "base"),
         }
@@ -4477,17 +4729,21 @@ def first_search_result(data: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def find_existing_connector_object(root: Path, operation: str, params: dict[str, Any], idempotency_key: str, stats: ConnectorStats) -> tuple[str, str] | None:
-    marker = connector_marker(idempotency_key)
+def find_existing_connector_object(root: Path, operation: str, params: dict[str, Any], idempotency_key: str, stats: ConnectorStats, project_key: str = "") -> tuple[str, str] | None:
+    marker = connector_marker(idempotency_key, project_key)
+    id_marker = connector_idempotency_marker(idempotency_key)
+    project_marker = connector_project_marker(project_key) if project_key else ""
     if operation == "github.issue.create":
         repo = require_param(params, "repo")
-        data = run_gh_api(root, "search/issues", {"q": f"{marker} repo:{repo} type:issue"}, stats)
+        query = f"{id_marker} {project_marker} repo:{repo} type:issue".strip()
+        data = run_gh_api(root, "search/issues", {"q": query}, stats)
         item = first_search_result(data)
         if item:
             return f"github:issue:{item.get('number') or item.get('id')}", str(item.get("html_url", ""))
     if operation == "github.pr.create":
         repo = require_param(params, "repo")
-        data = run_gh_api(root, "search/issues", {"q": f"{marker} repo:{repo} type:pr"}, stats)
+        query = f"{id_marker} {project_marker} repo:{repo} type:pr".strip()
+        data = run_gh_api(root, "search/issues", {"q": query}, stats)
         item = first_search_result(data)
         if item:
             return f"github:pr:{item.get('number') or item.get('id')}", str(item.get("html_url", ""))
@@ -4513,7 +4769,8 @@ def find_existing_connector_object(root: Path, operation: str, params: dict[str,
         comments = data.get("comments")
         if isinstance(comments, list):
             for comment in comments:
-                if isinstance(comment, dict) and marker in str(comment.get("message", "")):
+                message = str(comment.get("message", ""))
+                if isinstance(comment, dict) and id_marker in message and (not project_marker or project_marker in message):
                     return f"figma:comment:{comment.get('id')}", f"https://www.figma.com/file/{file_key}?comment-id={comment.get('id')}"
     if operation in {"linear.issue.create", "linear.issue.comment", "linear.issue.update"}:
         token = env_token("LINEAR_API_KEY", stats)
@@ -4549,10 +4806,10 @@ def find_existing_connector_object(root: Path, operation: str, params: dict[str,
     return None
 
 
-def notion_payload_for_page_create(params: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+def notion_payload_for_page_create(params: dict[str, Any], idempotency_key: str, project_key: str = "") -> dict[str, Any]:
     children = params.get("children")
     if children is None:
-        children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key)}}]}}]
+        children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key, project_key)}}]}}]
     if not isinstance(children, list):
         raise HarnessError("Notion payload children must be an array")
     return {
@@ -4576,15 +4833,15 @@ def validate_notion_payload(payload_value: dict[str, Any], stats: ConnectorStats
                 raise ConnectorFailure("Notion attachment exceeds 5MB; record a link or local fallback path instead", stats)
 
 
-def execute_linear_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
-    stats = connector_stats("linear", operation, params)
+def execute_linear_connector(operation: str, params: dict[str, Any], idempotency_key: str, project_key: str = "") -> ConnectorOutcome:
+    stats = connector_stats("linear", operation, params, project_key)
     token = env_token("LINEAR_API_KEY", stats)
     endpoint = f"{os.environ['HARNESS_LINEAR_API_URL'].rstrip('/')}/linear/graphql" if os.environ.get("HARNESS_LINEAR_API_URL") else "https://api.linear.app/graphql"
     if operation == "linear.probe":
         data = http_json(endpoint, token, {"query": "query Viewer { viewer { id name } }"}, stats=stats)
         viewer = data.get("data", {}).get("viewer", {})
         return ConnectorOutcome(f"linear:probe:{viewer.get('id', 'ok')}", "", stats)
-    existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+    existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats, project_key)
     if existing:
         return ConnectorOutcome(existing[0], existing[1], stats)
     if operation == "linear.issue.create":
@@ -4593,7 +4850,7 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
             token,
             {
                 "query": "mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }",
-                "variables": {"input": {"teamId": require_param(params, "team_id"), "title": require_param(params, "title"), "description": with_connector_marker(str(params.get("description", "")), idempotency_key)}},
+                "variables": {"input": {"teamId": require_param(params, "team_id"), "title": require_param(params, "title"), "description": with_connector_marker(str(params.get("description", "")), idempotency_key, project_key)}},
             },
             stats=stats,
         )
@@ -4605,7 +4862,7 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
             token,
             {
                 "query": "mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url } } }",
-                "variables": {"input": {"issueId": require_param(params, "issue_id"), "body": with_connector_marker(require_param(params, "body"), idempotency_key)}},
+                "variables": {"input": {"issueId": require_param(params, "issue_id"), "body": with_connector_marker(require_param(params, "body"), idempotency_key, project_key)}},
             },
             stats=stats,
         )
@@ -4627,8 +4884,8 @@ def execute_linear_connector(operation: str, params: dict[str, Any], idempotency
     raise ConnectorFailure(f"unsupported linear connector operation: {operation}", stats)
 
 
-def execute_notion_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
-    stats = connector_stats("notion", operation, params)
+def execute_notion_connector(operation: str, params: dict[str, Any], idempotency_key: str, project_key: str = "") -> ConnectorOutcome:
+    stats = connector_stats("notion", operation, params, project_key)
     token = env_token("NOTION_TOKEN", stats)
     base = os.environ.get("HARNESS_NOTION_API_URL", "https://api.notion.com").rstrip("/")
     headers = {"Notion-Version": "2022-06-28"}
@@ -4638,9 +4895,9 @@ def execute_notion_connector(operation: str, params: dict[str, Any], idempotency
         return ConnectorOutcome(f"notion:probe:{data.get('id', 'ok')}", "", stats)
     if operation == "notion.page.create":
         path = "/notion/v1/pages" if os.environ.get("HARNESS_NOTION_API_URL") else "/v1/pages"
-        body = notion_payload_for_page_create(params, idempotency_key)
+        body = notion_payload_for_page_create(params, idempotency_key, project_key)
         validate_notion_payload(body, stats)
-        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats, project_key)
         if existing:
             return ConnectorOutcome(existing[0], existing[1], stats)
         data = http_json(
@@ -4654,9 +4911,9 @@ def execute_notion_connector(operation: str, params: dict[str, Any], idempotency
     if operation == "notion.page.update":
         page_id = require_param(params, "page_id")
         path = f"/notion/v1/pages/{page_id}" if os.environ.get("HARNESS_NOTION_API_URL") else f"/v1/pages/{page_id}"
-        body = {"properties": {"title": {"title": [{"text": {"content": with_connector_marker(str(params.get("title", "")), idempotency_key)}}]}}}
+        body = {"properties": {"title": {"title": [{"text": {"content": with_connector_marker(str(params.get("title", "")), idempotency_key, project_key)}}]}}}
         validate_notion_payload(body, stats)
-        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats, project_key)
         if existing:
             return ConnectorOutcome(existing[0], existing[1], stats)
         data = http_json(
@@ -4671,8 +4928,8 @@ def execute_notion_connector(operation: str, params: dict[str, Any], idempotency
     raise ConnectorFailure(f"unsupported notion connector operation: {operation}", stats)
 
 
-def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
-    stats = connector_stats("figma", operation, params)
+def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_key: str, project_key: str = "") -> ConnectorOutcome:
+    stats = connector_stats("figma", operation, params, project_key)
     token = env_token("FIGMA_TOKEN", stats)
     base = os.environ.get("HARNESS_FIGMA_API_URL", "https://api.figma.com").rstrip("/")
     if operation == "figma.probe":
@@ -4686,14 +4943,14 @@ def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_
         return ConnectorOutcome(f"figma:probe:{data.get('id', 'ok')}", "", stats)
     if operation == "figma.comment.create":
         file_key = require_param(params, "file_key")
-        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats, project_key)
         if existing:
             return ConnectorOutcome(existing[0], existing[1], stats)
         path = f"/figma/v1/files/{file_key}/comments" if os.environ.get("HARNESS_FIGMA_API_URL") else f"/v1/files/{file_key}/comments"
         data = http_json(
             f"{base}{path}",
             token,
-            {"message": with_connector_marker(require_param(params, "message"), idempotency_key)},
+            {"message": with_connector_marker(require_param(params, "message"), idempotency_key, project_key)},
             stats=stats,
             headers={"X-Figma-Token": token},
         )
@@ -4701,8 +4958,8 @@ def execute_figma_connector(operation: str, params: dict[str, Any], idempotency_
     raise ConnectorFailure(f"unsupported figma connector operation: {operation}", stats)
 
 
-def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_key: str) -> ConnectorOutcome:
-    stats = connector_stats("slack", operation, params)
+def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_key: str, project_key: str = "") -> ConnectorOutcome:
+    stats = connector_stats("slack", operation, params, project_key)
     token = env_token("SLACK_BOT_TOKEN", stats)
     base = os.environ.get("HARNESS_SLACK_API_URL", "https://slack.com").rstrip("/")
     if operation == "slack.probe":
@@ -4710,14 +4967,14 @@ def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_
         data = http_json(f"{base}{path}", token, {}, stats=stats)
         return ConnectorOutcome(f"slack:probe:{data.get('team_id', 'ok')}", "", stats)
     if operation == "slack.message.post":
-        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats)
+        existing = find_existing_connector_object(Path.cwd(), operation, params, idempotency_key, stats, project_key)
         if existing:
             return ConnectorOutcome(existing[0], existing[1], stats)
         path = "/slack/api/chat.postMessage" if os.environ.get("HARNESS_SLACK_API_URL") else "/api/chat.postMessage"
         data = http_json(
             f"{base}{path}",
             token,
-            {"channel": require_param(params, "channel"), "text": with_connector_marker(require_param(params, "text"), idempotency_key)},
+            {"channel": require_param(params, "channel"), "text": with_connector_marker(require_param(params, "text"), idempotency_key, project_key)},
             stats=stats,
         )
         if data.get("ok") is False:
@@ -4731,18 +4988,19 @@ def execute_slack_connector(operation: str, params: dict[str, Any], idempotency_
 def execute_connector_action(root: Path, row: sqlite3.Row) -> ConnectorOutcome:
     payload_value = load_connector_payload(row)
     operation, params = validate_connector_request(row, payload_value)
+    project_key = validate_connector_namespace(root, row, payload_value, operation, params)
     idempotency_key = str(row["idempotency_key"])
     tool = str(row["tool"])
     if tool == "github":
-        return execute_github_connector(root, operation, params, idempotency_key)
+        return execute_github_connector(root, operation, params, idempotency_key, project_key)
     if tool == "linear":
-        return execute_linear_connector(operation, params, idempotency_key)
+        return execute_linear_connector(operation, params, idempotency_key, project_key)
     if tool == "notion":
-        return execute_notion_connector(operation, params, idempotency_key)
+        return execute_notion_connector(operation, params, idempotency_key, project_key)
     if tool == "figma":
-        return execute_figma_connector(operation, params, idempotency_key)
+        return execute_figma_connector(operation, params, idempotency_key, project_key)
     if tool == "slack":
-        return execute_slack_connector(operation, params, idempotency_key)
+        return execute_slack_connector(operation, params, idempotency_key, project_key)
     raise HarnessError(f"unsupported connector tool: {tool}")
 
 
@@ -4814,10 +5072,13 @@ def recover_connector_action(root: Path, action_id: str, reason: str = "") -> bo
         raise HarnessError(f"missing adapter action: {action_id}")
     if row["status"] == "completed":
         return True
-    operation, params, stats = connector_stats_for_row(row)
+    payload_value = load_connector_payload(row)
+    operation, params = validate_connector_request(row, payload_value)
+    project_key = validate_connector_namespace(root, row, payload_value, operation, params)
+    stats = connector_stats(str(row["tool"]), operation, params, project_key)
     stats.last_error = reason[:1000]
     try:
-        existing = find_existing_connector_object(root, operation, params, str(row["idempotency_key"]), stats)
+        existing = find_existing_connector_object(root, operation, params, str(row["idempotency_key"]), stats, project_key)
     except ConnectorFailure as exc:
         mark_connector_blocked(root, action_id, exc.stats, str(exc))
         raise HarnessError(f"connector recovery failed: {exc}") from exc
@@ -5103,6 +5364,9 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
             reason = current["blocked_reason"] or "connector action is blocked"
             raise HarnessError(f"connector execution failed: {reason}")
         if should_execute_connector(current):
+            payload_value = load_connector_payload(current)
+            operation, params = validate_connector_request(current, payload_value)
+            validate_connector_namespace(root, current, payload_value, operation, params)
             if current["status"] == "unknown" or (current["status"] == "executing" and is_expired(current["claim_expires_at"])):
                 if recover_connector_action(root, action_id, current["blocked_reason"] or "recovering connector action before retry"):
                     return
@@ -7175,6 +7439,7 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
         with transaction(root, validate_invariants=False) as conn:
             create_schema(conn)
             initialize_project(conn)
+            ensure_connector_project_key(conn, root)
             conn.execute(
                 "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
                 (from_version_int, to_version, now_iso()),
@@ -7205,6 +7470,11 @@ def doctor(root: Path) -> list[str]:
                 issues.append(f"schema version mismatch: expected {SCHEMA_VERSION}, actual {project['schema_version']}")
             if project["runtime_version"] != RUNTIME_VERSION:
                 issues.append(f"runtime version mismatch: expected {RUNTIME_VERSION}, actual {project['runtime_version']}")
+            if "connector_project_key" not in project.keys() or not project["connector_project_key"]:
+                with transaction(root, validate_invariants=False) as write_conn:
+                    create_schema(write_conn)
+                    ensure_columns(write_conn)
+                    ensure_connector_project_key(write_conn, root)
         integrity = conn.execute("pragma integrity_check").fetchone()[0]
         if integrity != "ok":
             issues.append(f"sqlite integrity check failed: {integrity}")
@@ -7244,6 +7514,7 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("adapter_actions", "status", ADAPTER_ACTION_STATUSES, "adapter action status"),
         ("adapter_actions", "connector_status", CONNECTOR_STATUSES, "adapter action connector status"),
         ("connector_budgets", "status", CONNECTOR_STATUSES, "connector budget status"),
+        ("connector_profiles", "status", CONNECTOR_PROFILE_STATUSES, "connector profile status"),
         ("advisory_fallbacks", "status", ADVISORY_FALLBACK_STATUSES, "advisory fallback status"),
         ("agents", "status", {"available", "leased", "disabled"}, "agent status"),
         ("dispatch_runs", "status", DISPATCH_STATUSES, "dispatch run status"),
@@ -7291,6 +7562,8 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
             json.loads(row["payload_json"])
         except json.JSONDecodeError as exc:
             issues.append(f"invalid event payload_json: {row['id']} {exc.msg}")
+    for row in conn.execute("select tool, project_key, status, scope_json from connector_profiles"):
+        issues.extend(connector_profile_issues_for_row(row["tool"], row["project_key"], row["status"], row["scope_json"]))
     issues.extend(schema_contract_issues(conn))
     return issues
 
@@ -7371,7 +7644,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
 
     project = conn.execute(
         """
-        select status, phase, current_cycle_id, scope_status, current_owner, schema_version, runtime_version, project_id, revision, updated_at
+        select status, phase, current_cycle_id, connector_project_key, scope_status, current_owner, schema_version, runtime_version, project_id, revision, updated_at
         from project where id = 1
         """
     ).fetchall()
@@ -7395,6 +7668,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("adapter.schema.json", "adapters", [row_snapshot(row) or {} for row in conn.execute("select * from adapters")]),
         ("adapter-action.schema.json", "adapter_actions", [row_snapshot(row) or {} for row in conn.execute("select * from adapter_actions")]),
         ("connector-budget.schema.json", "connector_budgets", [row_snapshot(row) or {} for row in conn.execute("select * from connector_budgets")]),
+        ("connector-profile.schema.json", "connector_profiles", [row_snapshot(row) or {} for row in conn.execute("select * from connector_profiles")]),
         ("advisory-fallback.schema.json", "advisory_fallbacks", [row_snapshot(row) or {} for row in conn.execute("select * from advisory_fallbacks")]),
         ("ci-verification.schema.json", "ci_verifications", [row_snapshot(row) or {} for row in conn.execute("select * from ci_verifications")]),
         ("command-log.schema.json", "command_log", [row_snapshot(row) or {} for row in conn.execute("select * from command_log")]),

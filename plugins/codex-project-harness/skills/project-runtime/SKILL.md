@@ -64,6 +64,7 @@ kafa doctor --repo .
 | Record quality gate | `harness.py --root . gate record --finding F1` |
 | Record delivery | `harness.py --root . delivery record` |
 | Record adapter link | `harness.py --root . adapter record` |
+| Bind connector scopes | `harness.py --root . connector profile status --json`, `harness.py --root . connector profile set --project-key KEY --github-repo owner/repo --slack-channel C123`, `harness.py --root . connector profile unset --tool slack` |
 | Plan adapter action | `harness.py --root . adapter plan`, `harness.py --root . adapter draft`, `harness.py --root . adapter confirm`, `harness.py --root . adapter complete`, `harness.py --root . adapter reconcile` |
 | Checkpoint / audit events | `harness.py --root . checkpoint create`, `harness.py --root . checkpoint export`, `harness.py --root . checkpoint import`, `harness.py --root . event validate` |
 | Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . executor allow-prefix add --prefix "pytest" --reason "test runner"`, `harness.py --root . dispatch run --agent developer --target UNIT --command "pytest" --code-identity content-hash`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
@@ -186,7 +187,20 @@ When an AgentProvider is available, use `dispatch provider start --run-id <run-i
 
 `--provider host-codex` starts nonblocking. `dispatch provider start` only registers the provider session, claims the assignment, creates an assignment-specific git worktree, and launches a background worker outside the SQLite write transaction; it does not wait for the Codex turn to finish. The worker uses the Python Codex SDK with `Sandbox.workspace_write` and `ApprovalMode.deny_all`, fixes SDK cwd to `.ai-team/runtime/worktrees/<run>/<task>/<agent>`, commits non-`.ai-team/` worktree changes to the assignment agent branch, and writes its status artifact under `.ai-team/runtime/host-codex/`. Poll with `dispatch provider collect --run-id <run-id>` until the raw report is collected, then run `dispatch verify-attempt`. `HARNESS_CODEX_BIN` and `HARNESS_CODEX_MODEL` are optional SDK configuration inputs. Host Codex reports are stricter than fixture/manual reports, but they are still raw reports until controller verification.
 
-For real connector adapters, keep using the existing adapter commands. `adapter confirm` executes GitHub/Linear/Notion/Figma/Slack only when the planned action payload contains `{"execute": true, "operation": "...", "params": {...}}`; otherwise it remains a manual confirmation record. GitHub uses `gh api`; Linear, Notion, Figma, and Slack read their tokens from `LINEAR_API_KEY`, `NOTION_TOKEN`, `FIGMA_TOKEN`, and `SLACK_BOT_TOKEN`. Connector results are external workflow links, not delivery evidence.
+For real connector adapters, first bind the current project to existing external targets. Harness does not create Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories. Use `connector profile status --json` to inspect the project key and binding state, then set only the scopes this project is allowed to write:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile set \
+  --project-key my-project \
+  --github-repo owner/repo \
+  --linear-team TEAM \
+  --linear-project PROJECT \
+  --notion-parent PAGE_ID \
+  --slack-channel C123456 \
+  --figma-file FILE_KEY
+```
+
+Keep using the existing adapter commands after the profile is bound. `adapter confirm` executes GitHub/Linear/Notion/Figma/Slack only when the planned action payload contains `{"execute": true, "operation": "...", "params": {...}}`; otherwise it remains a manual confirmation record. For executable writes, missing profile or scope mismatch fails closed before any external API request. `scope_override=true` is only valid with `mode=write-confirm`, never `write-auto`, and must leave an audit finding/event. GitHub uses `gh api`; Linear, Notion, Figma, and Slack read their tokens from `LINEAR_API_KEY`, `NOTION_TOKEN`, `FIGMA_TOKEN`, and `SLACK_BOT_TOKEN`. Connector results are external workflow links, not delivery evidence.
 
 This plugin also bundles Codex lifecycle hooks. Review and trust them with `/hooks` after plugin install or update. They inject read-only status, subagent boundaries, write warnings, change summaries, and Stop-time readiness checks. Hooks are advisory only: never treat hook output as trusted evidence, and never bypass controller verification, integration hardening, HMAC/session attestation, or delivery gates because a hook message looked good. Set `CODEX_PROJECT_HARNESS_PLUGIN_ROOT` when the plugin is installed outside the repository `plugins/codex-project-harness` path.
 
@@ -207,6 +221,8 @@ From v1.16.0, blocked connector actions also generate Advisory Fallback Layer ar
 From v1.20.0, connector writes are protected by a transactional outbox. `adapter confirm` must claim `adapter_actions.execution_fence` before calling external APIs, and `unknown` actions must recover by idempotency marker before retrying. Treat `unknown` as unresolved, not successful; connector records still cannot satisfy delivery evidence or replace controller verification.
 
 From v1.21.0, target execution policy is a Kernel fact. Use `test-target add --stack-profile ... --requires-sandbox --requires-no-network --result-format ... --result-path ...` when a target needs a specific stack, no-network container verification, or structured test semantics. Structured result formats must parse as pass with more than zero tests; local runner evidence cannot satisfy sandbox/no-network targets.
+
+From v1.22.0, connector namespace isolation is a Kernel fact. Configure per-project connector profiles before executable connector writes, expect double markers (`project-key` and `idempotency-key`) in external bodies, and treat old single-marker objects as audit candidates only. If a connector is blocked by missing profile, mismatch, token failure, rate limit, or unknown recovery, continue from local `.ai-team/` facts and advisory fallbacks instead of broadening the external scope.
 
 ## Evidence Protocol
 

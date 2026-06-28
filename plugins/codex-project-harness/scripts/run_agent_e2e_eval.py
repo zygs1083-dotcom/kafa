@@ -287,6 +287,27 @@ def plan_action(root: Path, tool: str, operation: str, params: dict[str, object]
     return result.stdout.strip().split()[-1]
 
 
+def set_connector_profiles(root: Path, project_key: str = "e2e") -> None:
+    run_harness(
+        root,
+        "connector",
+        "profile",
+        "set",
+        "--project-key",
+        project_key,
+        "--github-repo",
+        "owner/repo",
+        "--linear-team",
+        "TEAM",
+        "--notion-parent",
+        "PARENT",
+        "--slack-channel",
+        "C123",
+        "--figma-file",
+        "FILE1",
+    )
+
+
 def fake_gh(temp: Path) -> tuple[Path, Path]:
     bin_dir = temp / "bin"
     bin_dir.mkdir()
@@ -732,6 +753,7 @@ def scenario_connector_mock_server_e2e() -> dict[str, Any]:
         root = temp_path / "repo"
         root.mkdir()
         run_harness(root, "init")
+        set_connector_profiles(root)
         bin_dir, gh_log = fake_gh(temp_path)
         with ConnectorMockServer() as server:
             cases = [
@@ -777,8 +799,9 @@ def scenario_connector_exactly_once_recovery() -> dict[str, Any]:
         root = Path(temp) / "repo"
         root.mkdir()
         run_harness(root, "init")
+        set_connector_profiles(root)
         key = "e2e:slack:exactly-once-recovery"
-        marker = f"codex-project-harness:idempotency-key={key}"
+        marker = f"codex-project-harness:project-key=e2e\ncodex-project-harness:idempotency-key={key}"
         with ConnectorMockServer(marker=marker) as server:
             action = plan_action(root, "slack", "slack.message.post", {"channel": "C123", "text": "Ship it"}, key=key)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:

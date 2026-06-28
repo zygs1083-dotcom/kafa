@@ -32,6 +32,7 @@ from core.api import (
     complete_task,
     confirm_scope,
     connection,
+    connector_profile_status,
     create_checkpoint,
     cycle_close,
     cycle_start,
@@ -99,6 +100,8 @@ from core.api import (
     validate_runtime,
     review_task,
     run_idempotent,
+    set_connector_profile,
+    unset_connector_profile,
 )
 
 
@@ -126,6 +129,25 @@ def build_parser() -> argparse.ArgumentParser:
     cycle_status_parser.add_argument("--json", action="store_true")
     cycle_close_parser = cycle_sub.add_parser("close")
     cycle_close_parser.add_argument("--status", required=True, choices=["delivered", "archived"])
+
+    connector = sub.add_parser("connector")
+    connector_sub = connector.add_subparsers(dest="connector_command", required=True)
+    connector_profile = connector_sub.add_parser("profile")
+    connector_profile_sub = connector_profile.add_subparsers(dest="connector_profile_command", required=True)
+    connector_profile_status_parser = connector_profile_sub.add_parser("status")
+    connector_profile_status_parser.add_argument("--json", action="store_true")
+    connector_profile_set = connector_profile_sub.add_parser("set")
+    connector_profile_set.add_argument("--project-key", required=True)
+    connector_profile_set.add_argument("--github-repo", default="")
+    connector_profile_set.add_argument("--linear-team", default="")
+    connector_profile_set.add_argument("--linear-project", default="")
+    connector_profile_set.add_argument("--notion-parent", default="")
+    connector_profile_set.add_argument("--slack-channel", default="")
+    connector_profile_set.add_argument("--figma-file", default="")
+    add_request_id(connector_profile_set)
+    connector_profile_unset = connector_profile_sub.add_parser("unset")
+    connector_profile_unset.add_argument("--tool", required=True, choices=["github", "linear", "notion", "figma", "slack"])
+    add_request_id(connector_profile_unset)
 
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--delivery", action="store_true")
@@ -700,6 +722,26 @@ def main() -> int:
                 print(f"cycle={row['id']} status={row['status']} phase={row['phase']} candidate={row.get('candidate_sha', '')}")
         elif args.command == "cycle" and args.cycle_command == "close":
             mutate("cycle.close", lambda: (cycle_close(root, args.status), f"OK: cycle closed {args.status}")[1])
+        elif args.command == "connector" and args.connector_command == "profile" and args.connector_profile_command == "status":
+            data = connector_profile_status(root)
+            if args.json:
+                print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"project_key={data['project_key']}")
+                for tool, profile in data["profiles"].items():
+                    scope = json.dumps(profile["scope"], ensure_ascii=False, sort_keys=True)
+                    print(f"{tool}: {profile['status']} {scope}")
+        elif args.command == "connector" and args.connector_command == "profile" and args.connector_profile_command == "set":
+            scopes = {
+                "github": {"repo": args.github_repo},
+                "linear": {"team_id": args.linear_team, "project_id": args.linear_project},
+                "notion": {"parent_page_id": args.notion_parent},
+                "slack": {"channel": args.slack_channel},
+                "figma": {"file_key": args.figma_file},
+            }
+            mutate("connector.profile.set", lambda: (set_connector_profile(root, project_key=args.project_key, scopes=scopes), f"OK: connector profile set {args.project_key}")[1])
+        elif args.command == "connector" and args.connector_command == "profile" and args.connector_profile_command == "unset":
+            mutate("connector.profile.unset", lambda: (unset_connector_profile(root, args.tool), f"OK: connector profile unset {args.tool}")[1])
         elif args.command == "validate":
             issues = validate_runtime(root, delivery=args.delivery)
             if issues:

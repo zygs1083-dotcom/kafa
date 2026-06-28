@@ -23,10 +23,12 @@ Expected:
 
 ```text
 OK: plugin structure is valid
-1.21.3-beta.1
+1.22.0-beta.1
 ```
 
 `kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.
+
+Installation does not configure business-project connector scopes. After installing the plugin, each project that wants real GitHub/Linear/Notion/Figma/Slack writes must bind existing external targets with `harness.py --root <project> connector profile set ...`. Harness does not create external workspaces, projects, channels, files, repositories, or connector tokens.
 
 ## Install For This Repo
 
@@ -105,6 +107,7 @@ If you previously pointed Codex at the plugin directory manually:
 - Paths with spaces are supported when passed as quoted `--repo` or `--plugin-path` values.
 - Repo-scope install writes inside the current repository. User-scope install writes under the current user's home directory.
 - No secrets or connector tokens are required for installation.
+- Connector profile bindings are per project runtime state, not installation state. `kafa doctor` can remind you of the boundary, but it does not create or migrate profiles.
 
 ## Troubleshooting
 
@@ -115,3 +118,4 @@ If you previously pointed Codex at the plugin directory manually:
 - Plugin does not appear in Codex: restart Codex and confirm `.agents/plugins/marketplace.json` exists.
 - Hooks do not run: review and trust plugin hooks with `/hooks`; set `CODEX_PROJECT_HARNESS_PLUGIN_ROOT` if the plugin is outside the default repo path.
 - `control plane contract` fails in `kafa doctor`: inspect the named layer and restore the boundary text or implementation path before release.
+- Connector writes fail with missing profile or scope mismatch: run `harness.py --root <project> connector profile status --json`, then bind only the existing external target that project may write.

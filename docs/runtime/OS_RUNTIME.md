@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.14.3
+# Codex OS Runtime Layer v4.15.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.14.3 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, and P1 reliability hardening for dispatch aggregation, structured test semantics, and target sandbox policy. The repository release remains a beta release, while the runtime implementation version is `4.14.3` and the database schema version is `27`.
+Kernel v4.15.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, P1 reliability hardening for dispatch aggregation, structured test semantics, target sandbox policy, and connector namespace isolation. The repository release remains a beta release, while the runtime implementation version is `4.15.0` and the database schema version is `28`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.14.3
+## Kernel v4.15.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -148,13 +148,30 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stabi
 
 A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-eval-example.json`; real run durations are intentionally not committed.
 
-## Connector Resilience And Fallback
+## Connector Namespace, Resilience, And Fallback
 
 Real connector adapters remain workflow synchronization only. `adapter confirm` can execute GitHub, Linear, Notion, Figma, and Slack operations when `payload_json.execute` is true, but connector results do not create delivery-eligible evidence and do not satisfy controller verification, HMAC/session attestation, integration, or delivery gates.
 
-Schema 27 records connector health in `connector_budgets`, local second-level fallback artifacts in `advisory_fallbacks`, and transactional outbox state on `adapter_actions`: `execution_fence`, `claimed_at`, `claim_expires_at`, `last_recovery_at`, and `remote_recovery_count`. GitHub `gh api` calls and HTTP connectors share retry-aware handling for 429/529, common 5xx failures, GitHub rate-limit stderr/header signals, and `Retry-After`. Notion calls are throttled toward 2 req/s, Slack posting is throttled per channel, and Figma plan/tier headers are recorded as free-plan risk when present.
+Schema 28 adds project-level connector namespace state. `project.connector_project_key` identifies the local project, and `connector_profiles` binds that project to existing external targets. Harness does not create Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories.
 
-Before external writes, `adapter confirm` claims the action with a short SQLite transaction and fence, performs the remote write outside the transaction, and uses the same fence to mark the action completed. Concurrent confirms that do not own the claim do not call the external API. If a transport failure makes the remote result unknown, the action is marked `unknown`; subsequent confirm/reconcile must search for the stable marker `codex-project-harness:idempotency-key=<key>` and reuse a matching external object before any retry. When retries are exhausted or a payload is unsafe, the action is marked `blocked`, a connector finding is written, and the local `.ai-team/` fact source remains the fallback for continuing verified code delivery.
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile status --json
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile set \
+  --project-key my-project \
+  --github-repo owner/repo \
+  --linear-team TEAM \
+  --linear-project PROJECT \
+  --notion-parent PAGE_ID \
+  --slack-channel C123456 \
+  --figma-file FILE_KEY
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile unset --tool slack
+```
+
+For `payload_json.execute=true`, `adapter confirm` validates the action against the current connector profile before any external request. GitHub writes must match the bound repo, Linear writes must match the bound team or project, Notion page creates must match the bound parent page, Figma comments must match the bound file, and Slack posts must match the bound channel. Missing profiles and scope mismatches fail closed before remote API calls. `payload_json.scope_override=true` is allowed only in `write-confirm` mode, is never allowed in `write-auto`, and leaves an audit finding/event.
+
+Connector health is recorded in `connector_budgets`, local second-level fallback artifacts in `advisory_fallbacks`, and transactional outbox state on `adapter_actions`: `execution_fence`, `claimed_at`, `claim_expires_at`, `last_recovery_at`, and `remote_recovery_count`. GitHub `gh api` calls and HTTP connectors share retry-aware handling for 429/529, common 5xx failures, GitHub rate-limit stderr/header signals, and `Retry-After`. Notion calls are throttled toward 2 req/s, Slack posting is throttled per channel, and Figma plan/tier headers are recorded as free-plan risk when present.
+
+Before external writes, `adapter confirm` claims the action with a short SQLite transaction and fence, performs the remote write outside the transaction, and uses the same fence to mark the action completed. Concurrent confirms that do not own the claim do not call the external API. If a transport failure makes the remote result unknown, the action is marked `unknown`; subsequent confirm/reconcile must search for both stable markers, `codex-project-harness:project-key=<project_key>` and `codex-project-harness:idempotency-key=<key>`, and reuse a matching external object before any retry. Old single-marker objects are audit candidates only; they are not automatically recovered across project boundaries. When retries are exhausted or a payload is unsafe, the action is marked `blocked`, a connector finding is written, and the local `.ai-team/` fact source remains the fallback for continuing verified code delivery.
 
 When a connector action is blocked, the Advisory Fallback Layer writes a local Markdown artifact under `docs/harness/advisory-fallbacks/` and a projection at `.ai-team/control/advisory-fallbacks.md`. GitHub fallbacks are PR/issue/comment drafts, Linear fallbacks are task and risk breakdowns, Notion fallbacks are structured spec/ADR/handoff drafts, Figma fallbacks are Product Design briefs and visual QA checklists, and Slack fallbacks are post-ready handoff summaries. Each row is explicitly `delivery_eligible=0`; these artifacts help people continue work but cannot satisfy evidence, validation, HMAC/session attestation, integration, or delivery gates.
 
@@ -166,7 +183,7 @@ Schema 27 also records target execution policy on `test_targets`: `stack_profile
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. v1.20 intentionally moves the schema baseline to 26 for connector transactional outbox fence and recovery audit state. v1.21 intentionally moves the schema baseline to 27 for target sandbox policy and structured test semantic evidence while only extending existing `test-target add` options. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. v1.20 intentionally moves the schema baseline to 26 for connector transactional outbox fence and recovery audit state. v1.21 intentionally moves the schema baseline to 27 for target sandbox policy and structured test semantic evidence while only extending existing `test-target add` options. v1.22 intentionally moves the schema baseline to 28 and adds the `connector profile` CLI surface for per-project external target binding. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
 
 ## Installation And Release Helper
 
@@ -186,6 +203,8 @@ kafa plugin uninstall --repo .
 ```
 
 `kafa` does not write harness DB rows, does not add harness runtime CLI commands, does not publish PyPI packages, and does not directly mutate Codex plugin caches.
+
+Connector profiles are not installation state. After installing the plugin, configure external write boundaries inside each business project with `harness.py --root <project> connector profile set ...`; `kafa doctor` only reports that installation does not create external workspaces.
 
 ## Session Attestation And Independent QA
 

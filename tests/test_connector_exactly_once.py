@@ -66,6 +66,10 @@ def plan_slack_action(root: Path, *, key: str = "exactly-once:slack") -> str:
     return action_id(result.stdout)
 
 
+def set_slack_profile(root: Path) -> None:
+    run_harness(root, "connector", "profile", "set", "--project-key", "exactly-once", "--slack-channel", "C123")
+
+
 class ExactlyOnceHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     counts: dict[str, int] = {}
@@ -150,6 +154,7 @@ class ConnectorExactlyOnceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer(mode="slow-write") as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_slack_profile(root)
             action = plan_slack_action(root)
             env = os.environ.copy()
             env.update({"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url, "HARNESS_CONNECTOR_RETRY_SLEEP": "0"})
@@ -170,10 +175,11 @@ class ConnectorExactlyOnceTest(unittest.TestCase):
 
     def test_unknown_action_recovers_existing_remote_marker_without_duplicate_write(self) -> None:
         key = "exactly-once:recovery"
-        marker = f"codex-project-harness:idempotency-key={key}"
+        marker = f"codex-project-harness:project-key=exactly-once\ncodex-project-harness:idempotency-key={key}"
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer(marker=marker) as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_slack_profile(root)
             action = plan_slack_action(root, key=key)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update adapter_actions set status = 'unknown', connector_status = 'degraded', blocked_reason = 'local commit lost' where id = ?", (action,))
@@ -196,6 +202,7 @@ class ConnectorExactlyOnceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer(mode="crash-after-write") as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_slack_profile(root)
             action = plan_slack_action(root, key="exactly-once:ambiguous")
 
             first = run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url}, check=False)
@@ -218,6 +225,7 @@ class ConnectorExactlyOnceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer() as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_slack_profile(root)
             action = plan_slack_action(root, key="exactly-once:not-evidence")
 
             run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url})
@@ -229,10 +237,11 @@ class ConnectorExactlyOnceTest(unittest.TestCase):
 
     def test_same_request_id_retry_does_not_duplicate_recovery_or_write(self) -> None:
         key = "exactly-once:request-id"
-        marker = f"codex-project-harness:idempotency-key={key}"
+        marker = f"codex-project-harness:project-key=exactly-once\ncodex-project-harness:idempotency-key={key}"
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer(marker=marker) as server:
             root = Path(temp)
             run_harness(root, "init")
+            set_slack_profile(root)
             action = plan_slack_action(root, key=key)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update adapter_actions set status = 'unknown', connector_status = 'degraded', blocked_reason = 'retry recovery' where id = ?", (action,))

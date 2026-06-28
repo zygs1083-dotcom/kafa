@@ -20,6 +20,17 @@ For long-running projects, check the current Delivery Cycle before recording new
 python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
 ```
 
+For real connector writes, bind the project to existing external targets first. This does not create external workspaces, projects, channels, files, or repos:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile set \
+  --project-key my-project \
+  --github-repo owner/repo \
+  --notion-parent PAGE_ID \
+  --slack-channel C123456
+python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile status --json
+```
+
 For user-scope installation:
 
 ```bash
