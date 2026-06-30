@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kafa"
-version = "1.22.0b1"
+version = "1.23.0b1"
 description = "Local installer and release helper for Codex Project Harness"
 readme = "README.md"
 requires-python = ">=3.11"

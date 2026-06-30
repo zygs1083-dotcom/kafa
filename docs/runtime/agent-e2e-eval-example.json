@@ -72,6 +72,21 @@
       "skip_reason": ""
     },
     {
+      "category": "host-codex",
+      "details": {
+        "evidence_count": 0,
+        "selected_model": "gpt-5.3-codex-spark",
+        "spark_eligible": true,
+        "thread_run_model": "gpt-5.3-codex-spark",
+        "thread_start_model": "gpt-5.3-codex-spark"
+      },
+      "duration_seconds": 0.0,
+      "mode": "stability",
+      "name": "host_codex_spark_policy_fake_sdk_e2e",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
       "category": "session",
       "details": {},
       "duration_seconds": 0.0,
@@ -136,9 +151,9 @@
     "forged_evidence_block_count": 1,
     "human_intervention_count": 0,
     "merge_conflict_count": 0,
-    "passed_count": 11,
+    "passed_count": 12,
     "retry_count": 0,
-    "scenario_count": 11,
+    "scenario_count": 12,
     "skipped_count": 0,
     "sqlite_lock_error_count": 0,
     "task_once_completion_rate": 1.0

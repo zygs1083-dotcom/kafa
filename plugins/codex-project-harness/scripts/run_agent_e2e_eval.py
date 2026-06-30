@@ -238,6 +238,7 @@ def fake_codex_sdk(temp: Path) -> tuple[Path, Path]:
                         "cwd": str(cwd),
                         "sandbox": str(sandbox),
                         "approval_mode": str(approval_mode),
+                        "model": model,
                         "output_schema_required": sorted((output_schema or {}).get("required", [])),
                     })
                     Path(str(cwd)).joinpath("agent.txt").write_text("host codex sdk work\n", encoding="utf-8")
@@ -255,7 +256,7 @@ def fake_codex_sdk(temp: Path) -> tuple[Path, Path]:
                     log({"method": "codex.__exit__"})
 
                 def thread_start(self, *, cwd=None, sandbox=None, approval_mode=None, model=None, **kwargs):
-                    log({"method": "thread_start", "cwd": str(cwd), "sandbox": str(sandbox), "approval_mode": str(approval_mode)})
+                    log({"method": "thread_start", "cwd": str(cwd), "sandbox": str(sandbox), "approval_mode": str(approval_mode), "model": model})
                     return Thread()
             '''
         ).strip()
@@ -678,6 +679,62 @@ def scenario_host_codex_fake_sdk_e2e() -> dict[str, Any]:
         )
 
 
+def scenario_host_codex_spark_policy_fake_sdk_e2e() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        temp_path = Path(temp)
+        root = temp_path / "repo"
+        root.mkdir()
+        init_git_repo(root)
+        add_unittest(root)
+        run_harness(root, "init")
+        commit_harness_scaffold(root)
+        run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Spark policy acceptance")
+        run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
+        run_harness(root, "task", "add", "--id", "T1", "--task", "Spark eligible developer task", "--owner", "developer", "--acceptance", "AC1")
+        run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
+        run_id = run_harness(root, "dispatch", "plan", "--scope", "Spark Policy").stdout.strip().split()[-1]
+        package_root, log_path = fake_codex_sdk(temp_path)
+        env = {
+            "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
+            "HARNESS_CODEX_MODEL_POLICY": "spark-deterministic",
+            "FAKE_CODEX_SDK_LOG": str(log_path),
+            "PYTHONPATH": str(package_root),
+        }
+        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+        collect = wait_for_provider_collect(root, run_id)
+        session = db_rows(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))[0]
+        metadata = json.loads(session["input_json"])["provider_metadata"]
+        events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        by_method = {event["method"]: event for event in events}
+        evidence_count = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
+        ok = (
+            "collected 1 provider report" in collect.stdout
+            and by_method["thread_start"]["model"] == "gpt-5.3-codex-spark"
+            and by_method["thread.run"]["model"] == "gpt-5.3-codex-spark"
+            and metadata["selected_model"] == "gpt-5.3-codex-spark"
+            and metadata["model_policy"] == "spark-deterministic"
+            and metadata["spark_eligible"] is True
+            and evidence_count == 0
+        )
+        return scenario_result(
+            "host_codex_spark_policy_fake_sdk_e2e",
+            started,
+            ok,
+            {
+                "run_id": run_id,
+                "thread_start_model": by_method.get("thread_start", {}).get("model"),
+                "thread_run_model": by_method.get("thread.run", {}).get("model"),
+                "selected_model": metadata.get("selected_model"),
+                "model_policy": metadata.get("model_policy"),
+                "spark_eligible": metadata.get("spark_eligible"),
+                "evidence_count": evidence_count,
+            },
+            category="host-codex",
+            mode="stability",
+        )
+
+
 def scenario_multi_role_thread_lifecycle() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
@@ -956,6 +1013,7 @@ FIXTURE_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
 
 STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
     scenario_host_codex_fake_sdk_e2e,
+    scenario_host_codex_spark_policy_fake_sdk_e2e,
     scenario_multi_role_thread_lifecycle,
     scenario_connector_mock_server_e2e,
     scenario_connector_exactly_once_recovery,

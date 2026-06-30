@@ -86,6 +86,17 @@ def wait_for_session_status(root: Path, run_id: str, status: str, *, timeout: fl
     return row
 
 
+def wait_for_sdk_events(log_path: Path, *, timeout: float = 5.0) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_path.exists() and "thread.run" in log_path.read_text(encoding="utf-8"):
+            return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        time.sleep(0.05)
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
 def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, Path]:
     package_root = temp / "fake_sdk"
     package_dir = package_root / "openai_codex"
@@ -322,6 +333,110 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertIn("branch_name", by_method["thread.run"]["output_schema_required"])
             self.assertIn("fence", by_method["thread.run"]["output_schema_required"])
             run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
+
+    def test_host_codex_model_override_wins_over_spark_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+            env["HARNESS_CODEX_MODEL"] = "gpt-custom-main"
+
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            events = wait_for_sdk_events(log_path)
+            by_method = {event["method"]: event for event in events}
+            session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
+            metadata = json.loads(session["input_json"])["provider_metadata"]
+            self.assertEqual(by_method["thread_start"]["model"], "gpt-custom-main")
+            self.assertEqual(by_method["thread.run"]["model"], "gpt-custom-main")
+            self.assertEqual(metadata["selected_model"], "gpt-custom-main")
+            self.assertEqual(metadata["model_policy"], "spark-deterministic")
+            self.assertEqual(metadata["model_selection_reason"], "HARNESS_CODEX_MODEL override")
+            self.assertTrue(metadata["spark_eligible"])
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
+
+    def test_host_codex_spark_policy_selects_spark_for_eligible_developer_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            events = wait_for_sdk_events(log_path)
+            by_method = {event["method"]: event for event in events}
+            session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
+            metadata = json.loads(session["input_json"])["provider_metadata"]
+            self.assertEqual(by_method["thread_start"]["model"], "gpt-5.3-codex-spark")
+            self.assertEqual(by_method["thread.run"]["model"], "gpt-5.3-codex-spark")
+            self.assertEqual(metadata["selected_model"], "gpt-5.3-codex-spark")
+            self.assertEqual(metadata["model_policy"], "spark-deterministic")
+            self.assertTrue(metadata["spark_eligible"])
+            self.assertIn("spark eligible", metadata["model_selection_reason"])
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
+
+    def test_host_codex_spark_policy_keeps_default_for_ineligible_tasks(self) -> None:
+        cases = [
+            ("architect role", {"owner": "architect"}),
+            ("qa reviewer role", {"owner": "qa-reviewer"}),
+            ("missing target", {"link_target": False}),
+            ("non gateable target", {"command_template": "echo hello"}),
+            ("sandbox target", {"requires_sandbox": True}),
+            ("no network target", {"requires_no_network": True}),
+            ("high risk", {"risk": "high"}),
+            ("critical risk", {"risk": "critical"}),
+        ]
+        for _name, options in cases:
+            with self.subTest(_name):
+                with tempfile.TemporaryDirectory() as temp:
+                    temp_path = Path(temp)
+                    root = temp_path / "repo"
+                    root.mkdir()
+                    git_repo(root)
+                    run_harness(root, "init")
+                    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+                    target_args = ["test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", str(options.get("command_template", TEST_COMMAND))]
+                    if options.get("requires_sandbox"):
+                        target_args.append("--requires-sandbox")
+                    if options.get("requires_no_network"):
+                        target_args.append("--requires-no-network")
+                    run_harness(root, *target_args)
+                    if options.get("risk"):
+                        run_harness(root, "failure-mode", "add", "--id", "FM1", "--feature", "Example", "--scenario", "Risk", "--trigger", "change", "--expected", "safe", "--risk", str(options["risk"]), "--acceptance", "AC1")
+                    task_args = ["task", "add", "--id", "T1", "--task", "Example", "--owner", str(options.get("owner", "developer")), "--acceptance", "AC1"]
+                    if options.get("risk"):
+                        task_args.extend(["--failure-mode", "FM1"])
+                    run_harness(root, *task_args)
+                    if options.get("link_target", True):
+                        run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
+                    run_id = run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
+                    package_root, log_path = fake_sdk_package(temp_path)
+                    env = self.host_env(package_root, log_path)
+                    env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+
+                    run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+                    events = wait_for_sdk_events(log_path)
+                    by_method = {event["method"]: event for event in events}
+                    session = db_one(root, "select * from agent_provider_sessions where run_id = ?", (run_id,))
+                    metadata = json.loads(session["input_json"])["provider_metadata"]
+                    self.assertIsNone(by_method["thread_start"]["model"])
+                    self.assertIsNone(by_method["thread.run"]["model"])
+                    self.assertEqual(metadata["selected_model"], "")
+                    self.assertEqual(metadata["model_policy"], "spark-deterministic")
+                    self.assertFalse(metadata["spark_eligible"])
+                    self.assertIn("spark ineligible", metadata["model_selection_reason"])
+                    run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
 
     def test_host_codex_worker_commits_in_isolated_worktree_and_controller_verify_creates_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

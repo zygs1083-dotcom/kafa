@@ -54,6 +54,41 @@ class AgentJobReport:
     result_json: str
 
 
+def _host_codex_model_selection(request: AgentJobRequest, explicit_model: str, policy: str, spark_model: str) -> dict[str, Any]:
+    normalized_policy = (policy or "default").strip() or "default"
+    spark_eligible = bool(request.input_json.get("spark_eligible"))
+    base_reason = str(request.input_json.get("model_selection_reason") or "")
+    if explicit_model:
+        return {
+            "model_policy": normalized_policy,
+            "selected_model": explicit_model,
+            "model_selection_reason": "HARNESS_CODEX_MODEL override",
+            "spark_eligible": spark_eligible,
+        }
+    if normalized_policy == "default":
+        return {
+            "model_policy": normalized_policy,
+            "selected_model": "",
+            "model_selection_reason": "SDK default model",
+            "spark_eligible": spark_eligible,
+        }
+    if normalized_policy != "spark-deterministic":
+        raise RuntimeError(f"unsupported HARNESS_CODEX_MODEL_POLICY: {normalized_policy}")
+    if spark_eligible:
+        return {
+            "model_policy": normalized_policy,
+            "selected_model": spark_model or "gpt-5.3-codex-spark",
+            "model_selection_reason": base_reason or "spark eligible deterministic developer task",
+            "spark_eligible": True,
+        }
+    return {
+        "model_policy": normalized_policy,
+        "selected_model": "",
+        "model_selection_reason": base_reason or "spark ineligible; SDK default model",
+        "spark_eligible": False,
+    }
+
+
 class AgentProvider(Protocol):
     name: str
 
@@ -234,6 +269,10 @@ def _update_host_codex_report(path: Path, updates: dict[str, Any]) -> None:
         "sdk_approval_mode",
         "sdk_model",
         "codex_bin",
+        "model_policy",
+        "selected_model",
+        "model_selection_reason",
+        "spark_eligible",
         "worktree_path",
         "duration_seconds",
         "job_path",
@@ -274,7 +313,9 @@ class HostCodexProvider:
     def spawn(self, request: AgentJobRequest) -> AgentJobHandle:
         timeout = float(os.environ.get("HARNESS_CODEX_TURN_TIMEOUT_SECONDS", "1800"))
         codex_bin = os.environ.get("HARNESS_CODEX_BIN", "")
-        model = os.environ.get("HARNESS_CODEX_MODEL", "")
+        explicit_model = os.environ.get("HARNESS_CODEX_MODEL", "").strip()
+        model_policy = os.environ.get("HARNESS_CODEX_MODEL_POLICY", "default").strip()
+        spark_model = os.environ.get("HARNESS_CODEX_SPARK_MODEL", "gpt-5.3-codex-spark").strip()
         provider_session_id = request.provider_session_id or f"host-codex:{request.run_id}:{request.task_id}"
         job_path = self._job_path(request.root, request.run_id, request.task_id)
         report_path = self._report_path(request.root, request.run_id, request.task_id)
@@ -286,6 +327,17 @@ class HostCodexProvider:
                 status="spawn_failed",
                 message="host-codex requires an isolated worktree",
             )
+        try:
+            model_selection = _host_codex_model_selection(request, explicit_model, model_policy, spark_model)
+        except RuntimeError as exc:
+            return AgentJobHandle(
+                provider=self.name,
+                provider_session_id=provider_session_id,
+                provider_job_id=request.task_id,
+                status="spawn_failed",
+                message=str(exc),
+            )
+        selected_model = str(model_selection["selected_model"])
         job_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         job = {
@@ -307,7 +359,8 @@ class HostCodexProvider:
             "provider": self.name,
             "provider_session_id": provider_session_id,
             "codex_bin": codex_bin,
-            "model": model,
+            "model": selected_model,
+            "model_selection": model_selection,
             "timeout": timeout,
             "report_path": str(report_path),
             "created_at": time.time(),
@@ -322,8 +375,9 @@ class HostCodexProvider:
                     "sdk": "openai-codex",
                     "sdk_sandbox": "workspace_write",
                     "sdk_approval_mode": "deny_all",
-                    "sdk_model": model,
+                    "sdk_model": selected_model,
                     "codex_bin": codex_bin,
+                    **model_selection,
                     "worktree_path": request.worktree_path,
                     "job_path": job_path.relative_to(request.root).as_posix(),
                     "report_path": report_path.relative_to(request.root).as_posix(),
@@ -331,10 +385,11 @@ class HostCodexProvider:
                 },
             },
         )
+        worker_command = [sys.executable, str(Path(__file__).resolve()), "host-codex-worker", str(job_path)]
         try:
             _write_json_atomic(job_path, job)
             worker = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "host-codex-worker", str(job_path)],
+                worker_command,
                 cwd=request.root,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -346,15 +401,16 @@ class HostCodexProvider:
                 provider_session_id=provider_session_id,
                 provider_job_id=request.task_id,
                 status="spawn_failed",
-                message=json.dumps({"error": str(exc), "app_server_command": command}, sort_keys=True),
+                message=json.dumps({"error": str(exc), "worker_command": worker_command}, sort_keys=True),
             )
         metadata = {
             "worker_pid": worker.pid,
             "sdk": "openai-codex",
             "sdk_sandbox": "workspace_write",
             "sdk_approval_mode": "deny_all",
-            "sdk_model": model,
+            "sdk_model": selected_model,
             "codex_bin": codex_bin,
+            **model_selection,
             "worktree_path": request.worktree_path,
             "job_path": job_path.relative_to(request.root).as_posix(),
             "report_path": report_path.relative_to(request.root).as_posix(),
@@ -431,7 +487,7 @@ class HostCodexProvider:
             codex_bin=codex_bin or None,
             client_name="codex_project_harness",
             client_title="Codex Project Harness",
-            client_version="1.22.0-beta.1",
+            client_version="1.23.0-beta.1",
         )
         kwargs: dict[str, Any] = {
             "cwd": str(worktree),
@@ -540,6 +596,9 @@ def _host_codex_worker(job_path: Path) -> int:
     request = _request_from_job(job)
     codex_bin = str(job.get("codex_bin", os.environ.get("HARNESS_CODEX_BIN", "")))
     model = str(job.get("model", os.environ.get("HARNESS_CODEX_MODEL", "")))
+    model_selection = job.get("model_selection", {})
+    if not isinstance(model_selection, dict):
+        model_selection = {}
     timeout = float(job.get("timeout", os.environ.get("HARNESS_CODEX_TURN_TIMEOUT_SECONDS", "1800")))
     report_path = Path(str(job.get("report_path") or provider._report_path(request.root, request.run_id, request.task_id)))
     started = time.monotonic()
@@ -550,6 +609,7 @@ def _host_codex_worker(job_path: Path) -> int:
         "sdk_approval_mode": "deny_all",
         "sdk_model": model,
         "codex_bin": codex_bin,
+        **model_selection,
         "worktree_path": request.worktree_path,
         "job_path": str(job_path),
         "report_path": str(report_path),

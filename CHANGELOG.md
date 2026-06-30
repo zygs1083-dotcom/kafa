@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.23.0-beta.1 - 2026-06-30
+
+### Added
+
+- Opt-in Host Codex model policy routing via `HARNESS_CODEX_MODEL_POLICY=default|spark-deterministic` and `HARNESS_CODEX_SPARK_MODEL`.
+- Spark eligibility checks for low-risk `developer` assignments with linked gateable test targets, no sandbox/no-network target policy, and no high/critical linked failure modes.
+- Provider session/runtime artifact audit metadata for `model_policy`, `selected_model`, `model_selection_reason`, and `spark_eligible`.
+- Stability matrix coverage for fake SDK Spark policy routing without requiring a real Spark model, account, or network.
+
+### Changed
+
+- Runtime implementation version is now `4.16.0`; runtime schema remains `28`.
+- `HARNESS_CODEX_MODEL` remains the highest-priority hard override and bypasses policy selection.
+
+### Boundaries
+
+- Spark routing affects only Host Codex Provider execution. It does not affect the main Codex session, manual/fixture providers, native fan-out, schema, CLI surface, delivery trust, controller verification, HMAC/session attestation, integration, or delivery gates.
+
 ## v1.22.0-beta.1 - 2026-06-27
 
 ### Added

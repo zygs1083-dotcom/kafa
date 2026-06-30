@@ -52,7 +52,7 @@ class CodexHooksTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
-        self.assertIn("runtime_version: 4.15.0", result.stdout)
+        self.assertIn("runtime_version: 4.16.0", result.stdout)
         self.assertIn("Harness Status", result.stdout)
         self.assertEqual(before, after)
 
@@ -108,7 +108,9 @@ class CodexHooksTest(unittest.TestCase):
     def test_stop_validate_warn_only_and_strict_failure(self) -> None:
         with self._temp_harness_root() as root:
             db_path = root / ".ai-team" / "state" / "harness.db"
-            db_path.unlink()
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("update project set schema_version = 1 where id = 1")
+                conn.commit()
             warn = self._run_hook("Stop", root, {})
             strict = self._run_hook("Stop", root, {}, extra_env={"HARNESS_HOOK_STRICT": "1"})
 
@@ -116,6 +118,17 @@ class CodexHooksTest(unittest.TestCase):
         self.assertIn("validation failed", warn.stdout.lower())
         self.assertNotEqual(strict.returncode, 0)
         self.assertIn("strict mode", strict.stdout.lower())
+
+    def test_stop_skips_uninitialized_project_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            result = self._run_hook("Stop", root, {}, extra_env={"HARNESS_HOOK_STRICT": "1"})
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("readiness command: skipped", result.stdout)
+        self.assertIn("not initialized", result.stdout)
+        self.assertNotIn("traceback", result.stdout.lower() + result.stderr.lower())
 
     def test_stop_delivery_flag_runs_delivery_validation(self) -> None:
         with self._temp_harness_root() as root:

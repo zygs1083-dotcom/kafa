@@ -35,7 +35,7 @@ def copy_release_repo(target: Path) -> Path:
 class InstallReleaseTest(unittest.TestCase):
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
-        self.assertEqual(result.stdout.strip(), "1.22.0-beta.1")
+        self.assertEqual(result.stdout.strip(), "1.23.0-beta.1")
 
     def test_doctor_reports_repo_health_as_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -124,7 +124,7 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.22.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
+            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.23.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
 
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 

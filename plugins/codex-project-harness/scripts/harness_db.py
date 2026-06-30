@@ -59,7 +59,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 28
-RUNTIME_VERSION = "4.15.0"
+RUNTIME_VERSION = "4.16.0"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -5779,6 +5779,46 @@ def provider_assignment_rows(conn: sqlite3.Connection, run_id: str) -> list[sqli
     ).fetchall()
 
 
+def task_failure_mode_risks(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    rows = conn.execute(
+        """
+        select fm.risk from task_failure_modes tfm
+        join failure_modes fm on fm.id = tfm.failure_mode_id
+        where tfm.task_id = ?
+        order by fm.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return sorted({str(row["risk"]) for row in rows if row["risk"]})
+
+
+def host_codex_model_policy_input(agent_id: str, target: sqlite3.Row | None, failure_mode_risks: list[str]) -> dict[str, Any]:
+    blockers: list[str] = []
+    if agent_id != "developer":
+        blockers.append(f"agent is {agent_id}, not developer")
+    if target is None:
+        blockers.append("missing registered test target")
+    else:
+        if int(target["gateable"] or 0) != 1:
+            blockers.append("target is not gateable")
+        if not str(target["command_template"] or "").strip():
+            blockers.append("target command template is empty")
+        if int(target["requires_sandbox"] or 0) == 1:
+            blockers.append("target requires sandbox")
+        if int(target["requires_no_network"] or 0) == 1:
+            blockers.append("target requires no-network")
+    high_risks = [risk for risk in failure_mode_risks if risk in {"high", "critical"}]
+    if high_risks:
+        blockers.append(f"linked failure mode risk is {','.join(high_risks)}")
+    eligible = not blockers
+    reason = "spark eligible: developer task with gateable local target and no high/critical failure modes" if eligible else "spark ineligible: " + "; ".join(blockers)
+    return {
+        "spark_eligible": eligible,
+        "model_selection_reason": reason,
+        "failure_mode_risks": failure_mode_risks,
+    }
+
+
 def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_concurrency: int = 6) -> int:
     from core.agent_provider import AgentJobRequest, provider_for
 
@@ -5809,6 +5849,8 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
             agent_session_id = f"AGENT-SESSION-{uuid.uuid4().hex[:12]}"
             role = agent_id if agent_id in SESSION_ROLES else "developer"
             context_id = f"{run_id}:{row['task_id']}"
+            failure_mode_risks = task_failure_mode_risks(conn, row["task_id"])
+            model_policy_input = host_codex_model_policy_input(agent_id, target, failure_mode_risks) if provider.name == "host-codex" else {}
             request = AgentJobRequest(
                 root=root,
                 run_id=run_id,
@@ -5826,6 +5868,7 @@ def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_
                     "branch_name": branch_name,
                     "target_id": target["id"] if target else "",
                     "command_template": target["command_template"] if target else "",
+                    **model_policy_input,
                 },
                 session_id=session_id,
                 provider_session_id=provider_session_id,

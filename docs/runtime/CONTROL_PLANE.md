@@ -20,6 +20,7 @@ Codex Project Harness is an architecture control plane for verified code deliver
 - Delivery Cycles, Connector outbox recovery state, and Connector namespace profiles are Kernel facts. Skills and hooks may prompt `cycle start/status/close` or `connector profile status/set/unset`, but only Kernel schema 28 state determines which cycle, candidate, connector claim, bound external scope, or recovered external marker is delivery-relevant.
 - Target sandbox policy, stack profile, and structured test semantic status are Kernel facts. Local runner output cannot satisfy targets that require sandbox or no-network, and regex output cannot impersonate structured result evidence.
 - Host Codex and native fan-out worker output always enters as `agent_reports` plus `task_attempts(status=reported)` before controller verification.
+- Host Codex model policy is execution routing only. `spark-deterministic` may select a faster SDK model for low-risk, testable developer assignments, but selected model metadata never creates delivery evidence or relaxes Kernel verification.
 - Connector writes are external workflow synchronization records governed by project profile scope checks plus transactional outbox claim/recovery. Harness never creates external workspaces, projects, channels, files, or repos; it only binds the project to existing targets. Connector links cannot satisfy high/critical delivery gates without existing connector(HMAC) trust anchors.
 - Evals are release gates for the harness itself. They do not prove an arbitrary project task is ready to deliver.
 
@@ -39,3 +40,5 @@ User intent
 ```
 
 `kafa doctor --repo .` includes a `control plane contract` check that verifies the packaged components still declare these boundaries.
+
+From v1.23.0, Host Codex model policy is opt-in through environment variables. Keep `HARNESS_CODEX_MODEL_POLICY=default` for SDK defaults, or use `spark-deterministic` only when controller-verifiable low-risk developer tasks are acceptable Spark candidates. `HARNESS_CODEX_MODEL` remains a hard override. If Spark is unavailable, the provider fails closed through the normal Host Codex lifecycle; it does not silently promote or demote model capability.

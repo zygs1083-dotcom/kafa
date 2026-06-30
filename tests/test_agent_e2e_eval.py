@@ -85,6 +85,7 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(summary["human_intervention_count"], 0)
         for name in {
             "host_codex_fake_sdk_e2e",
+            "host_codex_spark_policy_fake_sdk_e2e",
             "multi_role_thread_lifecycle",
             "connector_mock_server_e2e",
             "connector_exactly_once_recovery",
@@ -94,6 +95,8 @@ class AgentE2EEvalTest(unittest.TestCase):
             self.assertIn(name, scenarios)
             self.assertTrue(scenarios[name]["pass"], scenarios[name]["details"])
         self.assertEqual(scenarios["connector_mock_server_e2e"]["details"]["evidence_count"], 0)
+        self.assertEqual(scenarios["host_codex_spark_policy_fake_sdk_e2e"]["details"]["thread_run_model"], "gpt-5.3-codex-spark")
+        self.assertEqual(scenarios["host_codex_spark_policy_fake_sdk_e2e"]["details"]["evidence_count"], 0)
         self.assertEqual(scenarios["connector_exactly_once_recovery"]["details"]["writes"], 0)
         self.assertEqual(scenarios["connector_exactly_once_recovery"]["details"]["remote_recovery_count"], 1)
         self.assertEqual(scenarios["crash_retry_recovery"]["details"]["reports"], 1)

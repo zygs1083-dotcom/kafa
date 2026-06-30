@@ -4,7 +4,7 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.22.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.15.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前发布版本是 **v1.23.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.16.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
@@ -25,6 +25,7 @@ git show v1.18.0-beta.1
 git show v1.19.0-beta.1
 git show v1.20.0-beta.1
 git show v1.22.0-beta.1
+git show v1.23.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
@@ -193,11 +194,13 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . connector prof
 python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile status --json
 ```
 
-从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。v1.17 修复 Host Codex Provider 非阻塞生命周期；v1.18 在 schema 24 内把 Host Codex 执行固定到独立 git worktree 并迁移到 mandatory Codex SDK；v1.19 显式把 schema baseline 提升到 25 并允许 `cycle` CLI surface，用于修复一次性交付模型；v1.20 显式把 schema baseline 提升到 26，用于 connector outbox fence、claim lease 和 unknown recovery 审计；v1.21 显式把 schema baseline 提升到 27，用于 target sandbox policy、stack profile 和 structured test semantic evidence；v1.22 显式把 schema baseline 提升到 28 并允许 `connector profile` CLI surface，用于项目级外部空间边界。Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
+从 v1.23.0 开始，Host Codex Provider 支持保守模型路由策略。默认不改变 SDK 模型；当设置 `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` 时，只有 `developer` assignment、已绑定 gateable test target、无 sandbox/no-network 要求、且没有 high/critical failure mode 的开发任务才会向 SDK 传 `gpt-5.3-codex-spark`。`HARNESS_CODEX_MODEL` 仍是最高优先级硬覆盖；`HARNESS_CODEX_SPARK_MODEL` 可覆盖 Spark 模型名。Spark 只是更快的小任务执行候选，不是确定性保证，也不是可信 evidence 来源。
+
+从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。v1.17 修复 Host Codex Provider 非阻塞生命周期；v1.18 在 schema 24 内把 Host Codex 执行固定到独立 git worktree 并迁移到 mandatory Codex SDK；v1.19 显式把 schema baseline 提升到 25 并允许 `cycle` CLI surface，用于修复一次性交付模型；v1.20 显式把 schema baseline 提升到 26，用于 connector outbox fence、claim lease 和 unknown recovery 审计；v1.21 显式把 schema baseline 提升到 27，用于 target sandbox policy、stack profile 和 structured test semantic evidence；v1.22 显式把 schema baseline 提升到 28 并允许 `connector profile` CLI surface，用于项目级外部空间边界；v1.23 只增加 Host Codex 内部模型策略和审计元数据，schema/CLI/table allowlist 保持不变。Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
 
 从 v1.11.0 开始，插件自带 Codex lifecycle hooks。安装或更新插件后，用 `/hooks` 审核并信任它们；也可以用 `[features] hooks = false` 关闭 Codex hooks。默认 hooks 只做辅助护栏：`SessionStart` 注入项目状态，`SubagentStart` 提醒角色/任务/验收边界，`PreToolUse` 在需求未确认或无 active task 时提示写入风险，`PostToolUse` 汇总变更，`Stop` 运行 readiness 检查。若插件不在项目默认 `plugins/codex-project-harness` 路径下，设置 `CODEX_PROJECT_HARNESS_PLUGIN_ROOT`。Hooks 不生成可信 evidence，也不能替代 controller verification、integration gate、HMAC/session attestation 或 CI。
 
-从 v1.18.0 开始，现有 `dispatch provider start --provider host-codex` 是非阻塞、worktree-isolated 的 Host Codex SDK 入口：它在短事务中登记 provider session 和 agent session，事务外为每个 assignment 创建 `.ai-team/runtime/worktrees/<run>/<task>/<agent>` 独立 git worktree，再启动后台 worker。Worker 使用 `openai-codex>=0.1.0b3`，以 `Sandbox.workspace_write` 和 `ApprovalMode.deny_all` 在该 worktree cwd 内运行，完成后把非 `.ai-team/` 变更提交到 assignment 的 agent branch；用户主工作区不会被切换或污染。最终 JSON 仍只作为 raw provider report 导入；交付资格仍必须由 `dispatch verify-attempt` 在 controller 侧重新执行目标命令后生成可信 evidence。
+从 v1.18.0 开始，现有 `dispatch provider start --provider host-codex` 是非阻塞、worktree-isolated 的 Host Codex SDK 入口：它在短事务中登记 provider session 和 agent session，事务外为每个 assignment 创建 `.ai-team/runtime/worktrees/<run>/<task>/<agent>` 独立 git worktree，再启动后台 worker。Worker 使用 `openai-codex>=0.1.0b3`，以 `Sandbox.workspace_write` 和 `ApprovalMode.deny_all` 在该 worktree cwd 内运行，完成后把非 `.ai-team/` 变更提交到 assignment 的 agent branch；用户主工作区不会被切换或污染。v1.23 可通过 `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` 对低风险、可复验 developer 任务选择 Spark 模型，并在 provider metadata 中记录 `model_policy`、`selected_model`、`model_selection_reason` 和 `spark_eligible`。最终 JSON 仍只作为 raw provider report 导入；交付资格仍必须由 `dispatch verify-attempt` 在 controller 侧重新执行目标命令后生成可信 evidence。
 
 从 v1.10.0 开始，现有 `adapter confirm` 在 `adapter_actions.payload_json` 含 `{"execute": true, "operation": "...", "params": {...}}` 时可以执行真实 connector adapter。GitHub 通过 `gh api` 执行；Linear、Notion、Figma、Slack 通过官方 HTTP API 和环境变量 token 执行。外部写入结果只进入 adapter/action 记录，不自动成为 delivery evidence，也不放宽 high/critical 的 HMAC 信任要求。
 
