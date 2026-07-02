@@ -12,6 +12,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -209,7 +210,7 @@ def project_state(repo_root: Path) -> dict[str, str]:
     if not db.exists():
         return {}
     try:
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("select phase, status, scope_status from project where id = 1").fetchone()
             return dict(row) if row else {}
@@ -222,7 +223,7 @@ def active_task_count(repo_root: Path) -> int:
     if not db.exists():
         return 0
     try:
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn:
             task_count = conn.execute(
                 "select count(*) from tasks where status in ('ready', 'claimed', 'in_progress', 'submitted', 'reviewed')"
             ).fetchone()[0]

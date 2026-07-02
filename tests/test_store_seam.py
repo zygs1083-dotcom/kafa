@@ -28,6 +28,7 @@ class StoreSeamTest(unittest.TestCase):
         store = InMemoryStore(root)
         harness_db.set_store_factory(lambda _: store)
         self.addCleanup(harness_db.set_store_factory, SqliteStore)
+        self.addCleanup(store.close)
         return store
 
     def test_in_memory_store_runs_task_lifecycle(self) -> None:

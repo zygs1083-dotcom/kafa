@@ -113,6 +113,9 @@ class InMemoryStore:
     def connection(self) -> Iterator[sqlite3.Connection]:
         yield self._conn
 
+    def close(self) -> None:
+        self._conn.close()
+
     @contextmanager
     def transaction(
         self,

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -113,7 +114,7 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             self.assertIn("OK: quickstart minimal delivered SMOKE", result.stdout)
             self.assertEqual(cycle["status"], "delivered")
             self.assertIn("phase: delivery_readiness", status)
-            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select count(*) from evidence").fetchone()[0], 1)
                 self.assertEqual(conn.execute("select count(*) from deliveries").fetchone()[0], 1)
                 self.assertEqual(conn.execute("select status from tasks where id = 'SMOKE-T1'").fetchone()[0], "accepted")
@@ -132,7 +133,7 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             result = run_harness(root, "task", "accept-ready", "--id", "T1", "--agent", "qa-reviewer", "--evidence", "reviewed")
 
             self.assertIn("OK: task accepted T1", result.stdout)
-            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select status from tasks where id = 'T1'").fetchone()[0], "accepted")
 
     def test_validation_without_evidence_warns_audit_only(self) -> None:

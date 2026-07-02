@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -341,7 +342,7 @@ def harness_project_initialized(db_path: Path) -> bool:
     try:
         import sqlite3
 
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             exists = conn.execute("select 1 from sqlite_master where type='table' and name='project'").fetchone()
             if not exists:
                 return False

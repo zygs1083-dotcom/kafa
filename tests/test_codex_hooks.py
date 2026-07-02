@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -108,7 +109,7 @@ class CodexHooksTest(unittest.TestCase):
     def test_stop_validate_warn_only_and_strict_failure(self) -> None:
         with self._temp_harness_root() as root:
             db_path = root / ".ai-team" / "state" / "harness.db"
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn:
                 conn.execute("update project set schema_version = 1 where id = 1")
                 conn.commit()
             warn = self._run_hook("Stop", root, {})
@@ -174,7 +175,7 @@ class CodexHooksTest(unittest.TestCase):
         return _TempHarnessRoot()
 
     def _counts(self, root: Path) -> dict[str, int]:
-        with sqlite3.connect(root / ".ai-team" / "state" / "harness.db") as conn:
+        with closing(sqlite3.connect(root / ".ai-team" / "state" / "harness.db")) as conn:
             return {
                 table: int(conn.execute(f"select count(*) from {table}").fetchone()[0])
                 for table in ["events", "evidence", "validations", "tasks"]
