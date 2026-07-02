@@ -1,10 +1,10 @@
-# Codex OS Runtime Layer v4.17.0
+# Codex OS Runtime Layer v4.18.0
 
 This document describes the executable runtime layer for Codex Project Harness. The runtime turns the Harness methodology into a local project control plane for verified code delivery.
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.17.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, P1 reliability hardening for dispatch aggregation, structured test semantics, target sandbox policy, connector namespace isolation, conservative Host Codex model policy routing for low-risk developer tasks, and a cold-start guided loop for new projects. The repository release remains a beta release, while the runtime implementation version is `4.17.0` and the database schema version is `28`.
+Kernel v4.18.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, P1 reliability hardening for dispatch aggregation, structured test semantics, target sandbox policy, connector namespace isolation, conservative Host Codex model policy routing for low-risk developer tasks, a cold-start guided loop for new projects, and read-only route advice before Spark/provider execution. The repository release remains a beta release, while the runtime implementation version is `4.18.0` and the database schema version is `28`.
 
 ## Fact Source
 
@@ -18,7 +18,7 @@ Markdown files under `.ai-team/` and `docs/harness/` are generated human-readabl
 
 SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and task leases.
 
-## Kernel v4.17.0
+## Kernel v4.18.0
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
@@ -59,6 +59,17 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . quickstart min
 ```
 
 `kafa doctor` remains a Kafa/plugin source repository check. `kafa project doctor` is the ordinary-project check and does not require a copied plugin source tree. `quickstart status` reports missing requirement, acceptance, task, target, baseline, evidence, validation, QA, and delivery steps. `quickstart minimal --execute` uses the existing dispatch runner to produce controller-local command evidence, then records validation, task acceptance, an independent quality gate, and delivery through the normal gate. Free-text validation without linked evidence is explicitly audit-only.
+
+## Spark And Provider Route Advice
+
+Schema 28 also includes read-only dispatch routing advice:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --json
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --run-id <run-id> --json
+```
+
+The report classifies ready tasks before execution. `host-codex-spark` is emitted only for `developer` tasks with a gateable target, non-empty command, no sandbox/no-network requirement, and no linked high/critical failure mode. Architect, QA, high-risk, sandboxed, no-network, missing-target, or blocked tasks are routed to default Host Codex, main-model review, or manual handling. This command is advisory only; it does not spawn subagents, select the main session model, call Spark, or write delivery evidence.
 
 ## Architecture Control Plane
 
@@ -197,7 +208,7 @@ Schema 27 also records target execution policy on `test_targets`: `stack_profile
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. v1.20 intentionally moves the schema baseline to 26 for connector transactional outbox fence and recovery audit state. v1.21 intentionally moves the schema baseline to 27 for target sandbox policy and structured test semantic evidence while only extending existing `test-target add` options. v1.22 intentionally moves the schema baseline to 28 and adds the `connector profile` CLI surface for per-project external target binding. v1.23 keeps schema 28 and adds only Host Codex internal model policy selection plus audit metadata. v1.24 keeps schema 28 and adds guided cold-start CLI surface (`quickstart` and `task accept-ready`) plus root-level `kafa project doctor`. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
+The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. v1.20 intentionally moves the schema baseline to 26 for connector transactional outbox fence and recovery audit state. v1.21 intentionally moves the schema baseline to 27 for target sandbox policy and structured test semantic evidence while only extending existing `test-target add` options. v1.22 intentionally moves the schema baseline to 28 and adds the `connector profile` CLI surface for per-project external target binding. v1.23 keeps schema 28 and adds only Host Codex internal model policy selection plus audit metadata. v1.24 keeps schema 28 and adds guided cold-start CLI surface (`quickstart` and `task accept-ready`) plus root-level `kafa project doctor`. v1.25 keeps schema 28 and adds read-only `dispatch route-advice` so the main model can decide Spark/provider/manual routing before execution. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
 
 ## Installation And Release Helper
 

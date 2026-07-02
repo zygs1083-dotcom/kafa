@@ -226,6 +226,15 @@ From v1.22.0, connector namespace isolation is a Kernel fact. Configure per-proj
 
 From v1.23.0, Host Codex can opt into Spark routing with `HARNESS_CODEX_MODEL_POLICY=spark-deterministic`. Use it only for small, deterministic-looking developer tasks that have controller-verifiable targets. Spark selection is an execution hint, not a trust anchor; controller verification and delivery gates remain mandatory.
 
+From v1.25.0, inspect `dispatch route-advice` before using Host Codex or Spark for implementation work:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root <project> dispatch route-advice --json
+python3 plugins/codex-project-harness/scripts/harness.py --root <project> dispatch route-advice --run-id <run-id> --json
+```
+
+Only tasks reported as `host-codex-spark` are Spark candidates. Treat the report as a planning input for the controlling model; it does not spawn subagents, change the main Codex model, call Spark, or create delivery evidence.
+
 From v1.24.0, prefer guided cold-start commands when a project is new or the user is confused about the first loop:
 
 ```bash

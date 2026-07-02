@@ -47,6 +47,15 @@ For long-running projects, check the current Delivery Cycle before recording new
 python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
 ```
 
+Before splitting work into Host Codex or Spark-capable subagent tasks, ask the runtime for route advice:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch plan --scope "next implementation slice"
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --run-id <run-id> --json
+```
+
+Only tasks reported as `host-codex-spark` should be considered for Spark execution, and Spark still requires explicit `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` plus Host Codex Provider start. All other tasks remain with the main model, manual review, or default Host Codex.
+
 For real connector writes, bind the project to existing external targets first. This does not create external workspaces, projects, channels, files, or repos:
 
 ```bash

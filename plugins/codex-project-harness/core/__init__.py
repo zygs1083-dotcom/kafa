@@ -1,3 +1,3 @@
 """Codex Project Harness consistency kernel."""
 
-KERNEL_VERSION = "4.17.0"
+KERNEL_VERSION = "4.18.0"

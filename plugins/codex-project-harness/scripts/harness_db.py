@@ -59,7 +59,7 @@ from core.store import DB_PATH, SqliteStore, Store
 
 
 SCHEMA_VERSION = 28
-RUNTIME_VERSION = "4.17.0"
+RUNTIME_VERSION = "4.18.0"
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -5873,6 +5873,147 @@ def host_codex_model_policy_input(agent_id: str, target: sqlite3.Row | None, fai
         "model_selection_reason": reason,
         "failure_mode_risks": failure_mode_risks,
     }
+
+
+def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
+    from core.scheduler import ready_queue
+
+    with connection(root) as conn:
+        ready_ids = set(ready_queue(conn))
+        rows: list[sqlite3.Row]
+        run_scope = ""
+        if run_id:
+            run = conn.execute("select * from dispatch_runs where id = ?", (run_id,)).fetchone()
+            if not run:
+                raise HarnessError(f"missing dispatch run: {run_id}")
+            run_scope = run["scope"]
+            rows = conn.execute(
+                """
+                select da.run_id, da.task_id, da.agent_id, da.capability, da.status as assignment_status,
+                       t.task, t.owner, t.status as task_status, t.fence
+                from dispatch_assignments da
+                join tasks t on t.id = da.task_id
+                where da.run_id = ?
+                order by da.task_id
+                """,
+                (run_id,),
+            ).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in ready_ids)
+            rows = (
+                conn.execute(
+                    f"""
+                    select '' as run_id, t.id as task_id, '' as agent_id,
+                           case when t.owner = '' or t.owner = 'unassigned' then 'developer' else t.owner end as capability,
+                           'ready' as assignment_status, t.task, t.owner, t.status as task_status, t.fence
+                    from tasks t
+                    where t.id in ({placeholders})
+                    order by t.id
+                    """,
+                    tuple(ready_ids),
+                ).fetchall()
+                if ready_ids
+                else []
+            )
+        tasks: list[dict[str, Any]] = []
+        summary = {
+            "task_count": 0,
+            "ready_count": 0,
+            "spark_eligible_count": 0,
+            "host_codex_default_count": 0,
+            "main_model_or_manual_count": 0,
+        }
+        for row in rows:
+            task_id = row["task_id"]
+            agent_id = row["agent_id"] or row["capability"] or row["owner"] or "developer"
+            target = task_target(conn, task_id)
+            failure_mode_risks = task_failure_mode_risks(conn, task_id)
+            policy = host_codex_model_policy_input(agent_id, target, failure_mode_risks)
+            ready = task_id in ready_ids and row["task_status"] == "ready" and row["assignment_status"] in {"ready", "planned", "claimed"}
+            recommendation = "main-model-or-manual"
+            if not ready:
+                recommendation = "blocked-not-ready"
+            elif policy["spark_eligible"]:
+                recommendation = "host-codex-spark"
+            elif agent_id == "developer" and target is not None and int(target["gateable"] or 0) == 1 and str(target["command_template"] or "").strip():
+                recommendation = "host-codex-default"
+            task_report = {
+                "task_id": task_id,
+                "task": row["task"],
+                "agent_id": agent_id,
+                "assignment_status": row["assignment_status"],
+                "task_status": row["task_status"],
+                "ready": ready,
+                "target_id": target["id"] if target else "",
+                "target_gateable": bool(int(target["gateable"] or 0)) if target else False,
+                "target_requires_sandbox": bool(int(target["requires_sandbox"] or 0)) if target else False,
+                "target_requires_no_network": bool(int(target["requires_no_network"] or 0)) if target else False,
+                "failure_mode_risks": failure_mode_risks,
+                "spark_eligible": bool(policy["spark_eligible"]) and ready,
+                "recommendation": recommendation,
+                "reason": policy["model_selection_reason"] if ready else "task is not ready for dispatch",
+            }
+            tasks.append(task_report)
+            summary["task_count"] += 1
+            if ready:
+                summary["ready_count"] += 1
+            if task_report["spark_eligible"]:
+                summary["spark_eligible_count"] += 1
+            elif recommendation == "host-codex-default":
+                summary["host_codex_default_count"] += 1
+            elif recommendation in {"main-model-or-manual", "blocked-not-ready"}:
+                summary["main_model_or_manual_count"] += 1
+        next_commands: list[str] = []
+        if tasks and not run_id:
+            next_commands.append("harness.py --root . dispatch plan --scope '<scope>'")
+        if run_id and summary["spark_eligible_count"]:
+            next_commands.append(f"HARNESS_CODEX_MODEL_POLICY=spark-deterministic harness.py --root . dispatch provider start --run-id {run_id} --provider host-codex")
+        elif run_id and summary["host_codex_default_count"]:
+            next_commands.append(f"harness.py --root . dispatch provider start --run-id {run_id} --provider host-codex")
+        return {
+            "run_id": run_id,
+            "scope": run_scope,
+            "policy": "spark-deterministic-advisory",
+            "spark_model": os.environ.get("HARNESS_CODEX_SPARK_MODEL", "gpt-5.3-codex-spark"),
+            "summary": summary,
+            "tasks": tasks,
+            "next_commands": next_commands,
+            "boundaries": [
+                "Spark is only an execution candidate for low-risk developer tasks with controller-verifiable targets.",
+                "Spark output is not delivery evidence; dispatch verify-attempt and delivery gates remain mandatory.",
+                "Architect, QA, high/critical risk, sandbox/no-network, missing-target, and ambiguous tasks require main-model or manual review.",
+            ],
+        }
+
+
+def dispatch_route_advice_lines(root: Path, run_id: str = "") -> list[str]:
+    report = dispatch_route_advice(root, run_id)
+    lines = [
+        f"policy: {report['policy']}",
+        f"spark_model: {report['spark_model']}",
+        f"run_id: {report['run_id'] or '(none)'}",
+        markdown_row(["task", "agent", "target", "ready", "spark", "recommendation", "reason"]),
+    ]
+    for task in report["tasks"]:
+        lines.append(
+            markdown_row(
+                [
+                    task["task_id"],
+                    task["agent_id"],
+                    task["target_id"] or "-",
+                    "yes" if task["ready"] else "no",
+                    "yes" if task["spark_eligible"] else "no",
+                    task["recommendation"],
+                    task["reason"],
+                ]
+            )
+        )
+    if not report["tasks"]:
+        lines.append("No ready dispatch tasks found.")
+    for command in report["next_commands"]:
+        lines.append(f"next: {command}")
+    lines.extend(f"boundary: {boundary}" for boundary in report["boundaries"])
+    return lines
 
 
 def dispatch_provider_start(root: Path, run_id: str, provider_name: str, *, max_concurrency: int = 6) -> int:

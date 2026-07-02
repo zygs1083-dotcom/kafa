@@ -4,6 +4,24 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.25.0-beta.1 - 2026-07-02
+
+### Added
+
+- Read-only `dispatch route-advice [--run-id] [--json]` to classify ready tasks before provider/subagent execution.
+- Spark candidate reporting for low-risk `developer` tasks with gateable controller-verifiable targets.
+- Explicit routing buckets for `host-codex-spark`, `host-codex-default`, `main-model-or-manual`, and `blocked-not-ready`.
+
+### Changed
+
+- Runtime implementation version is now `4.18.0`; runtime schema remains `28`.
+- `project-harness` guidance now requires route advice before splitting work into Spark-capable subagent tasks.
+
+### Boundaries
+
+- Route advice is advisory and read-only. It does not spawn subagents, call Spark, generate evidence, relax controller verification, or change delivery gates.
+- Spark remains opt-in through `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` and only affects Host Codex Provider execution.
+
 ## v1.24.0-beta.1 - 2026-07-02
 
 ### Added

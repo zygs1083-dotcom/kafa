@@ -52,6 +52,8 @@ from core.api import (
     dispatch_provider_start,
     dispatch_provider_status,
     dispatch_recover_stale,
+    dispatch_route_advice,
+    dispatch_route_advice_lines,
     dispatch_run,
     dispatch_status,
     dispatch_verify_attempt,
@@ -604,6 +606,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_plan_parser = dispatch_sub.add_parser("plan")
     dispatch_plan_parser.add_argument("--scope", required=True)
     add_request_id(dispatch_plan_parser)
+    dispatch_route = dispatch_sub.add_parser("route-advice")
+    dispatch_route.add_argument("--run-id", default="")
+    dispatch_route.add_argument("--json", action="store_true")
     dispatch_export = dispatch_sub.add_parser("export-csv")
     dispatch_export.add_argument("run_id")
     dispatch_export.add_argument("--out-dir", default="")
@@ -1165,6 +1170,11 @@ def main() -> int:
             mutate("session.close", lambda: (close_agent_session(root, args.session_id), f"OK: session closed {args.session_id}")[1])
         elif args.command == "dispatch" and args.dispatch_command == "plan":
             mutate("dispatch.plan", lambda: f"OK: dispatch planned {dispatch_plan(root, args.scope)}")
+        elif args.command == "dispatch" and args.dispatch_command == "route-advice":
+            if args.json:
+                print(json.dumps(dispatch_route_advice(root, args.run_id), ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                print("\n".join(dispatch_route_advice_lines(root, args.run_id)))
         elif args.command == "dispatch" and args.dispatch_command == "export-csv":
             out_dir = Path(args.out_dir) if args.out_dir else None
             mutate("dispatch.export-csv", lambda: f"OK: dispatch csv exported {dispatch_export_csv(root, args.run_id, out_dir=(root / out_dir if out_dir and not out_dir.is_absolute() else out_dir), max_concurrency=args.max_concurrency, max_runtime_seconds=args.max_runtime_seconds)}")

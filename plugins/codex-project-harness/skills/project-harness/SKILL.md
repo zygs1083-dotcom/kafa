@@ -103,13 +103,14 @@ Use this baseline confirmation shape before implementation on broad work:
 8. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
 9. Use `team-architecture` logic to choose the smallest effective agent team.
 10. Add tasks through `project-runtime` with owners, acceptance mapping, failure-mode mapping, tool mapping, dependencies, and evidence fields.
-11. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
-12. Keep producer and reviewer roles separate.
-13. Use a maximum of two producer-reviewer retry loops before escalating.
-14. Run integration coherence QA before declaring completion.
-15. Record QA, quality-gate, and delivery evidence through `project-runtime`.
-16. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
-17. Finish with a concise delivery report and update the evolution log when useful.
+11. Before dispatching provider/subagent work, run `dispatch route-advice` or equivalent runtime logic and have the controlling model classify tasks into Spark candidates, default Host Codex candidates, and main-model/manual work.
+12. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
+13. Keep producer and reviewer roles separate.
+14. Use a maximum of two producer-reviewer retry loops before escalating.
+15. Run integration coherence QA before declaring completion.
+16. Record QA, quality-gate, and delivery evidence through `project-runtime`.
+17. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
+18. Finish with a concise delivery report and update the evolution log when useful.
 
 ## Skill Routing
 
@@ -151,6 +152,9 @@ Codex should decide whether each tool is needed. Ask only before high-impact ext
 - Layer 1 Domain Sessions are role-based contexts such as Product, Architecture, Development, QA, Security, and Delivery. Use separate sessions when the runtime supports them; otherwise emulate them with clearly labeled role outputs in the same conversation.
 - Layer 2 Subagents are short-lived task execution units. They may be spawned inside a domain session for independent checks such as QA-A API contract, QA-B UI behavior, and QA-C data/schema safety. They do not need independent user-visible sessions unless the runtime provides them.
 - Every subagent returns a verifiable artifact, not just an opinion.
+- Use Spark only for tasks that the controlling model judges to be small, deterministic-looking, low-risk developer tasks and that `dispatch route-advice` reports as `host-codex-spark`.
+- Do not use Spark for architecture decisions, QA judgment, high/critical failure modes, sandbox/no-network targets, missing-target work, broad refactors, or ambiguous tasks.
+- If no Spark candidate exists, state that clearly and keep the work with the main model, manual flow, or default Host Codex Provider.
 
 ## Control Files
 
