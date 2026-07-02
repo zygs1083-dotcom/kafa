@@ -17,9 +17,10 @@ Make the smallest complete change that satisfies the requested behavior.
 6. Preserve existing style and local abstractions.
 7. Add or update focused tests when risk justifies it.
 8. Run the narrowest meaningful verification first, then broader checks if needed.
-9. Inspect the diff for unrelated churn.
-10. Update local task-board or external issue status when useful.
-11. Report what changed, how it was verified, tool links used, and any residual risk.
+9. Run a quick adversarial review against logic gaps, incorrect facts, simpler alternatives, and verification evidence.
+10. Inspect the diff for unrelated churn.
+11. Update local task-board or external issue status when useful.
+12. Report what changed, why key decisions were made, how it was verified, tool links used, and any residual risk.
 
 ## Guardrails
 
@@ -27,3 +28,4 @@ Make the smallest complete change that satisfies the requested behavior.
 - Do not reformat unrelated files.
 - Do not silently overwrite user changes.
 - A small patch must still be complete enough to be safe.
+- Do not claim "looks good" without verification evidence or explicit residual risk.

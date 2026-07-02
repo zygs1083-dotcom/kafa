@@ -91,6 +91,20 @@ Use this baseline confirmation shape before implementation on broad work:
 请确认或修正以上范围。确认后我会按这个基线拆任务并开始实现。
 ```
 
+## Work Method Discipline
+
+Before implementation:
+
+- Restate the root problem the task is meant to solve.
+- Split the work into the smallest units that can be independently verified.
+- Explain why key decisions are being made, not only how to implement them.
+
+Before delivery:
+
+- Run an adversarial review against logic gaps, incorrect facts, simpler alternatives, and verification evidence.
+- List the most likely remaining failure points when risk remains.
+- Do not claim the work is complete based on "looks good"; provide verification evidence or explicit residual risk.
+
 ## Workflow
 
 1. Inspect the workspace and current repository state.
