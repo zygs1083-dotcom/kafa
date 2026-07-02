@@ -226,6 +226,16 @@ From v1.22.0, connector namespace isolation is a Kernel fact. Configure per-proj
 
 From v1.23.0, Host Codex can opt into Spark routing with `HARNESS_CODEX_MODEL_POLICY=spark-deterministic`. Use it only for small, deterministic-looking developer tasks that have controller-verifiable targets. Spark selection is an execution hint, not a trust anchor; controller verification and delivery gates remain mandatory.
 
+From v1.24.0, prefer guided cold-start commands when a project is new or the user is confused about the first loop:
+
+```bash
+kafa project doctor --repo <project>
+python3 plugins/codex-project-harness/scripts/harness.py --root <project> quickstart status
+python3 plugins/codex-project-harness/scripts/harness.py --root <project> quickstart minimal --id SMOKE --goal "..." --acceptance "..." --task "..." --test-command "..." --execute
+```
+
+Use `kafa doctor` only for the Kafa/plugin source repository. In ordinary projects, `kafa project doctor` checks initialization and next steps without requiring `plugins/codex-project-harness/`. `quickstart minimal --execute` still uses controller-local command evidence and the normal delivery gate; validation records without evidence remain audit-only.
+
 ## Evidence Protocol
 
 Record validation before delivery readiness:

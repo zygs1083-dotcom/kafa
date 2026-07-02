@@ -14,6 +14,33 @@ This creates the repo-scoped Codex marketplace entry at `.agents/plugins/marketp
 
 `kafa doctor --repo .` also verifies the control-plane contract so installation does not drift from the Skill/Plugin/Hooks/Host/Kernel/Connector/Eval boundary model.
 
+Use `kafa doctor --repo <kafa-repo>` for the Kafa source checkout. For an ordinary business project, use project doctor instead:
+
+```bash
+kafa project doctor --repo /path/to/business-project
+```
+
+Inside a business project, initialize and inspect the guided checklist:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/scripts/harness.py --root . init
+python3 /path/to/kafa/plugins/codex-project-harness/scripts/harness.py --root . quickstart status
+```
+
+For a tiny project that already has a real test command, the minimal loop can produce a full local delivery cycle:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/scripts/harness.py --root . quickstart minimal \
+  --id SMOKE \
+  --goal "Keep the current behavior working" \
+  --acceptance "The existing test command passes" \
+  --task "Verify the current behavior" \
+  --test-command "python3 -B -m unittest discover -s . -p 'test_*.py'" \
+  --execute
+```
+
+`quickstart minimal --execute` still uses controller-local command evidence and the normal delivery gate. A `validation record` without evidence is audit-only and will not satisfy delivery readiness.
+
 For long-running projects, check the current Delivery Cycle before recording new delivery evidence:
 
 ```bash

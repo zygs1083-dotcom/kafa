@@ -26,8 +26,8 @@ from core import KERNEL_VERSION  # noqa: E402
 from validate_structure import REQUIRED_CORE, REQUIRED_HOOKS, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
 
 
-EXPECTED_PLUGIN_VERSION = "1.23.0-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.16.0"
+EXPECTED_PLUGIN_VERSION = "1.24.0-beta.1"
+EXPECTED_RUNTIME_VERSION = "4.17.0"
 EXPECTED_SCHEMA_VERSION = 28
 
 EXPECTED_TABLES = {
@@ -171,6 +171,9 @@ EXPECTED_CLI_SURFACE = {
     "phase",
     "projection",
     "projection.rebuild",
+    "quickstart",
+    "quickstart.minimal",
+    "quickstart.status",
     "repair",
     "requirement",
     "requirement.add",
@@ -186,6 +189,7 @@ EXPECTED_CLI_SURFACE = {
     "status",
     "task",
     "task.accept",
+    "task.accept-ready",
     "task.add",
     "task.block",
     "task.claim",

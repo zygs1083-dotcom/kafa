@@ -35,7 +35,7 @@ def copy_release_repo(target: Path) -> Path:
 class InstallReleaseTest(unittest.TestCase):
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
-        self.assertEqual(result.stdout.strip(), "1.23.0-beta.1")
+        self.assertEqual(result.stdout.strip(), "1.24.0-beta.1")
 
     def test_doctor_reports_repo_health_as_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -47,6 +47,19 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["scope"], "repo")
         self.assertIn("plugin structure", {check["name"] for check in report["checks"]})
+
+    def test_project_doctor_checks_business_project_without_plugin_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            result = run_kafa("project", "doctor", "--repo", str(root), "--json")
+            report = json.loads(result.stdout)
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["kind"], "project")
+        self.assertIn("harness initialized", {check["name"] for check in report["checks"]})
+        self.assertNotIn("plugin structure", {check["name"] for check in report["checks"]})
+        self.assertIn("harness.py --root", report["next_commands"][0])
 
     def test_repo_install_writes_marketplace_and_preserves_other_plugins(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -124,7 +137,7 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.23.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
+            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.24.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
 
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 

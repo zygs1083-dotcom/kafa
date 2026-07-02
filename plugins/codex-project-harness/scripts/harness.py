@@ -14,6 +14,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from core.api import (
     HarnessError,
+    accept_ready_task,
     accept_task,
     adapter_plan,
     adapter_reconcile,
@@ -82,6 +83,9 @@ from core.api import (
     record_test,
     record_validation,
     projection_rebuild,
+    quickstart_minimal,
+    quickstart_status,
+    quickstart_status_lines,
     heartbeat_task,
     recover_stale_leases,
     release_task,
@@ -102,6 +106,8 @@ from core.api import (
     run_idempotent,
     set_connector_profile,
     unset_connector_profile,
+    runtime_initialized,
+    uninitialized_lines,
 )
 
 
@@ -117,6 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--dry-run", action="store_true")
     sub.add_parser("status")
     sub.add_parser("doctor")
+
+    quickstart = sub.add_parser("quickstart")
+    quickstart_sub = quickstart.add_subparsers(dest="quickstart_command", required=True)
+    quickstart_status_parser = quickstart_sub.add_parser("status")
+    quickstart_status_parser.add_argument("--json", action="store_true")
+    quickstart_minimal_parser = quickstart_sub.add_parser("minimal")
+    quickstart_minimal_parser.add_argument("--id", required=True)
+    quickstart_minimal_parser.add_argument("--goal", required=True)
+    quickstart_minimal_parser.add_argument("--acceptance", required=True)
+    quickstart_minimal_parser.add_argument("--task", required=True)
+    quickstart_minimal_parser.add_argument("--test-command", required=True)
+    quickstart_minimal_parser.add_argument("--execute", action="store_true")
 
     cycle = sub.add_parser("cycle")
     cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
@@ -318,6 +336,13 @@ def build_parser() -> argparse.ArgumentParser:
     task_accept.add_argument("--evidence", required=True)
     task_accept.add_argument("--session-id", default="")
     add_request_id(task_accept)
+
+    task_accept_ready = task_sub.add_parser("accept-ready")
+    task_accept_ready.add_argument("--id", required=True)
+    task_accept_ready.add_argument("--agent", required=True)
+    task_accept_ready.add_argument("--evidence", required=True)
+    task_accept_ready.add_argument("--session-id", default="")
+    add_request_id(task_accept_ready)
 
     task_block = task_sub.add_parser("block")
     task_block.add_argument("id")
@@ -691,6 +716,13 @@ def main() -> int:
         print(run_idempotent(root, getattr(args, "request_id", None), command, semantic_args(), fn))
 
     try:
+        needs_initialized = (
+            args.command in {"status", "doctor", "validate"}
+            or (args.command == "cycle" and args.cycle_command == "status")
+        )
+        if needs_initialized and not runtime_initialized(root):
+            print("\n".join(uninitialized_lines(root)))
+            return 1
         if args.command == "init":
             if args.dry_run:
                 print("DRY-RUN: would create .ai-team/state/harness.db, local harness views, and .codex/agents templates")
@@ -722,6 +754,26 @@ def main() -> int:
                 print(f"cycle={row['id']} status={row['status']} phase={row['phase']} candidate={row.get('candidate_sha', '')}")
         elif args.command == "cycle" and args.cycle_command == "close":
             mutate("cycle.close", lambda: (cycle_close(root, args.status), f"OK: cycle closed {args.status}")[1])
+        elif args.command == "quickstart" and args.quickstart_command == "status":
+            report = quickstart_status(root)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            else:
+                print("\n".join(quickstart_status_lines(root)))
+        elif args.command == "quickstart" and args.quickstart_command == "minimal":
+            print(
+                "\n".join(
+                    quickstart_minimal(
+                        root,
+                        args.id,
+                        args.goal,
+                        args.acceptance,
+                        args.task,
+                        args.test_command,
+                        execute=args.execute,
+                    )
+                )
+            )
         elif args.command == "connector" and args.connector_command == "profile" and args.connector_profile_command == "status":
             data = connector_profile_status(root)
             if args.json:
@@ -875,11 +927,14 @@ def main() -> int:
             mutate("task.review", review_output)
         elif args.command == "task" and args.task_command == "accept":
             mutate("task.accept", lambda: (accept_task(root, args.id, args.evidence, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence, session_id=args.session_id), f"OK: task accepted {args.id}")[1])
+        elif args.command == "task" and args.task_command == "accept-ready":
+            mutate("task.accept-ready", lambda: (accept_ready_task(root, args.id, args.agent, args.evidence, session_id=args.session_id), f"OK: task accepted {args.id}")[1])
         elif args.command == "task" and args.task_command == "block":
             mutate("task.block", lambda: (block_task(root, args.id, args.reason, agent=args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task blocked {args.id}")[1])
         elif args.command == "task" and args.task_command == "release":
             mutate("task.release", lambda: (release_task(root, args.id, args.agent, lease_token=args.lease_token, expected_revision=args.expected_revision, expected_fence=args.fence), f"OK: task released {args.id}")[1])
         elif args.command == "validation" and args.validation_command == "record":
+            audit_only = not args.evidence and not args.test and not args.target
             mutate(
                 "validation.record",
                 lambda: (
@@ -911,6 +966,8 @@ def main() -> int:
                     "OK: validation recorded",
                 )[1],
             )
+            if audit_only:
+                print("NOTE: audit-only validation; it will not satisfy delivery gate until linked to controller evidence or passing test evidence.")
         elif args.command == "test-target" and args.test_target_command == "add":
             mutate(
                 "test-target.add",

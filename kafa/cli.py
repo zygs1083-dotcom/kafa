@@ -43,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return command_doctor(args)
+        if args.command == "project":
+            return command_project(args)
         if args.command == "plugin":
             return command_plugin(args)
     except KafaError as exc:
@@ -60,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check local packaging, plugin, and marketplace readiness.")
     add_common_scope_args(doctor)
     doctor.add_argument("--json", action="store_true", help="Print machine-readable check results.")
+
+    project = sub.add_parser("project", help="Inspect an ordinary project using Kafa runtime state.")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    project_doctor = project_sub.add_parser("doctor", help="Check a business project without requiring plugin source files.")
+    project_doctor.add_argument("--repo", default=".", help="Project root. Defaults to the current directory.")
+    project_doctor.add_argument("--json", action="store_true", help="Print machine-readable check results.")
 
     plugin = sub.add_parser("plugin", help="Manage Codex marketplace entries for the harness plugin.")
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
@@ -105,6 +113,21 @@ def command_doctor(args: argparse.Namespace) -> int:
             prefix = "OK" if check["ok"] else "ERROR"
             print(f"{prefix}: {check['name']}: {check['details']}")
     return 0 if report["ok"] else 1
+
+
+def command_project(args: argparse.Namespace) -> int:
+    if args.project_command != "doctor":
+        raise KafaError(f"unknown project command: {args.project_command}")
+    report = project_doctor_report(Path(args.repo).expanduser().resolve())
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for check in report["checks"]:
+            prefix = "OK" if check["ok"] else "ERROR"
+            print(f"{prefix}: {check['name']}: {check['details']}")
+        for command in report["next_commands"]:
+            print(f"NEXT: {command}")
+    return 0
 
 
 def install_plugin(args: argparse.Namespace, *, upgrade: bool) -> list[str]:
@@ -272,6 +295,59 @@ def doctor_report(repo: Path, scope: str) -> dict[str, Any]:
     marketplace_path, _target, _source_path = marketplace_locations(repo, scope)
     add_check(checks, "marketplace path", True, str(marketplace_path))
     return {"ok": all(check["ok"] for check in checks), "scope": scope, "repo": str(repo), "checks": checks}
+
+
+def project_doctor_report(repo: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    next_commands: list[str] = []
+    add_check(checks, "python", sys.version_info >= (3, 11), f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    add_check(checks, "git", shutil.which("git") is not None, shutil.which("git") or "not found")
+    add_check(checks, "project root", repo.exists(), str(repo))
+    if repo.exists() and shutil.which("git"):
+        completed = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo, text=True, capture_output=True, check=False)
+        add_check(checks, "git project", completed.returncode == 0 and completed.stdout.strip() == "true", "git repo" if completed.returncode == 0 else "not a git repo")
+    else:
+        add_check(checks, "git project", False, "project root or git missing")
+
+    db_path = repo / ".ai-team" / "state" / "harness.db"
+    initialized = harness_project_initialized(db_path)
+    add_check(checks, "harness initialized", initialized, str(db_path) if initialized else f"missing initialized runtime at {db_path}")
+    if not initialized:
+        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} init")
+        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} quickstart status")
+    else:
+        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} quickstart status")
+
+    gitignore = repo / ".gitignore"
+    ignored = True
+    details = "runtime state should stay out of git"
+    if repo.exists() and gitignore.exists():
+        text = gitignore.read_text(encoding="utf-8")
+        required = [".ai-team/state/", ".ai-team/runtime/"]
+        missing = [pattern for pattern in required if pattern not in text]
+        ignored = not missing
+        details = "ok" if ignored else "missing " + ", ".join(missing)
+    elif repo.exists():
+        ignored = False
+        details = "missing .gitignore runtime rules"
+    add_check(checks, "runtime gitignore", ignored, details)
+    add_check(checks, "connector namespace boundary", True, "connector profiles are per project; project doctor does not create external workspaces")
+    return {"ok": all(check["ok"] for check in checks), "kind": "project", "repo": str(repo), "checks": checks, "next_commands": next_commands}
+
+
+def harness_project_initialized(db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        import sqlite3
+
+        with sqlite3.connect(db_path) as conn:
+            exists = conn.execute("select 1 from sqlite_master where type='table' and name='project'").fetchone()
+            if not exists:
+                return False
+            return conn.execute("select 1 from project where id = 1").fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
 def control_plane_contract(source: Path) -> tuple[bool, str]:

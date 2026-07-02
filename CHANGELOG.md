@@ -4,6 +4,26 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
+## v1.24.0-beta.1 - 2026-07-02
+
+### Added
+
+- `kafa project doctor --repo <project>` for ordinary business-project checks without requiring the Kafa plugin source tree.
+- Runtime `quickstart status` checklist for missing requirement, acceptance, task, target, baseline, evidence, validation, quality gate, and delivery steps.
+- Runtime `quickstart minimal --execute` for a first local closed loop using existing dispatch command evidence, validation, task acceptance, quality gate, and delivery gates.
+- `task accept-ready` to hide reviewer lease/fence mechanics for submitted tasks while still using the existing review/accept transitions.
+
+### Changed
+
+- Runtime implementation version is now `4.17.0`; runtime schema remains `28`.
+- Uninitialized `status`, `doctor`, `validate`, and `cycle status` now return friendly initialization guidance instead of SQLite tracebacks.
+- `.gitignore` runtime rules now include Python cache patterns.
+- `validation record` without evidence/test linkage prints an audit-only warning.
+
+### Boundaries
+
+- Cold-start guidance does not create delivery evidence outside controller execution, does not relax delivery gates, and does not add DB tables, schema files, core files, runtime scripts, Skills, or Hooks.
+
 ## v1.23.0-beta.1 - 2026-06-30
 
 ### Added

@@ -23,10 +23,18 @@ Expected:
 
 ```text
 OK: plugin structure is valid
-1.23.0-beta.1
+1.24.0-beta.1
 ```
 
 `kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.
+
+`kafa doctor` is for this Kafa/plugin source repository. To inspect an ordinary project that uses Kafa, run:
+
+```bash
+kafa project doctor --repo /path/to/business-project
+```
+
+Project doctor checks whether the business project has initialized `.ai-team/state/harness.db`, has runtime ignore rules, and has clear next commands. It does not require or look for `plugins/codex-project-harness/` inside the business project.
 
 Installation does not configure business-project connector scopes. After installing the plugin, each project that wants real GitHub/Linear/Notion/Figma/Slack writes must bind existing external targets with `harness.py --root <project> connector profile set ...`. Harness does not create external workspaces, projects, channels, files, repositories, or connector tokens.
 

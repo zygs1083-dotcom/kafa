@@ -42,3 +42,5 @@ User intent
 `kafa doctor --repo .` includes a `control plane contract` check that verifies the packaged components still declare these boundaries.
 
 From v1.23.0, Host Codex model policy is opt-in through environment variables. Keep `HARNESS_CODEX_MODEL_POLICY=default` for SDK defaults, or use `spark-deterministic` only when controller-verifiable low-risk developer tasks are acceptable Spark candidates. `HARNESS_CODEX_MODEL` remains a hard override. If Spark is unavailable, the provider fails closed through the normal Host Codex lifecycle; it does not silently promote or demote model capability.
+
+From v1.24.0, cold-start guidance is explicit. Use `kafa project doctor --repo <project>` for ordinary projects, and use `quickstart status` or `quickstart minimal --execute` inside the harness runtime when a new user needs a guided first loop. These commands call the Kernel runtime and existing dispatch evidence paths; they do not create delivery evidence outside controller execution, and they do not weaken delivery readiness.
