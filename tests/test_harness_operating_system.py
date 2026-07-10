@@ -1363,6 +1363,8 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 sha,
                 "--origin",
                 "connector",
+                "--verification-token",
+                ci_hmac(CONNECTOR_KEY, "github", "run-1", sha, "success"),
                 env=connector_env(),
             )
             record_pass_validation(root, failure_mode="FM1", code_identity="git")
