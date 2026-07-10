@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = REPO_ROOT / "plugins/codex-project-harness/scripts/harness.py"
+AGENT_PROVIDER = REPO_ROOT / "plugins/codex-project-harness/core/agent_provider.py"
 TEST_COMMAND = "python3 -m unittest"
 
 
@@ -229,11 +230,128 @@ def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, P
 class HostCodexProviderTest(unittest.TestCase):
     def host_env(self, package_root: Path, log_path: Path, *, mode: str = "success", timeout: str = "5") -> dict[str, str]:
         return {
+            "HARNESS_CODEX_LEGACY_HOST_POLICY": "isolated-deny-all",
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": timeout,
             "FAKE_CODEX_SDK_LOG": str(log_path),
             "FAKE_CODEX_MODE": mode,
             "PYTHONPATH": str(package_root),
         }
+
+    def test_host_codex_requires_explicit_legacy_permission_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["HARNESS_CODEX_LEGACY_HOST_POLICY"] = ""
+
+            started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            evidence_count = db_one(root, "select count(*) as count from evidence")["count"]
+            self.assertIn("started 0 provider session", started.stdout)
+            self.assertEqual(session["status"], "spawn_failed")
+            self.assertIn("requires explicit HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all", session["last_error"])
+            self.assertEqual(evidence_count, 0)
+            self.assertFalse(log_path.exists())
+
+    def test_host_codex_worker_rejects_tampered_job_without_legacy_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            worktree = root / "worktree"
+            worktree.mkdir()
+            package_root, log_path = fake_sdk_package(temp_path)
+            report_path = root / "report.json"
+            job_path = root / "job.json"
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "request": {
+                            "root": str(root),
+                            "run_id": "RUN1",
+                            "task_id": "T1",
+                            "agent_id": "developer",
+                            "branch_name": "agent/T1",
+                            "fence": 1,
+                            "target_id": "UNIT",
+                            "command_template": TEST_COMMAND,
+                            "instruction": "Do not run",
+                            "input_json": {},
+                            "worktree_path": "worktree",
+                        },
+                        "legacy_host_policy": "",
+                        "report_path": str(report_path),
+                        "timeout": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = self.host_env(package_root, log_path)
+
+            result = subprocess.run(
+                ["python3", str(AGENT_PROVIDER), "host-codex-worker", str(job_path)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, **env},
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("requires matching job and environment", report["last_error"])
+            self.assertFalse(log_path.exists())
+
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            job["legacy_host_policy"] = "isolated-deny-all"
+            job_path.write_text(json.dumps(job), encoding="utf-8")
+            report_path.unlink()
+            env["HARNESS_CODEX_LEGACY_HOST_POLICY"] = ""
+            environment_bypass = subprocess.run(
+                ["python3", str(AGENT_PROVIDER), "host-codex-worker", str(job_path)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, **env},
+            )
+            environment_report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(environment_bypass.returncode, 1)
+            self.assertEqual(environment_report["status"], "failed")
+            self.assertIn("requires matching job and environment", environment_report["last_error"])
+            self.assertFalse(log_path.exists())
+
+            direct_call = subprocess.run(
+                [
+                    "python3",
+                    "-c",
+                    (
+                        "import sys; from pathlib import Path; "
+                        "from core.agent_provider import AgentJobRequest, HostCodexProvider; "
+                        "root=Path(sys.argv[1]); "
+                        "request=AgentJobRequest(root=root, run_id='RUN1', task_id='T1', agent_id='developer', "
+                        "branch_name='agent/T1', fence=1, target_id='UNIT', command_template='test', "
+                        "instruction='Do not run', input_json={}, worktree_path='worktree'); "
+                        "HostCodexProvider()._run_sdk_turn(request, codex_bin='', model='')"
+                    ),
+                    str(root),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    **os.environ,
+                    **env,
+                    "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "plugins/codex-project-harness"), str(package_root)]),
+                },
+            )
+            self.assertNotEqual(direct_call.returncode, 0)
+            self.assertIn("SDK execution requires explicit", direct_call.stderr)
+            self.assertFalse(log_path.exists())
 
     def test_host_codex_start_returns_before_turn_completion_and_releases_db_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

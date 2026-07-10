@@ -252,6 +252,7 @@ def _update_host_codex_report(path: Path, updates: dict[str, Any]) -> None:
         "selected_model",
         "model_selection_reason",
         "spark_eligible",
+        "legacy_host_policy",
         "worktree_path",
         "duration_seconds",
         "job_path",
@@ -295,6 +296,7 @@ class HostCodexProvider:
         explicit_model = os.environ.get("HARNESS_CODEX_MODEL", "").strip()
         model_policy = os.environ.get("HARNESS_CODEX_MODEL_POLICY", "default").strip()
         spark_model = os.environ.get("HARNESS_CODEX_SPARK_MODEL", "").strip()
+        legacy_host_policy = os.environ.get("HARNESS_CODEX_LEGACY_HOST_POLICY", "").strip()
         provider_session_id = request.provider_session_id or f"host-codex:{request.run_id}:{request.task_id}"
         job_path = self._job_path(request.root, request.run_id, request.task_id)
         report_path = self._report_path(request.root, request.run_id, request.task_id)
@@ -305,6 +307,17 @@ class HostCodexProvider:
                 provider_job_id=request.task_id,
                 status="spawn_failed",
                 message="host-codex requires an isolated worktree",
+            )
+        if legacy_host_policy != "isolated-deny-all":
+            return AgentJobHandle(
+                provider=self.name,
+                provider_session_id=provider_session_id,
+                provider_job_id=request.task_id,
+                status="spawn_failed",
+                message=(
+                    "legacy host-codex cannot inherit native task permissions; "
+                    "requires explicit HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all"
+                ),
             )
         try:
             model_selection = _host_codex_model_selection(request, explicit_model, model_policy, spark_model)
@@ -340,6 +353,7 @@ class HostCodexProvider:
             "codex_bin": codex_bin,
             "model": selected_model,
             "model_selection": model_selection,
+            "legacy_host_policy": legacy_host_policy,
             "timeout": timeout,
             "report_path": str(report_path),
             "created_at": time.time(),
@@ -357,6 +371,7 @@ class HostCodexProvider:
                     "sdk_model": selected_model,
                     "codex_bin": codex_bin,
                     **model_selection,
+                    "legacy_host_policy": legacy_host_policy,
                     "worktree_path": request.worktree_path,
                     "job_path": job_path.relative_to(request.root).as_posix(),
                     "report_path": report_path.relative_to(request.root).as_posix(),
@@ -390,6 +405,7 @@ class HostCodexProvider:
             "sdk_model": selected_model,
             "codex_bin": codex_bin,
             **model_selection,
+            "legacy_host_policy": legacy_host_policy,
             "worktree_path": request.worktree_path,
             "job_path": job_path.relative_to(request.root).as_posix(),
             "report_path": report_path.relative_to(request.root).as_posix(),
@@ -454,6 +470,11 @@ class HostCodexProvider:
         model: str,
         state_update: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        if os.environ.get("HARNESS_CODEX_LEGACY_HOST_POLICY", "").strip() != "isolated-deny-all":
+            raise RuntimeError(
+                "legacy host-codex SDK execution requires explicit "
+                "HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all"
+            )
         if not request.worktree_path:
             raise RuntimeError("host-codex job missing worktree_path")
         worktree = request.root / request.worktree_path
@@ -582,6 +603,8 @@ def _host_codex_worker(job_path: Path) -> int:
     model_selection = job.get("model_selection", {})
     if not isinstance(model_selection, dict):
         model_selection = {}
+    legacy_host_policy = str(job.get("legacy_host_policy", ""))
+    runtime_legacy_host_policy = os.environ.get("HARNESS_CODEX_LEGACY_HOST_POLICY", "").strip()
     timeout = float(job.get("timeout", os.environ.get("HARNESS_CODEX_TURN_TIMEOUT_SECONDS", "1800")))
     report_path = Path(str(job.get("report_path") or provider._report_path(request.root, request.run_id, request.task_id)))
     started = time.monotonic()
@@ -593,11 +616,26 @@ def _host_codex_worker(job_path: Path) -> int:
         "sdk_model": model,
         "codex_bin": codex_bin,
         **model_selection,
+        "legacy_host_policy": legacy_host_policy,
         "worktree_path": request.worktree_path,
         "job_path": str(job_path),
         "report_path": str(report_path),
         "timeout_seconds": timeout,
     }
+    if legacy_host_policy != "isolated-deny-all" or runtime_legacy_host_policy != "isolated-deny-all":
+        _write_json_atomic(
+            report_path,
+            {
+                "status": "failed",
+                "last_error": (
+                    "legacy host-codex worker requires matching job and environment "
+                    "HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all"
+                ),
+                "result_json": "",
+                "metadata": base_metadata,
+            },
+        )
+        return 1
     _write_json_atomic(
         report_path,
         {

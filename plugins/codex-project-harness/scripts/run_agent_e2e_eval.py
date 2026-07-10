@@ -640,6 +640,7 @@ def scenario_host_codex_fake_sdk_e2e() -> dict[str, Any]:
         run_id = setup_basic_harness(root, ["T1"])
         package_root, log_path = fake_codex_sdk(temp_path)
         env = {
+            "HARNESS_CODEX_LEGACY_HOST_POLICY": "isolated-deny-all",
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
             "FAKE_CODEX_SDK_LOG": str(log_path),
             "PYTHONPATH": str(package_root),
@@ -696,6 +697,7 @@ def scenario_host_codex_spark_policy_fake_sdk_e2e() -> dict[str, Any]:
         run_id = run_harness(root, "dispatch", "plan", "--scope", "Spark Policy").stdout.strip().split()[-1]
         package_root, log_path = fake_codex_sdk(temp_path)
         env = {
+            "HARNESS_CODEX_LEGACY_HOST_POLICY": "isolated-deny-all",
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
             "HARNESS_CODEX_MODEL_POLICY": "spark-deterministic",
             "HARNESS_CODEX_SPARK_MODEL": "gpt-5.3-codex-spark",

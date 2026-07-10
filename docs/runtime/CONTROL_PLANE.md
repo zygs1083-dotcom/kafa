@@ -47,6 +47,8 @@ Native ChatGPT/Codex owns concrete model, reasoning, sandbox, approval, and task
 
 The base `kafa` installer and Kernel are stdlib-only. The legacy Host Codex SDK bridge is an explicit optional capability installed with `kafa[host-codex]`; missing SDK support fails closed at provider execution and does not affect plugin installation, doctor, project launchers, or non-Host delivery governance.
 
+The legacy bridge cannot inherit a native parent task's permission and approval policy. It is disabled by default and runs only when the operator explicitly sets `HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all`, accepting the fixed worktree sandbox and deny-all approval mode. Native tasks remain authoritative and need no such compatibility opt-in.
+
 From v1.24.0, cold-start guidance is explicit. Use `kafa project doctor --repo <project>` for ordinary projects, and use `quickstart status` or `quickstart minimal --execute` inside the harness runtime when a new user needs a guided first loop. These commands call the Kernel runtime and existing dispatch evidence paths; they do not create delivery evidence outside controller execution, and they do not weaken delivery readiness.
 
 From v1.25.0, `dispatch route-advice` gives the controlling model a read-only capability and risk report before native execution. It can identify small controller-verifiable candidates, but it cannot choose a model, spawn subagents, create evidence, or bypass the Kernel trust layer. With a run id it points to immutable `dispatch native-export` packages.
