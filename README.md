@@ -211,6 +211,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . connector prof
 
 从 v1.10.0 开始，现有 `adapter confirm` 在 `adapter_actions.payload_json` 含 `{"execute": true, "operation": "...", "params": {...}}` 时可以执行真实 connector adapter。GitHub 通过 `gh api` 执行；Linear、Notion、Figma、Slack 通过官方 HTTP API 和环境变量 token 执行。外部写入结果只进入 adapter/action 记录，不自动成为 delivery evidence，也不放宽 high/critical 的 HMAC 信任要求。
 
+长期 Connector 边界已在 [Apps/MCP Connector Receipt ADR](docs/runtime/APPS_MCP_RECEIPT_ADR.md) 中锁定：ChatGPT Apps/MCP 负责授权、workspace policy、tool approval 和外部动作，Kafa 只治理 project scope、immutable intent、outbox fence、receipt validation 与 fallback。当前 `gh`/HTTP 路径明确属于 `legacy-direct` 兼容模式；ADR 不代表 receipt runtime 已实现，也不会把 Apps/MCP 工具输出升级为 delivery evidence。
+
 信任等级按强度分为三档：
 
 - `local-only`：本地模型会话执行证据，可覆盖 low/medium 风险。

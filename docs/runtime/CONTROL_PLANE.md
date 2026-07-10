@@ -22,6 +22,7 @@ Codex Project Harness is an architecture control plane for verified code deliver
 - Host Codex and native fan-out worker output always enters as `agent_reports` plus `task_attempts(status=reported)` before controller verification.
 - Host Codex model policy is execution routing only. `spark-deterministic` may select a faster SDK model for low-risk, testable developer assignments, but selected model metadata never creates delivery evidence or relaxes Kernel verification.
 - Connector writes are external workflow synchronization records governed by project profile scope checks plus transactional outbox claim/recovery. Harness never creates external workspaces, projects, channels, files, or repos; it only binds the project to existing targets. Connector links cannot satisfy high/critical delivery gates without existing connector(HMAC) trust anchors.
+- Apps/MCP is the target authorization and external-action boundary. The Kernel accepts only receipts bound to the exact action, fence, payload hash, project key, and external scope; model-visible tool output is audit-only unless a non-forgeable host attestation is available. Current direct HTTP/`gh` adapters are `legacy-direct` compatibility paths. See [Apps/MCP Connector Receipt Boundary](APPS_MCP_RECEIPT_ADR.md).
 - Evals are release gates for the harness itself. They do not prove an arbitrary project task is ready to deliver.
 
 ## Control Flow
