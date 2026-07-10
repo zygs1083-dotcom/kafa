@@ -4,7 +4,7 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
-## v1.25.0-beta.1 - 2026-07-02
+## v1.25.0-beta.1 - Unreleased
 
 ### Added
 
@@ -14,8 +14,14 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 
 ### Changed
 
-- Runtime implementation version is now `4.18.0`; runtime schema remains `28`.
+- Runtime implementation version remains `4.18.0`; the unreleased correctness baseline is now schema 29.
 - `project-harness` guidance now requires route advice before splitting work into Spark-capable subagent tasks.
+- The base `kafa` wheel is stdlib-only; the legacy Host Codex SDK moved to the optional `kafa[host-codex]` extra.
+- Release state, source version, package/plugin metadata, runtime/schema versions, tag, notes, and Codex compatibility smoke are governed by `release.json`.
+
+### Fixed
+
+- Stop-ship correctness hardening now covers transactional schema migration/replay, cycle-local identities, monotonic quality gates, structured critical findings, external trust receipts, safe quickstart handoff, user marketplace resolution, location-independent project launchers, installed hooks, and layered installed-plugin/cache doctor checks.
 
 ### Boundaries
 

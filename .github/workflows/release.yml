@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+            python_version: "3.11"
+            extended: true
+          - os: macos-latest
+            python: python3
+            python_version: "3.12"
+            extended: false
+          - os: windows-latest
+            python: python
+            python_version: "3.11"
+            extended: false
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Provide python3 shim on Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          mkdir -p .ci-bin
+          printf '#!/usr/bin/env bash\npython "$@"\n' > .ci-bin/python3
+          chmod +x .ci-bin/python3
+          echo "$PWD/.ci-bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned Codex CLI
+        run: |
+          codex_version="$(${{ matrix.python }} -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
+          npm install --global "@openai/codex@$codex_version"
+
+      - name: Validate tagged release source
+        run: |
+          ${{ matrix.python }} -m kafa.release --require-tag
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
+          ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py tests/run_isolated_install_smoke.py
+
+      - name: Run unit regression gate
+        run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Run real isolated install smoke
+        run: ${{ matrix.python }} tests/run_isolated_install_smoke.py --repo .
+
+      - name: Run extended runtime and eval gate
+        if: matrix.extended
+        run: |
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_runtime_smoke.py
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_forward_eval.py
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_skill_eval.py
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Codex CLI
+        run: |
+          codex_version="$(python -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
+          npm install --global "@openai/codex@$codex_version"
+
+      - name: Revalidate tag before artifact build
+        run: python -m kafa.release --require-tag
+
+      - name: Build final local release artifacts
+        run: |
+          mkdir -p dist
+          python -m pip wheel --no-deps . --wheel-dir dist
+          git archive --format=tar.gz --prefix="kafa-${GITHUB_REF_NAME}/" --output="dist/kafa-${GITHUB_REF_NAME}-source.tar.gz" "$GITHUB_REF_NAME"
+
+      - name: Smoke final release artifacts
+        run: |
+          python tests/run_isolated_install_smoke.py \
+            --repo . \
+            --wheel dist/*.whl \
+            --source-archive dist/*-source.tar.gz
+
+      - name: Prepare release notes and checksums
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from kafa.release import changelog_section
+
+          manifest = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          section = changelog_section(Path("CHANGELOG.md").read_text(encoding="utf-8"), manifest["tag"])
+          Path("release-notes.md").write_text(section.split("\n", 1)[1].strip() + "\n", encoding="utf-8")
+          PY
+          (cd dist && sha256sum ./*.whl ./*-source.tar.gz > SHA256SUMS)
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --prerelease \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

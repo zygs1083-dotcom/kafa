@@ -4,34 +4,22 @@ Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本
 
 这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
 
-当前发布版本是 **v1.25.0-beta.1**，架构代际定位为 **Codex Harness Kernel v4.18.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前源码候选版本是 **v1.25.0-beta.1**，`release.json` 将其明确标记为 `development`，因此它不是已发布版本。最新正式 tag/release 以 GitHub 和 `git tag` 为准。当前架构代际定位为 **Codex Harness Kernel v4.18.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
 ## 版本与发布
 
-本项目从 `v0.4.0-beta.1` 开始使用正式 Git tag 标记版本。普通 commit 用来记录开发过程，tag 用来标记可回看、可安装、可对比的版本点。
+本项目从 `v0.4.0-beta.1` 开始使用正式 Git tag 标记版本。普通 commit 和 `release_state=development` 只表示开发源码；只有 `release.json`、版本文件、Changelog、tag 和 GitHub prerelease 全部一致时，版本才是可回看、可安装、可对比的发布点。
 
 ```bash
 cat VERSION
+cat release.json
+python3 -m kafa.release --json
 git tag --list
 git show v0.4.0-beta.1
-git show v1.9.0-beta.1
-git show v1.10.0-beta.1
-git show v1.11.0-beta.1
-git show v1.12.0-beta.1
-git show v1.13.0-beta.1
-git show v1.14.0-beta.1
-git show v1.16.0-beta.1
-git show v1.18.0-beta.1
-git show v1.19.0-beta.1
-git show v1.20.0-beta.1
-git show v1.22.0-beta.1
-git show v1.23.0-beta.1
-git show v1.24.0-beta.1
-git show v1.25.0-beta.1
 git log <old-tag>..<new-tag> --oneline
 ```
 
-版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。
+版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。Tag workflow 会先执行 `python -m kafa.release --require-tag`、完整回归和真实隔离安装 smoke，再构建 wheel 与完整 source archive 并创建 GitHub prerelease；开发状态下即使误推 tag 也会 fail-closed。
 
 ## 这个项目解决什么问题
 

@@ -2,6 +2,8 @@
 
 Codex Project Harness is distributed as a local Git/Codex plugin bundle. Phase 6 adds the `kafa` helper CLI for repeatable local marketplace setup; it does not publish to PyPI and does not mutate Codex plugin caches directly.
 
+`release.json` is the source/tag/package contract. A source checkout marked `release_state=development` is not a published release even when its `VERSION` is newer than the latest GitHub tag. Use `python3 -m kafa.release --json` to inspect that distinction.
+
 ## Requirements
 
 - Python 3.11 or newer.

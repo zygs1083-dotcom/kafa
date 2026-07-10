@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "release_state": "development",
+  "version": "1.25.0-beta.1",
+  "pep440_version": "1.25.0b1",
+  "tag": "v1.25.0-beta.1",
+  "channel": "prerelease",
+  "package": "kafa",
+  "plugin": "codex-project-harness",
+  "runtime_version": "4.18.0",
+  "kernel_version": "4.18.0",
+  "schema_version_runtime": 29,
+  "codex_cli_smoke_version": "0.143.0"
+}
