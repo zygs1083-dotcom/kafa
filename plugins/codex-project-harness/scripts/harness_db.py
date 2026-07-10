@@ -5252,13 +5252,19 @@ def find_existing_connector_object(root: Path, operation: str, params: dict[str,
 def notion_payload_for_page_create(params: dict[str, Any], idempotency_key: str, project_key: str = "") -> dict[str, Any]:
     children = params.get("children")
     if children is None:
-        children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": with_connector_marker(str(params.get("content", "")), idempotency_key, project_key)}}]}}]
+        children = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": str(params.get("content", ""))}}]}}]
     if not isinstance(children, list):
         raise HarnessError("Notion payload children must be an array")
+    marker = connector_marker(idempotency_key, project_key)
+    marker_block = {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": marker}}]},
+    }
     return {
         "parent": {"page_id": require_param(params, "parent_page_id")},
-        "properties": {"title": {"title": [{"text": {"content": require_param(params, "title")}}]}},
-        "children": children,
+        "properties": {"title": {"title": [{"text": {"content": with_connector_marker(require_param(params, "title"), idempotency_key, project_key)}}]}},
+        "children": [*children, marker_block],
     }
 
 
@@ -5857,6 +5863,10 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
                     current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
                     if not current:
                         raise HarnessError(f"missing adapter action: {action_id}")
+                if operation == "notion.page.create" and current["status"] == "unknown":
+                    raise HarnessError(
+                        f"notion page create remains unknown after marker recovery miss; refusing duplicate create: {action_id}"
+                    )
             if current["status"] == "executing" and not is_expired(current["claim_expires_at"]):
                 raise HarnessError(f"connector action already executing: {action_id}")
             claimed = claim_connector_action(root, action_id, confirmation)
