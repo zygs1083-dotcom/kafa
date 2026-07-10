@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -69,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     project_doctor = project_sub.add_parser("doctor", help="Check a business project without requiring plugin source files.")
     project_doctor.add_argument("--repo", default=".", help="Project root. Defaults to the current directory.")
     project_doctor.add_argument("--json", action="store_true", help="Print machine-readable check results.")
+    for name in ["init", "status"]:
+        command = project_sub.add_parser(name, help=f"Run Harness {name} in an ordinary project.")
+        command.add_argument("--repo", default=".", help="Project root. Defaults to the current directory.")
+    project_quickstart = project_sub.add_parser("quickstart", help="Run Harness quickstart in an ordinary project.")
+    project_quickstart.add_argument("--repo", default=".", help="Project root. Defaults to the current directory.")
+    project_quickstart.add_argument("harness_args", nargs=argparse.REMAINDER)
 
     plugin = sub.add_parser("plugin", help="Manage Codex marketplace entries for the harness plugin.")
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
@@ -117,18 +124,54 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def command_project(args: argparse.Namespace) -> int:
-    if args.project_command != "doctor":
-        raise KafaError(f"unknown project command: {args.project_command}")
-    report = project_doctor_report(Path(args.repo).expanduser().resolve())
-    if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    else:
-        for check in report["checks"]:
-            prefix = "OK" if check["ok"] else "ERROR"
-            print(f"{prefix}: {check['name']}: {check['details']}")
-        for command in report["next_commands"]:
-            print(f"NEXT: {command}")
-    return 0
+    repo = Path(args.repo).expanduser().resolve()
+    if args.project_command == "doctor":
+        report = project_doctor_report(repo)
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            for check in report["checks"]:
+                prefix = "OK" if check["ok"] else "ERROR"
+                print(f"{prefix}: {check['name']}: {check['details']}")
+            for command in report["next_commands"]:
+                print(f"NEXT: {command}")
+        return 0 if report["ok"] else 1
+    harness_args = [args.project_command]
+    if args.project_command == "quickstart":
+        if not args.harness_args:
+            raise KafaError("project quickstart requires status or minimal arguments")
+        harness_args = ["quickstart", *args.harness_args]
+    return run_project_harness(repo, harness_args)
+
+
+def installed_plugin_root(repo: Path) -> Path:
+    candidates = []
+    env_root = os.environ.get("CODEX_PROJECT_HARNESS_PLUGIN_ROOT", "").strip()
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.extend(
+        [
+            REPO_VERSION_FILE.parent / "plugins" / PLUGIN_NAME,
+            Path(os.environ.get("HOME", str(Path.home()))).expanduser() / ".agents" / "plugins" / PLUGIN_NAME,
+            repo / "plugins" / PLUGIN_NAME,
+        ]
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (resolved / "scripts" / "harness.py").exists():
+            return resolved
+    raise KafaError("installed codex-project-harness runtime not found; install the user plugin first")
+
+
+def run_project_harness(repo: Path, harness_args: list[str]) -> int:
+    plugin_root = installed_plugin_root(repo)
+    command = [sys.executable, str(plugin_root / "scripts" / "harness.py"), "--root", str(repo), *harness_args]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    return completed.returncode
 
 
 def install_plugin(args: argparse.Namespace, *, upgrade: bool) -> list[str]:
@@ -314,10 +357,10 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
     initialized = harness_project_initialized(db_path)
     add_check(checks, "harness initialized", initialized, str(db_path) if initialized else f"missing initialized runtime at {db_path}")
     if not initialized:
-        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} init")
-        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} quickstart status")
+        next_commands.append(f"kafa project init --repo {shlex.quote(str(repo))}")
+        next_commands.append(f"kafa project quickstart --repo {shlex.quote(str(repo))} status")
     else:
-        next_commands.append(f"python3 plugins/codex-project-harness/scripts/harness.py --root {repo} quickstart status")
+        next_commands.append(f"kafa project quickstart --repo {shlex.quote(str(repo))} status")
 
     gitignore = repo / ".gitignore"
     ignored = True

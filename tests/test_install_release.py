@@ -52,14 +52,32 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
 
-            result = run_kafa("project", "doctor", "--repo", str(root), "--json")
+            result = run_kafa("project", "doctor", "--repo", str(root), "--json", check=False)
             report = json.loads(result.stdout)
 
+        self.assertNotEqual(result.returncode, 0)
         self.assertFalse(report["ok"], report)
         self.assertEqual(report["kind"], "project")
         self.assertIn("harness initialized", {check["name"] for check in report["checks"]})
         self.assertNotIn("plugin structure", {check["name"] for check in report["checks"]})
-        self.assertIn("harness.py --root", report["next_commands"][0])
+        self.assertTrue(report["next_commands"][0].startswith("kafa project init --repo "))
+
+    def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "business"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            package_env = {"PYTHONPATH": str(REPO_ROOT)}
+            initialized = run_kafa("project", "init", "--repo", str(root), cwd=root, env=package_env, check=False)
+            status = run_kafa("project", "status", "--repo", str(root), cwd=root, env=package_env, check=False)
+            quickstart = run_kafa("project", "quickstart", "--repo", str(root), "status", cwd=root, env=package_env, check=False)
+
+        self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertEqual(quickstart.returncode, 0, quickstart.stdout + quickstart.stderr)
+        self.assertIn("schema_version:", status.stdout)
+        self.assertIn("initialized: true", quickstart.stdout)
 
     def test_repo_install_writes_marketplace_and_preserves_other_plugins(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
