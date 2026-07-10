@@ -27,6 +27,18 @@ def bootstrap_run(root: Path) -> str:
 
 
 class CodexFanoutExportTest(unittest.TestCase):
+    def test_manual_csv_is_exchange_not_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_id = bootstrap_run(root)
+
+            provider = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "manual-csv", check=False)
+            exported = run_harness(root, "dispatch", "export-csv", run_id)
+
+        self.assertNotEqual(provider.returncode, 0)
+        self.assertIn("invalid choice", provider.stdout + provider.stderr)
+        self.assertIn("dispatch csv exported", exported.stdout)
+
     def test_export_csv_writes_native_spawn_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

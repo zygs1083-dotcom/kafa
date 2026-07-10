@@ -150,7 +150,7 @@ Native Codex/ChatGPT is not an `AgentProvider` process lifecycle. `dispatch nati
 
 Native worktrees are recorded as `host-managed`. Kafa may integrate their branch but does not remove the host-owned checkout. Mutable `.ai-team/state/harness.db` remains a single-writer root-workspace fact source; managed worktrees receive package facts, not copied databases. Hosted/cloud tasks without a separately authenticated Project Fact Transport are unsupported for Kernel mutation.
 
-`dispatch provider start` records host/manual/fixture-managed agent sessions for ready dispatch assignments. `dispatch provider collect` imports provider output as raw `agent_reports` and `task_attempts`; it never writes delivery-eligible evidence. `dispatch provider cancel` and `dispatch provider reconcile` make cancellation and timeout recovery auditable without allowing stale reports to overwrite newer work. Real Codex session creation remains a host/provider capability; provider lifecycle state is still a raw-report control plane, not a delivery trust anchor.
+`dispatch provider start` records legacy Host SDK or fixture-managed agent sessions for ready dispatch assignments. CSV is not a provider; use `dispatch export-csv/import-csv` only as controller-mediated exchange. `dispatch provider collect` imports provider output as raw `agent_reports` and `task_attempts`; it never writes delivery-eligible evidence. `dispatch provider cancel` and `dispatch provider reconcile` make cancellation and timeout recovery auditable without allowing stale reports to overwrite newer work. Real native Codex session creation remains a host capability; provider lifecycle state is still a raw-report control plane, not a delivery trust anchor.
 
 `--provider host-codex` now uses a nonblocking two-phase start. A short transaction registers `agent_provider_sessions(status='spawning')`, the corresponding `agent_sessions`, assignment claim, lease, and provider session id. The Codex worker process is spawned outside the SQLite write transaction. A second short transaction uses session id, provider session id, fence, and `status='spawning'` as a CAS guard before marking the session `running` or `spawn_failed`; cancelled or timed-out sessions are not overwritten.
 
@@ -159,11 +159,8 @@ The Host Codex background worker uses the optional `kafa[host-codex]` extra, whi
 Host Codex model selection is conservative and opt-in. `HARNESS_CODEX_MODEL` remains a hard override. Without it, `HARNESS_CODEX_MODEL_POLICY=default` uses the SDK default model. `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` selects `HARNESS_CODEX_SPARK_MODEL` or `gpt-5.3-codex-spark` only for `developer` assignments that have a linked gateable test target, a nonempty command template, no sandbox/no-network target requirement, and no linked high/critical failure modes. All other assignments use the SDK default. Model selection metadata is written to provider session metadata and the Host Codex runtime artifact; it does not change evidence trust, controller verification, integration, or delivery gate behavior.
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider start --run-id <run-id> --provider manual-csv
-python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider collect --run-id <run-id>
-python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch provider reconcile --run-id <run-id>
-python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
-python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integrate --run-id <run-id>
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch export-csv <run-id>
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch import-csv <run-id> --result <output.csv>
 ```
 
 ## Agent E2E Evaluation

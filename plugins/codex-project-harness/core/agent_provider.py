@@ -108,31 +108,6 @@ class AgentProvider(Protocol):
         """Cancel a provider-managed session."""
 
 
-class ManualCsvProvider:
-    name = "manual-csv"
-
-    def spawn(self, request: AgentJobRequest) -> AgentJobHandle:
-        return AgentJobHandle(
-            provider=self.name,
-            provider_session_id=request.provider_session_id or f"manual-csv:{request.run_id}:{request.task_id}",
-            provider_job_id=request.task_id,
-            status="running",
-            message="waiting for external spawn_agents_on_csv result",
-        )
-
-    def status(self, handle: AgentJobHandle) -> AgentJobHandle:
-        return handle
-
-    def heartbeat(self, handle: AgentJobHandle) -> AgentJobHandle:
-        return handle
-
-    def collect(self, handle: AgentJobHandle, *, root: Path, run_id: str, task_id: str) -> AgentJobReport | None:
-        return None
-
-    def cancel(self, handle: AgentJobHandle, reason: str) -> AgentJobHandle:
-        return AgentJobHandle(handle.provider, handle.provider_session_id, handle.provider_job_id, "cancelled", reason)
-
-
 class FixtureAgentProvider:
     name = "fixture"
 
@@ -587,8 +562,6 @@ class HostCodexProvider:
 
 
 def provider_for(name: str) -> AgentProvider:
-    if name == "manual-csv":
-        return ManualCsvProvider()
     if name == "fixture":
         return FixtureAgentProvider()
     if name == "host-codex":

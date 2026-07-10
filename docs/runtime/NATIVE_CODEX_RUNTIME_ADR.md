@@ -182,10 +182,9 @@ native subagent implementation and must not be selected implicitly. Before it
 can be considered operationally safe, it still needs real process-tree
 watchdog, liveness, deadline, and cancellation guarantees.
 
-`manual-csv` is an exchange format, not a live provider. Export/import must be
-described as controller-mediated task package and receipt exchange; a provider
-whose `collect()` can never return a report must not claim a running provider
-lifecycle.
+CSV is an exchange format, not a live provider. The `manual-csv` provider
+surface is removed; `dispatch export-csv/import-csv` remain controller-mediated
+exchange commands and do not claim a running provider lifecycle.
 
 ## Native flow
 
@@ -231,7 +230,7 @@ returned by the host boundary or recorded as unknown.
    second host lifecycle state machine.
 4. Update Skills to use native Codex thread/task capabilities and return the
    receipt to the root controller.
-5. Reclassify `manual-csv` as exchange and `host-codex` as legacy.
+5. Keep CSV as exchange only and classify `host-codex` as legacy.
 6. Replace concrete model routing with capability/risk hints.
 7. Add real-host compatibility gates for create, cancel, steer, handoff, and
    worktree receipt import. A skipped live profile is not success.

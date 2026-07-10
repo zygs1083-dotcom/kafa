@@ -681,7 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_provider_sub = dispatch_provider.add_subparsers(dest="dispatch_provider_command", required=True)
     dispatch_provider_start_parser = dispatch_provider_sub.add_parser("start")
     dispatch_provider_start_parser.add_argument("--run-id", required=True)
-    dispatch_provider_start_parser.add_argument("--provider", required=True, choices=["manual-csv", "fixture", "host-codex"])
+    dispatch_provider_start_parser.add_argument("--provider", required=True, choices=["fixture", "host-codex"])
     dispatch_provider_start_parser.add_argument("--max-concurrency", type=int, default=6)
     add_request_id(dispatch_provider_start_parser)
     dispatch_provider_status_parser = dispatch_provider_sub.add_parser("status")
