@@ -4908,16 +4908,53 @@ def connector_scope_mismatch(tool: str, operation: str, params: dict[str, Any], 
         expected_project = str(scope.get("project_id", ""))
         actual_team = str(params.get("team_id", ""))
         actual_project = str(params.get("project_id", ""))
+        if operation in {"linear.issue.comment", "linear.issue.update"}:
+            return ""
         if expected_team and actual_team == expected_team:
             return ""
         if expected_project and actual_project == expected_project:
-            return ""
-        if operation in {"linear.issue.comment", "linear.issue.update"} and (expected_team or expected_project):
             return ""
         expected = expected_team or expected_project or "<unbound>"
         actual = actual_team or actual_project or str(params.get("issue_id", "")) or "<missing>"
         return f"linear scope mismatch: expected {expected}, got {actual}"
     return ""
+
+
+def linear_issue_scope_mismatch(
+    operation: str,
+    params: dict[str, Any],
+    scope: dict[str, Any],
+    project_key: str,
+) -> str:
+    stats = connector_stats("linear", operation, params, project_key)
+    token = env_token("LINEAR_API_KEY", stats)
+    endpoint = f"{os.environ['HARNESS_LINEAR_API_URL'].rstrip('/')}/linear/graphql" if os.environ.get("HARNESS_LINEAR_API_URL") else "https://api.linear.app/graphql"
+    data = http_json(
+        endpoint,
+        token,
+        {
+            "query": "query IssueScope($id: String!) { issue(id: $id) { id team { id } project { id } } }",
+            "variables": {"id": require_param(params, "issue_id")},
+        },
+        stats=stats,
+    )
+    issue = data.get("data", {}).get("issue")
+    if not isinstance(issue, dict) or not issue.get("id"):
+        return "linear issue scope could not be confirmed"
+    team = issue.get("team")
+    project = issue.get("project")
+    actual_team = str(team.get("id", "")) if isinstance(team, dict) else ""
+    actual_project = str(project.get("id", "")) if isinstance(project, dict) else ""
+    expected_team = str(scope.get("team_id", ""))
+    expected_project = str(scope.get("project_id", ""))
+    mismatches: list[str] = []
+    if expected_team and actual_team != expected_team:
+        mismatches.append(f"team expected {expected_team}, got {actual_team or '<missing>'}")
+    if expected_project and actual_project != expected_project:
+        mismatches.append(f"project expected {expected_project}, got {actual_project or '<missing>'}")
+    if not expected_team and not expected_project:
+        mismatches.append("linear profile has no team or project scope")
+    return "; ".join(mismatches)
 
 
 def audit_connector_scope_override(root: Path, row: sqlite3.Row, project_key: str, reason: str) -> None:
@@ -4950,6 +4987,8 @@ def validate_connector_namespace(root: Path, row: sqlite3.Row, payload_value: di
     if profile["status"] != "bound":
         raise HarnessError(f"connector profile is {profile['status']} for {tool}")
     mismatch = connector_scope_mismatch(tool, operation, params, scope)
+    if not mismatch and tool == "linear" and operation in {"linear.issue.comment", "linear.issue.update"}:
+        mismatch = linear_issue_scope_mismatch(operation, params, scope, project_key)
     if not mismatch:
         return project_key
     if payload_value.get("scope_override") is True:
