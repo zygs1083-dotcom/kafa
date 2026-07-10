@@ -481,7 +481,13 @@ class HostCodexProvider:
         if not worktree.exists():
             raise RuntimeError(f"host-codex worktree missing: {request.worktree_path}")
         worktree = worktree.resolve()
-        from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+        try:
+            from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+        except ImportError as exc:
+            raise RuntimeError(
+                "Host Codex Provider requires the optional SDK; install kafa[host-codex] "
+                f"before starting this provider ({exc})"
+            ) from exc
 
         config = CodexConfig(
             codex_bin=codex_bin or None,

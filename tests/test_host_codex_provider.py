@@ -527,6 +527,7 @@ class HostCodexProviderTest(unittest.TestCase):
             evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
             self.assertEqual(session["status"], "verification_failed")
             self.assertIn("fake sdk missing", session["last_error"])
+            self.assertIn("install kafa[host-codex]", session["last_error"])
             self.assertEqual(assignment["status"], "verification_failed")
             self.assertTrue(assignment["provider_session_id"].startswith("host-codex:"))
             self.assertEqual(evidence_count, 0)

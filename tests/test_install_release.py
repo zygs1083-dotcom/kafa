@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 
@@ -140,7 +142,7 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertFalse(checks["plugin structure"]["ok"])
         self.assertIn("core inventory mismatch", checks["plugin structure"]["details"])
 
-    def test_doctor_static_structure_matches_dependency_contract(self) -> None:
+    def test_doctor_static_structure_requires_host_codex_optional_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
             pyproject = root / "pyproject.toml"
@@ -156,7 +158,34 @@ class InstallReleaseTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(checks["plugin structure"]["ok"])
-        self.assertIn("dependencies must include", checks["plugin structure"]["details"])
+        self.assertIn("optional dependency host-codex", checks["plugin structure"]["details"])
+
+    def test_base_wheel_keeps_host_codex_sdk_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            release = Path(temp) / "release"
+            release.mkdir()
+            for name in ["VERSION", "README.md", "pyproject.toml"]:
+                shutil.copyfile(REPO_ROOT / name, release / name)
+            shutil.copytree(REPO_ROOT / "kafa", release / "kafa", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            dist = Path(temp) / "dist"
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", "--no-deps", ".", "--wheel-dir", str(dist)],
+                cwd=release,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            wheel = next(dist.glob("kafa-*.whl"))
+            with zipfile.ZipFile(wheel) as archive:
+                metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+                metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
+
+        requirements = metadata.get_all("Requires-Dist") or []
+        sdk_requirements = [item for item in requirements if item.startswith("openai-codex")]
+        self.assertEqual(metadata.get_all("Provides-Extra"), ["host-codex"])
+        self.assertEqual(len(sdk_requirements), 1, requirements)
+        self.assertIn('extra == "host-codex"', sdk_requirements[0])
 
     def test_user_doctor_validates_installed_copy_and_hook_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -445,7 +474,7 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pyproject requires-python must be >=3.11", result.stdout)
 
-    def test_validate_structure_requires_codex_sdk_dependency(self) -> None:
+    def test_validate_structure_requires_host_codex_optional_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
@@ -454,7 +483,7 @@ class InstallReleaseTest(unittest.TestCase):
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pyproject dependencies must include openai-codex>=0.1.0b3", result.stdout)
+        self.assertIn("pyproject optional dependency host-codex must include openai-codex>=0.1.0b3", result.stdout)
 
 
 if __name__ == "__main__":

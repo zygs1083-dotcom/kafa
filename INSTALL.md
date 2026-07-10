@@ -8,7 +8,7 @@ Codex Project Harness is distributed as a local Git/Codex plugin bundle. Phase 6
 - Git on `PATH`.
 - Codex with plugin marketplace support.
 - A checkout of this repository.
-- `python3 -m pip install -e .` installs the mandatory Host Codex SDK dependency `openai-codex>=0.1.0b3`.
+- The base `kafa` package is stdlib-only. Host Codex Provider users install the optional SDK extra separately.
 
 Check the repository:
 
@@ -19,6 +19,14 @@ kafa --version
 kafa plugin install --repo .
 kafa doctor --repo .
 ```
+
+Only when using `dispatch provider start --provider host-codex`, install the optional provider dependency:
+
+```bash
+python3 -m pip install -e '.[host-codex]'
+```
+
+Ordinary plugin installation, doctor, project launchers, fixture providers, and Kernel commands do not require the Host Codex SDK.
 
 Expected:
 

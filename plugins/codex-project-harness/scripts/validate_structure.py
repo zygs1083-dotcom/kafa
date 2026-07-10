@@ -175,8 +175,12 @@ def main() -> int:
         if project.get("requires-python") != ">=3.11":
             errors.append("pyproject requires-python must be >=3.11")
         dependencies = project.get("dependencies", [])
-        if not isinstance(dependencies, list) or "openai-codex>=0.1.0b3" not in dependencies:
-            errors.append("pyproject dependencies must include openai-codex>=0.1.0b3")
+        if not isinstance(dependencies, list) or dependencies:
+            errors.append("pyproject base dependencies must remain empty")
+        optional_dependencies = project.get("optional-dependencies", {})
+        host_codex = optional_dependencies.get("host-codex", []) if isinstance(optional_dependencies, dict) else []
+        if not isinstance(host_codex, list) or "openai-codex>=0.1.0b3" not in host_codex:
+            errors.append("pyproject optional dependency host-codex must include openai-codex>=0.1.0b3")
         if scripts.get("kafa") != "kafa.cli:main":
             errors.append("pyproject must expose kafa = kafa.cli:main")
 
