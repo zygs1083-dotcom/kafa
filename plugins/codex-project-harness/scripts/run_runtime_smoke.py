@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sqlite3
 import subprocess
@@ -22,6 +24,10 @@ for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
 HARNESS = ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
 RESULT_PATH = ROOT / "docs" / "runtime" / "runtime-smoke-results.json"
 TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
+
+
+def connector_hmac(key: str, payload: str) -> str:
+    return hmac.new(key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -97,15 +103,24 @@ def scenario_full_project() -> dict[str, object]:
         commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", evidence_id))
         key_file = root / ".ai-team/runtime/connector.key"
         key_file.parent.mkdir(parents=True, exist_ok=True)
-        key_file.write_text("smoke-connector-key\n", encoding="utf-8")
+        connector_key = "smoke-connector-key"
+        key_file.write_text(f"{connector_key}\n", encoding="utf-8")
         key_path_file = root / ".ai-team/control/connector-key-path.txt"
         key_path_file.parent.mkdir(parents=True, exist_ok=True)
         key_path_file.write_text(".ai-team/runtime/connector.key\n", encoding="utf-8")
-        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector")
+        external_token = connector_hmac(
+            connector_key,
+            f"external-session:smoke-session-1:smoke-verifier:{commit_sha}:verified",
+        )
+        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector", "--verification-token", external_token)
         commands.append(session)
         session_id = session.stdout.strip().rsplit(" ", 1)[-1] if session.returncode == 0 else "smoke-session-1:smoke-verifier"
         commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", session_id, "--code-identity", "git"))
-        reviewer_session = run(root, "session", "attest", "--session-id", "smoke-qa-session", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "smoke-qa-context", "--origin", "connector")
+        reviewer_token = connector_hmac(
+            connector_key,
+            "agent-session:smoke-qa-session:qa-reviewer:qa-reviewer:smoke-qa-context",
+        )
+        reviewer_session = run(root, "session", "attest", "--session-id", "smoke-qa-session", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "smoke-qa-context", "--origin", "connector", "--verification-token", reviewer_token)
         commands.append(reviewer_session)
         reviewer_attestation_id = stdout_field(reviewer_session.stdout, "attestation") if reviewer_session.returncode == 0 else ""
         commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed", "--reviewer-session-id", "smoke-qa-session", "--reviewer-attestation-id", reviewer_attestation_id))
