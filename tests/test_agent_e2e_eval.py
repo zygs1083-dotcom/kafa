@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import ast
 from pathlib import Path
 
 
@@ -16,13 +17,17 @@ import run_agent_e2e_eval  # noqa: E402
 
 
 def run_eval(*args: str, env: dict[str, str] | None = None) -> dict[str, object]:
-    command_env = os.environ.copy()
-    if env is not None:
-        command_env.update(env)
-    result = subprocess.run([sys.executable, str(EVAL), *args], text=True, capture_output=True, check=False, env=command_env)
+    result = run_eval_process(*args, env=env)
     if result.returncode != 0:
         raise AssertionError(result.stdout + result.stderr)
     return json.loads(result.stdout)
+
+
+def run_eval_process(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    command_env = os.environ.copy()
+    if env is not None:
+        command_env.update(env)
+    return subprocess.run([sys.executable, str(EVAL), *args], text=True, capture_output=True, check=False, env=command_env)
 
 
 class AgentE2EEvalTest(unittest.TestCase):
@@ -43,6 +48,21 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(set(scenarios), {"parallel_success", "dependency_blocked", "same_file_conflict", "forged_evidence_blocked", "integration_regression_blocked"})
         self.assertTrue(all(scenario["pass"] for scenario in scenarios.values()))
         self.assertTrue(all("category" in scenario and "mode" in scenario and "skip_reason" in scenario for scenario in scenarios.values()))
+        self.assertTrue(scenarios["parallel_success"]["details"]["integrate_via_public_cli"])
+        self.assertEqual(scenarios["parallel_success"]["details"]["delivery_validation_issues"], [])
+
+    def test_success_scenarios_do_not_replace_delivery_validator(self) -> None:
+        tree = ast.parse(EVAL.read_text(encoding="utf-8"))
+        assignments = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr == "validate_runtime":
+                    assignments.append(node.lineno)
+
+        self.assertEqual(assignments, [], f"release-critical validate_runtime replaced at lines {assignments}")
 
     def test_fixture_eval_blocks_forged_evidence_and_integration_regression(self) -> None:
         report = run_eval("--mode", "fixture")
@@ -102,13 +122,18 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(scenarios["crash_retry_recovery"]["details"]["reports"], 1)
         self.assertEqual(scenarios["sqlite_contention_stress"]["details"]["sqlite_lock_error_count"], 0)
 
-    def test_live_codex_without_enable_is_skipped(self) -> None:
-        report = run_eval("--mode", "live-codex", env={"HARNESS_E2E_ENABLE_LIVE_CODEX": ""})
+    def test_live_codex_without_enable_is_not_run_and_fails_explicit_profile(self) -> None:
+        result = run_eval_process("--mode", "live-codex", env={"HARNESS_E2E_ENABLE_LIVE_CODEX": ""})
+        report = json.loads(result.stdout)
 
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(report["mode"], "live-codex")
         self.assertTrue(report["live_skipped"])
+        self.assertEqual(report["live_status"], "not-run")
+        self.assertEqual(report["summary"]["passed_count"], 0)
         self.assertEqual(report["summary"]["failed_count"], 0)
         self.assertEqual(report["summary"]["skipped_count"], 2)
+        self.assertTrue(all(not scenario["pass"] for scenario in report["scenarios"]))
         self.assertIn("HARNESS_E2E_ENABLE_LIVE_CODEX", "; ".join(report["matrix"]["live_skipped_reasons"]))
 
     def test_should_fail_thresholds(self) -> None:
@@ -132,14 +157,16 @@ class AgentE2EEvalTest(unittest.TestCase):
         false_pass["summary"]["false_pass_count"] = 1
         self.assertTrue(run_agent_e2e_eval.should_fail(false_pass))
         live_skipped = {"mode": "live-codex", "live_skipped": True, "summary": {"failed_count": 0}}
-        self.assertFalse(run_agent_e2e_eval.should_fail(live_skipped))
+        self.assertTrue(run_agent_e2e_eval.should_fail(live_skipped))
 
     def test_out_matches_stdout_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp) / "report.json"
-            report = run_eval("--mode", "live-codex", "--out", str(out), env={"HARNESS_E2E_ENABLE_LIVE_CODEX": ""})
+            result = run_eval_process("--mode", "live-codex", "--out", str(out), env={"HARNESS_E2E_ENABLE_LIVE_CODEX": ""})
+            report = json.loads(result.stdout)
             from_file = json.loads(out.read_text(encoding="utf-8"))
 
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(from_file, report)
         self.assertIn("matrix", from_file)
         self.assertIn("summary", from_file)
