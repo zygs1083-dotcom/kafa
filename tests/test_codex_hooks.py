@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import py_compile
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -38,12 +39,106 @@ class CodexHooksTest(unittest.TestCase):
                     self.assertEqual(hook["type"], "command")
                     self.assertIn("harness_hook.py", hook["command"])
                     self.assertIn(event, hook["command"])
+                    self.assertIn("${PLUGIN_ROOT}", hook["command"])
+                    self.assertNotIn("CODEX_PROJECT_HARNESS_PLUGIN_ROOT", hook["command"])
+                    self.assertNotIn("git rev-parse", hook["command"])
+                    self.assertIn("commandWindows", hook)
+                    self.assertIn("%PLUGIN_ROOT%", hook["commandWindows"])
+                    self.assertIn(event, hook["commandWindows"])
                     self.assertIsInstance(hook.get("timeout"), int)
                     self.assertGreater(hook.get("timeout"), 0)
                     self.assertIsInstance(hook.get("statusMessage"), str)
 
         self.assertTrue(HOOK_SCRIPT.exists())
         py_compile.compile(str(HOOK_SCRIPT), doraise=True)
+
+    def test_installed_hook_command_uses_codex_plugin_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            installed_plugin = temp_root / "installed" / "codex-project-harness"
+            project_root = temp_root / "business-project"
+            shutil.copytree(PLUGIN_ROOT, installed_plugin)
+            project_root.mkdir()
+            subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True, text=True)
+
+            env = os.environ.copy()
+            env.pop("CODEX_PROJECT_HARNESS_PLUGIN_ROOT", None)
+            env.pop("HARNESS_PROJECT_ROOT", None)
+            env["PLUGIN_ROOT"] = str(installed_plugin)
+            nested = project_root / "nested"
+            nested.mkdir()
+            hook = json.loads((installed_plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))[
+                "hooks"
+            ]["SessionStart"][0]["hooks"][0]
+            command = hook["commandWindows"] if os.name == "nt" else hook["command"]
+            result = subprocess.run(
+                command,
+                input=json.dumps({"source": "startup"}),
+                text=True,
+                capture_output=True,
+                cwd=nested,
+                env=env,
+                shell=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
+        self.assertIn(f"repo: {project_root.resolve()}", result.stdout)
+
+    def test_installed_session_start_reads_version_from_plugin_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            installed_plugin = Path(temp) / "codex-project-harness"
+            shutil.copytree(PLUGIN_ROOT, installed_plugin)
+            with tempfile.TemporaryDirectory() as project_temp:
+                project_root = Path(project_temp)
+                subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True, text=True)
+                env = os.environ.copy()
+                env.pop("CODEX_PROJECT_HARNESS_PLUGIN_ROOT", None)
+                env.pop("HARNESS_PROJECT_ROOT", None)
+                result = subprocess.run(
+                    ["python3", str(installed_plugin / "hooks" / "harness_hook.py"), "SessionStart"],
+                    input=json.dumps({"source": "startup"}),
+                    text=True,
+                    capture_output=True,
+                    cwd=project_root,
+                    env=env,
+                    check=False,
+                )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("version: 1.25.0-beta.1", result.stdout)
+        self.assertNotIn("version: unknown", result.stdout)
+
+    def test_installed_hook_ignores_legacy_plugin_root_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            installed_plugin = temp_root / "installed" / "codex-project-harness"
+            decoy_plugin = temp_root / "decoy" / "codex-project-harness"
+            project_root = temp_root / "business-project"
+            shutil.copytree(PLUGIN_ROOT, installed_plugin)
+            shutil.copytree(PLUGIN_ROOT, decoy_plugin)
+            project_root.mkdir()
+            decoy_manifest = decoy_plugin / ".codex-plugin" / "plugin.json"
+            manifest = json.loads(decoy_manifest.read_text(encoding="utf-8"))
+            manifest["version"] = "0.0.0-decoy"
+            decoy_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            env = os.environ.copy()
+            env["CODEX_PROJECT_HARNESS_PLUGIN_ROOT"] = str(decoy_plugin)
+            env.pop("HARNESS_PROJECT_ROOT", None)
+            result = subprocess.run(
+                ["python3", str(installed_plugin / "hooks" / "harness_hook.py"), "SessionStart"],
+                input=json.dumps({"source": "startup"}),
+                text=True,
+                capture_output=True,
+                cwd=project_root,
+                env=env,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("version: 1.25.0-beta.1", result.stdout)
+        self.assertNotIn("0.0.0-decoy", result.stdout)
 
     def test_session_start_outputs_status_without_mutating_db(self) -> None:
         with self._temp_harness_root() as root:

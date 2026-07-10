@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"supported events: {', '.join(sorted(EVENTS))}")
         return 2
 
-    plugin_root = plugin_root_from_env()
+    plugin_root = Path(__file__).resolve().parents[1]
     repo_root = locate_repo_root()
     payload, payload_ok = read_payload()
     strict = os.environ.get("HARNESS_HOOK_STRICT") == "1"
@@ -50,13 +50,6 @@ def main(argv: list[str] | None = None) -> int:
     if event == "Stop":
         return stop(plugin_root, repo_root, strict)
     return 0
-
-
-def plugin_root_from_env() -> Path:
-    env_root = os.environ.get("CODEX_PROJECT_HARNESS_PLUGIN_ROOT")
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    return Path(__file__).resolve().parents[1]
 
 
 def locate_repo_root() -> Path:
@@ -93,7 +86,7 @@ def read_payload() -> tuple[dict[str, Any], bool]:
 
 def session_start(plugin_root: Path, repo_root: Path) -> int:
     print("purpose: inject read-only project status; delivery gates remain in the harness runtime.")
-    version = read_text(plugin_root / "../../VERSION").strip() or "unknown"
+    version = plugin_version(plugin_root)
     print(f"version: {version}")
     if not harness_db_exists(repo_root):
         print("harness status:")
@@ -106,6 +99,16 @@ def session_start(plugin_root: Path, repo_root: Path) -> int:
     dispatch = run_harness(plugin_root, repo_root, ["dispatch", "status"])
     print_block("dispatch status", dispatch, max_lines=6)
     return 0
+
+
+def plugin_version(plugin_root: Path) -> str:
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    return version.strip() if isinstance(version, str) and version.strip() else "unknown"
 
 
 def subagent_start(payload: dict[str, Any], payload_ok: bool) -> int:
