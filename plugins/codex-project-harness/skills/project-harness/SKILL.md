@@ -117,8 +117,8 @@ Before delivery:
 8. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
 9. Use `team-architecture` logic to choose the smallest effective agent team.
 10. Add tasks through `project-runtime` with owners, acceptance mapping, failure-mode mapping, tool mapping, dependencies, and evidence fields.
-11. Before dispatching provider/subagent work, run `dispatch route-advice` or equivalent runtime logic and have the controlling model classify tasks into Spark candidates, default Host Codex candidates, and main-model/manual work.
-12. Dispatch work with clear owners, inputs, outputs, acceptance mapping, tool mapping, and verification evidence.
+11. Before dispatching native subagent work, run `dispatch route-advice` for capability/risk hints; the host owns the concrete model, reasoning, sandbox, approval, and task/thread/worktree lifecycle.
+12. Use `dispatch native-export` to produce immutable packages, create visible native host tasks/subagents, and return real host task/thread/worktree IDs through `dispatch native-import`. Provider reports remain raw until controller verification.
 13. Keep producer and reviewer roles separate.
 14. Use a maximum of two producer-reviewer retry loops before escalating.
 15. Run integration coherence QA before declaring completion.

@@ -131,6 +131,12 @@ Harness maps to Codex native primitives instead of inventing a session protocol.
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . agents install
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch plan --scope "Feature slice"
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch native-export <run-id>
+# The host creates a visible native task/thread/subagent/worktree and returns receipt.json.
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch native-import <run-id> --receipt receipt.json
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
+
+# CSV remains a controller-mediated exchange compatibility format.
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch export-csv <run-id>
 # Host/user invokes Codex spawn_agents_on_csv using .ai-team/runtime/codex-fanout/<run-id>/spawn_config.json.
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch import-csv <run-id> --result .ai-team/runtime/codex-fanout/<run-id>/output.csv
@@ -139,6 +145,10 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch integ
 ```
 
 ## AgentProvider Lifecycle
+
+Native Codex/ChatGPT is not an `AgentProvider` process lifecycle. `dispatch native-export` writes immutable task packages under `.ai-team/runtime/native-dispatch/<run-id>/` without copying SQLite state or choosing a model slug. The host owns visible task/thread/subagent/worktree, approval, sandbox, model, cancel, steer, and handoff. `dispatch native-import` accepts a receipt only when its package hash, Kafa assignment, current constraints, branch, base/head SHA, required policy metadata, and real non-placeholder host IDs match. It records those IDs plus a raw `agent_report/task_attempt`; it creates no evidence. `dispatch verify-attempt` remains the controller trust boundary.
+
+Native worktrees are recorded as `host-managed`. Kafa may integrate their branch but does not remove the host-owned checkout. Mutable `.ai-team/state/harness.db` remains a single-writer root-workspace fact source; managed worktrees receive package facts, not copied databases. Hosted/cloud tasks without a separately authenticated Project Fact Transport are unsupported for Kernel mutation.
 
 `dispatch provider start` records host/manual/fixture-managed agent sessions for ready dispatch assignments. `dispatch provider collect` imports provider output as raw `agent_reports` and `task_attempts`; it never writes delivery-eligible evidence. `dispatch provider cancel` and `dispatch provider reconcile` make cancellation and timeout recovery auditable without allowing stale reports to overwrite newer work. Real Codex session creation remains a host/provider capability; provider lifecycle state is still a raw-report control plane, not a delivery trust anchor.
 

@@ -44,6 +44,8 @@ from core.api import (
     dispatch_file_claim_release,
     dispatch_export_csv,
     dispatch_import_csv,
+    dispatch_export_native,
+    dispatch_import_native,
     dispatch_integrate,
     dispatch_plan,
     dispatch_provider_cancel,
@@ -624,6 +626,14 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_import.add_argument("run_id")
     dispatch_import.add_argument("--result", required=True)
     add_request_id(dispatch_import)
+    dispatch_native_export = dispatch_sub.add_parser("native-export")
+    dispatch_native_export.add_argument("run_id")
+    dispatch_native_export.add_argument("--out-dir", default="")
+    add_request_id(dispatch_native_export)
+    dispatch_native_import = dispatch_sub.add_parser("native-import")
+    dispatch_native_import.add_argument("run_id")
+    dispatch_native_import.add_argument("--receipt", required=True)
+    add_request_id(dispatch_native_import)
     dispatch_verify = dispatch_sub.add_parser("verify-attempt")
     dispatch_verify.add_argument("--run-id", required=True)
     dispatch_verify.add_argument("--task", required=True)
@@ -1202,6 +1212,18 @@ def main() -> int:
         elif args.command == "dispatch" and args.dispatch_command == "import-csv":
             result_path = Path(args.result)
             mutate("dispatch.import-csv", lambda: f"OK: dispatch csv imported {dispatch_import_csv(root, args.run_id, result_path if result_path.is_absolute() else root / result_path)}")
+        elif args.command == "dispatch" and args.dispatch_command == "native-export":
+            out_dir = Path(args.out_dir) if args.out_dir else None
+            mutate(
+                "dispatch.native-export",
+                lambda: f"OK: native task packages exported {dispatch_export_native(root, args.run_id, out_dir=(root / out_dir if out_dir and not out_dir.is_absolute() else out_dir))}",
+            )
+        elif args.command == "dispatch" and args.dispatch_command == "native-import":
+            receipt_path = Path(args.receipt)
+            mutate(
+                "dispatch.native-import",
+                lambda: f"OK: {dispatch_import_native(root, args.run_id, receipt_path if receipt_path.is_absolute() else root / receipt_path)}",
+            )
         elif args.command == "dispatch" and args.dispatch_command == "verify-attempt":
             mutate("dispatch.verify-attempt", lambda: f"OK: dispatch attempt verified {dispatch_verify_attempt(root, args.run_id, args.task, runner=args.runner, container_image=args.container_image)}")
         elif args.command == "dispatch" and args.dispatch_command == "claim-next":

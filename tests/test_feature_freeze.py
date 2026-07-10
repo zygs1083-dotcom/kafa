@@ -135,6 +135,8 @@ EXPECTED_CLI_SURFACE = {
     "dispatch.file-claim.release",
     "dispatch.import-csv",
     "dispatch.integrate",
+    "dispatch.native-export",
+    "dispatch.native-import",
     "dispatch.plan",
     "dispatch.provider",
     "dispatch.provider.cancel",

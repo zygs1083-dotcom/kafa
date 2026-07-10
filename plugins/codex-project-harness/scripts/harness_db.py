@@ -6059,6 +6059,165 @@ def default_codex_fanout_dir(root: Path, run_id: str) -> Path:
     return root / ".ai-team" / "runtime" / "codex-fanout" / safe_branch_part(run_id)
 
 
+def default_native_dispatch_dir(root: Path, run_id: str) -> Path:
+    return root / ".ai-team" / "runtime" / "native-dispatch" / safe_branch_part(run_id)
+
+
+def stored_runtime_path(root: Path, path: Path) -> str:
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+
+
+def native_package_without_hash(package: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in package.items() if key != "package_sha256"}
+
+
+def native_package_hash(package: dict[str, Any]) -> str:
+    return stable_digest(native_package_without_hash(package))
+
+
+def dispatch_export_native(root: Path, run_id: str, *, out_dir: Path | None = None) -> Path:
+    if not (root / ".git").exists():
+        raise HarnessError("native dispatch requires a git repository")
+    output_dir = out_dir if out_dir else default_native_dispatch_dir(root, run_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_sha = current_candidate_sha(root)
+    base_sha = git_base_commit(root) or candidate_sha
+    with connection(root) as conn:
+        run = conn.execute("select * from dispatch_runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HarnessError(f"missing dispatch run: {run_id}")
+        cycle_id = str(run["cycle_id"])
+        assignments = provider_assignment_rows(conn, run_id)
+        if not assignments:
+            raise HarnessError(f"no ready dispatch assignments for run: {run_id}")
+        packages: list[dict[str, Any]] = []
+        for assignment in assignments:
+            task_id = str(assignment["task_id"])
+            agent_id = str(assignment["agent_id"] or assignment["capability"] or assignment["owner"] or "developer")
+            agent = conn.execute("select role from agents where id = ?", (agent_id,)).fetchone()
+            role = str(agent["role"]) if agent and str(agent["role"]) in SESSION_ROLES else str(assignment["capability"] or assignment["owner"] or "developer")
+            if role not in SESSION_ROLES:
+                role = "developer"
+            target = task_target(conn, task_id, cycle_id)
+            acceptance_ids = sorted(parse_ids(grouped(conn, "task_acceptance", "task_id", "acceptance_id", cycle_id).get(task_id, "")))
+            failure_mode_ids = sorted(parse_ids(grouped(conn, "task_failure_modes", "task_id", "failure_mode_id", cycle_id).get(task_id, "")))
+            target_rows = conn.execute(
+                """
+                select tt.* from task_test_targets ttt
+                join test_targets tt on tt.id = ttt.target_id
+                where ttt.cycle_id = ? and ttt.task_id = ? order by tt.id
+                """,
+                (cycle_id, task_id),
+            ).fetchall()
+            file_claims = [
+                str(row["path"])
+                for row in conn.execute(
+                    "select path from task_file_claims where run_id = ? and task_id = ? and status = 'active' order by path",
+                    (run_id, task_id),
+                )
+            ]
+            risks = task_failure_mode_risks(conn, task_id, cycle_id)
+            risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+            risk = max(risks, key=lambda value: risk_order.get(value, -1), default="low")
+            branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(task_id)}/{safe_branch_part(agent_id)}"
+            package: dict[str, Any] = {
+                "package_version": "1",
+                "run_id": run_id,
+                "assignment_id": f"{run_id}:{task_id}",
+                "task_id": task_id,
+                "cycle_id": cycle_id,
+                "candidate_sha": candidate_sha,
+                "base_sha": base_sha,
+                "base_ref": "HEAD",
+                "target_branch": branch_name,
+                "agent_id": agent_id,
+                "role": role,
+                "goal": str(assignment["task"]),
+                "acceptance_ids": acceptance_ids,
+                "failure_mode_ids": failure_mode_ids,
+                "test_target_ids": [str(row["id"]) for row in target_rows],
+                "target_id": str(target["id"]) if target else "",
+                "command_template": str(target["command_template"]) if target else "",
+                "file_claims": file_claims,
+                "capability_hints": {
+                    "risk": risk,
+                    "task_shape": "small-verified-code-change" if agent_id == "developer" and target else "host-policy-required",
+                    "requires_sandbox": bool(int(target["requires_sandbox"] or 0)) if target else False,
+                    "requires_no_network": bool(int(target["requires_no_network"] or 0)) if target else False,
+                    "gateable_target": bool(int(target["gateable"] or 0)) if target else False,
+                },
+                "state_transport": "root-controller-only",
+            }
+            package["package_sha256"] = native_package_hash(package)
+            packages.append(package)
+
+    manifest_entries: list[dict[str, str]] = []
+    for package in packages:
+        package_path = output_dir / f"{safe_branch_part(str(package['task_id']))}.task.json"
+        package_path.write_text(json.dumps(package, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        manifest_entries.append(
+            {
+                "assignment_id": str(package["assignment_id"]),
+                "task_id": str(package["task_id"]),
+                "package_sha256": str(package["package_sha256"]),
+                "path": stored_runtime_path(root, package_path),
+            }
+        )
+    manifest = {
+        "manifest_version": "1",
+        "run_id": run_id,
+        "state_transport": "root-controller-only",
+        "packages": manifest_entries,
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
+        for package, manifest_entry in zip(packages, manifest_entries, strict=True):
+            existing = conn.execute(
+                "select * from agent_provider_sessions where run_id = ? and task_id = ? and provider = 'native-codex'",
+                (run_id, package["task_id"]),
+            ).fetchone()
+            input_data = {
+                "native_package": package,
+                "provider_metadata": {
+                    "package_path": manifest_entry["path"],
+                    "manifest_path": stored_runtime_path(root, manifest_path),
+                    "lifecycle_owner": "native-host",
+                    "state_transport": "root-controller-only",
+                },
+            }
+            if existing:
+                existing_data = json.loads(existing["input_json"] or "{}")
+                existing_package = existing_data.get("native_package", {}) if isinstance(existing_data, dict) else {}
+                if not isinstance(existing_package, dict) or native_package_hash(existing_package) != package["package_sha256"]:
+                    raise HarnessError(f"native package conflict: {package['assignment_id']}")
+                continue
+            session_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                insert into agent_provider_sessions
+                (id, run_id, task_id, provider, provider_session_id, provider_job_id, agent_id, status, fence,
+                 branch_name, worktree_path, input_json, spawned_at)
+                values (?, ?, ?, 'native-codex', '', '', ?, 'package_exported', ?, ?, '', ?, ?)
+                """,
+                (
+                    session_id,
+                    run_id,
+                    package["task_id"],
+                    package["agent_id"],
+                    int(next(item["fence"] for item in assignments if str(item["task_id"]) == package["task_id"])),
+                    package["target_branch"],
+                    stable_json(input_data),
+                    now_iso(),
+                ),
+            )
+            session = conn.execute("select * from agent_provider_sessions where id = ?", (session_id,)).fetchone()
+            provider_event(conn, session, "package_exported", {"package_sha256": package["package_sha256"], "package_path": manifest_entry["path"]})
+            emit_event(conn, "native_task_package_exported", payload(run_id=run_id, task_id=package["task_id"], package_sha256=package["package_sha256"]))
+    return manifest_path
+
+
 def codex_output_schema() -> dict[str, Any]:
     properties: dict[str, Any] = {
         "command": {"type": "string"},
@@ -7275,7 +7434,7 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
         raise HarnessError("dispatch integrate requires a named current branch")
     with connection(root) as conn:
         rows = conn.execute(
-            "select * from dispatch_worktrees where run_id = ? and status = 'active' order by created_at",
+            "select * from dispatch_worktrees where run_id = ? and status in ('active', 'host-managed') order by created_at",
             (run_id,),
         ).fetchall()
     if not rows:
@@ -7321,7 +7480,7 @@ def dispatch_integrate(root: Path, run_id: str, *, target_branch: str = "") -> s
             conn.execute("update dispatch_assignments set status = 'integrated', updated_at = ? where run_id = ?", (now_iso(), run_id))
             refresh_dispatch_run_status(conn, run_id)
             for row in rows:
-                if row["worktree_path"]:
+                if row["worktree_path"] and row["status"] == "active":
                     worktree = root / row["worktree_path"]
                     subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, text=True, capture_output=True, check=False)
                 conn.execute("update dispatch_worktrees set status = 'cleaned', cleaned_at = ? where id = ?", (now_iso(), row["id"]))
@@ -7422,6 +7581,263 @@ def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str
     elif int(task["fence"]) != int(expected["fence"]):
         issues.append(f"fence-stale: {expected['item_id']} expected={expected['fence']} actual={task['fence']}")
     return issues
+
+
+def require_native_host_identity(host: dict[str, Any], field: str) -> str:
+    value = str(host.get(field, "")).strip()
+    lowered = value.lower()
+    if not value or lowered in {"unknown", "none", "null", "sdk-turn", "sdk-thread", "sdk-worktree"}:
+        raise HarnessError(f"native receipt requires real host {field}")
+    if lowered.startswith("sdk-"):
+        raise HarnessError(f"native receipt rejects placeholder host {field}: {value}")
+    return value
+
+
+def native_receipt_session(conn: sqlite3.Connection, run_id: str, assignment_id: str) -> tuple[sqlite3.Row, dict[str, Any], dict[str, Any]]:
+    sessions = conn.execute(
+        "select * from agent_provider_sessions where run_id = ? and provider = 'native-codex' order by task_id",
+        (run_id,),
+    ).fetchall()
+    for session in sessions:
+        try:
+            input_data = json.loads(session["input_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        package = input_data.get("native_package", {}) if isinstance(input_data, dict) else {}
+        if isinstance(package, dict) and str(package.get("assignment_id", "")) == assignment_id:
+            return session, input_data, package
+    raise HarnessError(f"native receipt has no exported assignment: {assignment_id}")
+
+
+def dispatch_import_native(root: Path, run_id: str, receipt_path: Path) -> str:
+    if not receipt_path.exists():
+        raise HarnessError(f"native receipt file does not exist: {receipt_path}")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"native receipt is invalid JSON: {exc.msg}") from exc
+    if not isinstance(receipt, dict):
+        raise HarnessError("native receipt must be a JSON object")
+    if str(receipt.get("receipt_version", "")) != "1":
+        raise HarnessError("native receipt_version must be 1")
+    if str(receipt.get("run_id", "")) != run_id:
+        raise HarnessError(f"native receipt run mismatch: expected {run_id}, got {receipt.get('run_id', '')}")
+    assignment_id = str(receipt.get("assignment_id", ""))
+    if not assignment_id:
+        raise HarnessError("native receipt requires assignment_id")
+    with connection(root) as conn:
+        session, input_data, package = native_receipt_session(conn, run_id, assignment_id)
+    package_hash = native_package_hash(package)
+    if str(package.get("package_sha256", "")) != package_hash:
+        raise HarnessError(f"stored native package hash mismatch: {assignment_id}")
+    if str(receipt.get("package_sha256", "")) != package_hash:
+        raise HarnessError(f"native receipt package hash mismatch: {assignment_id}")
+    receipt_hash = stable_digest(receipt)
+    metadata = input_data.get("provider_metadata", {}) if isinstance(input_data, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    existing_receipt_hash = str(metadata.get("receipt_hash", ""))
+    if session["status"] == "receipt_imported":
+        if existing_receipt_hash == receipt_hash:
+            return "imported 1 native receipt(s) (already applied)"
+        raise HarnessError(f"native receipt conflict: {assignment_id}")
+    if session["status"] != "package_exported":
+        raise HarnessError(f"native receipt cannot import from session status {session['status']}: {assignment_id}")
+    if str(package.get("candidate_sha", "")) != current_candidate_sha(root):
+        raise HarnessError(f"native package candidate is stale: {assignment_id}")
+    if str(receipt.get("status", "")) != "completed":
+        raise HarnessError(f"native receipt status is not completed: {receipt.get('status', '')}")
+
+    host = receipt.get("host")
+    policy = receipt.get("policy")
+    report = receipt.get("report")
+    provenance = receipt.get("provenance")
+    if not isinstance(host, dict):
+        raise HarnessError("native receipt host must be an object")
+    if not isinstance(policy, dict):
+        raise HarnessError("native receipt policy must be an object")
+    if not isinstance(report, dict):
+        raise HarnessError("native receipt report must be an object")
+    if not isinstance(provenance, dict):
+        raise HarnessError("native receipt provenance must be an object")
+    host_task_id = require_native_host_identity(host, "task_id")
+    host_thread_id = require_native_host_identity(host, "thread_id")
+    host_worktree_id = require_native_host_identity(host, "worktree_id")
+    host_worktree_path = require_native_host_identity(host, "worktree_path")
+    if not str(host.get("surface", "")).strip():
+        raise HarnessError("native receipt host requires surface")
+    kafa_identities = {run_id, assignment_id, str(package.get("task_id", ""))}
+    for field, value in [("task_id", host_task_id), ("thread_id", host_thread_id), ("worktree_id", host_worktree_id)]:
+        if value in kafa_identities:
+            raise HarnessError(f"native receipt host {field} reuses a Kafa identity: {value}")
+    for field in ["approval_mode", "sandbox", "network", "selected_model", "reasoning"]:
+        if not str(policy.get(field, "")).strip():
+            raise HarnessError(f"native receipt policy requires {field}")
+
+    branch_name = str(receipt.get("branch", ""))
+    if branch_name != str(package.get("target_branch", "")):
+        raise HarnessError(f"native receipt branch mismatch: expected {package.get('target_branch', '')}, got {branch_name}")
+    base_sha = str(receipt.get("base_sha", ""))
+    if base_sha != str(package.get("base_sha", "")):
+        raise HarnessError(f"native receipt base SHA mismatch: expected {package.get('base_sha', '')}, got {base_sha}")
+    head_sha = str(receipt.get("head_sha", ""))
+    actual_head = git_ref_commit(root, branch_name)
+    if not actual_head or head_sha != actual_head:
+        raise HarnessError(f"native receipt head SHA mismatch: expected branch {actual_head or '<missing>'}, got {head_sha or '<missing>'}")
+    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", base_sha, head_sha], cwd=root, text=True, capture_output=True, check=False)
+    if ancestor.returncode != 0:
+        raise HarnessError(f"native receipt head is not descended from exported base: {assignment_id}")
+
+    hints = package.get("capability_hints", {})
+    hints = hints if isinstance(hints, dict) else {}
+    if bool(hints.get("requires_sandbox")) and str(policy.get("sandbox", "")).lower() in {"", "unknown", "none", "unavailable"}:
+        raise HarnessError(f"native target requires reported sandbox: {assignment_id}")
+    if bool(hints.get("requires_no_network")) and str(policy.get("network", "")).lower() not in {"none", "no-network", "disabled"}:
+        raise HarnessError(f"native target requires reported no-network policy: {assignment_id}")
+
+    expected = {
+        "item_id": str(package["task_id"]),
+        "cycle_id": str(package["cycle_id"]),
+        "target_id": str(package.get("target_id", "")),
+        "command_template": str(package.get("command_template", "")),
+        "branch_name": branch_name,
+        "fence": str(session["fence"]),
+        "agent_id": str(package["agent_id"]),
+    }
+    with connection(root) as conn:
+        issues = codex_report_issues(root, conn, expected, report)
+        task = conn.execute(
+            "select * from tasks where cycle_id = ? and id = ?",
+            (package["cycle_id"], package["task_id"]),
+        ).fetchone()
+        target = conn.execute("select * from test_targets where id = ?", (package.get("target_id", ""),)).fetchone()
+        current_acceptance = sorted(parse_ids(grouped(conn, "task_acceptance", "task_id", "acceptance_id", str(package["cycle_id"])).get(str(package["task_id"]), "")))
+        current_failure_modes = sorted(parse_ids(grouped(conn, "task_failure_modes", "task_id", "failure_mode_id", str(package["cycle_id"])).get(str(package["task_id"]), "")))
+        current_targets = [
+            str(row["target_id"])
+            for row in conn.execute(
+                "select target_id from task_test_targets where cycle_id = ? and task_id = ? order by target_id",
+                (package["cycle_id"], package["task_id"]),
+            )
+        ]
+    if not task:
+        issues.append(f"native receipt task is missing: {package['task_id']}")
+    elif int(task["fence"] or 0) != int(session["fence"] or 0):
+        issues.append(f"native receipt fence is stale: {package['task_id']}")
+    elif str(task["task"]) != str(package.get("goal", "")):
+        issues.append(f"native package task goal changed: {package['task_id']}")
+    if current_acceptance != sorted(str(value) for value in package.get("acceptance_ids", [])):
+        issues.append(f"native package acceptance changed: {package['task_id']}")
+    if current_failure_modes != sorted(str(value) for value in package.get("failure_mode_ids", [])):
+        issues.append(f"native package failure modes changed: {package['task_id']}")
+    if current_targets != sorted(str(value) for value in package.get("test_target_ids", [])):
+        issues.append(f"native package test targets changed: {package['task_id']}")
+    if bool(hints.get("requires_sandbox")) and target is None:
+        issues.append(f"native receipt sandbox target is missing: {package.get('target_id', '')}")
+    if issues:
+        raise HarnessError("native receipt rejected: " + "; ".join(issues[:5]))
+
+    report_id = f"REPORT-NATIVE-{receipt_hash[:12]}"
+    attempt_id = f"ATTEMPT-NATIVE-{receipt_hash[:12]}"
+    tree_sha = git_ref_tree(root, branch_name)
+    finished_at = str(receipt.get("completed_at", "")) or now_iso()
+    started_at = str(receipt.get("started_at", "")) or now_iso()
+    metadata = {
+        **metadata,
+        "lifecycle_owner": "native-host",
+        "receipt_hash": receipt_hash,
+        "host": host,
+        "policy": policy,
+        "provenance": provenance,
+    }
+    updated_input = {**input_data, "provider_metadata": metadata, "native_receipt": receipt}
+    with transaction(root, touched=[("dispatch_assignment", package["task_id"]), ("task_attempt", attempt_id)]) as conn:
+        current = conn.execute("select * from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+        if not current:
+            raise HarnessError(f"native provider session disappeared: {assignment_id}")
+        if current["status"] == "receipt_imported":
+            current_data = json.loads(current["input_json"] or "{}")
+            current_metadata = current_data.get("provider_metadata", {}) if isinstance(current_data, dict) else {}
+            if isinstance(current_metadata, dict) and current_metadata.get("receipt_hash") == receipt_hash:
+                return "imported 1 native receipt(s) (already applied)"
+            raise HarnessError(f"native receipt conflict: {assignment_id}")
+        if current["status"] != "package_exported":
+            raise HarnessError(f"native receipt claim conflict: {assignment_id}")
+        existing_thread = conn.execute("select * from agent_sessions where session_id = ?", (host_thread_id,)).fetchone()
+        if existing_thread and (existing_thread["agent_id"] != package["agent_id"] or existing_thread["context_id"] != host_task_id):
+            raise HarnessError(f"native thread identity is already bound to another task: {host_thread_id}")
+        existing_worktree = conn.execute("select * from dispatch_worktrees where id = ?", (host_worktree_id,)).fetchone()
+        if existing_worktree and (existing_worktree["run_id"] != run_id or existing_worktree["task_id"] != package["task_id"]):
+            raise HarnessError(f"native worktree identity is already bound to another task: {host_worktree_id}")
+        conn.execute(
+            """
+            insert into agent_sessions
+            (session_id, agent_id, role, context_id, provider_session_id, origin, trust_level,
+             effective_trust, receipt_provenance, status, started_at, ended_at)
+            values (?, ?, ?, ?, ?, 'manual', 'local-only', 'local-only', ?, 'reported', ?, ?)
+            on conflict(session_id) do update set status='reported', ended_at=excluded.ended_at
+            """,
+            (host_thread_id, package["agent_id"], package["role"], host_task_id, host_thread_id, str(provenance.get("kind", "audit-only")), started_at, finished_at),
+        )
+        conn.execute(
+            """
+            insert into agent_reports
+            (id, run_id, task_id, provider_session_id, job_id, status, last_error, result_json, created_at)
+            values (?, ?, ?, ?, ?, 'success', '', ?, ?)
+            """,
+            (report_id, run_id, package["task_id"], host_thread_id, host_task_id, stable_json(report), now_iso()),
+        )
+        conn.execute(
+            """
+            insert into task_attempts
+            (id, run_id, cycle_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+             branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, ?, '', ?, ?)
+            """,
+            (
+                attempt_id,
+                run_id,
+                package["cycle_id"],
+                package["task_id"],
+                package["agent_id"],
+                int(session["fence"]),
+                base_sha,
+                head_sha,
+                tree_sha,
+                branch_name,
+                package.get("target_id", ""),
+                host_thread_id,
+                host_thread_id,
+                report_id,
+                started_at,
+                finished_at,
+            ),
+        )
+        conn.execute(
+            """
+            update agent_provider_sessions
+            set provider_session_id = ?, provider_job_id = ?, agent_session_id = ?, status = 'receipt_imported',
+                worktree_path = ?, input_json = ?, report_id = ?, attempt_id = ?, collected_at = ?, finished_at = ?
+            where id = ? and status = 'package_exported'
+            """,
+            (host_thread_id, host_task_id, host_thread_id, host_worktree_path, stable_json(updated_input), report_id, attempt_id, now_iso(), finished_at, session["id"]),
+        )
+        conn.execute(
+            "update dispatch_assignments set agent_id = ?, status = 'reported', provider_session_id = ?, updated_at = ? where run_id = ? and task_id = ?",
+            (package["agent_id"], host_thread_id, now_iso(), run_id, package["task_id"]),
+        )
+        conn.execute(
+            """
+            insert into dispatch_worktrees
+            (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
+            values (?, ?, ?, ?, ?, ?, 'host-managed', ?, '')
+            """,
+            (host_worktree_id, run_id, package["task_id"], package["agent_id"], branch_name, host_worktree_path, now_iso()),
+        )
+        updated = conn.execute("select * from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+        provider_event(conn, updated, "native_receipt_imported", {"receipt_hash": receipt_hash, "host_task_id": host_task_id, "host_thread_id": host_thread_id, "host_worktree_id": host_worktree_id})
+        emit_event(conn, "native_host_receipt_imported", payload(run_id=run_id, task_id=package["task_id"], receipt_hash=receipt_hash, host_task_id=host_task_id, host_thread_id=host_thread_id))
+        refresh_dispatch_run_status(conn, run_id)
+    return "imported 1 native receipt(s)"
 
 
 def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:

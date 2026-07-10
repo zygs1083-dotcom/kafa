@@ -68,6 +68,7 @@ kafa doctor --repo .
 | Plan adapter action | `harness.py --root . adapter plan`, `harness.py --root . adapter draft`, `harness.py --root . adapter confirm`, `harness.py --root . adapter complete`, `harness.py --root . adapter reconcile` |
 | Checkpoint / audit events | `harness.py --root . checkpoint create`, `harness.py --root . checkpoint export`, `harness.py --root . checkpoint import`, `harness.py --root . event validate` |
 | Dispatch local agents | `harness.py --root . agent capability add`, `harness.py --root . dispatch plan`, `harness.py --root . dispatch claim-next`, `harness.py --root . executor allow-prefix add --prefix "pytest" --reason "test runner"`, `harness.py --root . dispatch run --agent developer --target UNIT --command "pytest" --code-identity content-hash`, `harness.py --root . dispatch recover-stale`, `harness.py --root . dispatch status` |
+| Exchange native Codex tasks | `harness.py --root . dispatch native-export <run-id>`, host creates the visible task/thread/worktree, `harness.py --root . dispatch native-import <run-id> --receipt <receipt.json>`, then `harness.py --root . dispatch verify-attempt --run-id <run-id> --task <task-id>` |
 | Sweep expired accepted risk | `harness.py --root . risk sweep-expired` |
 | Kernel diagnostics / projections | `harness.py --root . kernel doctor`, `harness.py --root . invariant validate`, `harness.py --root . projection rebuild` |
 | Validate local harness state | `harness.py --root . validate`, `harness.py --root . validate --delivery` |
@@ -85,6 +86,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . cycle start \
 ```
 
 Old cycle validations, gates, deliveries, and invalidations are audit records. They do not block a new cycle, but they also do not satisfy the new cycle's delivery gate. Record current candidate validation, trusted evidence, quality gate, and risk coverage again.
+
+For native Codex/ChatGPT work, do not start a hidden SDK worker and call it a native subagent. Export the immutable package, let the host own task/thread/worktree/approval/model lifecycle, and import a receipt containing real host IDs. The receipt creates only a raw reported attempt; controller verification remains mandatory. Mutable `.ai-team/state/harness.db` stays in the root workspace and must not be copied into a managed worktree.
 
 Use this phase sequence:
 

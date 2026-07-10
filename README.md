@@ -420,16 +420,16 @@ harness.py --root . event validate
 harness.py --root . dispatch plan --scope "Example scope"
 harness.py --root . dispatch route-advice --run-id <run-id> --json
 harness.py --root . agents install
+harness.py --root . dispatch native-export <run-id>
+# Codex/ChatGPT host creates the visible task/thread/subagent/worktree and returns receipt.json.
+harness.py --root . dispatch native-import <run-id> --receipt receipt.json
+harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
 harness.py --root . dispatch export-csv <run-id>
 # Host/user runs Codex spawn_agents_on_csv with generated spawn_config.json.
 harness.py --root . dispatch import-csv <run-id> --result .ai-team/runtime/codex-fanout/<run-id>/output.csv
 harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
 harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1 --runner container --container-image python:3.12-slim
 harness.py --root . dispatch integrate --run-id <run-id>
-harness.py --root . dispatch provider start --run-id <run-id> --provider manual-csv
-harness.py --root . dispatch provider collect --run-id <run-id>
-harness.py --root . dispatch provider reconcile --run-id <run-id>
-harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
 harness.py --root . dispatch integrate --run-id <run-id>
 harness.py --root . executor allow-prefix add --prefix "pytest" --reason "local test runner"
 harness.py --root . dispatch run --agent developer --target UNIT --command "pytest" --sandbox-profile none
