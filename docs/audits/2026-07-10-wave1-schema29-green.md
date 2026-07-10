@@ -41,18 +41,17 @@ git diff --check: PASS
 Full regression:
 
 ```text
-Ran 274 tests in 458.741s
-Expected failing stop-ship regressions: 4
-Unexpected failures: 0
+Ran 277 tests in 473.962s
+Failures: 0
 ```
 
-The four remaining failures are intentionally retained and were not weakened:
+The original stop-ship regression baseline is now fully green without deleted assertions or skipped tests:
 
-- DT-001: open critical structured findings do not yet block delivery;
-- TR-001: the ordinary CLI can still self-issue connector trust;
-- QS-001: quickstart still manufactures QA/gate/delivery state;
-- IN-001: user-scope marketplace source resolution is still invalid.
+- DT-001: structured high/critical findings and governed waivers participate in delivery readiness;
+- TR-001: the ordinary CLI verifies externally supplied receipts and never signs connector trust;
+- QS-001: quickstart stops before independent review, quality gate, and delivery;
+- IN-001: user-scope marketplace source resolves to the copied plugin directory.
 
 ## Release State
 
-Stop-ship remains active. This batch is not release evidence and does not authorize push, merge, or publication.
+The P0 stop-ship exit criteria are satisfied: all identified P0 regressions are closed and the full unit suite is green. This is still not release authorization: P1/P2 remediation, real-host compatibility evidence, push, merge, and publication remain separate decisions.
