@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import hmac
 import sqlite3
 import subprocess
 import tempfile
@@ -58,7 +60,7 @@ def review(root: Path, session_id: str | None = None) -> tuple[str, str]:
 
 
 class SessionAttestationTest(unittest.TestCase):
-    def test_connector_without_key_downgrades_to_manual(self) -> None:
+    def test_connector_without_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
@@ -79,19 +81,23 @@ class SessionAttestationTest(unittest.TestCase):
                 "connector",
                 "--verification-token",
                 "arbitrary",
+                check=False,
                 env={"HARNESS_CONNECTOR_KEY": ""},
             )
 
-            self.assertIn("origin=manual", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("connector verifier key unavailable", result.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                row = conn.execute("select origin, token_status, trust_level from session_attestations").fetchone()
-            self.assertEqual(row, ("manual", "downgraded-no-key", "human-confirmed"))
+                count = conn.execute("select count(*) from session_attestations").fetchone()[0]
+            self.assertEqual(count, 0)
 
-    def test_connector_with_key_generates_valid_session_hmac(self) -> None:
+    def test_connector_with_key_verifies_external_session_hmac(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
 
+            payload = "agent-session:S-review:qa-reviewer:qa-reviewer:ctx-review"
+            token = hmac.new(b"test-secret", payload.encode("utf-8"), hashlib.sha256).hexdigest()
             result = run_harness(
                 root,
                 "session",
@@ -106,6 +112,8 @@ class SessionAttestationTest(unittest.TestCase):
                 "ctx-review",
                 "--origin",
                 "connector",
+                "--verification-token",
+                token,
                 env={"HARNESS_CONNECTOR_KEY": "test-secret"},
             )
 

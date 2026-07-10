@@ -72,6 +72,7 @@ def stdout_field(stdout: str, name: str) -> str:
 
 
 def connector_reviewer_attestation(root: Path, *, session_id: str = "S-qa-hmac", context_id: str = "ctx-qa") -> str:
+    token = connector_hmac(CONNECTOR_KEY, f"agent-session:{session_id}:qa-reviewer:qa-reviewer:{context_id}")
     result = run_harness(
         root,
         "session",
@@ -86,6 +87,8 @@ def connector_reviewer_attestation(root: Path, *, session_id: str = "S-qa-hmac",
         context_id,
         "--origin",
         "connector",
+        "--verification-token",
+        token,
         env=connector_env(),
     )
     return stdout_field(result.stdout, "attestation")
@@ -1497,7 +1500,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             self.assertNotEqual(validate.returncode, 0)
             self.assertIn("ci verification origin is not connector", validate.stdout)
 
-    def test_connector_ci_without_key_is_downgraded_and_rejected(self) -> None:
+    def test_connector_ci_without_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(["git", "init"], cwd=root, text=True, capture_output=True, check=True)
@@ -1509,21 +1512,13 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
             prepare_basic_delivery_project(root, failure_mode_risk="critical")
-            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-1", "--conclusion", "success", "--commit-sha", sha, "--origin", "connector", "--verification-token", "arbitrary")
+            rejected = run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-1", "--conclusion", "success", "--commit-sha", sha, "--origin", "connector", "--verification-token", "arbitrary", check=False)
             record_pass_validation(root, failure_mode="FM1", code_identity="git")
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                row = conn.execute("select origin, verification_token, token_status from ci_verifications where id = 'github:run-1'").fetchone()
-                conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
-                conn.commit()
-            self.assertEqual(row[0], "manual")
-            self.assertEqual(row[1], "")
-            self.assertEqual(row[2], "downgraded-no-key")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
-
-            validate = run_harness(root, "validate", "--delivery", check=False)
-
-            self.assertNotEqual(validate.returncode, 0)
-            self.assertIn("ci verification origin is not connector", validate.stdout)
+                row = conn.execute("select count(*) from ci_verifications where id = 'github:run-1'").fetchone()[0]
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("connector verifier key unavailable", rejected.stdout + rejected.stderr)
+            self.assertEqual(row, 0)
 
     def test_connector_ci_rejects_bad_token_when_key_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1568,9 +1563,8 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             key_path_file.parent.mkdir(parents=True, exist_ok=True)
             key_path_file.write_text(".ai-team/runtime/connector.key\n", encoding="utf-8")
 
-            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-file", "--conclusion", "success", "--commit-sha", "abc123", "--origin", "connector")
-
             expected = ci_hmac(key, "github", "run-file", "abc123", "success")
+            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-file", "--conclusion", "success", "--commit-sha", "abc123", "--origin", "connector", "--verification-token", expected)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 row = conn.execute("select origin, verification_token, token_status from ci_verifications where id = 'github:run-file'").fetchone()
                 db_dump = "\n".join(conn.iterdump())
@@ -1599,7 +1593,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
             prepare_basic_delivery_project(root, failure_mode_risk="critical")
-            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-1", "--conclusion", "success", "--commit-sha", sha, "--origin", "connector", env=connector_env())
+            run_harness(root, "adapter", "ci-verify", "--provider", "github", "--run-id", "run-1", "--conclusion", "success", "--commit-sha", sha, "--origin", "connector", "--verification-token", ci_hmac(CONNECTOR_KEY, "github", "run-1", sha, "success"), env=connector_env())
             record_pass_validation(root, failure_mode="FM1", code_identity="git")
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update validations set trust_anchor = 'ci', trust_anchor_id = 'github:run-1'")
@@ -1645,7 +1639,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
             prepare_basic_delivery_project(root, failure_mode_risk="high")
-            verification = run_harness(root, "adapter", "external-session-verify", "--session-id", "session-1", "--verifier", "independent-codex", "--conclusion", "verified", "--commit-sha", sha, "--origin", "connector", env=connector_env())
+            verification = run_harness(root, "adapter", "external-session-verify", "--session-id", "session-1", "--verifier", "independent-codex", "--conclusion", "verified", "--commit-sha", sha, "--origin", "connector", "--verification-token", external_session_hmac(CONNECTOR_KEY, "session-1", "independent-codex", sha, "verified"), env=connector_env())
             verification_id = verification.stdout.strip().rsplit(" ", 1)[-1]
             record_pass_validation(root, failure_mode="FM1", code_identity="git")
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:

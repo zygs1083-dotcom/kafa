@@ -76,13 +76,15 @@ def agent_session_payload(session_id: str, agent_id: str, role: str, context_id:
 def prepare_connector_record(root: Path, origin: str, provided_token: str, payload: str) -> tuple[str, str, str, str]:
     if origin != "connector":
         return origin, provided_token if origin == "manual" else "", "manual", ""
+    if not provided_token:
+        raise ConnectorTrustError("connector origin requires an externally issued verification_token")
     key = load_connector_key(root)
     if key is None:
-        return "manual", "", "downgraded-no-key", "connector key unavailable; recorded as manual"
+        raise ConnectorTrustError("connector verifier key unavailable")
     expected = connector_hmac(key.value, payload)
-    if provided_token and not hmac.compare_digest(provided_token, expected):
+    if not hmac.compare_digest(provided_token, expected):
         raise ConnectorTrustError("verification_token does not match connector HMAC")
-    return "connector", expected, "hmac-valid", f"verified with {key.source}"
+    return "connector", provided_token, "hmac-valid", f"verified external receipt with {key.source}"
 
 
 def verify_connector_record(root: Path, token: str, payload: str) -> tuple[bool, str]:
