@@ -86,7 +86,7 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             self.assertIn("acceptance", report["missing"])
             self.assertIn("next_commands", report)
 
-    def test_quickstart_minimal_execute_reaches_delivered_cycle(self) -> None:
+    def test_quickstart_minimal_execute_stops_before_independent_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             git_init(root)
@@ -111,13 +111,14 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             cycle = json.loads(run_harness(root, "cycle", "status", "--json").stdout)
             status = run_harness(root, "status").stdout
 
-            self.assertIn("OK: quickstart minimal delivered SMOKE", result.stdout)
-            self.assertEqual(cycle["status"], "delivered")
-            self.assertIn("phase: delivery_readiness", status)
+            self.assertIn("OK: quickstart minimal verified setup SMOKE", result.stdout)
+            self.assertIn("NEXT: independent reviewer", result.stdout)
+            self.assertEqual(cycle["status"], "active")
+            self.assertIn("phase: implementation", status)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select count(*) from evidence").fetchone()[0], 1)
-                self.assertEqual(conn.execute("select count(*) from deliveries").fetchone()[0], 1)
-                self.assertEqual(conn.execute("select status from tasks where id = 'SMOKE-T1'").fetchone()[0], "accepted")
+                self.assertEqual(conn.execute("select count(*) from deliveries").fetchone()[0], 0)
+                self.assertEqual(conn.execute("select status from tasks where id = 'SMOKE-T1'").fetchone()[0], "submitted")
 
     def test_task_accept_ready_hides_review_lease_mechanics(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
