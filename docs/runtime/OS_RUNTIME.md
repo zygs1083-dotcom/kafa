@@ -60,7 +60,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . quickstart min
 
 `kafa doctor` remains a Kafa/plugin source repository check. `kafa project doctor` is the ordinary-project check and does not require a copied plugin source tree. `quickstart status` reports missing requirement, acceptance, task, target, baseline, evidence, validation, QA, and delivery steps. `quickstart minimal --execute` uses the existing dispatch runner to produce controller-local command evidence, then records validation, task acceptance, an independent quality gate, and delivery through the normal gate. Free-text validation without linked evidence is explicitly audit-only.
 
-## Spark And Provider Route Advice
+## Native Host Route Advice
 
 Schema 28 also includes read-only dispatch routing advice:
 
@@ -69,7 +69,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --run-id <run-id> --json
 ```
 
-The report classifies ready tasks before execution. `host-codex-spark` is emitted only for `developer` tasks with a gateable target, non-empty command, no sandbox/no-network requirement, and no linked high/critical failure mode. Architect, QA, high-risk, sandboxed, no-network, missing-target, or blocked tasks are routed to default Host Codex, main-model review, or manual handling. This command is advisory only; it does not spawn subagents, select the main session model, call Spark, or write delivery evidence.
+The report classifies ready tasks as `native-host-small-verified`, `native-host-general`, `main-model-or-manual`, or `blocked-not-ready`. It exports risk and verification hints only. The native host owns concrete model, reasoning, sandbox, approval, task/thread/subagent/worktree, cancel, steer, and handoff behavior. With a run id, use `dispatch native-export` to produce immutable task packages; route advice never starts a provider or writes delivery evidence.
 
 ## Architecture Control Plane
 
@@ -156,7 +156,7 @@ Native worktrees are recorded as `host-managed`. Kafa may integrate their branch
 
 The Host Codex background worker uses the optional `kafa[host-codex]` extra, which installs `openai-codex>=0.1.0b3`; the base installer and Kernel remain stdlib-only. Before spawning the worker, Harness creates an assignment-specific git worktree under `.ai-team/runtime/worktrees/<run>/<task>/<agent>` and persists that path in `agent_provider_sessions.worktree_path` plus `dispatch_worktrees.worktree_path`. The SDK thread/run cwd is fixed to that worktree with `Sandbox.workspace_write` and `ApprovalMode.deny_all`; Harness does not rely on prompt self-discipline for branch isolation. When the SDK turn finishes, the worker commits non-`.ai-team/` changes from the isolated worktree to the assignment agent branch, writes `.ai-team/runtime/host-codex/<run-id>/<task-id>.json`, and `dispatch provider collect` imports only the final JSON as a raw provider report. Use `dispatch verify-attempt` to produce trusted controller evidence before integration or delivery.
 
-Host Codex model selection is conservative and opt-in. `HARNESS_CODEX_MODEL` remains a hard override. Without it, `HARNESS_CODEX_MODEL_POLICY=default` uses the SDK default model. `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` selects `HARNESS_CODEX_SPARK_MODEL` or `gpt-5.3-codex-spark` only for `developer` assignments that have a linked gateable test target, a nonempty command template, no sandbox/no-network target requirement, and no linked high/critical failure modes. All other assignments use the SDK default. Model selection metadata is written to provider session metadata and the Host Codex runtime artifact; it does not change evidence trust, controller verification, integration, or delivery gate behavior.
+Native Codex model selection is host-owned. The legacy Host Codex Provider keeps an explicit compatibility policy only: `HARNESS_CODEX_MODEL` is the highest-priority hard override; without that override, `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` requires an explicit `HARNESS_CODEX_SPARK_MODEL` and selects it only for eligible low-risk developer assignments. Kafa ships no default preview model slug. Selection metadata remains raw provider metadata and does not change evidence trust, controller verification, integration, or delivery gate behavior.
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch export-csv <run-id>

@@ -188,7 +188,7 @@ For native Codex fan-out, use `agents install`, `dispatch export-csv <run-id>`, 
 
 When an AgentProvider is available, use `dispatch provider start --run-id <run-id> --provider <provider>`, then `dispatch provider collect --run-id <run-id>` or `dispatch provider reconcile --run-id <run-id>` to manage the session lifecycle. Provider output remains a raw report; never treat it as delivery evidence until `dispatch verify-attempt` reruns the linked target and records controller evidence.
 
-`--provider host-codex` starts nonblocking and requires the optional `kafa[host-codex]` package extra; ordinary Kernel and fixture workflows do not require the SDK. `dispatch provider start` only registers the provider session, claims the assignment, creates an assignment-specific git worktree, and launches a background worker outside the SQLite write transaction; it does not wait for the Codex turn to finish. The worker uses the Python Codex SDK with `Sandbox.workspace_write` and `ApprovalMode.deny_all`, fixes SDK cwd to `.ai-team/runtime/worktrees/<run>/<task>/<agent>`, commits non-`.ai-team/` worktree changes to the assignment agent branch, and writes its status artifact under `.ai-team/runtime/host-codex/`. Poll with `dispatch provider collect --run-id <run-id>` until the raw report is collected, then run `dispatch verify-attempt`. `HARNESS_CODEX_BIN` and `HARNESS_CODEX_MODEL` are optional SDK configuration inputs; `HARNESS_CODEX_MODEL` is a hard override. `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` can select `HARNESS_CODEX_SPARK_MODEL` or `gpt-5.3-codex-spark` only for low-risk `developer` assignments with a gateable linked test target and no sandbox/no-network/high/critical blockers. Host Codex reports are stricter than fixture/manual reports, but they are still raw reports until controller verification.
+`--provider host-codex` is a legacy nonblocking SDK bridge and requires the optional `kafa[host-codex]` package extra; ordinary Kernel and native host workflows do not require it. Prefer `dispatch native-export` plus visible host tasks/subagents so the host retains task/thread/worktree, approval, sandbox, model, cancel, steer, and handoff ownership. For legacy compatibility, `HARNESS_CODEX_MODEL` is a hard override and `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` requires an explicit `HARNESS_CODEX_SPARK_MODEL`; Kafa has no default preview model slug. Legacy Host Codex provider reports are still raw reports until controller verification.
 
 For real connector adapters, first bind the current project to existing external targets. Harness does not create Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories. Use `connector profile status --json` to inspect the project key and binding state, then set only the scopes this project is allowed to write:
 
@@ -227,16 +227,16 @@ From v1.21.0, target execution policy is a Kernel fact. Use `test-target add --s
 
 From v1.22.0, connector namespace isolation is a Kernel fact. Configure per-project connector profiles before executable connector writes, expect double markers (`project-key` and `idempotency-key`) in external bodies, and treat old single-marker objects as audit candidates only. If a connector is blocked by missing profile, mismatch, token failure, rate limit, or unknown recovery, continue from local `.ai-team/` facts and advisory fallbacks instead of broadening the external scope.
 
-From v1.23.0, Host Codex can opt into Spark routing with `HARNESS_CODEX_MODEL_POLICY=spark-deterministic`. Use it only for small, deterministic-looking developer tasks that have controller-verifiable targets. Spark selection is an execution hint, not a trust anchor; controller verification and delivery gates remain mandatory.
+The native host owns model selection. The legacy Host Codex bridge may opt into `spark-deterministic` only with an explicit `HARNESS_CODEX_SPARK_MODEL` and an eligible controller-verifiable developer task. This compatibility hint is not a trust anchor.
 
-From v1.25.0, inspect `dispatch route-advice` before using Host Codex or Spark for implementation work:
+Inspect `dispatch route-advice` before exporting native implementation work:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root <project> dispatch route-advice --json
 python3 plugins/codex-project-harness/scripts/harness.py --root <project> dispatch route-advice --run-id <run-id> --json
 ```
 
-Only tasks reported as `host-codex-spark` are Spark candidates. Treat the report as a planning input for the controlling model; it does not spawn subagents, change the main Codex model, call Spark, or create delivery evidence.
+Treat `native-host-small-verified` as a capability hint, not a model slug. The host chooses the concrete model and execution policy; the report does not spawn subagents or create delivery evidence.
 
 From v1.24.0, prefer guided cold-start commands when a project is new or the user is confused about the first loop:
 

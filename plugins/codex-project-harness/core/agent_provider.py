@@ -74,10 +74,14 @@ def _host_codex_model_selection(request: AgentJobRequest, explicit_model: str, p
         }
     if normalized_policy != "spark-deterministic":
         raise RuntimeError(f"unsupported HARNESS_CODEX_MODEL_POLICY: {normalized_policy}")
+    if not spark_model:
+        raise RuntimeError(
+            "HARNESS_CODEX_MODEL_POLICY=spark-deterministic requires explicit HARNESS_CODEX_SPARK_MODEL"
+        )
     if spark_eligible:
         return {
             "model_policy": normalized_policy,
-            "selected_model": spark_model or "gpt-5.3-codex-spark",
+            "selected_model": spark_model,
             "model_selection_reason": base_reason or "spark eligible deterministic developer task",
             "spark_eligible": True,
         }
@@ -290,7 +294,7 @@ class HostCodexProvider:
         codex_bin = os.environ.get("HARNESS_CODEX_BIN", "")
         explicit_model = os.environ.get("HARNESS_CODEX_MODEL", "").strip()
         model_policy = os.environ.get("HARNESS_CODEX_MODEL_POLICY", "default").strip()
-        spark_model = os.environ.get("HARNESS_CODEX_SPARK_MODEL", "gpt-5.3-codex-spark").strip()
+        spark_model = os.environ.get("HARNESS_CODEX_SPARK_MODEL", "").strip()
         provider_session_id = request.provider_session_id or f"host-codex:{request.run_id}:{request.task_id}"
         job_path = self._job_path(request.root, request.run_id, request.task_id)
         report_path = self._report_path(request.root, request.run_id, request.task_id)

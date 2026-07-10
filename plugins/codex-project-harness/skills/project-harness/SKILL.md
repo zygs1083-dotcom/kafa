@@ -166,9 +166,9 @@ Codex should decide whether each tool is needed. Ask only before high-impact ext
 - Layer 1 Domain Sessions are role-based contexts such as Product, Architecture, Development, QA, Security, and Delivery. Use separate sessions when the runtime supports them; otherwise emulate them with clearly labeled role outputs in the same conversation.
 - Layer 2 Subagents are short-lived task execution units. They may be spawned inside a domain session for independent checks such as QA-A API contract, QA-B UI behavior, and QA-C data/schema safety. They do not need independent user-visible sessions unless the runtime provides them.
 - Every subagent returns a verifiable artifact, not just an opinion.
-- Use Spark only for tasks that the controlling model judges to be small, deterministic-looking, low-risk developer tasks and that `dispatch route-advice` reports as `host-codex-spark`.
-- Do not use Spark for architecture decisions, QA judgment, high/critical failure modes, sandbox/no-network targets, missing-target work, broad refactors, or ambiguous tasks.
-- If no Spark candidate exists, state that clearly and keep the work with the main model, manual flow, or default Host Codex Provider.
+- Treat `native-host-small-verified` as a capability hint for a small, low-risk, controller-verifiable developer task; the native host owns the concrete model and reasoning policy.
+- Require stronger host policy or main-model/manual review for architecture, QA judgment, high/critical failure modes, sandbox/no-network targets, missing-target work, broad refactors, or ambiguous tasks.
+- If no native candidate exists, state that clearly and keep the work with the controlling model or manual flow.
 
 ## Control Files
 

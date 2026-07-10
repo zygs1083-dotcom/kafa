@@ -698,6 +698,7 @@ def scenario_host_codex_spark_policy_fake_sdk_e2e() -> dict[str, Any]:
         env = {
             "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
             "HARNESS_CODEX_MODEL_POLICY": "spark-deterministic",
+            "HARNESS_CODEX_SPARK_MODEL": "gpt-5.3-codex-spark",
             "FAKE_CODEX_SDK_LOG": str(log_path),
             "PYTHONPATH": str(package_root),
         }

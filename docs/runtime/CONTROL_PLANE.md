@@ -43,10 +43,10 @@ User intent
 
 `kafa doctor --repo .` includes a `control plane contract` check that verifies the packaged components still declare these boundaries.
 
-From v1.23.0, Host Codex model policy is opt-in through environment variables. Keep `HARNESS_CODEX_MODEL_POLICY=default` for SDK defaults, or use `spark-deterministic` only when controller-verifiable low-risk developer tasks are acceptable Spark candidates. `HARNESS_CODEX_MODEL` remains a hard override. If Spark is unavailable, the provider fails closed through the normal Host Codex lifecycle; it does not silently promote or demote model capability.
+Native ChatGPT/Codex owns concrete model, reasoning, sandbox, approval, and task lifecycle selection. The legacy Host Codex Provider retains environment-variable compatibility only: `HARNESS_CODEX_MODEL` is the highest-priority hard override; without it, `spark-deterministic` requires an explicit `HARNESS_CODEX_SPARK_MODEL`. Kafa does not embed a preview model slug or treat model selection as evidence.
 
 The base `kafa` installer and Kernel are stdlib-only. The legacy Host Codex SDK bridge is an explicit optional capability installed with `kafa[host-codex]`; missing SDK support fails closed at provider execution and does not affect plugin installation, doctor, project launchers, or non-Host delivery governance.
 
 From v1.24.0, cold-start guidance is explicit. Use `kafa project doctor --repo <project>` for ordinary projects, and use `quickstart status` or `quickstart minimal --execute` inside the harness runtime when a new user needs a guided first loop. These commands call the Kernel runtime and existing dispatch evidence paths; they do not create delivery evidence outside controller execution, and they do not weaken delivery readiness.
 
-From v1.25.0, `dispatch route-advice` gives the controlling model a read-only task routing report before Host Codex or Spark execution. It is an advisory planning input only: it cannot spawn subagents, invoke Spark, create evidence, or bypass the Kernel trust layer. Only tasks explicitly reported as `host-codex-spark` should be considered for Spark execution.
+From v1.25.0, `dispatch route-advice` gives the controlling model a read-only capability and risk report before native execution. It can identify small controller-verifiable candidates, but it cannot choose a model, spawn subagents, create evidence, or bypass the Kernel trust layer. With a run id it points to immutable `dispatch native-export` packages.

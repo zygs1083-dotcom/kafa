@@ -6487,6 +6487,36 @@ def host_codex_model_policy_input(agent_id: str, target: sqlite3.Row | None, fai
     }
 
 
+def native_route_capability_input(agent_id: str, target: sqlite3.Row | None, failure_mode_risks: list[str]) -> dict[str, Any]:
+    blockers: list[str] = []
+    if agent_id != "developer":
+        blockers.append(f"agent is {agent_id}, not developer")
+    if target is None:
+        blockers.append("missing registered test target")
+    else:
+        if int(target["gateable"] or 0) != 1:
+            blockers.append("target is not gateable")
+        if not str(target["command_template"] or "").strip():
+            blockers.append("target command template is empty")
+        if int(target["requires_sandbox"] or 0) == 1:
+            blockers.append("target requires sandbox")
+        if int(target["requires_no_network"] or 0) == 1:
+            blockers.append("target requires no-network")
+    high_risks = [risk for risk in failure_mode_risks if risk in {"high", "critical"}]
+    if high_risks:
+        blockers.append(f"linked failure mode risk is {','.join(high_risks)}")
+    candidate = not blockers
+    return {
+        "small_verified_candidate": candidate,
+        "reason": (
+            "small verified candidate: developer task with gateable local target and no high/critical failure modes"
+            if candidate
+            else "small verified candidate blocked: " + "; ".join(blockers)
+        ),
+        "failure_mode_risks": failure_mode_risks,
+    }
+
+
 def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
     from core.scheduler import ready_queue
 
@@ -6534,8 +6564,8 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
         summary = {
             "task_count": 0,
             "ready_count": 0,
-            "spark_eligible_count": 0,
-            "host_codex_default_count": 0,
+            "small_verified_count": 0,
+            "native_host_general_count": 0,
             "main_model_or_manual_count": 0,
         }
         for row in rows:
@@ -6543,15 +6573,15 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
             agent_id = row["agent_id"] or row["capability"] or row["owner"] or "developer"
             target = task_target(conn, task_id, cycle_id)
             failure_mode_risks = task_failure_mode_risks(conn, task_id, cycle_id)
-            policy = host_codex_model_policy_input(agent_id, target, failure_mode_risks)
+            policy = native_route_capability_input(agent_id, target, failure_mode_risks)
             ready = task_id in ready_ids and row["task_status"] == "ready" and row["assignment_status"] in {"ready", "planned", "claimed"}
             recommendation = "main-model-or-manual"
             if not ready:
                 recommendation = "blocked-not-ready"
-            elif policy["spark_eligible"]:
-                recommendation = "host-codex-spark"
+            elif policy["small_verified_candidate"]:
+                recommendation = "native-host-small-verified"
             elif agent_id == "developer" and target is not None and int(target["gateable"] or 0) == 1 and str(target["command_template"] or "").strip():
-                recommendation = "host-codex-default"
+                recommendation = "native-host-general"
             task_report = {
                 "task_id": task_id,
                 "task": row["task"],
@@ -6564,39 +6594,42 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
                 "target_requires_sandbox": bool(int(target["requires_sandbox"] or 0)) if target else False,
                 "target_requires_no_network": bool(int(target["requires_no_network"] or 0)) if target else False,
                 "failure_mode_risks": failure_mode_risks,
-                "spark_eligible": bool(policy["spark_eligible"]) and ready,
+                "small_verified_candidate": bool(policy["small_verified_candidate"]) and ready,
                 "recommendation": recommendation,
-                "reason": policy["model_selection_reason"] if ready else "task is not ready for dispatch",
+                "reason": policy["reason"] if ready else "task is not ready for dispatch",
+                "capability_hints": {
+                    "risk": max(failure_mode_risks, key=lambda value: {"low": 0, "medium": 1, "high": 2, "critical": 3}.get(value, -1), default="low"),
+                    "requires_sandbox": bool(int(target["requires_sandbox"] or 0)) if target else False,
+                    "requires_no_network": bool(int(target["requires_no_network"] or 0)) if target else False,
+                    "host_selects_model": True,
+                },
             }
             tasks.append(task_report)
             summary["task_count"] += 1
             if ready:
                 summary["ready_count"] += 1
-            if task_report["spark_eligible"]:
-                summary["spark_eligible_count"] += 1
-            elif recommendation == "host-codex-default":
-                summary["host_codex_default_count"] += 1
+            if task_report["small_verified_candidate"]:
+                summary["small_verified_count"] += 1
+            elif recommendation == "native-host-general":
+                summary["native_host_general_count"] += 1
             elif recommendation in {"main-model-or-manual", "blocked-not-ready"}:
                 summary["main_model_or_manual_count"] += 1
         next_commands: list[str] = []
         if tasks and not run_id:
             next_commands.append("harness.py --root . dispatch plan --scope '<scope>'")
-        if run_id and summary["spark_eligible_count"]:
-            next_commands.append(f"HARNESS_CODEX_MODEL_POLICY=spark-deterministic harness.py --root . dispatch provider start --run-id {run_id} --provider host-codex")
-        elif run_id and summary["host_codex_default_count"]:
-            next_commands.append(f"harness.py --root . dispatch provider start --run-id {run_id} --provider host-codex")
+        if run_id and summary["ready_count"]:
+            next_commands.append(f"harness.py --root . dispatch native-export {run_id}")
         return {
             "run_id": run_id,
             "scope": run_scope,
-            "policy": "spark-deterministic-advisory",
-            "spark_model": os.environ.get("HARNESS_CODEX_SPARK_MODEL", "gpt-5.3-codex-spark"),
+            "policy": "native-host-capability-advisory",
             "summary": summary,
             "tasks": tasks,
             "next_commands": next_commands,
             "boundaries": [
-                "Spark is only an execution candidate for low-risk developer tasks with controller-verifiable targets.",
-                "Spark output is not delivery evidence; dispatch verify-attempt and delivery gates remain mandatory.",
-                "Architect, QA, high/critical risk, sandbox/no-network, missing-target, and ambiguous tasks require main-model or manual review.",
+                "The host owns concrete model, reasoning, sandbox, approval, and native task/thread/worktree lifecycle.",
+                "Route advice exports capability and risk hints only; host output is not delivery evidence.",
+                "Architect, QA, high/critical risk, sandbox/no-network, missing-target, and ambiguous tasks require stronger host policy or main-model/manual review.",
             ],
         }
 
@@ -6605,9 +6638,8 @@ def dispatch_route_advice_lines(root: Path, run_id: str = "") -> list[str]:
     report = dispatch_route_advice(root, run_id)
     lines = [
         f"policy: {report['policy']}",
-        f"spark_model: {report['spark_model']}",
         f"run_id: {report['run_id'] or '(none)'}",
-        markdown_row(["task", "agent", "target", "ready", "spark", "recommendation", "reason"]),
+        markdown_row(["task", "agent", "target", "ready", "small_verified", "recommendation", "reason"]),
     ]
     for task in report["tasks"]:
         lines.append(
@@ -6617,7 +6649,7 @@ def dispatch_route_advice_lines(root: Path, run_id: str = "") -> list[str]:
                     task["agent_id"],
                     task["target_id"] or "-",
                     "yes" if task["ready"] else "no",
-                    "yes" if task["spark_eligible"] else "no",
+                    "yes" if task["small_verified_candidate"] else "no",
                     task["recommendation"],
                     task["reason"],
                 ]

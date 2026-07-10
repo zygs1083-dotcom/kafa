@@ -370,6 +370,7 @@ class HostCodexProviderTest(unittest.TestCase):
             package_root, log_path = fake_sdk_package(temp_path)
             env = self.host_env(package_root, log_path)
             env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+            env["HARNESS_CODEX_SPARK_MODEL"] = "gpt-5.3-codex-spark"
 
             run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
 
@@ -384,6 +385,64 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertTrue(metadata["spark_eligible"])
             self.assertIn("spark eligible", metadata["model_selection_reason"])
             run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--reason", "test cleanup")
+
+    def test_host_codex_spark_policy_requires_explicit_legacy_model_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+            env["HARNESS_CODEX_SPARK_MODEL"] = ""
+
+            started = run_harness(
+                root,
+                "dispatch",
+                "provider",
+                "start",
+                "--run-id",
+                run_id,
+                "--provider",
+                "host-codex",
+                env=env,
+            )
+
+            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            assignment = db_one(root, "select status from dispatch_assignments where run_id = ?", (run_id,))
+            evidence_count = db_one(root, "select count(*) as count from evidence where id like 'CODEX-%'")["count"]
+            self.assertIn("started 0 provider session", started.stdout)
+            self.assertEqual(session["status"], "spawn_failed")
+            self.assertIn("requires explicit HARNESS_CODEX_SPARK_MODEL", session["last_error"])
+            self.assertEqual(assignment["status"], "planned")
+            self.assertEqual(evidence_count, 0)
+            self.assertFalse(log_path.exists())
+
+    def test_host_codex_spark_policy_does_not_hide_missing_model_on_ineligible_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Architecture")
+            run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Architecture", "--owner", "architect", "--acceptance", "AC1")
+            run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
+            run_id = run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+            env["HARNESS_CODEX_SPARK_MODEL"] = ""
+
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            self.assertEqual(session["status"], "spawn_failed")
+            self.assertIn("requires explicit HARNESS_CODEX_SPARK_MODEL", session["last_error"])
+            self.assertFalse(log_path.exists())
 
     def test_host_codex_spark_policy_keeps_default_for_ineligible_tasks(self) -> None:
         cases = [
@@ -423,6 +482,7 @@ class HostCodexProviderTest(unittest.TestCase):
                     package_root, log_path = fake_sdk_package(temp_path)
                     env = self.host_env(package_root, log_path)
                     env["HARNESS_CODEX_MODEL_POLICY"] = "spark-deterministic"
+                    env["HARNESS_CODEX_SPARK_MODEL"] = "gpt-5.3-codex-spark"
 
                     run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
 

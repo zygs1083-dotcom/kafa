@@ -8,16 +8,18 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 
 ### Added
 
-- Read-only `dispatch route-advice [--run-id] [--json]` to classify ready tasks before provider/subagent execution.
-- Spark candidate reporting for low-risk `developer` tasks with gateable controller-verifiable targets.
-- Explicit routing buckets for `host-codex-spark`, `host-codex-default`, `main-model-or-manual`, and `blocked-not-ready`.
+- Read-only `dispatch route-advice [--run-id] [--json]` to export host-neutral capability and risk hints before native task execution.
+- Native task package/receipt exchange through `dispatch native-export` and `dispatch native-import`, with real host task/thread/worktree identities and controller verification kept separate.
+- Explicit routing buckets for `native-host-small-verified`, `native-host-general`, `main-model-or-manual`, and `blocked-not-ready`.
 
 ### Changed
 
 - Runtime implementation version remains `4.18.0`; the unreleased correctness baseline is now schema 29.
-- `project-harness` guidance now requires route advice before splitting work into Spark-capable subagent tasks.
+- `project-harness` guidance now requires host-neutral capability/risk advice before exporting native subagent tasks.
 - The base `kafa` wheel is stdlib-only; the legacy Host Codex SDK moved to the optional `kafa[host-codex]` extra.
 - Release state, source version, package/plugin metadata, runtime/schema versions, tag, notes, and Codex compatibility smoke are governed by `release.json`.
+- Concrete model, reasoning, approval, sandbox, and task/thread/subagent/worktree lifecycle selection now belong to the native ChatGPT/Codex host; route advice no longer emits a model slug or legacy provider start command.
+- Without a higher-priority `HARNESS_CODEX_MODEL` override, legacy `spark-deterministic` compatibility now requires an explicit `HARNESS_CODEX_SPARK_MODEL`; Kafa no longer embeds a preview model name.
 
 ### Fixed
 
@@ -25,8 +27,8 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 
 ### Boundaries
 
-- Route advice is advisory and read-only. It does not spawn subagents, call Spark, generate evidence, relax controller verification, or change delivery gates.
-- Spark remains opt-in through `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` and only affects Host Codex Provider execution.
+- Route advice is advisory and read-only. It does not spawn subagents, choose a model, generate evidence, relax controller verification, or change delivery gates.
+- The legacy Host Codex model policy is explicit compatibility only and does not affect native host model selection.
 
 ## v1.24.0-beta.1 - 2026-07-02
 
