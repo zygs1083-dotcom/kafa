@@ -213,6 +213,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . connector prof
 
 长期 Connector 边界已在 [Apps/MCP Connector Receipt ADR](docs/runtime/APPS_MCP_RECEIPT_ADR.md) 中锁定：ChatGPT Apps/MCP 负责授权、workspace policy、tool approval 和外部动作，Kafa 只治理 project scope、immutable intent、outbox fence、receipt validation 与 fallback。当前 `gh`/HTTP 路径明确属于 `legacy-direct` 兼容模式；ADR 不代表 receipt runtime 已实现，也不会把 Apps/MCP 工具输出升级为 delivery evidence。
 
+原生 Agent 生命周期边界见 [Native Codex Runtime ADR](docs/runtime/NATIVE_CODEX_RUNTIME_ADR.md)：Codex/ChatGPT 宿主管理 task、thread、subagent、worktree、approval、model、steer、cancel 与 handoff；Kafa 根控制器只导出不可变 task package、导入真实 host receipt，并继续负责 controller verification 和 delivery gate。当前 SQLite 主事实源保持 root-workspace single-writer，managed worktree 不复制或修改数据库；hosted transport 未实现前不冒充兼容。
+
 信任等级按强度分为三档：
 
 - `local-only`：本地模型会话执行证据，可覆盖 low/medium 风险。
