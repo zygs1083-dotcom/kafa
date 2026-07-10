@@ -137,7 +137,8 @@ def git_dirty(root: Path) -> bool | None:
         return None
     for line in result.stdout.splitlines():
         relpath = line[3:] if len(line) > 3 else ""
-        if relpath and not relpath.startswith(HARNESS_GIT_PREFIXES):
+        harness_path = any(relpath == prefix.rstrip("/") or relpath.startswith(prefix) for prefix in HARNESS_GIT_PREFIXES)
+        if relpath and not harness_path:
             return True
     return False
 

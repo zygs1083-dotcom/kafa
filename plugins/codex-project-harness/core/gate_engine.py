@@ -18,11 +18,19 @@ def _value(row: sqlite3.Row, field: str) -> object:
 def _artifact_digest(root: Path, artifact_path: str) -> tuple[bool, str, str]:
     if not artifact_path:
         return False, "", ""
-    candidate = (root / artifact_path).resolve()
+    relative = Path(artifact_path)
+    candidate = (root / relative).resolve()
     try:
         candidate.relative_to(root.resolve())
     except ValueError:
-        return False, "", ""
+        control_root = (root / ".ai-team").resolve()
+        is_runtime_artifact = relative.parts[:2] == (".ai-team", "runtime")
+        try:
+            candidate.relative_to(control_root)
+        except ValueError:
+            return False, "", ""
+        if not is_runtime_artifact:
+            return False, "", ""
     if not candidate.exists() or not candidate.is_file():
         return False, "", ""
     data = candidate.read_bytes()

@@ -110,11 +110,15 @@ def add_unittest(root: Path, *, failing_on_integration: bool = False) -> None:
 def setup_basic_harness(root: Path, task_ids: list[str]) -> str:
     run_harness(root, "init")
     commit_harness_scaffold(root)
+    run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Agent E2E requirement")
     run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Eval acceptance")
+    run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
     run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
     for task_id in task_ids:
         run_harness(root, "task", "add", "--id", task_id, "--task", f"Task {task_id}", "--owner", f"agent-{task_id.lower()}", "--acceptance", "AC1")
         run_harness(root, "test-target", "link", "--task", task_id, "--target", "UNIT")
+    run_harness(root, "scope", "confirm", "--by", "eval-controller", "--summary", "Agent E2E scope confirmed")
+    run_harness(root, "baseline", "freeze", "--id", "E2E-BL", "--summary", "Agent E2E delivery baseline")
     return run_harness(root, "dispatch", "plan", "--scope", "Agent E2E").stdout.strip().split()[-1]
 
 
@@ -441,6 +445,73 @@ def collect_and_verify(root: Path, run_id: str, branches: dict[str, str]) -> Non
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", task_id)
 
 
+def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> list[str]:
+    original_branch = run_git(root, "branch", "--show-current")
+    preview_branch = f"e2e-preview/{run_id}"
+    subprocess.run(["git", "switch", "-C", preview_branch, original_branch], cwd=root, check=True, capture_output=True)
+    try:
+        for branch in branches.values():
+            merge = subprocess.run(
+                ["git", "merge", "--no-ff", "--no-edit", branch],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if merge.returncode != 0:
+                raise AssertionError(merge.stdout + merge.stderr)
+        evidence_id = run_harness(
+            root,
+            "dispatch",
+            "run",
+            "--agent",
+            "controller",
+            "--target",
+            "UNIT",
+            "--command",
+            TEST_COMMAND,
+        ).stdout.strip().rsplit(" ", 1)[-1]
+        run_harness(
+            root,
+            "validation",
+            "record",
+            "--surface",
+            "Agent E2E integration candidate",
+            "--acceptance",
+            "AC1",
+            "--commands",
+            TEST_COMMAND,
+            "--findings",
+            "passed",
+            "--result",
+            "pass",
+            "--evidence",
+            evidence_id,
+            "--target",
+            "UNIT",
+        )
+        run_harness(
+            root,
+            "gate",
+            "record",
+            "--reviewer-context",
+            "fresh",
+            "--result",
+            "pass",
+            "--commands",
+            TEST_COMMAND,
+            "--evidence",
+            "integration candidate independently reviewed",
+        )
+        validation = run_harness(root, "validate", "--delivery", check=False)
+        if validation.returncode == 0:
+            return []
+        return [line for line in (validation.stdout + validation.stderr).splitlines() if line.strip()]
+    finally:
+        subprocess.run(["git", "switch", original_branch], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-D", preview_branch], cwd=root, check=False, capture_output=True)
+
+
 def wait_for_provider_collect(root: Path, run_id: str, *, expected: str = "collected 1 provider report", timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
     deadline = time.perf_counter() + timeout
     result = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
@@ -478,7 +549,7 @@ def skipped_scenario(name: str, reason: str, *, category: str, mode: str) -> dic
         "name": name,
         "category": category,
         "mode": mode,
-        "pass": True,
+        "pass": False,
         "duration_seconds": 0,
         "skip_reason": reason,
         "details": {},
@@ -524,20 +595,26 @@ def scenario_parallel_success() -> dict[str, Any]:
         collect_and_verify(root, run_id, branches)
         for task_id in branches:
             accept_task_via_cli(root, task_id)
-        run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", TEST_COMMAND, "--evidence", "fixture review")
-
-        import harness_db
-
-        original_validate = harness_db.validate_runtime
-        try:
-            harness_db.validate_runtime = lambda _root, delivery=False: []
-            target = harness_db.dispatch_integrate(root, run_id)
-        finally:
-            harness_db.validate_runtime = original_validate
-        integrated_a = run_git(root, "show", f"{target}:a.txt") == "A"
-        integrated_b = run_git(root, "show", f"{target}:b.txt") == "B"
+        delivery_validation_issues = record_integration_candidate_gate(root, run_id, branches)
+        integrate = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
+        target = integrate.stdout.strip().rsplit(" ", 1)[-1] if integrate.returncode == 0 else ""
+        integrated_a = bool(target) and run_git(root, "show", f"{target}:a.txt") == "A"
+        integrated_b = bool(target) and run_git(root, "show", f"{target}:b.txt") == "B"
         status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        return scenario_result("parallel_success", started, integrated_a and integrated_b and status == "integrated", {"run_id": run_id, "target_branch": target})
+        return scenario_result(
+            "parallel_success",
+            started,
+            not delivery_validation_issues and integrate.returncode == 0 and integrated_a and integrated_b and status == "integrated",
+            {
+                "run_id": run_id,
+                "target_branch": target,
+                "integrate_via_public_cli": True,
+                "integrate_returncode": integrate.returncode,
+                "delivery_validation_issues": delivery_validation_issues,
+                "integrate_stdout_tail": integrate.stdout[-1000:],
+                "integrate_stderr_tail": integrate.stderr[-1000:],
+            },
+        )
 
 
 def scenario_dependency_blocked() -> dict[str, Any]:
@@ -653,28 +730,27 @@ def scenario_host_codex_fake_sdk_e2e() -> dict[str, Any]:
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
         evidence_after = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
         accept_task_via_cli(root, "T1")
-        run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", TEST_COMMAND, "--evidence", "host codex fake review")
-
-        import harness_db
-
-        original_validate = harness_db.validate_runtime
-        try:
-            harness_db.validate_runtime = lambda _root, delivery=False: []
-            target = harness_db.dispatch_integrate(root, run_id)
-            integrate_returncode = 0
-        except Exception:  # noqa: BLE001 - scenario result records failed integration.
-            target = ""
-            integrate_returncode = 1
-        finally:
-            harness_db.validate_runtime = original_validate
+        branches = {"T1": session["branch_name"]}
+        delivery_validation_issues = record_integration_candidate_gate(root, run_id, branches)
+        integrate = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
+        target = integrate.stdout.strip().rsplit(" ", 1)[-1] if integrate.returncode == 0 else ""
+        integrate_returncode = integrate.returncode
         status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
         sdk_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
-        ok = "collected 1 provider report" in collect.stdout and evidence_before == 0 and evidence_after == 1 and integrate_returncode == 0 and status == "integrated"
+        ok = "collected 1 provider report" in collect.stdout and evidence_before == 0 and evidence_after == 1 and not delivery_validation_issues and integrate_returncode == 0 and status == "integrated"
         return scenario_result(
             "host_codex_fake_sdk_e2e",
             started,
             ok,
-            {"run_id": run_id, "sdk_methods": sdk_methods[:4], "integrate_returncode": integrate_returncode, "status": status, "target_branch": target},
+            {
+                "run_id": run_id,
+                "sdk_methods": sdk_methods[:4],
+                "integrate_returncode": integrate_returncode,
+                "status": status,
+                "target_branch": target,
+                "integrate_via_public_cli": True,
+                "delivery_validation_issues": delivery_validation_issues,
+            },
             category="host-codex",
             mode="stability",
         )
@@ -1033,15 +1109,16 @@ def summarize(
     live_skipped: bool = False,
     live_skipped_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
-    passed = sum(1 for scenario in scenarios if scenario["pass"])
     skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
+    passed = sum(1 for scenario in scenarios if scenario["pass"] and not scenario.get("skip_reason"))
+    failed = sum(1 for scenario in scenarios if not scenario["pass"] and not scenario.get("skip_reason"))
     forged_blocks = sum(1 for scenario in scenarios if scenario["name"] == "forged_evidence_blocked" and scenario["pass"])
     false_pass_count = sum(1 for scenario in scenarios if scenario["name"] in {"forged_evidence_blocked", "integration_regression_blocked"} and not scenario["pass"])
     sqlite_lock_errors = sum(int(scenario.get("details", {}).get("sqlite_lock_error_count", 0) or 0) for scenario in scenarios)
     summary = {
         "scenario_count": len(scenarios),
         "passed_count": passed,
-        "failed_count": len(scenarios) - passed,
+        "failed_count": failed,
         "skipped_count": skipped,
         "task_once_completion_rate": round(passed / max(len(scenarios), 1), 4),
         "false_pass_count": false_pass_count,
@@ -1052,9 +1129,18 @@ def summarize(
         "human_intervention_count": 0,
         "duration_seconds": round(time.perf_counter() - started, 6),
     }
+    live_status = "not-applicable"
+    if mode in {"live-command", "live-codex"}:
+        if live_skipped:
+            live_status = "not-run"
+        elif failed:
+            live_status = "failed"
+        elif scenarios:
+            live_status = "passed"
     return {
         "mode": mode,
         "live_skipped": live_skipped,
+        "live_status": live_status,
         "matrix": matrix_info(mode, live_skipped_reasons=live_skipped_reasons),
         "token_count": None,
         "estimated_cost": None,
@@ -1137,7 +1223,9 @@ def run_live_codex() -> dict[str, Any]:
 
 
 def should_fail(report: dict[str, Any]) -> bool:
-    if report["mode"] in {"live-command", "live-codex"} and report["live_skipped"]:
+    if report["mode"] == "live-codex" and report["live_skipped"]:
+        return True
+    if report["mode"] == "live-command" and report["live_skipped"]:
         return False
     summary = report["summary"]
     if summary["failed_count"] != 0:
