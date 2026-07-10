@@ -32,17 +32,18 @@ def dispatch_assignment_task_ids(root: Path, run_id: str) -> list[str]:
 
 def insert_dispatch_run(root: Path, run_id: str) -> None:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+        cycle_id = conn.execute("select current_cycle_id from project where id = 1").fetchone()[0]
         conn.execute(
-            "insert into dispatch_runs (id, scope, status, created_at, updated_at) values (?, 'scope', 'planned', 'now', 'now')",
-            (run_id,),
+            "insert into dispatch_runs (id, cycle_id, scope, status, created_at, updated_at) values (?, ?, 'scope', 'planned', 'now', 'now')",
+            (run_id, cycle_id),
         )
         conn.execute(
-            "insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, 'T1', 'prereq-capability', 'planned', 'now')",
-            (run_id,),
+            "insert into dispatch_assignments (run_id, cycle_id, task_id, capability, status, updated_at) values (?, ?, 'T1', 'prereq-capability', 'planned', 'now')",
+            (run_id, cycle_id),
         )
         conn.execute(
-            "insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, 'T2', 'developer', 'planned', 'now')",
-            (run_id,),
+            "insert into dispatch_assignments (run_id, cycle_id, task_id, capability, status, updated_at) values (?, ?, 'T2', 'developer', 'planned', 'now')",
+            (run_id, cycle_id),
         )
         conn.commit()
 

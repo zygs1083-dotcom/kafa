@@ -2,8 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Acceptance Criterion",
   "type": "object",
-  "required": ["id", "criterion", "status"],
+  "required": ["uid", "id", "cycle_id", "criterion", "status"],
   "properties": {
+    "uid": { "type": "string" },
     "id": { "type": "string" },
     "cycle_id": { "type": "string" },
     "criterion": { "type": "string" },

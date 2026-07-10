@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -102,7 +103,7 @@ class SchemaLifecycleTest(unittest.TestCase):
             root = Path(temp)
             self.assertEqual(run_harness(root, "init").returncode, 0)
 
-            result = run_harness(root, "migrate", "--from-version", "6", "--to-version", "28")
+            result = run_harness(root, "migrate", "--from-version", "6", "--to-version", "29")
             version = project_schema_version(root)
             migrations = migration_count(root)
 
@@ -111,7 +112,7 @@ class SchemaLifecycleTest(unittest.TestCase):
             0,
             "DB-002: migrate trusted caller-authored from-version instead of the database version",
         )
-        self.assertEqual(version, 28)
+        self.assertEqual(version, 29)
         self.assertEqual(migrations, 0)
 
     def test_db_002_migrate_rejects_unknown_target_version(self) -> None:
@@ -119,22 +120,22 @@ class SchemaLifecycleTest(unittest.TestCase):
             root = Path(temp)
             self.assertEqual(run_harness(root, "init").returncode, 0)
 
-            result = run_harness(root, "migrate", "--from-version", "28", "--to-version", "999")
+            result = run_harness(root, "migrate", "--from-version", "29", "--to-version", "999")
             version = project_schema_version(root)
 
         self.assertNotEqual(result.returncode, 0, "DB-002: unknown migration target 999 was accepted")
-        self.assertEqual(version, 28)
+        self.assertEqual(version, 29)
 
     def test_db_002_migrate_rejects_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.assertEqual(run_harness(root, "init").returncode, 0)
 
-            result = run_harness(root, "migrate", "--from-version", "28", "--to-version", "27")
+            result = run_harness(root, "migrate", "--from-version", "29", "--to-version", "28")
             version = project_schema_version(root)
 
         self.assertNotEqual(result.returncode, 0, "DB-002: schema downgrade was accepted")
-        self.assertEqual(version, 28)
+        self.assertEqual(version, 29)
 
     def test_db_002_dry_run_validates_migration_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -145,7 +146,7 @@ class SchemaLifecycleTest(unittest.TestCase):
                 root,
                 "migrate",
                 "--from-version",
-                "28",
+                "29",
                 "--to-version",
                 "999",
                 "--dry-run",
@@ -153,7 +154,7 @@ class SchemaLifecycleTest(unittest.TestCase):
             version = project_schema_version(root)
 
         self.assertNotEqual(result.returncode, 0, "DB-002: dry-run reported an unknown migration path as valid")
-        self.assertEqual(version, 28)
+        self.assertEqual(version, 29)
 
     def test_db_002_markdown_import_rejects_non_current_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -182,7 +183,7 @@ class SchemaLifecycleTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 before = conn.execute("select schema_version, revision from project where id = 1").fetchone()
 
-            result = run_harness(root, "migrate", "--from-version", "28", "--to-version", "28")
+            result = run_harness(root, "migrate", "--from-version", "29", "--to-version", "29")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 after = conn.execute("select schema_version, revision from project where id = 1").fetchone()
@@ -207,7 +208,7 @@ class SchemaLifecycleTest(unittest.TestCase):
                 side_effect=harness_db.HarnessError("injected migration invariant failure"),
             ):
                 with self.assertRaisesRegex(harness_db.HarnessError, "injected migration invariant failure"):
-                    harness_db.migrate(root, "24", 28)
+                    harness_db.migrate(root, "24", 29)
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 version = conn.execute("select schema_version from project where id = 1").fetchone()[0]
@@ -236,7 +237,7 @@ class SchemaLifecycleTest(unittest.TestCase):
 
             def migrate_once() -> str:
                 try:
-                    harness_db.migrate(root, "24", 28)
+                    harness_db.migrate(root, "24", 29)
                 except harness_db.HarnessError as exc:
                     return str(exc)
                 return "ok"
@@ -251,7 +252,7 @@ class SchemaLifecycleTest(unittest.TestCase):
 
         self.assertEqual(results.count("ok"), 1, results)
         self.assertTrue(any("migration source changed concurrently" in result for result in results), results)
-        self.assertEqual(version, 28)
+        self.assertEqual(version, 29)
         self.assertEqual(migrations, 1)
 
     def test_checkpoint_round_trip_preserves_foreign_key_relationships(self) -> None:
@@ -280,6 +281,28 @@ class SchemaLifecycleTest(unittest.TestCase):
         self.assertEqual(link, ("T1", "UNIT"))
         self.assertEqual(foreign_key_errors, [])
 
+    def test_schema28_checkpoint_is_rejected_before_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source"
+            target = Path(temp) / "target"
+            package = Path(temp) / "schema28-checkpoint.json"
+            harness_db.init_runtime(source)
+            harness_db.add_requirement(source, "R1", "functional", "Legacy package")
+            harness_db.create_checkpoint(source, "legacy-package")
+            harness_db.export_checkpoint(source, package)
+            data = json.loads(package.read_text(encoding="utf-8"))
+            data["schema_version"] = 28
+            package.write_text(json.dumps(data), encoding="utf-8")
+            harness_db.init_runtime(target)
+
+            issues = harness_db.import_checkpoint(target, package, apply=True)
+
+            with harness_db.connection(target) as conn:
+                count = conn.execute("select count(*) from requirements").fetchone()[0]
+
+        self.assertEqual(issues, ["schema version differs: package=28 runtime=29"])
+        self.assertEqual(count, 0)
+
     def test_event_replay_failure_removes_partial_output_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -298,6 +321,104 @@ class SchemaLifecycleTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "injected replay failure"):
                     rebuild_state_from_events(root, sequence, out)
             self.assertFalse(out.exists(), "event replay left a partially committed output database")
+
+    def test_event_replay_preserves_same_local_id_in_multiple_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "replayed.db"
+            harness_db.init_runtime(root)
+            harness_db.add_requirement(root, "R1", "functional", "First cycle")
+            harness_db.create_checkpoint(root, "before-next-cycle")
+            harness_db.cycle_close(root, "archived")
+            harness_db.cycle_start(root, "CYCLE-next", "Next", "Iterate")
+            harness_db.add_requirement(root, "R1", "functional", "Second cycle")
+            harness_db.add_acceptance(root, "AC1", "Second acceptance")
+            harness_db.link_requirement_acceptance(root, "R1", "AC1")
+            harness_db.add_task(root, "T1", "Second task", acceptance="AC1")
+            with harness_db.connection(root) as conn:
+                sequence = int(conn.execute("select max(sequence) from events").fetchone()[0])
+                live_project = conn.execute(
+                    "select current_cycle_id, phase from project where id = 1"
+                ).fetchone()
+                live_cycles = conn.execute(
+                    "select id, status, phase from delivery_cycles order by id"
+                ).fetchall()
+                live_relations = {
+                    table: conn.execute(f"select * from {table} order by 1, 2").fetchall()
+                    for table in ["requirement_acceptance", "task_acceptance"]
+                }
+
+            rebuild_state_from_events(root, sequence, out)
+
+            with closing(sqlite3.connect(out)) as conn:
+                rows = conn.execute(
+                    "select cycle_id, id, body from requirements where id = 'R1' order by cycle_id"
+                ).fetchall()
+                replay_project = conn.execute(
+                    "select current_cycle_id, phase from project where id = 1"
+                ).fetchone()
+                replay_cycles = conn.execute(
+                    "select id, status, phase from delivery_cycles order by id"
+                ).fetchall()
+                replay_relations = {
+                    table: conn.execute(f"select * from {table} order by 1, 2").fetchall()
+                    for table in ["requirement_acceptance", "task_acceptance"]
+                }
+
+        self.assertEqual(
+            rows,
+            [("CYCLE-current", "R1", "First cycle"), ("CYCLE-next", "R1", "Second cycle")],
+        )
+        self.assertEqual(replay_project, tuple(live_project))
+        self.assertEqual(replay_cycles, [tuple(row) for row in live_cycles])
+        self.assertEqual(replay_relations, {table: [tuple(row) for row in values] for table, values in live_relations.items()})
+
+    def test_event_replay_preserves_quality_gate_supersession(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "gate-replayed.db"
+            harness_db.init_runtime(root)
+            harness_db.create_checkpoint(root, "before-gates")
+            harness_db.record_gate(root, "fresh", "pass")
+            harness_db.record_gate(root, "fresh", "fail")
+            with harness_db.connection(root) as conn:
+                sequence = int(conn.execute("select max(sequence) from events").fetchone()[0])
+                live = conn.execute(
+                    "select id, sequence, result, gate_status, superseded_by from quality_gates order by sequence"
+                ).fetchall()
+
+            rebuild_state_from_events(root, sequence, out)
+
+            with closing(sqlite3.connect(out)) as conn:
+                replayed = conn.execute(
+                    "select id, sequence, result, gate_status, superseded_by from quality_gates order by sequence"
+                ).fetchall()
+
+        self.assertEqual(replayed, [tuple(row) for row in live])
+
+    def test_schema29_event_without_mutation_journal_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "invalid-event-replay.db"
+            harness_db.init_runtime(root)
+            harness_db.create_checkpoint(root, "before-invalid-event")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    """
+                    insert into events
+                    (id, schema_version, type, source, target, correlation_id, causation_id, idempotency_key, payload_json, created_at)
+                    values ('missing-journal', 29, 'task_changed', 'test', 'task:T1', '', '', '', '{}', '2026-07-10T00:00:00Z')
+                    """
+                )
+                sequence = int(conn.execute("select max(sequence) from events").fetchone()[0])
+                conn.commit()
+
+            issues = harness_db.validate_events(root)
+            with self.assertRaisesRegex(ValueError, "missing canonical_mutations"):
+                rebuild_state_from_events(root, sequence, out)
+
+        self.assertTrue(any("missing canonical_mutations" in issue for issue in issues), issues)
+        self.assertFalse(out.exists())
 
     def test_markdown_migration_concurrency_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -321,7 +442,7 @@ class SchemaLifecycleTest(unittest.TestCase):
 
             def migrate_once() -> str:
                 try:
-                    harness_db.migrate(root, "markdown-v1", 28)
+                    harness_db.migrate(root, "markdown-v1", 29)
                 except Exception as exc:
                     return f"{type(exc).__name__}: {exc}"
                 return "ok"
@@ -333,7 +454,7 @@ class SchemaLifecycleTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 acceptance_count = conn.execute("select count(*) from acceptance where id = 'AC1'").fetchone()[0]
                 migration_count = conn.execute(
-                    "select count(*) from migrations where from_version = 1 and to_version = 28"
+                    "select count(*) from migrations where from_version = 1 and to_version = 29"
                 ).fetchone()[0]
 
         self.assertEqual(results, ["ok", "ok"])
@@ -348,7 +469,7 @@ class SchemaLifecycleTest(unittest.TestCase):
                 conn.execute("drop table command_log")
                 conn.commit()
 
-            result = run_harness(root, "migrate", "--from-version", "28", "--to-version", "28")
+            result = run_harness(root, "migrate", "--from-version", "29", "--to-version", "29")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("current schema is incomplete", result.stdout + result.stderr)
@@ -363,16 +484,16 @@ class SchemaLifecycleTest(unittest.TestCase):
 
             with patch.object(harness_db, "render_all", side_effect=OSError("projection unavailable")):
                 with self.assertRaisesRegex(harness_db.HarnessError, "migration committed but projection rebuild failed"):
-                    harness_db.migrate(root, "24", 28)
+                    harness_db.migrate(root, "24", 29)
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 committed = conn.execute("select schema_version from project where id = 1").fetchone()[0]
-                migrations = conn.execute("select count(*) from migrations where from_version = 24 and to_version = 28").fetchone()[0]
+                migrations = conn.execute("select count(*) from migrations where from_version = 24 and to_version = 29").fetchone()[0]
 
             with patch.object(harness_db, "render_all", wraps=harness_db.render_all) as render:
-                harness_db.migrate(root, "28", 28)
+                harness_db.migrate(root, "29", 29)
 
-        self.assertEqual(committed, 28)
+        self.assertEqual(committed, 29)
         self.assertEqual(migrations, 1)
         render.assert_called_once_with(root)
 
@@ -391,20 +512,20 @@ class SchemaLifecycleTest(unittest.TestCase):
 
             with patch.object(harness_db, "render_all", side_effect=OSError("projection unavailable")):
                 with self.assertRaisesRegex(harness_db.HarnessError, "markdown migration committed but projection rebuild failed"):
-                    harness_db.migrate(root, "markdown-v1", 28)
+                    harness_db.migrate(root, "markdown-v1", 29)
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 committed = conn.execute(
-                    "select count(*) from migrations where from_version = 1 and to_version = 28"
+                    "select count(*) from migrations where from_version = 1 and to_version = 29"
                 ).fetchone()[0]
                 acceptance_count = conn.execute("select count(*) from acceptance where id = 'AC1'").fetchone()[0]
 
             with patch.object(harness_db, "render_all", wraps=harness_db.render_all) as render:
-                harness_db.migrate(root, "markdown-v1", 28)
+                harness_db.migrate(root, "markdown-v1", 29)
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 migration_count = conn.execute(
-                    "select count(*) from migrations where from_version = 1 and to_version = 28"
+                    "select count(*) from migrations where from_version = 1 and to_version = 29"
                 ).fetchone()[0]
 
         self.assertEqual(committed, 1)

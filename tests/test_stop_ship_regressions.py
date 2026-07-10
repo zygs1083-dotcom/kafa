@@ -348,21 +348,43 @@ class StopShipRegressionTest(unittest.TestCase):
                 "AC1",
                 check=False,
             )
+            claimed = run_harness(
+                root,
+                "task",
+                "claim",
+                "T1",
+                "--agent",
+                "developer",
+                "--expected-revision",
+                "1",
+                check=False,
+            )
+            trace = run_harness(root, "trace", "validate", check=False)
             with closing(sqlite3.connect(db_path(root))) as conn:
                 requirements = cycle_fact_rows(conn, "requirements", "body", "R1")
                 acceptance = cycle_fact_rows(conn, "acceptance", "criterion", "AC1")
                 tasks = cycle_fact_rows(conn, "tasks", "task", "T1")
+                task_states = conn.execute(
+                    "select cycle_id, status, revision from tasks where id = 'T1' order by cycle_id"
+                ).fetchall()
+            task_board = (root / ".ai-team/planning/task-board.md").read_text(encoding="utf-8")
 
         self.assertEqual(
-            (requirements, acceptance, second_task.returncode, tasks),
+            (requirements, acceptance, second_task.returncode, claimed.returncode, tasks, task_states),
             (
                 [("CYCLE-current", "Original requirement"), ("CYCLE-next", "Next requirement")],
                 [("CYCLE-current", "Original acceptance"), ("CYCLE-next", "Next acceptance")],
                 0,
+                0,
                 [("CYCLE-current", "Original task"), ("CYCLE-next", "Next task")],
+                [("CYCLE-current", "ready", 1), ("CYCLE-next", "claimed", 2)],
             ),
             "CY-001: cycle-local IDs must preserve old requirement, acceptance, and task history",
         )
+        self.assertIn("Next task", task_board)
+        self.assertNotIn("Original task", task_board)
+        self.assertNotEqual(trace.returncode, 0)
+        self.assertIn("requirement has no acceptance link: R1", trace.stdout + trace.stderr)
 
     def test_tr_001_cli_cannot_self_issue_connector_attestation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

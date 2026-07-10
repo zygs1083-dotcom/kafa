@@ -2,8 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Requirement",
   "type": "object",
-  "required": ["id", "kind", "body", "status", "revision", "updated_at"],
+  "required": ["uid", "id", "cycle_id", "kind", "body", "status", "revision", "updated_at"],
   "properties": {
+    "uid": { "type": "string" },
     "id": { "type": "string" },
     "cycle_id": { "type": "string" },
     "kind": {

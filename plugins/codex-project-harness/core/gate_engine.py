@@ -306,11 +306,11 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             """
             select v.* from validation_failure_modes vfm
             join validations v on v.id = vfm.validation_id
-            where vfm.failure_mode_id = ? and v.cycle_id = ? and v.candidate_sha = ?
+            where vfm.cycle_id = ? and vfm.failure_mode_id = ? and v.cycle_id = vfm.cycle_id and v.candidate_sha = ?
               and v.validation_status = 'active' and v.result = 'pass'
             order by v.created_at desc, v.id desc
             """,
-            (failure_mode["id"], cycle_id, current_source_hash),
+            (cycle_id, failure_mode["id"], current_source_hash),
         ).fetchall()
         coverage_issues: list[str] = []
         covered_with_evidence = False
@@ -333,8 +333,8 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
     latest_gate = conn.execute(
         """
         select * from quality_gates
-        where cycle_id = ? and candidate_sha = ?
-        order by created_at desc, id desc limit 1
+        where cycle_id = ? and candidate_sha = ? and gate_status = 'active'
+        order by sequence desc limit 1
         """,
         (cycle_id, current_source_hash),
     ).fetchone()

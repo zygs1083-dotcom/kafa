@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness CI Verification",
   "type": "object",
-  "required": ["id", "provider", "run_id", "conclusion", "commit_sha", "origin", "token_status", "token_reason", "created_at"],
+  "required": ["id", "provider", "run_id", "conclusion", "commit_sha", "origin", "token_status", "token_reason", "effective_trust", "receipt_provenance", "created_at"],
   "properties": {
     "id": { "type": "string" },
     "provider": { "type": "string" },
@@ -13,6 +13,8 @@
     "verification_token": { "type": "string" },
     "token_status": { "type": "string" },
     "token_reason": { "type": "string" },
+    "effective_trust": { "type": "string", "enum": ["local-only", "human-confirmed", "connector", "legacy-untrusted"] },
+    "receipt_provenance": { "type": "string" },
     "external_link": { "type": "string" },
     "created_at": { "type": "string" }
   },

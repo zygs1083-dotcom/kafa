@@ -71,7 +71,7 @@ def check_runtime_invariants(
     for row in query_scoped(
         conn,
         "select id, status from tasks order by id",
-        "select id, status from tasks where id in ({placeholders}) order by id",
+        "select id, status from tasks where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) order by id",
         task_ids,
     ):
         if row["status"] not in TASK_STATUSES:
@@ -80,7 +80,7 @@ def check_runtime_invariants(
     for row in query_scoped(
         conn,
         "select id, lease_agent, lease_expires_at from tasks where lease_agent is not null and lease_expires_at is not null order by id",
-        "select id, lease_agent, lease_expires_at from tasks where id in ({placeholders}) and lease_agent is not null and lease_expires_at is not null order by id",
+        "select id, lease_agent, lease_expires_at from tasks where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) and lease_agent is not null and lease_expires_at is not null order by id",
         task_ids,
     ):
         if is_expired(row["lease_expires_at"]):
@@ -88,8 +88,8 @@ def check_runtime_invariants(
 
     for row in query_scoped(
         conn,
-        "select id, evidence, owner, accepted_by from tasks where status = 'accepted' order by id",
-        "select id, evidence, owner, accepted_by from tasks where id in ({placeholders}) and status = 'accepted' order by id",
+        "select cycle_id, id, evidence, owner, accepted_by from tasks where status = 'accepted' order by id",
+        "select cycle_id, id, evidence, owner, accepted_by from tasks where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) and status = 'accepted' order by id",
         task_ids,
     ):
         if not row["evidence"]:
@@ -99,9 +99,10 @@ def check_runtime_invariants(
             """
             select 1 from events
             where type = 'task_accepted' and json_extract(payload_json, '$.entity_id') = ?
+              and json_extract(payload_json, '$.after.cycle_id') = ?
             limit 1
             """,
-            (row["id"],),
+            (row["id"], row["cycle_id"]),
         ).fetchone()
         if not accepted_by and not accept_event:
             issues.append(issue("accepted-task-missing-actor", "task", row["id"], f"invariant failed: accepted task has no accept actor/event {row['id']}"))
@@ -111,7 +112,7 @@ def check_runtime_invariants(
     for row in query_scoped(
         conn,
         "select id, status from failure_modes order by id",
-        "select id, status from failure_modes where id in ({placeholders}) order by id",
+        "select id, status from failure_modes where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) order by id",
         failure_mode_ids,
     ):
         if row["status"] not in FAILURE_MODE_STATUSES:

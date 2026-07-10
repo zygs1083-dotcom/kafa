@@ -178,7 +178,7 @@ def create_schema28_fixture(root: Path) -> None:
               ('github:1', 'github', '1', 'success', 'abc', 'connector', 'self-signed',
                'hmac-valid', 'legacy', '', '2026-07-10T00:00:00Z');
             insert into external_session_verifications values
-              ('external:1', 'S-review', 'host', 'pass', 'abc', 'connector', 'self-signed',
+              ('external:1', 'S-review', 'host', 'verified', 'abc', 'connector', 'self-signed',
                'hmac-valid', 'legacy', '', '2026-07-10T00:00:00Z');
             """
         )
@@ -271,6 +271,85 @@ class Schema29MigrationTest(unittest.TestCase):
         self.assertEqual(tuple(ci), ("legacy-untrusted", "schema28-unprovable"))
         self.assertEqual(tuple(external), ("legacy-untrusted", "schema28-unprovable"))
         self.assertEqual(foreign_key_errors, [])
+
+    def test_schema29_rebuild_rolls_back_when_post_migration_contract_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_schema28_fixture(root)
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute("update external_session_verifications set conclusion = 'invalid-legacy-value'")
+                conn.commit()
+
+            result = run_harness(root, "migrate", "--from-version", "28", "--to-version", "29")
+
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                version = conn.execute("select schema_version from project where id = 1").fetchone()[0]
+                requirement_columns = {row[1] for row in conn.execute("pragma table_info(requirements)")}
+                conclusion = conn.execute("select conclusion from external_session_verifications").fetchone()[0]
+                migrations = conn.execute("select count(*) from migrations").fetchone()[0]
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("migration schema validation failed", result.stdout + result.stderr)
+        self.assertEqual(version, 28)
+        self.assertNotIn("uid", requirement_columns)
+        self.assertEqual(conclusion, "invalid-legacy-value")
+        self.assertEqual(migrations, 0)
+
+    def test_scoped_invariant_does_not_match_archived_cycle_local_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual(run_harness(root, "init").returncode, 0)
+            self.assertEqual(run_harness(root, "task", "add", "--id", "T1", "--task", "Old").returncode, 0)
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute(
+                    "update tasks set lease_agent = 'developer', lease_token = 'old', lease_expires_at = '2000-01-01T00:00:00Z' where cycle_id = 'CYCLE-current' and id = 'T1'"
+                )
+                conn.commit()
+            self.assertEqual(run_harness(root, "cycle", "close", "--status", "archived").returncode, 0)
+            self.assertEqual(
+                run_harness(root, "cycle", "start", "--id", "CYCLE-next", "--name", "Next", "--goal", "Iterate").returncode,
+                0,
+            )
+
+            added = run_harness(root, "task", "add", "--id", "T1", "--task", "Current")
+
+        self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+
+    def test_expired_lease_repair_updates_only_internal_task_uid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual(run_harness(root, "init").returncode, 0)
+            self.assertEqual(run_harness(root, "task", "add", "--id", "T1", "--task", "Old").returncode, 0)
+            self.assertEqual(run_harness(root, "cycle", "close", "--status", "archived").returncode, 0)
+            self.assertEqual(
+                run_harness(root, "cycle", "start", "--id", "CYCLE-next", "--name", "Next", "--goal", "Iterate").returncode,
+                0,
+            )
+            self.assertEqual(run_harness(root, "task", "add", "--id", "T1", "--task", "Current").returncode, 0)
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute(
+                    "update tasks set lease_agent = 'developer', lease_token = 'old', lease_expires_at = '2000-01-01T00:00:00Z' where cycle_id = 'CYCLE-current' and id = 'T1'"
+                )
+                conn.execute(
+                    "update tasks set lease_agent = 'qa-reviewer', lease_token = 'current', lease_expires_at = '2999-01-01T00:00:00Z' where cycle_id = 'CYCLE-next' and id = 'T1'"
+                )
+                conn.commit()
+
+            repaired = run_harness(
+                root,
+                "repair",
+                "--clear-invariant",
+                "expired-lease",
+                "--confirm",
+                "expired-lease",
+            )
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                leases = conn.execute(
+                    "select cycle_id, lease_token from tasks where id = 'T1' order by cycle_id"
+                ).fetchall()
+
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        self.assertEqual(leases, [("CYCLE-current", None), ("CYCLE-next", "current")])
 
 
 if __name__ == "__main__":

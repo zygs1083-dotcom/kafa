@@ -95,9 +95,10 @@ class AgentProviderLifecycleTest(unittest.TestCase):
             run_harness(root, "task", "add", "--id", "T2", "--task", "Dependent", "--owner", "developer", "--acceptance", "AC1", "--depends-on", "T1")
             run_id = "RUN-provider-ready"
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                conn.execute("insert into dispatch_runs (id, scope, status, created_at, updated_at) values (?, 'scope', 'planned', 'now', 'now')", (run_id,))
-                conn.execute("insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, 'T1', 'developer', 'planned', 'now')", (run_id,))
-                conn.execute("insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, 'T2', 'developer', 'planned', 'now')", (run_id,))
+                cycle_id = conn.execute("select current_cycle_id from project where id = 1").fetchone()[0]
+                conn.execute("insert into dispatch_runs (id, cycle_id, scope, status, created_at, updated_at) values (?, ?, 'scope', 'planned', 'now', 'now')", (run_id, cycle_id))
+                conn.execute("insert into dispatch_assignments (run_id, cycle_id, task_id, capability, status, updated_at) values (?, ?, 'T1', 'developer', 'planned', 'now')", (run_id, cycle_id))
+                conn.execute("insert into dispatch_assignments (run_id, cycle_id, task_id, capability, status, updated_at) values (?, ?, 'T2', 'developer', 'planned', 'now')", (run_id, cycle_id))
                 conn.commit()
 
             started = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture")

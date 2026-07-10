@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
@@ -31,6 +31,9 @@ class Store(Protocol):
 
     def connection(self) -> Iterator[sqlite3.Connection]:
         """Read-oriented connection context manager."""
+
+    def backup_to(self, target: Path) -> None:
+        """Write a consistent database snapshot to target."""
 
     def transaction(
         self,
@@ -88,6 +91,11 @@ class SqliteStore:
         finally:
             conn.close()
 
+    def backup_to(self, target: Path) -> None:
+        ensure_parent(target)
+        with self.connection() as source, closing(sqlite3.connect(target)) as destination:
+            source.backup(destination)
+
     @contextmanager
     def transaction(
         self,
@@ -128,6 +136,11 @@ class InMemoryStore:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         yield self._conn
+
+    def backup_to(self, target: Path) -> None:
+        ensure_parent(target)
+        with closing(sqlite3.connect(target)) as destination:
+            self._conn.backup(destination)
 
     def close(self) -> None:
         self._conn.close()

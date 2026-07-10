@@ -61,7 +61,8 @@ def write_view(root: Path, relpath: str, content: str) -> None:
 def render_requirements(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from requirements order by id").fetchall()
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from requirements where cycle_id = ? order by id", (cycle_id,)).fetchall()
     lines = ["# Requirements", "", "| ID | Kind | Body | Priority | Status | Tool Link | Revision |", "| --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["id"], row["kind"], row["body"], row["priority"], row["status"], row["tool_link"], row["revision"]]) for row in rows)
     write_view(root, ".ai-team/requirements/requirements.md", "\n".join(lines))
@@ -75,7 +76,8 @@ def render_traceability(root: Path) -> None:
 def render_acceptance(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from acceptance order by id").fetchall()
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from acceptance where cycle_id = ? order by id", (cycle_id,)).fetchall()
     lines = ["# Acceptance Criteria", "", "| ID | Criterion | Priority | Tool Link | Status |", "| --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["id"], row["criterion"], row["priority"], row["tool_link"], row["status"]]) for row in rows)
     write_view(root, ".ai-team/requirements/acceptance.md", "\n".join(lines))
@@ -84,11 +86,13 @@ def render_acceptance(root: Path) -> None:
 def render_failure_modes(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from failure_modes order by id").fetchall()
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from failure_modes where cycle_id = ? order by id", (cycle_id,)).fetchall()
         mappings = {
             row["failure_mode_id"]: row["ids"]
             for row in conn.execute(
-                "select failure_mode_id, group_concat(acceptance_id, ', ') as ids from failure_mode_acceptance group by failure_mode_id"
+                "select failure_mode_id, group_concat(acceptance_id, ', ') as ids from failure_mode_acceptance where cycle_id = ? group by failure_mode_id",
+                (cycle_id,),
             )
         }
         covered = {
@@ -98,8 +102,9 @@ def render_failure_modes(root: Path) -> None:
                 select distinct vfm.failure_mode_id
                 from validation_failure_modes vfm
                 join validations v on v.id = vfm.validation_id
-                where v.result = 'pass'
-                """
+                where vfm.cycle_id = ? and v.cycle_id = vfm.cycle_id and v.result = 'pass'
+                """,
+                (cycle_id,),
             )
         }
     lines = ["# Failure Modes", "", "| ID | Feature | Scenario | Trigger | Expected Behavior | Recovery | Data Safety | Risk | Test Mapping | Status | Derived Coverage | Accepted By | Acceptance Reason | Acceptance Scope | Accepted Revision | Expires At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
@@ -132,10 +137,11 @@ def render_failure_modes(root: Path) -> None:
 def render_tasks(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from tasks order by id").fetchall()
-        acceptance = runtime.grouped(conn, "task_acceptance", "task_id", "acceptance_id")
-        failure_modes = runtime.grouped(conn, "task_failure_modes", "task_id", "failure_mode_id")
-        dependencies = runtime.grouped(conn, "task_dependencies", "task_id", "depends_on")
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from tasks where cycle_id = ? order by id", (cycle_id,)).fetchall()
+        acceptance = runtime.grouped(conn, "task_acceptance", "task_id", "acceptance_id", cycle_id)
+        failure_modes = runtime.grouped(conn, "task_failure_modes", "task_id", "failure_mode_id", cycle_id)
+        dependencies = runtime.grouped(conn, "task_dependencies", "task_id", "depends_on", cycle_id)
     lines = ["# Task Board", "", "| ID | Task | Owner | Status | Acceptance | Failure Modes | Depends On | Tool Link | Evidence | Revision | Lease |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         lines.append(
@@ -205,8 +211,9 @@ def render_test_targets(root: Path) -> None:
 def render_validation(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from validations order by created_at, id").fetchall()
-        failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from validations where cycle_id = ? order by created_at, id", (cycle_id,)).fetchall()
+        failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id", cycle_id)
     lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Command | Target | Executed Count | Count Source | Exit Code | Stdout SHA256 | Artifact | Policy | Trust Anchor | Sandbox | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(
         markdown_row(
@@ -287,7 +294,8 @@ def render_findings(root: Path) -> None:
 def render_gates(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from quality_gates order by created_at, id").fetchall()
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from quality_gates where cycle_id = ? order by sequence", (cycle_id,)).fetchall()
     lines = ["# Quality Gates", "", "| Gate | Commit | Base | Head | Source Hash | Diff Hash | Project Revision | Reviewer Context | Result | Blocking Findings | Commands | Evidence | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["gate"], row["reviewed_commit"], row["base_commit"], row["head_commit"], row["diff_hash"], row["tracked_diff_hash"], row["project_revision"], row["reviewer_context"], row["result"], row["blocking_findings"], row["commands"], row["evidence"], row["residual_risk"]]) for row in rows)
     write_view(root, "docs/harness/quality-gates.md", "\n".join(lines))
@@ -296,7 +304,8 @@ def render_gates(root: Path) -> None:
 def render_deliveries(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        rows = conn.execute("select * from deliveries order by created_at, id").fetchall()
+        cycle_id = runtime.current_cycle_id(conn)
+        rows = conn.execute("select * from deliveries where cycle_id = ? order by created_at, id", (cycle_id,)).fetchall()
     lines = ["# Delivery", ""]
     for row in rows:
         lines.extend(

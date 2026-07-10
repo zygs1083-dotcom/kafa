@@ -58,7 +58,7 @@ from core.schema_guard import (
 from core.store import DB_PATH, SqliteStore, Store
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 RUNTIME_VERSION = "4.18.0"
 MIN_MIGRATABLE_SCHEMA_VERSION = 6
 REGISTERED_SCHEMA_SOURCES = frozenset(range(MIN_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION))
@@ -390,14 +390,21 @@ def insert_active_command_log(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def transaction(root: Path, *, validate_invariants: bool = True, touched: list[tuple[str, str]] | None = None) -> Iterator[sqlite3.Connection]:
+    replay_before: dict[str, list[dict[str, Any]]] = {}
+    event_sequence_before = 0
+
     def before_commit(conn: sqlite3.Connection) -> None:
         insert_active_command_log(conn)
+        attach_transaction_replay_mutations(conn, replay_before, event_sequence_before)
         if validate_invariants:
             issues = transaction_invariant_issues(conn, root, touched)
             if issues:
                 raise HarnessError("; ".join(str(issue) for issue in issues))
 
     with get_store(root).transaction(before_commit=before_commit) as conn:
+        replay_before = replay_mutation_snapshot(conn)
+        if conn.execute("select 1 from sqlite_master where type = 'table' and name = 'events'").fetchone():
+            event_sequence_before = int(conn.execute("select coalesce(max(sequence), 0) from events").fetchone()[0])
         yield conn
 
 
@@ -480,16 +487,19 @@ def create_schema(conn: sqlite3.Connection) -> None:
             updated_at text not null
         );
         create table if not exists acceptance (
-            id text primary key,
+            uid text primary key default (lower(hex(randomblob(16)))),
+            id text not null,
             cycle_id text not null default '',
             criterion text not null,
             priority text not null default '',
             tool_link text not null default '',
             status text not null default 'active',
-            revision integer not null default 1
+            revision integer not null default 1,
+            unique(cycle_id, id)
         );
         create table if not exists requirements (
-            id text primary key,
+            uid text primary key default (lower(hex(randomblob(16)))),
+            id text not null,
             cycle_id text not null default '',
             kind text not null,
             body text not null,
@@ -497,10 +507,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             status text not null default 'active',
             tool_link text not null default '',
             revision integer not null default 1,
-            updated_at text not null
+            updated_at text not null,
+            unique(cycle_id, id)
         );
         create table if not exists failure_modes (
-            id text primary key,
+            uid text primary key default (lower(hex(randomblob(16)))),
+            id text not null,
             cycle_id text not null default '',
             feature text not null,
             scenario text not null,
@@ -515,17 +527,24 @@ def create_schema(conn: sqlite3.Connection) -> None:
             acceptance_scope text not null default '',
             accepted_revision integer,
             expires_at text,
-            revision integer not null default 1
+            revision integer not null default 1,
+            unique(cycle_id, id)
         );
         create table if not exists requirement_acceptance (
-            requirement_id text not null references requirements(id) on delete cascade,
-            acceptance_id text not null references acceptance(id) on delete cascade,
-            primary key (requirement_id, acceptance_id)
+            cycle_id text not null,
+            requirement_id text not null,
+            acceptance_id text not null,
+            primary key (cycle_id, requirement_id, acceptance_id),
+            foreign key (cycle_id, requirement_id) references requirements(cycle_id, id) on delete cascade,
+            foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
         );
         create table if not exists failure_mode_acceptance (
-            failure_mode_id text not null references failure_modes(id) on delete cascade,
-            acceptance_id text not null references acceptance(id) on delete cascade,
-            primary key (failure_mode_id, acceptance_id)
+            cycle_id text not null,
+            failure_mode_id text not null,
+            acceptance_id text not null,
+            primary key (cycle_id, failure_mode_id, acceptance_id),
+            foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade,
+            foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
         );
         create table if not exists baselines (
             id text primary key,
@@ -537,7 +556,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             created_at text not null
         );
         create table if not exists tasks (
-            id text primary key,
+            uid text primary key default (lower(hex(randomblob(16)))),
+            id text not null,
             cycle_id text not null default '',
             task text not null,
             owner text not null,
@@ -556,33 +576,46 @@ def create_schema(conn: sqlite3.Connection) -> None:
             retry_budget integer not null default 2,
             fence integer not null default 0,
             revision integer not null default 1,
-            updated_at text not null
+            updated_at text not null,
+            unique(cycle_id, id)
         );
         create table if not exists task_acceptance (
-            task_id text not null references tasks(id) on delete cascade,
-            acceptance_id text not null references acceptance(id) on delete cascade,
-            primary key (task_id, acceptance_id)
+            cycle_id text not null,
+            task_id text not null,
+            acceptance_id text not null,
+            primary key (cycle_id, task_id, acceptance_id),
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+            foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
         );
         create table if not exists task_failure_modes (
-            task_id text not null references tasks(id) on delete cascade,
-            failure_mode_id text not null references failure_modes(id) on delete cascade,
-            primary key (task_id, failure_mode_id)
+            cycle_id text not null,
+            task_id text not null,
+            failure_mode_id text not null,
+            primary key (cycle_id, task_id, failure_mode_id),
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+            foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade
         );
         create table if not exists task_dependencies (
-            task_id text not null references tasks(id) on delete cascade,
-            depends_on text not null references tasks(id) on delete restrict,
-            primary key (task_id, depends_on),
+            cycle_id text not null,
+            task_id text not null,
+            depends_on text not null,
+            primary key (cycle_id, task_id, depends_on),
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+            foreign key (cycle_id, depends_on) references tasks(cycle_id, id) on delete restrict,
             check (task_id != depends_on)
         );
         create table if not exists task_test_targets (
-            task_id text not null references tasks(id) on delete cascade,
+            cycle_id text not null,
+            task_id text not null,
             target_id text not null references test_targets(id) on delete cascade,
-            primary key (task_id, target_id)
+            primary key (cycle_id, task_id, target_id),
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade
         );
         create table if not exists task_attempts (
             id text primary key,
             run_id text not null,
-            task_id text not null references tasks(id) on delete cascade,
+            cycle_id text not null default '',
+            task_id text not null,
             agent_id text not null,
             fence integer not null default 0,
             base_commit_sha text not null default '',
@@ -596,7 +629,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             report_id text not null default '',
             evidence_id text not null default '',
             started_at text not null default '',
-            finished_at text not null default ''
+            finished_at text not null default '',
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade
         );
         create table if not exists validations (
             id text primary key,
@@ -644,8 +678,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists validation_failure_modes (
             validation_id text not null references validations(id) on delete cascade,
-            failure_mode_id text not null references failure_modes(id) on delete cascade,
-            primary key (validation_id, failure_mode_id)
+            cycle_id text not null,
+            failure_mode_id text not null,
+            primary key (validation_id, cycle_id, failure_mode_id),
+            foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade
         );
         create table if not exists validation_tests (
             validation_id text not null references validations(id) on delete cascade,
@@ -675,8 +711,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists quality_gates (
             id text primary key,
+            sequence integer not null default 0 unique,
             cycle_id text not null default '',
             candidate_sha text not null default '',
+            gate_status text not null default 'active',
+            superseded_by text not null default '',
             gate text not null,
             reviewed_commit text not null,
             evidence_commit text not null default '',
@@ -720,8 +759,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists delivery_acceptance (
             delivery_id text not null references deliveries(id) on delete cascade,
-            acceptance_id text not null references acceptance(id) on delete cascade,
-            primary key (delivery_id, acceptance_id)
+            cycle_id text not null,
+            acceptance_id text not null,
+            primary key (delivery_id, cycle_id, acceptance_id),
+            foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
         );
         create table if not exists evidence (
             id text primary key,
@@ -891,6 +932,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             provider_session_id text not null default '',
             origin text not null default 'manual',
             trust_level text not null default 'local-only',
+            effective_trust text not null default 'local-only',
+            receipt_provenance text not null default '',
             status text not null default 'active',
             started_at text not null,
             ended_at text not null default ''
@@ -907,6 +950,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             token_status text not null default 'unchecked',
             token_reason text not null default '',
             trust_level text not null default 'local-only',
+            effective_trust text not null default 'local-only',
+            receipt_provenance text not null default '',
             created_at text not null
         );
         create table if not exists ci_verifications (
@@ -919,6 +964,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             verification_token text not null default '',
             token_status text not null default 'unchecked',
             token_reason text not null default '',
+            effective_trust text not null default 'local-only',
+            receipt_provenance text not null default '',
             external_link text not null default '',
             created_at text not null,
             unique(provider, run_id)
@@ -933,6 +980,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             verification_token text not null default '',
             token_status text not null default 'unchecked',
             token_reason text not null default '',
+            effective_trust text not null default 'local-only',
+            receipt_provenance text not null default '',
             external_link text not null default '',
             created_at text not null,
             unique(session_id, verifier)
@@ -958,7 +1007,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists dispatch_assignments (
             run_id text not null references dispatch_runs(id) on delete cascade,
-            task_id text not null references tasks(id) on delete cascade,
+            cycle_id text not null default '',
+            task_id text not null,
             agent_id text not null default '',
             capability text not null default '',
             status text not null,
@@ -968,7 +1018,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             heartbeat_at text,
             lease_expires_at text,
             updated_at text not null,
-            primary key (run_id, task_id)
+            primary key (run_id, task_id),
+            foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade
         );
         create table if not exists dispatch_worktrees (
             id text primary key,
@@ -1126,6 +1177,19 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "requirements", "cycle_id", "text not null default ''")
     ensure_column(conn, "failure_modes", "cycle_id", "text not null default ''")
     ensure_column(conn, "tasks", "cycle_id", "text not null default ''")
+    for relation in [
+        "requirement_acceptance",
+        "failure_mode_acceptance",
+        "task_acceptance",
+        "task_failure_modes",
+        "task_dependencies",
+        "task_test_targets",
+        "validation_failure_modes",
+        "delivery_acceptance",
+    ]:
+        ensure_column(conn, relation, "cycle_id", "text not null default ''")
+    ensure_column(conn, "task_attempts", "cycle_id", "text not null default ''")
+    ensure_column(conn, "dispatch_assignments", "cycle_id", "text not null default ''")
     ensure_column(conn, "invalidations", "cycle_id", "text not null default ''")
     ensure_column(conn, "dispatch_runs", "cycle_id", "text not null default ''")
     ensure_column(conn, "failure_modes", "acceptance_scope", "text not null default ''")
@@ -1140,6 +1204,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "base_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "cycle_id", "text not null default ''")
     ensure_column(conn, "quality_gates", "candidate_sha", "text not null default ''")
+    ensure_column(conn, "quality_gates", "sequence", "integer not null default 0")
+    ensure_column(conn, "quality_gates", "gate_status", "text not null default 'active'")
+    ensure_column(conn, "quality_gates", "superseded_by", "text not null default ''")
     ensure_column(conn, "quality_gates", "head_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
@@ -1222,10 +1289,18 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
     ensure_column(conn, "ci_verifications", "token_status", "text not null default 'unchecked'")
     ensure_column(conn, "ci_verifications", "token_reason", "text not null default ''")
+    ensure_column(conn, "ci_verifications", "effective_trust", "text not null default 'local-only'")
+    ensure_column(conn, "ci_verifications", "receipt_provenance", "text not null default ''")
     ensure_column(conn, "external_session_verifications", "origin", "text not null default 'manual'")
     ensure_column(conn, "external_session_verifications", "verification_token", "text not null default ''")
     ensure_column(conn, "external_session_verifications", "token_status", "text not null default 'unchecked'")
     ensure_column(conn, "external_session_verifications", "token_reason", "text not null default ''")
+    ensure_column(conn, "external_session_verifications", "effective_trust", "text not null default 'local-only'")
+    ensure_column(conn, "external_session_verifications", "receipt_provenance", "text not null default ''")
+    ensure_column(conn, "agent_sessions", "effective_trust", "text not null default 'local-only'")
+    ensure_column(conn, "agent_sessions", "receipt_provenance", "text not null default ''")
+    ensure_column(conn, "session_attestations", "effective_trust", "text not null default 'local-only'")
+    ensure_column(conn, "session_attestations", "receipt_provenance", "text not null default ''")
     ensure_column(conn, "dispatch_assignments", "heartbeat_at", "text")
     ensure_column(conn, "dispatch_assignments", "lease_expires_at", "text")
     ensure_column(conn, "dispatch_assignments", "provider_session_id", "text not null default ''")
@@ -1501,6 +1576,111 @@ def runtime_snapshot(conn: sqlite3.Connection, *, include_events: bool = True) -
     return data
 
 
+def replay_mutation_snapshot(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    return {
+        table: table_rows(conn, table)
+        for table in SNAPSHOT_TABLES
+        if table != "events"
+        and conn.execute("select 1 from sqlite_master where type = 'table' and name = ?", (table,)).fetchone()
+    }
+
+
+def replay_row_key(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> dict[str, Any]:
+    primary_key = [
+        item["name"]
+        for item in sorted(conn.execute(f"pragma table_info({table})"), key=lambda item: int(item["pk"] or 0))
+        if int(item["pk"] or 0) > 0
+    ]
+    if not primary_key or any(column not in row for column in primary_key):
+        raise HarnessError(f"event replay requires a stable primary key: {table}")
+    return {column: row[column] for column in primary_key}
+
+
+def attach_transaction_replay_mutations(
+    conn: sqlite3.Connection,
+    before: dict[str, list[dict[str, Any]]],
+    event_sequence_before: int,
+) -> None:
+    event = conn.execute(
+        "select sequence, payload_json from events where sequence > ? order by sequence desc limit 1",
+        (event_sequence_before,),
+    ).fetchone()
+    after = replay_mutation_snapshot(conn)
+    if not event and before != after:
+        emit_event(conn, "transaction_state_changed", payload())
+        event = conn.execute(
+            "select sequence, payload_json from events where sequence > ? order by sequence desc limit 1",
+            (event_sequence_before,),
+        ).fetchone()
+    if event:
+        for prior_event in conn.execute(
+            "select sequence, payload_json from events where sequence > ? and sequence < ? order by sequence",
+            (event_sequence_before, event["sequence"]),
+        ):
+            prior_payload = json.loads(prior_event["payload_json"])
+            prior_payload.setdefault("canonical_mutations", [])
+            conn.execute(
+                "update events set payload_json = ? where sequence = ?",
+                (stable_json(prior_payload), prior_event["sequence"]),
+            )
+    before_project = before.get("project", [])
+    after_project = after.get("project", [])
+    before_schema = before_project[0].get("schema_version") if before_project else None
+    after_schema = after_project[0].get("schema_version") if after_project else None
+    if before_schema is not None and before_schema != after_schema:
+        if not event:
+            raise HarnessError("schema mutation has no replay event")
+        payload_data = json.loads(event["payload_json"])
+        payload_data["canonical_mutations"] = []
+        payload_data["replay_boundary"] = "checkpoint-required-after-schema-migration"
+        conn.execute(
+            "update events set payload_json = ? where sequence = ?",
+            (stable_json(payload_data), event["sequence"]),
+        )
+        return
+    mutations: list[dict[str, Any]] = []
+    table_order = [table for table in SNAPSHOT_TABLES if table != "events"]
+    indexed_before: dict[str, dict[str, dict[str, Any]]] = {}
+    indexed_after: dict[str, dict[str, dict[str, Any]]] = {}
+    for table in table_order:
+        if table not in before and table not in after:
+            continue
+        indexed_before[table] = {
+            stable_json(replay_row_key(conn, table, row)): row for row in before.get(table, [])
+        }
+        indexed_after[table] = {
+            stable_json(replay_row_key(conn, table, row)): row for row in after.get(table, [])
+        }
+    for table in reversed(table_order):
+        for key_json in sorted(set(indexed_before.get(table, {})) - set(indexed_after.get(table, {}))):
+            row = indexed_before[table][key_json]
+            mutations.append({"table": table, "op": "delete", "key": replay_row_key(conn, table, row)})
+    for table in table_order:
+        before_rows = indexed_before.get(table, {})
+        for key_json, row in sorted(indexed_after.get(table, {}).items()):
+            if before_rows.get(key_json) != row:
+                mutations.append(
+                    {"table": table, "op": "upsert", "key": replay_row_key(conn, table, row), "row": row}
+                )
+    if not mutations:
+        if event:
+            payload_data = json.loads(event["payload_json"])
+            payload_data["canonical_mutations"] = []
+            conn.execute(
+                "update events set payload_json = ? where sequence = ?",
+                (stable_json(payload_data), event["sequence"]),
+            )
+        return
+    if not event:
+        raise HarnessError("state mutation has no replay event")
+    payload_data = json.loads(event["payload_json"])
+    payload_data["canonical_mutations"] = mutations
+    conn.execute(
+        "update events set payload_json = ? where sequence = ?",
+        (stable_json(payload_data), event["sequence"]),
+    )
+
+
 def restore_snapshot(conn: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
     create_schema(conn)
     conn.execute("pragma defer_foreign_keys = on")
@@ -1532,8 +1712,8 @@ def baseline_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
             for row in conn.execute(
                 """
                 select ra.* from requirement_acceptance ra
-                join requirements r on r.id = ra.requirement_id
-                where r.cycle_id = ?
+                join requirements r on r.cycle_id = ra.cycle_id and r.id = ra.requirement_id
+                where ra.cycle_id = ?
                 order by ra.requirement_id, ra.acceptance_id
                 """,
                 (cycle_id,),
@@ -1545,8 +1725,8 @@ def baseline_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
             for row in conn.execute(
                 """
                 select fma.* from failure_mode_acceptance fma
-                join failure_modes fm on fm.id = fma.failure_mode_id
-                where fm.cycle_id = ?
+                join failure_modes fm on fm.cycle_id = fma.cycle_id and fm.id = fma.failure_mode_id
+                where fma.cycle_id = ?
                 order by fma.failure_mode_id, fma.acceptance_id
                 """,
                 (cycle_id,),
@@ -1592,13 +1772,14 @@ def validation_has_test_or_evidence(conn: sqlite3.Connection, validation_id: str
 
 
 def trace_snapshot(conn: sqlite3.Connection, requirement_id: str) -> dict[str, Any]:
+    cycle_id = current_cycle_id(conn)
     return {
         "requirement_id": requirement_id,
         "acceptance_ids": [
             row["acceptance_id"]
             for row in conn.execute(
-                "select acceptance_id from requirement_acceptance where requirement_id = ? order by acceptance_id",
-                (requirement_id,),
+                "select acceptance_id from requirement_acceptance where cycle_id = ? and requirement_id = ? order by acceptance_id",
+                (cycle_id, requirement_id),
             )
         ],
     }
@@ -1739,8 +1920,8 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
         targets.extend(
             ("task", row["task_id"])
             for row in conn.execute(
-                "select ta.task_id from task_acceptance ta join tasks t on t.id = ta.task_id where ta.acceptance_id = ? and t.cycle_id = ?",
-                (source_id, cycle_id),
+                "select ta.task_id from task_acceptance ta join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id where ta.cycle_id = ? and ta.acceptance_id = ?",
+                (cycle_id, source_id),
             )
         )
         targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ? and cycle_id = ?", (source_id, cycle_id)))
@@ -1749,8 +1930,8 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
         targets.extend(
             ("task", row["task_id"])
             for row in conn.execute(
-                "select tfm.task_id from task_failure_modes tfm join tasks t on t.id = tfm.task_id where tfm.failure_mode_id = ? and t.cycle_id = ?",
-                (source_id, cycle_id),
+                "select tfm.task_id from task_failure_modes tfm join tasks t on t.cycle_id = tfm.cycle_id and t.id = tfm.task_id where tfm.cycle_id = ? and tfm.failure_mode_id = ?",
+                (cycle_id, source_id),
             )
         )
         targets.extend(
@@ -1759,9 +1940,9 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
                 """
                 select vfm.validation_id from validation_failure_modes vfm
                 join validations v on v.id = vfm.validation_id
-                where vfm.failure_mode_id = ? and v.cycle_id = ?
+                where vfm.cycle_id = ? and vfm.failure_mode_id = ? and v.cycle_id = vfm.cycle_id
                 """,
-                (source_id, cycle_id),
+                (cycle_id, source_id),
             )
         )
         targets.extend(("quality_gate", row["id"]) for row in conn.execute("select id from quality_gates where cycle_id = ?", (cycle_id,)))
@@ -1771,10 +1952,10 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
             for row in conn.execute(
                 """
                 select ra.acceptance_id from requirement_acceptance ra
-                join acceptance a on a.id = ra.acceptance_id
-                where ra.requirement_id = ? and a.cycle_id = ?
+                join acceptance a on a.cycle_id = ra.cycle_id and a.id = ra.acceptance_id
+                where ra.cycle_id = ? and ra.requirement_id = ?
                 """,
-                (source_id, cycle_id),
+                (cycle_id, source_id),
             )
         ]
         for acceptance_id in acceptance_ids:
@@ -1782,8 +1963,8 @@ def invalidate_downstream(conn: sqlite3.Connection, source_type: str, source_id:
             targets.extend(
                 ("task", row["task_id"])
                 for row in conn.execute(
-                    "select ta.task_id from task_acceptance ta join tasks t on t.id = ta.task_id where ta.acceptance_id = ? and t.cycle_id = ?",
-                    (acceptance_id, cycle_id),
+                    "select ta.task_id from task_acceptance ta join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id where ta.cycle_id = ? and ta.acceptance_id = ?",
+                    (cycle_id, acceptance_id),
                 )
             )
             targets.extend(("validation", row["id"]) for row in conn.execute("select id from validations where acceptance_id = ? and cycle_id = ?", (acceptance_id, cycle_id)))
@@ -1859,6 +2040,20 @@ def backup_runtime(root: Path, reason: str) -> Path:
             continue
         target = backup_dir / relpath
         ensure_parent(target)
+        if relpath == ".ai-team/state" and source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            source_db = source / "harness.db"
+            if source_db.exists():
+                get_store(root).backup_to(target / "harness.db")
+            for child in source.iterdir():
+                if child.name in {"harness.db", "harness.db-wal", "harness.db-shm"}:
+                    continue
+                destination = target / child.name
+                if child.is_dir():
+                    shutil.copytree(child, destination, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(child, destination)
+            continue
         if source.is_dir():
             shutil.copytree(source, target, dirs_exist_ok=True)
         else:
@@ -2003,17 +2198,18 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
             if already_applied:
                 raise _MigrationAlreadyApplied
             initialize_project(conn)
+            cycle_id = current_cycle_id(conn)
             for cells in acceptance_rows:
                 if len(cells) < 2:
                     report_count(report, "skipped", "acceptance")
                     continue
                 conn.execute(
                     """
-                    insert into acceptance (id, criterion, priority, tool_link, status)
-                    values (?, ?, ?, ?, ?)
-                    on conflict(id) do nothing
+                    insert into acceptance (id, cycle_id, criterion, priority, tool_link, status)
+                    values (?, ?, ?, ?, ?, ?)
+                    on conflict(cycle_id, id) do nothing
                     """,
-                    (cells[0], cells[1], cells[2] if len(cells) > 2 else "", cells[3] if len(cells) > 3 else "", cells[4] if len(cells) > 4 else "active"),
+                    (cells[0], cycle_id, cells[1], cells[2] if len(cells) > 2 else "", cells[3] if len(cells) > 3 else "", cells[4] if len(cells) > 4 else "active"),
                 )
             for cells in requirement_rows:
                 if len(cells) < 3:
@@ -2021,12 +2217,13 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                     continue
                 conn.execute(
                     """
-                    insert into requirements (id, kind, body, priority, status, tool_link, revision, updated_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?)
-                    on conflict(id) do nothing
+                    insert into requirements (id, cycle_id, kind, body, priority, status, tool_link, revision, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(cycle_id, id) do nothing
                     """,
                     (
                         cells[0],
+                        cycle_id,
                         cells[1],
                         cells[2],
                         cells[3] if len(cells) > 3 else "",
@@ -2043,12 +2240,13 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 conn.execute(
                     """
                     insert into failure_modes
-                    (id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status)
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    on conflict(id) do nothing
+                    (id, cycle_id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(cycle_id, id) do nothing
                     """,
                     (
                         cells[0],
+                        cycle_id,
                         cells[1],
                         cells[2],
                         cells[3],
@@ -2061,10 +2259,10 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 )
                 if len(cells) > 8:
                     for acceptance_id in parse_ids(cells[8]):
-                        if conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+                        if conn.execute("select id from acceptance where cycle_id = ? and id = ?", (cycle_id, acceptance_id)).fetchone():
                             conn.execute(
-                                "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
-                                (cells[0], acceptance_id),
+                                "insert or ignore into failure_mode_acceptance (cycle_id, failure_mode_id, acceptance_id) values (?, ?, ?)",
+                                (cycle_id, cells[0], acceptance_id),
                             )
             for cells in task_rows:
                 if len(cells) < 4:
@@ -2073,12 +2271,13 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 status = cells[3] if cells[3] in TASK_STATUSES else "ready"
                 conn.execute(
                     """
-                    insert into tasks (id, task, owner, status, tool_link, evidence, updated_at)
-                    values (?, ?, ?, ?, ?, ?, ?)
-                    on conflict(id) do nothing
+                    insert into tasks (id, cycle_id, task, owner, status, tool_link, evidence, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(cycle_id, id) do nothing
                     """,
                     (
                         cells[0],
+                        cycle_id,
                         cells[1],
                         cells[2] if len(cells) > 2 else "unassigned",
                         status,
@@ -2088,11 +2287,11 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                     ),
                 )
                 for acceptance_id in parse_ids(cells[4] if len(cells) > 4 else ""):
-                    if conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
-                        conn.execute("insert or ignore into task_acceptance (task_id, acceptance_id) values (?, ?)", (cells[0], acceptance_id))
+                    if conn.execute("select id from acceptance where cycle_id = ? and id = ?", (cycle_id, acceptance_id)).fetchone():
+                        conn.execute("insert or ignore into task_acceptance (cycle_id, task_id, acceptance_id) values (?, ?, ?)", (cycle_id, cells[0], acceptance_id))
                 for fm_id in parse_ids(cells[5] if len(cells) > 5 else ""):
-                    if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
-                        conn.execute("insert or ignore into task_failure_modes (task_id, failure_mode_id) values (?, ?)", (cells[0], fm_id))
+                    if conn.execute("select id from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone():
+                        conn.execute("insert or ignore into task_failure_modes (cycle_id, task_id, failure_mode_id) values (?, ?, ?)", (cycle_id, cells[0], fm_id))
             for cells in validation_rows:
                 if len(cells) < 10:
                     report_count(report, "skipped", "validation")
@@ -2101,12 +2300,13 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 conn.execute(
                     """
                     insert into validations
-                    (id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
+                    (id, cycle_id, surface, acceptance_id, commands, findings, result, residual_risk, head_commit,
                      source_tree_hash, tracked_diff_hash, project_revision, created_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         validation_id,
+                        cycle_id,
                         cells[0],
                         cells[1] if len(cells) > 1 else "",
                         cells[8] if len(cells) > 8 else "",
@@ -2121,10 +2321,10 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
                     ),
                 )
                 for fm_id in parse_ids(cells[2] if len(cells) > 2 else ""):
-                    if conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
+                    if conn.execute("select id from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone():
                         conn.execute(
-                            "insert or ignore into validation_failure_modes (validation_id, failure_mode_id) values (?, ?)",
-                            (validation_id, fm_id),
+                            "insert or ignore into validation_failure_modes (validation_id, cycle_id, failure_mode_id) values (?, ?, ?)",
+                            (validation_id, cycle_id, fm_id),
                         )
             for cells in gate_rows:
                 if len(cells) < 9:
@@ -2453,20 +2653,20 @@ def add_requirement(root: Path, requirement_id: str, kind: str, body: str, prior
     guard_schema("validate_requirement", requirement_id, kind, body, status)
     with transaction(root, touched=[("requirement", requirement_id)]) as conn:
         cycle_id = current_cycle_id(conn)
-        existing = conn.execute("select * from requirements where id = ?", (requirement_id,)).fetchone()
+        existing = conn.execute("select * from requirements where cycle_id = ? and id = ?", (cycle_id, requirement_id)).fetchone()
         conn.execute(
             """
             insert into requirements (id, cycle_id, kind, body, priority, status, tool_link, updated_at)
             values (?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(id) do update set kind=excluded.kind, body=excluded.body, priority=excluded.priority,
-              cycle_id=excluded.cycle_id, status=excluded.status, tool_link=excluded.tool_link,
+            on conflict(cycle_id, id) do update set kind=excluded.kind, body=excluded.body, priority=excluded.priority,
+              status=excluded.status, tool_link=excluded.tool_link,
               revision=requirements.revision+1, updated_at=excluded.updated_at
             """,
             (requirement_id, cycle_id, kind, body, priority, status, tool_link, now_iso()),
         )
         if existing and (existing["kind"], existing["body"], existing["priority"], existing["status"], existing["tool_link"]) != (kind, body, priority, status, tool_link):
             invalidate_downstream(conn, "requirement", requirement_id, "requirement changed")
-        after = conn.execute("select * from requirements where id = ?", (requirement_id,)).fetchone()
+        after = conn.execute("select * from requirements where cycle_id = ? and id = ?", (cycle_id, requirement_id)).fetchone()
         emit_audit_event(
             conn,
             "requirement_recorded",
@@ -2484,19 +2684,19 @@ def add_acceptance(root: Path, acceptance_id: str, criterion: str, priority: str
     guard_schema("validate_acceptance", acceptance_id, criterion)
     with transaction(root, touched=[("acceptance", acceptance_id)]) as conn:
         cycle_id = current_cycle_id(conn)
-        existing = conn.execute("select * from acceptance where id = ?", (acceptance_id,)).fetchone()
+        existing = conn.execute("select * from acceptance where cycle_id = ? and id = ?", (cycle_id, acceptance_id)).fetchone()
         conn.execute(
             """
             insert into acceptance (id, cycle_id, criterion, priority, tool_link)
             values (?, ?, ?, ?, ?)
-            on conflict(id) do update set criterion=excluded.criterion, priority=excluded.priority, tool_link=excluded.tool_link,
-                cycle_id=excluded.cycle_id, revision=acceptance.revision+1
+            on conflict(cycle_id, id) do update set criterion=excluded.criterion, priority=excluded.priority,
+                tool_link=excluded.tool_link, revision=acceptance.revision+1
             """,
             (acceptance_id, cycle_id, criterion, priority, tool_link),
         )
         if existing and (existing["criterion"], existing["priority"], existing["tool_link"]) != (criterion, priority, tool_link):
             invalidate_downstream(conn, "acceptance", acceptance_id, "acceptance criterion changed")
-        after = conn.execute("select * from acceptance where id = ?", (acceptance_id,)).fetchone()
+        after = conn.execute("select * from acceptance where cycle_id = ? and id = ?", (cycle_id, acceptance_id)).fetchone()
         emit_audit_event(
             conn,
             "acceptance_recorded",
@@ -2530,7 +2730,7 @@ def add_failure_mode(
     guard_schema("validate_failure_mode", fm_id, risk, status)
     with transaction(root, touched=[("failure_mode", fm_id)]) as conn:
         cycle_id = current_cycle_id(conn)
-        existing = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
+        existing = conn.execute("select * from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone()
         accepted_revision = None
         if status not in FAILURE_MODE_STATUSES:
             raise HarnessError("failure mode status must be identified, accepted, or exempt; coverage is derived from passing validation")
@@ -2544,9 +2744,9 @@ def add_failure_mode(
             (id, cycle_id, feature, scenario, trigger, expected_behavior, recovery, data_safety, risk, status,
              accepted_by, acceptance_reason, acceptance_scope, accepted_revision, expires_at)
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(id) do update set feature=excluded.feature, scenario=excluded.scenario, trigger=excluded.trigger,
+            on conflict(cycle_id, id) do update set feature=excluded.feature, scenario=excluded.scenario, trigger=excluded.trigger,
               expected_behavior=excluded.expected_behavior, recovery=excluded.recovery, data_safety=excluded.data_safety,
-              cycle_id=excluded.cycle_id, risk=excluded.risk, status=excluded.status, accepted_by=excluded.accepted_by,
+              risk=excluded.risk, status=excluded.status, accepted_by=excluded.accepted_by,
               acceptance_reason=excluded.acceptance_reason, acceptance_scope=excluded.acceptance_scope,
               accepted_revision=excluded.accepted_revision, expires_at=excluded.expires_at, revision=failure_modes.revision+1
             """,
@@ -2571,8 +2771,8 @@ def add_failure_mode(
         if acceptance:
             require_acceptance(conn, acceptance)
             conn.execute(
-                "insert or ignore into failure_mode_acceptance (failure_mode_id, acceptance_id) values (?, ?)",
-                (fm_id, acceptance),
+                "insert or ignore into failure_mode_acceptance (cycle_id, failure_mode_id, acceptance_id) values (?, ?, ?)",
+                (cycle_id, fm_id, acceptance),
             )
         if existing and (
             existing["feature"],
@@ -2583,7 +2783,7 @@ def add_failure_mode(
             existing["status"],
         ) != (feature, scenario, trigger, expected, risk, status):
             invalidate_downstream(conn, "failure_mode", fm_id, "failure mode changed")
-        after = conn.execute("select * from failure_modes where id = ?", (fm_id,)).fetchone()
+        after = conn.execute("select * from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone()
         emit_audit_event(
             conn,
             "failure_mode_recorded",
@@ -2598,23 +2798,26 @@ def add_failure_mode(
 
 
 def require_acceptance(conn: sqlite3.Connection, acceptance_id: str) -> None:
-    if not conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+    cycle_id = current_cycle_id(conn)
+    if not conn.execute("select id from acceptance where cycle_id = ? and id = ?", (cycle_id, acceptance_id)).fetchone():
         raise HarnessError(f"missing acceptance: {acceptance_id}")
 
 
 def require_requirement(conn: sqlite3.Connection, requirement_id: str) -> None:
-    if not conn.execute("select id from requirements where id = ?", (requirement_id,)).fetchone():
+    cycle_id = current_cycle_id(conn)
+    if not conn.execute("select id from requirements where cycle_id = ? and id = ?", (cycle_id, requirement_id)).fetchone():
         raise HarnessError(f"missing requirement: {requirement_id}")
 
 
 def link_requirement_acceptance(root: Path, requirement_id: str, acceptance_id: str) -> None:
     with transaction(root, touched=[("requirement", requirement_id), ("acceptance", acceptance_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         require_requirement(conn, requirement_id)
         require_acceptance(conn, acceptance_id)
         before = trace_snapshot(conn, requirement_id)
         conn.execute(
-            "insert or ignore into requirement_acceptance (requirement_id, acceptance_id) values (?, ?)",
-            (requirement_id, acceptance_id),
+            "insert or ignore into requirement_acceptance (cycle_id, requirement_id, acceptance_id) values (?, ?, ?)",
+            (cycle_id, requirement_id, acceptance_id),
         )
         after = trace_snapshot(conn, requirement_id)
         emit_audit_event(
@@ -2630,7 +2833,8 @@ def link_requirement_acceptance(root: Path, requirement_id: str, acceptance_id: 
 
 
 def require_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
-    row = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+    cycle_id = current_cycle_id(conn)
+    row = conn.execute("select * from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone()
     if not row:
         raise HarnessError(f"missing task: {task_id}")
     return row
@@ -2803,7 +3007,13 @@ def close_agent_session(root: Path, session_id: str) -> None:
 def assert_no_dependency_cycle(conn: sqlite3.Connection, task_id: str, depends_on: str) -> None:
     from core.scheduler import assert_no_dependency_cycle as core_assert_no_dependency_cycle
 
-    core_assert_no_dependency_cycle(conn, task_id, depends_on, error_factory=HarnessError)
+    core_assert_no_dependency_cycle(
+        conn,
+        task_id,
+        depends_on,
+        cycle_id=current_cycle_id(conn),
+        error_factory=HarnessError,
+    )
 
 
 def add_task(
@@ -2826,7 +3036,7 @@ def add_task(
             raise HarnessError(f"invalid task status: {status}")
         if status == "accepted":
             raise HarnessError("new tasks cannot be created as accepted; use task complete with evidence")
-        if conn.execute("select id from tasks where id = ?", (task_id,)).fetchone():
+        if conn.execute("select id from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone():
             raise HarnessError(f"duplicate task id: {task_id}")
         conn.execute(
             """
@@ -2835,21 +3045,21 @@ def add_task(
             """,
             (task_id, cycle_id, task, owner, status, evidence, tool_link, now_iso()),
         )
-        conn.execute("delete from task_acceptance where task_id = ?", (task_id,))
+        conn.execute("delete from task_acceptance where cycle_id = ? and task_id = ?", (cycle_id, task_id))
         for acceptance_id in parse_ids(acceptance):
             require_acceptance(conn, acceptance_id)
-            conn.execute("insert into task_acceptance (task_id, acceptance_id) values (?, ?)", (task_id, acceptance_id))
-        conn.execute("delete from task_failure_modes where task_id = ?", (task_id,))
+            conn.execute("insert into task_acceptance (cycle_id, task_id, acceptance_id) values (?, ?, ?)", (cycle_id, task_id, acceptance_id))
+        conn.execute("delete from task_failure_modes where cycle_id = ? and task_id = ?", (cycle_id, task_id))
         for fm_id in parse_ids(failure_modes):
-            if not conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
+            if not conn.execute("select id from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone():
                 raise HarnessError(f"missing failure mode: {fm_id}")
-            conn.execute("insert into task_failure_modes (task_id, failure_mode_id) values (?, ?)", (task_id, fm_id))
-        conn.execute("delete from task_dependencies where task_id = ?", (task_id,))
+            conn.execute("insert into task_failure_modes (cycle_id, task_id, failure_mode_id) values (?, ?, ?)", (cycle_id, task_id, fm_id))
+        conn.execute("delete from task_dependencies where cycle_id = ? and task_id = ?", (cycle_id, task_id))
         for dep in parse_ids(depends_on):
             require_task(conn, dep)
             assert_no_dependency_cycle(conn, task_id, dep)
-            conn.execute("insert into task_dependencies (task_id, depends_on) values (?, ?)", (task_id, dep))
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+            conn.execute("insert into task_dependencies (cycle_id, task_id, depends_on) values (?, ?, ?)", (cycle_id, task_id, dep))
+        after = conn.execute("select * from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone()
         emit_audit_event(
             conn,
             "task_created",
@@ -2865,25 +3075,26 @@ def add_task(
 
 def update_task(root: Path, task_id: str, *, depends_on: str | None = None, status: str | None = None) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
+        cycle_id = current_cycle_id(conn)
         row = require_task(conn, task_id)
         if status and status not in TASK_STATUSES:
             raise HarnessError(f"invalid task status: {status}")
         if status == "accepted":
             raise HarnessError("task acceptance must use task complete with evidence")
         if depends_on is not None:
-            conn.execute("delete from task_dependencies where task_id = ?", (task_id,))
+            conn.execute("delete from task_dependencies where cycle_id = ? and task_id = ?", (cycle_id, task_id))
             for dep in parse_ids(depends_on):
                 require_task(conn, dep)
                 assert_no_dependency_cycle(conn, task_id, dep)
-                conn.execute("insert into task_dependencies (task_id, depends_on) values (?, ?)", (task_id, dep))
+                conn.execute("insert into task_dependencies (cycle_id, task_id, depends_on) values (?, ?, ?)", (cycle_id, task_id, dep))
         if status:
             conn.execute(
-                "update tasks set status = ?, revision = revision + 1, updated_at = ? where id = ?",
-                (status, now_iso(), task_id),
+                "update tasks set status = ?, revision = revision + 1, updated_at = ? where cycle_id = ? and id = ?",
+                (status, now_iso(), cycle_id, task_id),
             )
         else:
-            conn.execute("update tasks set revision = revision + 1, updated_at = ? where id = ?", (now_iso(), task_id))
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+            conn.execute("update tasks set revision = revision + 1, updated_at = ? where cycle_id = ? and id = ?", (now_iso(), cycle_id, task_id))
+        after = conn.execute("select * from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone()
         emit_audit_event(
             conn,
             "task_updated",
@@ -2900,13 +3111,13 @@ def ready_tasks(root: Path) -> list[str]:
     from core.scheduler import ready_queue
 
     with connection(root) as conn:
-        return ready_queue(conn)
+        return ready_queue(conn, current_cycle_id(conn))
 
 
 def dependency_blockers(conn: sqlite3.Connection, task_id: str) -> list[str]:
     from core.scheduler import dependency_blockers as core_dependency_blockers
 
-    return core_dependency_blockers(conn, task_id)
+    return core_dependency_blockers(conn, task_id, current_cycle_id(conn))
 
 
 def require_task_runnable(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -2932,9 +3143,9 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
         conn.execute(
             """
             update tasks set lease_agent = ?, lease_token = ?, lease_heartbeat_at = ?, lease_expires_at = ?, status = 'claimed',
-              revision = revision + 1, updated_at = ? where id = ?
+              revision = revision + 1, updated_at = ? where uid = ?
             """,
-            (agent, token, now_iso(), lease_deadline(), now_iso(), task_id),
+            (agent, token, now_iso(), lease_deadline(), now_iso(), row["uid"]),
         )
         conn.execute(
             """
@@ -2943,7 +3154,7 @@ def claim_task(root: Path, task_id: str, agent: str, expected_revision: int) -> 
             """,
             (task_id, now_iso(), agent),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_claimed",
@@ -2966,10 +3177,10 @@ def heartbeat_task(root: Path, task_id: str, agent: str, lease_token: str, expec
         require_lease(row, agent, lease_token)
         require_fence(row, expected_fence)
         conn.execute(
-            "update tasks set lease_heartbeat_at = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ? where id = ?",
-            (now_iso(), lease_deadline(), now_iso(), task_id),
+            "update tasks set lease_heartbeat_at = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ? where uid = ?",
+            (now_iso(), lease_deadline(), now_iso(), row["uid"]),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_heartbeat",
@@ -2988,7 +3199,7 @@ def recover_stale_leases(root: Path) -> int:
     with transaction(root, touched=[]) as conn:
         rows = conn.execute(
             """
-            select id, status, lease_agent from tasks
+            select uid, id, status, lease_agent from tasks
             where lease_expires_at is not null and lease_expires_at <= ? and lease_agent is not null
             order by id
             """,
@@ -2999,9 +3210,9 @@ def recover_stale_leases(root: Path) -> int:
             conn.execute(
                 """
                 update tasks set status = ?, lease_agent = null, lease_token = null, lease_heartbeat_at = null,
-                  lease_expires_at = null, revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
+                  lease_expires_at = null, revision = revision + 1, fence = fence + 1, updated_at = ? where uid = ?
                 """,
-                (next_status, now_iso(), row["id"]),
+                (next_status, now_iso(), row["uid"]),
             )
             if row["lease_agent"]:
                 conn.execute(
@@ -3025,12 +3236,12 @@ def release_task(root: Path, task_id: str, agent: str, *, lease_token: str | Non
         conn.execute(
             """
             update tasks set lease_agent = null, lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
-              status = 'ready', revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
+              status = 'ready', revision = revision + 1, fence = fence + 1, updated_at = ? where uid = ?
             """,
-            (now_iso(), task_id),
+            (now_iso(), row["uid"]),
         )
         conn.execute("update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?", (now_iso(), agent))
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_released",
@@ -3056,11 +3267,11 @@ def start_task(root: Path, task_id: str, agent: str, *, lease_token: str | None 
         require_task_runnable(conn, row)
         conn.execute(
             """
-            update tasks set status = 'in_progress', owner = ?, revision = revision + 1, updated_at = ? where id = ?
+            update tasks set status = 'in_progress', owner = ?, revision = revision + 1, updated_at = ? where uid = ?
             """,
-            (agent, now_iso(), task_id),
+            (agent, now_iso(), row["uid"]),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_started",
@@ -3089,15 +3300,15 @@ def submit_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
             """
             update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null, lease_token = null,
               lease_heartbeat_at = null, lease_expires_at = null,
-              submitted_session_id = ?, revision = revision + 1, updated_at = ? where id = ?
+              submitted_session_id = ?, revision = revision + 1, updated_at = ? where uid = ?
             """,
-            (evidence, agent, session_id, now_iso(), task_id),
+            (evidence, agent, session_id, now_iso(), row["uid"]),
         )
         conn.execute(
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_submitted",
@@ -3134,15 +3345,15 @@ def review_task(root: Path, task_id: str, agent: str, expected_revision: int, *,
         conn.execute(
             """
             update tasks set status = 'review', lease_agent = ?, lease_token = ?, lease_heartbeat_at = ?, lease_expires_at = ?,
-              revision = revision + 1, fence = fence + 1, updated_at = ? where id = ?
+              revision = revision + 1, fence = fence + 1, updated_at = ? where uid = ?
             """,
-            (agent, token, now_iso(), lease_deadline(), now_iso(), task_id),
+            (agent, token, now_iso(), lease_deadline(), now_iso(), row["uid"]),
         )
         conn.execute(
             "update agents set lease_task_id = ?, status = 'leased', updated_at = ? where id = ?",
             (task_id, now_iso(), agent),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_review_started",
@@ -3175,15 +3386,15 @@ def accept_task(root: Path, task_id: str, evidence: str, *, agent: str, lease_to
             """
             update tasks set status = 'accepted', evidence = ?, accepted_by = ?, lease_agent = null, lease_token = null,
               lease_heartbeat_at = null, lease_expires_at = null,
-              accepted_session_id = ?, revision = revision + 1, updated_at = ? where id = ?
+              accepted_session_id = ?, revision = revision + 1, updated_at = ? where uid = ?
             """,
-            (evidence, agent, session_id, now_iso(), task_id),
+            (evidence, agent, session_id, now_iso(), row["uid"]),
         )
         conn.execute(
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_accepted",
@@ -3231,15 +3442,15 @@ def block_task(root: Path, task_id: str, reason: str, *, agent: str, lease_token
         conn.execute(
             """
             update tasks set status = 'blocked', evidence = ?, lease_agent = null, lease_token = null,
-              lease_heartbeat_at = null, lease_expires_at = null, revision = revision + 1, updated_at = ? where id = ?
+              lease_heartbeat_at = null, lease_expires_at = null, revision = revision + 1, updated_at = ? where uid = ?
             """,
-            (reason, now_iso(), task_id),
+            (reason, now_iso(), row["uid"]),
         )
         conn.execute(
             "update agents set lease_task_id = '', status = 'available', updated_at = ? where id = ?",
             (now_iso(), agent),
         )
-        after = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+        after = conn.execute("select * from tasks where uid = ?", (row["uid"],)).fetchone()
         emit_audit_event(
             conn,
             "task_blocked",
@@ -3328,25 +3539,27 @@ def add_test_target(
 
 def link_task_test_target(root: Path, task_id: str, target_id: str) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
-        if not conn.execute("select id from tasks where id = ?", (task_id,)).fetchone():
+        cycle_id = current_cycle_id(conn)
+        if not conn.execute("select id from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone():
             raise HarnessError(f"missing task: {task_id}")
         if not conn.execute("select id from test_targets where id = ?", (target_id,)).fetchone():
             raise HarnessError(f"missing test target: {target_id}")
-        conn.execute("insert or ignore into task_test_targets (task_id, target_id) values (?, ?)", (task_id, target_id))
+        conn.execute("insert or ignore into task_test_targets (cycle_id, task_id, target_id) values (?, ?, ?)", (cycle_id, task_id, target_id))
         emit_event(conn, "task_test_target_linked", payload(task_id=task_id, target_id=target_id))
     render_all(root)
 
 
-def task_target(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+def task_target(conn: sqlite3.Connection, task_id: str, cycle_id: str = "") -> sqlite3.Row | None:
+    cycle_id = cycle_id or current_cycle_id(conn)
     return conn.execute(
         """
         select tt.* from task_test_targets link
         join test_targets tt on tt.id = link.target_id
-        where link.task_id = ?
+        where link.cycle_id = ? and link.task_id = ?
         order by tt.id
         limit 1
         """,
-        (task_id,),
+        (cycle_id, task_id),
     ).fetchone()
 
 
@@ -3569,11 +3782,11 @@ def record_validation(
                 raise HarnessError(f"missing evidence: {evidence_id}")
             conn.execute("insert or ignore into validation_evidence (validation_id, evidence_id) values (?, ?)", (validation_id, evidence_id))
         for fm_id in parse_ids(failure_modes):
-            if not conn.execute("select id from failure_modes where id = ?", (fm_id,)).fetchone():
+            if not conn.execute("select id from failure_modes where cycle_id = ? and id = ?", (cycle_id, fm_id)).fetchone():
                 raise HarnessError(f"missing failure mode: {fm_id}")
             conn.execute(
-                "insert into validation_failure_modes (validation_id, failure_mode_id) values (?, ?)",
-                (validation_id, fm_id),
+                "insert into validation_failure_modes (validation_id, cycle_id, failure_mode_id) values (?, ?, ?)",
+                (validation_id, cycle_id, fm_id),
             )
             resolve_invalidations(conn, source_type="failure_mode", source_id=fm_id)
         after = conn.execute("select * from validations where id = ?", (validation_id,)).fetchone()
@@ -3732,11 +3945,11 @@ def sweep_expired_risks(root: Path) -> int:
                 """
                 update failure_modes set status = 'identified', accepted_by = null, acceptance_reason = null,
                   accepted_revision = null, revision = revision + 1
-                where id = ?
+                where uid = ?
                 """,
-                (row["id"],),
+                (row["uid"],),
             )
-            after = conn.execute("select * from failure_modes where id = ?", (row["id"],)).fetchone()
+            after = conn.execute("select * from failure_modes where uid = ?", (row["uid"],)).fetchone()
             emit_audit_event(
                 conn,
                 "risk_acceptance_expired",
@@ -3799,16 +4012,27 @@ def record_gate(
                 if not ok:
                     raise HarnessError(f"session connector HMAC invalid: {reason}")
         gate_id = str(uuid.uuid4())
+        sequence = int(conn.execute("select coalesce(max(sequence), 0) + 1 from quality_gates").fetchone()[0])
+        previous_gate = conn.execute(
+            """
+            select id from quality_gates
+            where cycle_id = ? and candidate_sha = ? and gate_status = 'active'
+            order by sequence desc limit 1
+            """,
+            (cycle_id, candidate_sha),
+        ).fetchone()
         conn.execute(
             """
             insert into quality_gates
-            (id, cycle_id, candidate_sha, gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
+            (id, sequence, cycle_id, candidate_sha, gate_status, superseded_by,
+             gate, reviewed_commit, evidence_commit, diff_hash, base_commit, head_commit, tracked_diff_hash,
              project_revision, reviewer_context, result, blocking_findings, commands, evidence, residual_risk,
              reviewer_session_id, reviewer_attestation_id, review_trust_level, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 gate_id,
+                sequence,
                 cycle_id,
                 candidate_sha,
                 gate,
@@ -3831,6 +4055,11 @@ def record_gate(
                 now_iso(),
             ),
         )
+        if previous_gate:
+            conn.execute(
+                "update quality_gates set gate_status = 'superseded', superseded_by = ? where id = ? and gate_status = 'active'",
+                (gate_id, previous_gate["id"]),
+            )
         for finding_id in parse_ids(findings):
             if not conn.execute("select id from findings where id = ?", (finding_id,)).fetchone():
                 raise HarnessError(f"missing finding: {finding_id}")
@@ -3905,11 +4134,14 @@ def record_delivery(
             ),
         )
         for acceptance_id in parse_ids(acceptance):
-            if not conn.execute("select id from acceptance where id = ?", (acceptance_id,)).fetchone():
+            if not conn.execute(
+                "select id from acceptance where cycle_id = ? and id = ?",
+                (cycle["id"], acceptance_id),
+            ).fetchone():
                 continue
             conn.execute(
-                "insert or ignore into delivery_acceptance (delivery_id, acceptance_id) values (?, ?)",
-                (delivery_id, acceptance_id),
+                "insert or ignore into delivery_acceptance (delivery_id, cycle_id, acceptance_id) values (?, ?, ?)",
+                (delivery_id, cycle["id"], acceptance_id),
             )
         after = conn.execute("select * from deliveries where id = ?", (delivery_id,)).fetchone()
         now = now_iso()
@@ -4485,7 +4717,7 @@ def mark_connector_blocked(root: Path, action_id: str, stats: ConnectorStats, re
     stats.status = "blocked"
     stats.last_error = reason[:1000]
     finding_id = f"connector:{action_id}:blocked"
-    with get_store(root).transaction() as conn:
+    with transaction(root, validate_invariants=False) as conn:
         insert_active_command_log(conn)
         row = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
         if not row:
@@ -5634,11 +5866,11 @@ def dispatch_plan(root: Path, scope: str) -> str:
         )
         ready_ids = ready_queue(conn)
         for task_id in ready_ids:
-            task = conn.execute("select id, owner from tasks where id = ?", (task_id,)).fetchone()
+            task = conn.execute("select id, owner from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone()
             capability = task["owner"] if task["owner"] and task["owner"] != "unassigned" else "developer"
             conn.execute(
-                "insert into dispatch_assignments (run_id, task_id, capability, status, updated_at) values (?, ?, ?, 'planned', ?)",
-                (run_id, task["id"], capability, now_iso()),
+                "insert into dispatch_assignments (run_id, cycle_id, task_id, capability, status, updated_at) values (?, ?, ?, ?, 'planned', ?)",
+                (run_id, cycle_id, task["id"], capability, now_iso()),
             )
         emit_event(conn, "dispatch_planned", payload(id=run_id, scope=scope))
     return run_id
@@ -5692,13 +5924,17 @@ def dispatch_export_csv(
     spawn_config_path = output_dir / "spawn_config.json"
 
     with connection(root) as conn:
-        ready_ids = set(ready_queue(conn))
+        run = conn.execute("select cycle_id from dispatch_runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HarnessError(f"missing dispatch run: {run_id}")
+        cycle_id = str(run["cycle_id"])
+        ready_ids = set(ready_queue(conn, cycle_id))
         assignments = conn.execute(
             """
             select da.run_id, da.task_id, da.agent_id, da.capability, da.status as assignment_status,
                    t.task, t.owner, t.fence
             from dispatch_assignments da
-            join tasks t on t.id = da.task_id
+            join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
             where da.run_id = ? and t.status = 'ready' and da.status in ('planned', 'claimed')
             order by da.task_id
             """,
@@ -5709,11 +5945,11 @@ def dispatch_export_csv(
             raise HarnessError(f"no ready dispatch assignments for run: {run_id}")
         rows: list[dict[str, str]] = []
         for assignment in assignments:
-            acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id").get(assignment["task_id"], "")
-            failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id").get(assignment["task_id"], "")
+            acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id", cycle_id).get(assignment["task_id"], "")
+            failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id", cycle_id).get(assignment["task_id"], "")
             agent_id = assignment["agent_id"] or assignment["capability"] or assignment["owner"] or "developer"
             branch_name = f"agent/{safe_branch_part(run_id)}/{safe_branch_part(assignment['task_id'])}/{safe_branch_part(agent_id)}"
-            target = task_target(conn, assignment["task_id"])
+            target = task_target(conn, assignment["task_id"], cycle_id)
             rows.append(
                 {
                     "item_id": assignment["task_id"],
@@ -5800,20 +6036,21 @@ def dispatch_claim_next(root: Path, agent: str) -> str:
             for row in conn.execute("select capability from agent_capabilities where agent_id = ?", (agent,))
         }
         capabilities.add(agent)
-        ready_ids = ready_queue(conn)
+        cycle_id = current_cycle_id(conn)
+        ready_ids = ready_queue(conn, cycle_id)
         if not ready_ids:
             raise HarnessError(f"no dispatch assignment for agent: {agent}")
         assignment = conn.execute(
             f"""
             select da.* from dispatch_assignments da
-            join tasks t on t.id = da.task_id
-            where da.status = 'planned' and t.status = 'ready'
+            join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
+            where da.cycle_id = ? and da.status = 'planned' and t.status = 'ready'
               and da.capability in ({','.join('?' for _ in capabilities)})
               and da.task_id in ({','.join('?' for _ in ready_ids)})
             order by da.updated_at, da.task_id
             limit 1
             """,
-            tuple(capabilities) + tuple(ready_ids),
+            (cycle_id, *tuple(capabilities), *tuple(ready_ids)),
         ).fetchone()
         if not assignment:
             raise HarnessError(f"no dispatch assignment for agent: {agent}")
@@ -5850,7 +6087,11 @@ def provider_event(conn: sqlite3.Connection, session: sqlite3.Row | dict[str, An
 def provider_assignment_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
     from core.scheduler import ready_queue
 
-    ready_ids = set(ready_queue(conn))
+    run = conn.execute("select cycle_id from dispatch_runs where id = ?", (run_id,)).fetchone()
+    if not run:
+        raise HarnessError(f"missing dispatch run: {run_id}")
+    cycle_id = str(run["cycle_id"])
+    ready_ids = set(ready_queue(conn, cycle_id))
     if not ready_ids:
         return []
     placeholders = ",".join("?" for _ in ready_ids)
@@ -5858,7 +6099,7 @@ def provider_assignment_rows(conn: sqlite3.Connection, run_id: str) -> list[sqli
         f"""
         select da.*, t.task, t.owner, t.fence
         from dispatch_assignments da
-        join tasks t on t.id = da.task_id
+        join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
         where da.run_id = ? and da.status in ('planned', 'claimed') and t.status = 'ready'
           and da.task_id in ({placeholders})
         order by da.updated_at, da.task_id
@@ -5867,15 +6108,16 @@ def provider_assignment_rows(conn: sqlite3.Connection, run_id: str) -> list[sqli
     ).fetchall()
 
 
-def task_failure_mode_risks(conn: sqlite3.Connection, task_id: str) -> list[str]:
+def task_failure_mode_risks(conn: sqlite3.Connection, task_id: str, cycle_id: str = "") -> list[str]:
+    cycle_id = cycle_id or current_cycle_id(conn)
     rows = conn.execute(
         """
         select fm.risk from task_failure_modes tfm
-        join failure_modes fm on fm.id = tfm.failure_mode_id
-        where tfm.task_id = ?
+        join failure_modes fm on fm.cycle_id = tfm.cycle_id and fm.id = tfm.failure_mode_id
+        where tfm.cycle_id = ? and tfm.task_id = ?
         order by fm.id
         """,
-        (task_id,),
+        (cycle_id, task_id),
     ).fetchall()
     return sorted({str(row["risk"]) for row in rows if row["risk"]})
 
@@ -5911,26 +6153,29 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
     from core.scheduler import ready_queue
 
     with connection(root) as conn:
-        ready_ids = set(ready_queue(conn))
         rows: list[sqlite3.Row]
         run_scope = ""
+        cycle_id = current_cycle_id(conn)
         if run_id:
             run = conn.execute("select * from dispatch_runs where id = ?", (run_id,)).fetchone()
             if not run:
                 raise HarnessError(f"missing dispatch run: {run_id}")
             run_scope = run["scope"]
+            cycle_id = str(run["cycle_id"])
+            ready_ids = set(ready_queue(conn, cycle_id))
             rows = conn.execute(
                 """
                 select da.run_id, da.task_id, da.agent_id, da.capability, da.status as assignment_status,
                        t.task, t.owner, t.status as task_status, t.fence
                 from dispatch_assignments da
-                join tasks t on t.id = da.task_id
+                join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
                 where da.run_id = ?
                 order by da.task_id
                 """,
                 (run_id,),
             ).fetchall()
         else:
+            ready_ids = set(ready_queue(conn, cycle_id))
             placeholders = ",".join("?" for _ in ready_ids)
             rows = (
                 conn.execute(
@@ -5939,10 +6184,10 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
                            case when t.owner = '' or t.owner = 'unassigned' then 'developer' else t.owner end as capability,
                            'ready' as assignment_status, t.task, t.owner, t.status as task_status, t.fence
                     from tasks t
-                    where t.id in ({placeholders})
+                    where t.cycle_id = ? and t.id in ({placeholders})
                     order by t.id
                     """,
-                    tuple(ready_ids),
+                    (cycle_id, *tuple(ready_ids)),
                 ).fetchall()
                 if ready_ids
                 else []
@@ -5958,8 +6203,8 @@ def dispatch_route_advice(root: Path, run_id: str = "") -> dict[str, Any]:
         for row in rows:
             task_id = row["task_id"]
             agent_id = row["agent_id"] or row["capability"] or row["owner"] or "developer"
-            target = task_target(conn, task_id)
-            failure_mode_risks = task_failure_mode_risks(conn, task_id)
+            target = task_target(conn, task_id, cycle_id)
+            failure_mode_risks = task_failure_mode_risks(conn, task_id, cycle_id)
             policy = host_codex_model_policy_input(agent_id, target, failure_mode_risks)
             ready = task_id in ready_ids and row["task_status"] == "ready" and row["assignment_status"] in {"ready", "planned", "claimed"}
             recommendation = "main-model-or-manual"
@@ -6549,6 +6794,7 @@ def dispatch_run(
     assignment = assignment_for_agent(root, agent)
     run_id = assignment["run_id"]
     task_id = assignment["task_id"]
+    cycle_id = str(assignment.get("cycle_id", ""))
     branch_name = ""
     worktree_path = ""
     work_dir = root
@@ -6662,15 +6908,15 @@ def dispatch_run(
             )
             refresh_dispatch_run_status(conn, run_id)
             if result.exit_code == 0:
-                task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
+                task = conn.execute("select uid, status from tasks where cycle_id = ? and id = ?", (cycle_id, task_id)).fetchone()
                 if task and task["status"] in {"ready", "claimed", "in_progress"}:
                     conn.execute(
                         """
                         update tasks set status = 'submitted', evidence = ?, submitted_by = ?, lease_agent = null,
                           lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
-                          revision = revision + 1, updated_at = ? where id = ?
+                          revision = revision + 1, updated_at = ? where uid = ?
                         """,
-                        (evidence_id, agent, now_iso(), task_id),
+                        (evidence_id, agent, now_iso(), task["uid"]),
                     )
         emit_event(
             conn,
@@ -6701,7 +6947,7 @@ def dispatch_recover_stale(root: Path) -> int:
         rows = conn.execute(
             """
             select da.run_id, da.task_id from dispatch_assignments da
-            join tasks t on t.id = da.task_id
+            join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
             where da.status = 'claimed' and t.status = 'ready'
               and da.lease_expires_at is not null and da.lease_expires_at <= ?
             order by da.updated_at
@@ -6988,7 +7234,10 @@ def codex_report_issues(root: Path, conn: sqlite3.Connection, expected: dict[str
     branch = subprocess.run(["git", "rev-parse", "--verify", str(result["branch_name"])], cwd=root, text=True, capture_output=True, check=False)
     if branch.returncode != 0:
         issues.append(f"branch is missing: {result['branch_name']}")
-    task = conn.execute("select fence from tasks where id = ?", (expected["item_id"],)).fetchone()
+    task = conn.execute(
+        "select fence from tasks where cycle_id = ? and id = ?",
+        (expected.get("cycle_id", ""), expected["item_id"]),
+    ).fetchone()
     if not task:
         issues.append(f"task is missing: {expected['item_id']}")
     elif int(task["fence"]) != int(expected["fence"]):
@@ -7000,7 +7249,13 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
     with connection(root) as conn:
         export = latest_fanout_export(conn, run_id)
         input_csv = resolve_runtime_path(root, export["input_csv_path"])
+        run = conn.execute("select cycle_id from dispatch_runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HarnessError(f"missing dispatch run: {run_id}")
+        run_cycle_id = str(run["cycle_id"])
     expected_rows = {row["item_id"]: row for row in read_csv_dicts(input_csv)}
+    for expected in expected_rows.values():
+        expected["cycle_id"] = run_cycle_id
     result_rows = read_csv_dicts(result_csv)
     seen: set[str] = set()
     imported = 0
@@ -7041,6 +7296,12 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
         head_commit = git_ref_commit(root, result["branch_name"])
         tree_sha = git_ref_tree(root, result["branch_name"])
         with transaction(root, touched=[("dispatch_assignment", item_id), ("task_attempt", attempt_id)]) as conn:
+            assignment = conn.execute(
+                "select cycle_id from dispatch_assignments where run_id = ? and task_id = ?",
+                (run_id, item_id),
+            ).fetchone()
+            if not assignment:
+                raise HarnessError(f"missing dispatch assignment: {run_id}:{item_id}")
             conn.execute(
                 """
                 insert into agent_reports
@@ -7052,13 +7313,14 @@ def dispatch_import_csv(root: Path, run_id: str, result_csv: Path) -> str:
             conn.execute(
                 """
                 insert into task_attempts
-                (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+                (id, run_id, cycle_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
                  branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', '', '', ?, '', ?, '')
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', '', '', ?, '', ?, '')
                 """,
                 (
                     attempt_id,
                     run_id,
+                    assignment["cycle_id"],
                     item_id,
                     expected["agent_id"],
                     int(expected["fence"]),
@@ -7177,7 +7439,13 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
                 cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
             continue
         with connection(root) as conn:
-            issues = codex_report_issues(root, conn, expected_from_provider_session(session), result, strict_evidence_fields=session["provider"] == "host-codex")
+            assignment = conn.execute(
+                "select cycle_id from dispatch_assignments where run_id = ? and task_id = ?",
+                (run_id, session["task_id"]),
+            ).fetchone()
+            expected = expected_from_provider_session(session)
+            expected["cycle_id"] = str(assignment["cycle_id"] if assignment else "")
+            issues = codex_report_issues(root, conn, expected, result, strict_evidence_fields=session["provider"] == "host-codex")
         if issues:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
                 record_integration_finding(conn, run_id, f"provider report rejected for {session['task_id']}: {'; '.join(issues[:5])}")
@@ -7193,6 +7461,12 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
         head_commit = git_ref_commit(root, result["branch_name"])
         tree_sha = git_ref_tree(root, result["branch_name"])
         with transaction(root, touched=[("agent_provider_session", session["id"]), ("task_attempt", attempt_id)]) as conn:
+            assignment = conn.execute(
+                "select cycle_id from dispatch_assignments where run_id = ? and task_id = ?",
+                (run_id, session["task_id"]),
+            ).fetchone()
+            if not assignment:
+                raise HarnessError(f"missing dispatch assignment: {run_id}:{session['task_id']}")
             conn.execute(
                 """
                 insert into agent_reports
@@ -7204,13 +7478,14 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
             conn.execute(
                 """
                 insert into task_attempts
-                (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
+                (id, run_id, cycle_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
                  branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, ?, '', ?, '')
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?, ?, '', ?, '')
                 """,
                 (
                     attempt_id,
                     run_id,
+                    assignment["cycle_id"],
                     session["task_id"],
                     session["agent_id"],
                     int(session["fence"]),
@@ -7383,8 +7658,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
         if not attempt:
             raise HarnessError(f"missing task attempt: {run_id}/{task_id}")
         target = conn.execute("select * from test_targets where id = ?", (attempt["target_id"],)).fetchone()
-        acceptance = conn.execute("select acceptance_id from task_acceptance where task_id = ? order by acceptance_id limit 1", (task_id,)).fetchone()
-        task = conn.execute("select fence from tasks where id = ?", (task_id,)).fetchone()
+        acceptance = conn.execute(
+            "select acceptance_id from task_acceptance where cycle_id = ? and task_id = ? order by acceptance_id limit 1",
+            (attempt["cycle_id"], task_id),
+        ).fetchone()
+        task = conn.execute("select uid, fence from tasks where cycle_id = ? and id = ?", (attempt["cycle_id"], task_id)).fetchone()
         assignment = conn.execute("select provider_session_id from dispatch_assignments where run_id = ? and task_id = ?", (run_id, task_id)).fetchone()
         provider_session = None
         if attempt["provider_session_id"]:
@@ -7665,15 +7943,15 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             (evidence_id, now_iso(), run_id, task_id),
         )
         refresh_dispatch_run_status(conn, run_id)
-        task = conn.execute("select status from tasks where id = ?", (task_id,)).fetchone()
+        task = conn.execute("select uid, status from tasks where cycle_id = ? and id = ?", (attempt["cycle_id"], task_id)).fetchone()
         if task and task["status"] in {"ready", "claimed", "in_progress"}:
             conn.execute(
                 """
                 update tasks set status = 'submitted', evidence = ?, submitted_by = ?, submitted_session_id = ?, lease_agent = null,
                   lease_token = null, lease_heartbeat_at = null, lease_expires_at = null,
-                  revision = revision + 1, updated_at = ? where id = ?
+                  revision = revision + 1, updated_at = ? where uid = ?
                 """,
-                (evidence_id, attempt["agent_id"], attempt["agent_session_id"], now_iso(), task_id),
+                (evidence_id, attempt["agent_id"], attempt["agent_session_id"], now_iso(), task["uid"]),
             )
         emit_event(conn, "dispatch_attempt_verified", payload(run_id=run_id, task_id=task_id, attempt_id=attempt["id"], evidence_id=evidence_id, verified_by=verified_by))
     render_all(root)
@@ -7693,6 +7971,305 @@ def dispatch_status(root: Path) -> list[str]:
     lines = ["| Run | Scope | Task | Agent | Capability | Status |", "| --- | --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["run_id"], row["scope"], row["task_id"] or "", row["agent_id"] or "", row["capability"] or "", row["status"] or ""]) for row in rows)
     return lines
+
+
+SCHEMA29_FACT_TABLES = ("requirements", "acceptance", "failure_modes", "tasks")
+SCHEMA29_RELATION_TABLES = (
+    "requirement_acceptance",
+    "failure_mode_acceptance",
+    "task_acceptance",
+    "task_failure_modes",
+    "task_dependencies",
+    "task_test_targets",
+    "validation_failure_modes",
+    "delivery_acceptance",
+    "task_attempts",
+    "dispatch_assignments",
+)
+
+
+def schema29_fact_uid(table: str, cycle_id: str, local_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"codex-project-harness:{table}:{cycle_id}:{local_id}"))
+
+
+def insert_snapshot_rows(conn: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    columns = table_columns(conn, table)
+    for row in rows:
+        writable = [column for column in columns if column in row]
+        conn.execute(
+            f"insert into {table} ({','.join(writable)}) values ({','.join('?' for _ in writable)})",
+            [row[column] for column in writable],
+        )
+
+
+def repair_schema29_relation_cycles(conn: sqlite3.Connection) -> None:
+    relation_specs = {
+        "requirement_acceptance": (("requirements", "requirement_id"), ("acceptance", "acceptance_id")),
+        "failure_mode_acceptance": (("failure_modes", "failure_mode_id"), ("acceptance", "acceptance_id")),
+        "task_acceptance": (("tasks", "task_id"), ("acceptance", "acceptance_id")),
+        "task_failure_modes": (("tasks", "task_id"), ("failure_modes", "failure_mode_id")),
+        "task_dependencies": (("tasks", "task_id"), ("tasks", "depends_on")),
+        "task_test_targets": (("tasks", "task_id"),),
+        "task_attempts": (("tasks", "task_id"),),
+        "dispatch_assignments": (("tasks", "task_id"),),
+    }
+    for relation, parents in relation_specs.items():
+        rows = conn.execute(f"select rowid as migration_rowid, * from {relation}").fetchall()
+        for row in rows:
+            candidate_cycles: set[str] | None = None
+            for parent_table, relation_column in parents:
+                parent_cycles = {
+                    str(parent["cycle_id"])
+                    for parent in conn.execute(
+                        f"select cycle_id from {parent_table} where id = ?",
+                        (row[relation_column],),
+                    )
+                    if parent["cycle_id"]
+                }
+                candidate_cycles = parent_cycles if candidate_cycles is None else candidate_cycles & parent_cycles
+            candidates = candidate_cycles or set()
+            current_cycle = str(row["cycle_id"] or "")
+            if current_cycle in candidates:
+                continue
+            if len(candidates) != 1:
+                raise HarnessError(
+                    f"schema29 migration cannot infer relation cycle: {relation}:rowid={row['migration_rowid']}"
+                )
+            conn.execute(
+                f"update {relation} set cycle_id = ? where rowid = ?",
+                (next(iter(candidates)), row["migration_rowid"]),
+            )
+
+    scoped_specs = {
+        "validation_failure_modes": ("validations", "validation_id", "failure_modes", "failure_mode_id"),
+        "delivery_acceptance": ("deliveries", "delivery_id", "acceptance", "acceptance_id"),
+    }
+    for relation, (owner_table, owner_column, parent_table, parent_column) in scoped_specs.items():
+        rows = conn.execute(f"select rowid as migration_rowid, * from {relation}").fetchall()
+        for row in rows:
+            owner_cycles = {
+                str(owner["cycle_id"])
+                for owner in conn.execute(
+                    f"select cycle_id from {owner_table} where id = ?",
+                    (row[owner_column],),
+                )
+                if owner["cycle_id"]
+            }
+            valid_cycles = {
+                cycle_id
+                for cycle_id in owner_cycles
+                if conn.execute(
+                    f"select 1 from {parent_table} where cycle_id = ? and id = ?",
+                    (cycle_id, row[parent_column]),
+                ).fetchone()
+            }
+            current_cycle = str(row["cycle_id"] or "")
+            if current_cycle in valid_cycles:
+                continue
+            if len(valid_cycles) != 1:
+                raise HarnessError(
+                    f"schema29 migration cannot infer relation cycle: {relation}:rowid={row['migration_rowid']}"
+                )
+            conn.execute(
+                f"update {relation} set cycle_id = ? where rowid = ?",
+                (next(iter(valid_cycles)), row["migration_rowid"]),
+            )
+
+
+def migrate_cycle_identity_schema29(conn: sqlite3.Connection, *, fallback_cycle_override: str = "") -> None:
+    if "uid" in table_columns(conn, "requirements"):
+        blank_fact_cycle = any(
+            conn.execute(f"select 1 from {table} where cycle_id = '' limit 1").fetchone()
+            for table in SCHEMA29_FACT_TABLES
+        )
+        if not blank_fact_cycle:
+            repair_schema29_relation_cycles(conn)
+        return
+    project = conn.execute("select current_cycle_id from project where id = 1").fetchone()
+    fallback_cycle = fallback_cycle_override or (
+        str(project["current_cycle_id"] or DEFAULT_CYCLE_ID) if project else DEFAULT_CYCLE_ID
+    )
+    now = now_iso()
+    fallback_status = "archived" if fallback_cycle == LEGACY_CYCLE_ID else "active"
+    fallback_phase = "archived" if fallback_cycle == LEGACY_CYCLE_ID else "intake"
+    conn.execute(
+        """
+        insert into delivery_cycles
+        (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+        values (?, 'Migrated Delivery Cycle', 'Schema 29 identity migration.', ?, ?, '', '', ?, ?, ?, ?)
+        on conflict(id) do nothing
+        """,
+        (fallback_cycle, fallback_status, fallback_phase, now, now if fallback_status == "archived" else "", now, now),
+    )
+    if fallback_cycle == LEGACY_CYCLE_ID:
+        conn.execute(
+            """
+            insert into delivery_cycles
+            (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+            values (?, 'Current Delivery Cycle', 'Current active delivery candidate.', 'active', 'intake', '', '', ?, '', ?, ?)
+            on conflict(id) do nothing
+            """,
+            (DEFAULT_CYCLE_ID, now, now, now),
+        )
+    fact_rows = {table: table_rows(conn, table) for table in SCHEMA29_FACT_TABLES}
+    for rows in fact_rows.values():
+        for row in rows:
+            if not row.get("cycle_id"):
+                row["cycle_id"] = fallback_cycle
+    relation_rows = {table: table_rows(conn, table) for table in SCHEMA29_RELATION_TABLES}
+    cycle_maps = {
+        table: {str(row["id"]): str(row["cycle_id"]) for row in rows}
+        for table, rows in fact_rows.items()
+    }
+
+    def require_cycle(table: str, local_id: str) -> str:
+        cycle_id = cycle_maps[table].get(str(local_id), "")
+        if not cycle_id:
+            raise HarnessError(f"schema29 migration missing cycle identity: {table}:{local_id}")
+        return cycle_id
+
+    for row in relation_rows["requirement_acceptance"]:
+        req_cycle = require_cycle("requirements", row["requirement_id"])
+        acceptance_cycle = require_cycle("acceptance", row["acceptance_id"])
+        if req_cycle != acceptance_cycle:
+            raise HarnessError("schema29 migration found cross-cycle requirement acceptance link")
+        row["cycle_id"] = req_cycle
+    for row in relation_rows["failure_mode_acceptance"]:
+        fm_cycle = require_cycle("failure_modes", row["failure_mode_id"])
+        acceptance_cycle = require_cycle("acceptance", row["acceptance_id"])
+        if fm_cycle != acceptance_cycle:
+            raise HarnessError("schema29 migration found cross-cycle failure-mode acceptance link")
+        row["cycle_id"] = fm_cycle
+    for table in ["task_acceptance", "task_failure_modes"]:
+        other_table = "acceptance" if table == "task_acceptance" else "failure_modes"
+        other_column = "acceptance_id" if table == "task_acceptance" else "failure_mode_id"
+        for row in relation_rows[table]:
+            task_cycle = require_cycle("tasks", row["task_id"])
+            other_cycle = require_cycle(other_table, row[other_column])
+            if task_cycle != other_cycle:
+                raise HarnessError(f"schema29 migration found cross-cycle {table} link")
+            row["cycle_id"] = task_cycle
+    for row in relation_rows["task_dependencies"]:
+        task_cycle = require_cycle("tasks", row["task_id"])
+        dependency_cycle = require_cycle("tasks", row["depends_on"])
+        if task_cycle != dependency_cycle:
+            raise HarnessError("schema29 migration found cross-cycle task dependency")
+        row["cycle_id"] = task_cycle
+    for row in relation_rows["task_test_targets"]:
+        row["cycle_id"] = require_cycle("tasks", row["task_id"])
+    validation_cycles = {
+        str(row["id"]): str(row["cycle_id"])
+        for row in conn.execute("select id, cycle_id from validations")
+    }
+    for row in relation_rows["validation_failure_modes"]:
+        fm_cycle = require_cycle("failure_modes", row["failure_mode_id"])
+        validation_cycle = validation_cycles.get(str(row["validation_id"]), "")
+        if not validation_cycle or fm_cycle != validation_cycle:
+            raise HarnessError("schema29 migration found cross-cycle validation failure-mode link")
+        row["cycle_id"] = fm_cycle
+    delivery_cycles = {
+        str(row["id"]): str(row["cycle_id"])
+        for row in conn.execute("select id, cycle_id from deliveries")
+    }
+    for row in relation_rows["delivery_acceptance"]:
+        acceptance_cycle = require_cycle("acceptance", row["acceptance_id"])
+        delivery_cycle = delivery_cycles.get(str(row["delivery_id"]), "")
+        if not delivery_cycle or acceptance_cycle != delivery_cycle:
+            raise HarnessError("schema29 migration found cross-cycle delivery acceptance link")
+        row["cycle_id"] = acceptance_cycle
+    for table in ["task_attempts", "dispatch_assignments"]:
+        for row in relation_rows[table]:
+            row["cycle_id"] = require_cycle("tasks", row["task_id"])
+
+    conn.execute("pragma defer_foreign_keys = on")
+    for table in SCHEMA29_RELATION_TABLES:
+        conn.execute(f"drop table {table}")
+    for table in reversed(SCHEMA29_FACT_TABLES):
+        conn.execute(f"drop table {table}")
+    create_schema(conn)
+
+    for table, rows in fact_rows.items():
+        for row in rows:
+            row["uid"] = schema29_fact_uid(table, str(row["cycle_id"]), str(row["id"]))
+        insert_snapshot_rows(conn, table, rows)
+    for table, rows in relation_rows.items():
+        insert_snapshot_rows(conn, table, rows)
+
+    for table, rows in fact_rows.items():
+        restored = int(conn.execute(f"select count(*) from {table}").fetchone()[0])
+        if restored != len(rows):
+            raise HarnessError(f"schema29 migration row count mismatch: {table} expected={len(rows)} actual={restored}")
+    for table, rows in relation_rows.items():
+        restored = int(conn.execute(f"select count(*) from {table}").fetchone()[0])
+        if restored != len(rows):
+            raise HarnessError(f"schema29 migration link count mismatch: {table} expected={len(rows)} actual={restored}")
+
+
+def migrate_quality_gate_schema29(conn: sqlite3.Connection) -> None:
+    rows = [
+        row_snapshot(row) or {}
+        for row in conn.execute("select rowid as legacy_rowid, * from quality_gates order by created_at, rowid")
+    ]
+    timestamp_counts: dict[tuple[str, str, str], int] = {}
+    by_candidate: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        timestamp_key = (str(row["cycle_id"]), str(row["candidate_sha"]), str(row["created_at"]))
+        timestamp_counts[timestamp_key] = timestamp_counts.get(timestamp_key, 0) + 1
+        by_candidate.setdefault((str(row["cycle_id"]), str(row["candidate_sha"])), []).append(row)
+    for sequence, row in enumerate(rows, start=1):
+        conn.execute("update quality_gates set sequence = ? where id = ?", (sequence, row["id"]))
+    for candidate_rows in by_candidate.values():
+        for index, row in enumerate(candidate_rows):
+            timestamp_key = (str(row["cycle_id"]), str(row["candidate_sha"]), str(row["created_at"]))
+            ambiguous = timestamp_counts[timestamp_key] > 1
+            later = candidate_rows[index + 1 :]
+            status = "legacy-ambiguous" if ambiguous else ("superseded" if later else "active")
+            superseded_by = str(later[0]["id"]) if status == "superseded" else ""
+            conn.execute(
+                "update quality_gates set gate_status = ?, superseded_by = ? where id = ?",
+                (status, superseded_by, row["id"]),
+            )
+    conn.execute("create unique index if not exists quality_gates_sequence_unique on quality_gates(sequence)")
+
+
+def downgrade_legacy_trust_schema29(conn: sqlite3.Connection) -> None:
+    for table in ["agent_sessions", "session_attestations"]:
+        conn.execute(
+            f"""
+            update {table}
+            set effective_trust = case when origin = 'connector' or trust_level = 'connector'
+                  then 'legacy-untrusted' else trust_level end,
+                receipt_provenance = case when origin = 'connector' or trust_level = 'connector'
+                  then 'schema28-unprovable' else 'schema28-local' end
+            """
+        )
+    for table in ["ci_verifications", "external_session_verifications"]:
+        conn.execute(
+            f"""
+            update {table}
+            set effective_trust = case when origin = 'connector' or token_status = 'hmac-valid'
+                  then 'legacy-untrusted' else 'local-only' end,
+                receipt_provenance = case when origin = 'connector' or token_status = 'hmac-valid'
+                  then 'schema28-unprovable' else 'schema28-local' end
+            """
+        )
+    conn.execute(
+        "update quality_gates set review_trust_level = 'legacy-untrusted' where review_trust_level = 'connector'"
+    )
+
+
+def migrate_schema29(conn: sqlite3.Connection, source_version: int) -> None:
+    if source_version >= 29:
+        return
+    migrate_cycle_identity_schema29(conn)
+    migrate_quality_gate_schema29(conn)
+    downgrade_legacy_trust_schema29(conn)
+    foreign_key_errors = conn.execute("pragma foreign_key_check").fetchall()
+    if foreign_key_errors:
+        details = "; ".join(":".join(str(value) for value in row) for row in foreign_key_errors[:5])
+        raise HarnessError(f"schema29 migration foreign key check failed: {len(foreign_key_errors)} issue(s): {details}")
 
 
 def validated_migration_path(root: Path, from_version: str, to_version: int) -> tuple[int, list[tuple[int, int]]]:
@@ -7754,10 +8331,17 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
             if not current or int(current["schema_version"]) != actual_version:
                 observed = "missing" if not current else str(current["schema_version"])
                 raise HarnessError(f"migration source changed concurrently: expected {actual_version}, actual {observed}")
-            create_schema(conn)
-            initialize_project(conn)
-            ensure_connector_project_key(conn, root)
             source_version, target_version = path[0]
+            create_schema(conn)
+            if target_version == 29 and "uid" not in table_columns(conn, "requirements"):
+                migrate_cycle_identity_schema29(
+                    conn,
+                    fallback_cycle_override=LEGACY_CYCLE_ID if source_version < 25 else "",
+                )
+            initialize_project(conn)
+            if target_version == 29:
+                migrate_schema29(conn, source_version)
+            ensure_connector_project_key(conn, root)
             conn.execute(
                 "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
                 (source_version, target_version, now_iso()),
@@ -7773,6 +8357,9 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
             if updated.rowcount != 1:
                 raise HarnessError(f"migration source changed concurrently: expected {source_version}")
             emit_event(conn, "migration_applied", payload(**{"from": source_version, "to": target_version}))
+            schema_issues = runtime_schema_issues(conn)
+            if schema_issues:
+                raise HarnessError("migration schema validation failed: " + "; ".join(schema_issues[:5]))
             require_full_invariants(conn, root, "migration")
     except Exception:
         raise
@@ -7956,21 +8543,41 @@ def validate_object_against_schema(label: str, data: dict[str, Any], schema: dic
 
 def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[dict[str, Any]]]]:
     tasks = []
-    task_acceptance = grouped(conn, "task_acceptance", "task_id", "acceptance_id")
-    task_failure_modes = grouped(conn, "task_failure_modes", "task_id", "failure_mode_id")
-    task_dependencies = grouped(conn, "task_dependencies", "task_id", "depends_on")
     for row in conn.execute("select * from tasks order by id"):
         data = row_snapshot(row) or {}
-        data["acceptance_ids"] = parse_ids(task_acceptance.get(row["id"], ""))
-        data["failure_mode_ids"] = parse_ids(task_failure_modes.get(row["id"], ""))
-        data["dependencies"] = parse_ids(task_dependencies.get(row["id"], ""))
+        data["acceptance_ids"] = [
+            item["acceptance_id"]
+            for item in conn.execute(
+                "select acceptance_id from task_acceptance where cycle_id = ? and task_id = ? order by acceptance_id",
+                (row["cycle_id"], row["id"]),
+            )
+        ]
+        data["failure_mode_ids"] = [
+            item["failure_mode_id"]
+            for item in conn.execute(
+                "select failure_mode_id from task_failure_modes where cycle_id = ? and task_id = ? order by failure_mode_id",
+                (row["cycle_id"], row["id"]),
+            )
+        ]
+        data["dependencies"] = [
+            item["depends_on"]
+            for item in conn.execute(
+                "select depends_on from task_dependencies where cycle_id = ? and task_id = ? order by depends_on",
+                (row["cycle_id"], row["id"]),
+            )
+        ]
         tasks.append(data)
 
     validations = []
-    validation_failure_modes = grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id")
     for row in conn.execute("select * from validations order by id"):
         data = row_snapshot(row) or {}
-        data["failure_mode_ids"] = parse_ids(validation_failure_modes.get(row["id"], ""))
+        data["failure_mode_ids"] = [
+            item["failure_mode_id"]
+            for item in conn.execute(
+                "select failure_mode_id from validation_failure_modes where validation_id = ? and cycle_id = ? order by failure_mode_id",
+                (row["id"], row["cycle_id"]),
+            )
+        ]
         validations.append(data)
 
     project = conn.execute(
@@ -8054,14 +8661,14 @@ def trace_rows(conn: sqlite3.Connection, requirement_id: str | None = None) -> l
           group_concat(distinct vfm.failure_mode_id) as failure_mode_ids,
           group_concat(distinct d.id) as delivery_ids
         from requirements r
-        left join requirement_acceptance ra on ra.requirement_id = r.id
-        left join acceptance a on a.id = ra.acceptance_id
-        left join task_acceptance ta on ta.acceptance_id = ra.acceptance_id
-        left join tasks t on t.id = ta.task_id and t.cycle_id = r.cycle_id
+        left join requirement_acceptance ra on ra.cycle_id = r.cycle_id and ra.requirement_id = r.id
+        left join acceptance a on a.cycle_id = ra.cycle_id and a.id = ra.acceptance_id
+        left join task_acceptance ta on ta.cycle_id = ra.cycle_id and ta.acceptance_id = ra.acceptance_id
+        left join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id
         left join validations v on v.acceptance_id = ra.acceptance_id and v.cycle_id = r.cycle_id and v.result = 'pass'
-        left join validation_failure_modes vfm on vfm.validation_id = v.id
-        left join delivery_acceptance da on da.acceptance_id = ra.acceptance_id
-        left join deliveries d on d.id = da.delivery_id and d.cycle_id = r.cycle_id
+        left join validation_failure_modes vfm on vfm.validation_id = v.id and vfm.cycle_id = v.cycle_id
+        left join delivery_acceptance da on da.cycle_id = ra.cycle_id and da.acceptance_id = ra.acceptance_id
+        left join deliveries d on d.id = da.delivery_id and d.cycle_id = da.cycle_id
         where {' and '.join(clauses)}
         group by r.id, ra.acceptance_id
         order by r.id, ra.acceptance_id
@@ -8082,8 +8689,8 @@ def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = N
     requirements = conn.execute(f"select id from requirements {req_clause} order by id", values).fetchall()
     for requirement in requirements:
         links = conn.execute(
-            "select acceptance_id from requirement_acceptance where requirement_id = ? order by acceptance_id",
-            (requirement["id"],),
+            "select acceptance_id from requirement_acceptance where cycle_id = ? and requirement_id = ? order by acceptance_id",
+            (cycle_id, requirement["id"]),
         ).fetchall()
         if not links:
             issues.append(f"requirement has no acceptance link: {requirement['id']}")
@@ -8093,11 +8700,11 @@ def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = N
             accepted_task = conn.execute(
                 """
                 select 1 from task_acceptance ta
-                join tasks t on t.id = ta.task_id
-                where ta.acceptance_id = ? and t.cycle_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
+                join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id
+                where ta.cycle_id = ? and ta.acceptance_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
                 limit 1
                 """,
-                (acceptance_id, cycle_id),
+                (cycle_id, acceptance_id),
             ).fetchone()
             if not accepted_task:
                 issues.append(f"acceptance has no completed task in trace: {requirement['id']} -> {acceptance_id}")
@@ -8182,15 +8789,15 @@ def quickstart_status(root: Path) -> dict[str, Any]:
         trace_count = conn.execute(
             """
             select count(*) from requirement_acceptance ra
-            join requirements r on r.id = ra.requirement_id
-            join acceptance a on a.id = ra.acceptance_id
-            where r.cycle_id = ? and a.cycle_id = ?
+            join requirements r on r.cycle_id = ra.cycle_id and r.id = ra.requirement_id
+            join acceptance a on a.cycle_id = ra.cycle_id and a.id = ra.acceptance_id
+            where ra.cycle_id = ?
             """,
-            (cycle_id, cycle_id),
+            (cycle_id,),
         ).fetchone()[0]
         task_count = conn.execute("select count(*) from tasks where cycle_id = ?", (cycle_id,)).fetchone()[0]
         target_count = conn.execute("select count(*) from test_targets").fetchone()[0]
-        linked_target_count = conn.execute("select count(*) from task_test_targets").fetchone()[0]
+        linked_target_count = conn.execute("select count(*) from task_test_targets where cycle_id = ?", (cycle_id,)).fetchone()[0]
         evidence_count = conn.execute("select count(*) from evidence").fetchone()[0]
         accepted_count = conn.execute("select count(*) from tasks where cycle_id = ? and status = 'accepted'", (cycle_id,)).fetchone()[0]
         quality_gate_count = conn.execute(
@@ -8384,7 +8991,7 @@ def repair(root: Path, *, dry_run: bool = False, clear_invariant: str = "", conf
             if clear_invariant == "expired-lease":
                 rows = conn.execute(
                     """
-                    select id, lease_agent from tasks
+                    select uid, id, lease_agent from tasks
                     where lease_expires_at is not null and lease_expires_at <= ? and lease_agent is not null
                     order by id
                     """,
@@ -8394,9 +9001,9 @@ def repair(root: Path, *, dry_run: bool = False, clear_invariant: str = "", conf
                     conn.execute(
                         """
                         update tasks set lease_agent = null, lease_token = null, lease_heartbeat_at = null,
-                          lease_expires_at = null, revision = revision + 1, updated_at = ? where id = ?
+                          lease_expires_at = null, revision = revision + 1, updated_at = ? where uid = ?
                         """,
-                        (now_iso(), row["id"]),
+                        (now_iso(), row["uid"]),
                     )
                     if row["lease_agent"]:
                         conn.execute(
@@ -8479,10 +9086,15 @@ def render_tasks(root: Path) -> None:
     core_render_tasks(root)
 
 
-def grouped(conn: sqlite3.Connection, table: str, key: str, value: str) -> dict[str, str]:
+def grouped(conn: sqlite3.Connection, table: str, key: str, value: str, cycle_id: str = "") -> dict[str, str]:
+    where = " where cycle_id = ?" if cycle_id else ""
+    params: tuple[str, ...] = (cycle_id,) if cycle_id else ()
     return {
         row[key]: row["ids"]
-        for row in conn.execute(f"select {key}, group_concat({value}, ', ') as ids from {table} group by {key}")
+        for row in conn.execute(
+            f"select {key}, group_concat({value}, ', ') as ids from {table}{where} group by {key}",
+            params,
+        )
     }
 
 

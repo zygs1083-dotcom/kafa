@@ -125,7 +125,7 @@ def validate_replay_compatible_events(conn: sqlite3.Connection) -> list[str]:
         "select event_sequence from runtime_snapshots order by event_sequence desc, created_at desc limit 1"
     ).fetchone()
     lower_bound = int(checkpoint["event_sequence"]) if checkpoint else None
-    query = "select sequence, id, payload_json from events order by sequence"
+    query = "select sequence, id, schema_version, payload_json from events order by sequence"
     for row in conn.execute(query):
         if lower_bound is not None and int(row["sequence"]) <= lower_bound:
             continue
@@ -134,6 +134,8 @@ def validate_replay_compatible_events(conn: sqlite3.Connection) -> list[str]:
         except json.JSONDecodeError as exc:
             issues.append(f"event {row['sequence']} invalid payload: {exc.msg}")
             continue
+        if int(row["schema_version"]) >= 29 and "canonical_mutations" not in payload_data and not conn.in_transaction:
+            issues.append(f"event {row['sequence']} missing canonical_mutations")
         if payload_data.get("entity_type"):
             for field in ["entity_id", "after", "correlation_id", "command"]:
                 if field not in payload_data:
@@ -142,9 +144,44 @@ def validate_replay_compatible_events(conn: sqlite3.Connection) -> list[str]:
 
 
 def apply_event_after(conn: sqlite3.Connection, event: sqlite3.Row) -> None:
-    from harness_db import table_columns
+    from harness_db import SNAPSHOT_TABLES, table_columns
 
     payload_data = json.loads(event["payload_json"])
+    if int(event["schema_version"]) >= 29 and "canonical_mutations" not in payload_data:
+        raise ValueError(f"event {event['sequence']} missing canonical_mutations")
+    if payload_data.get("replay_boundary"):
+        raise ValueError(str(payload_data["replay_boundary"]))
+    if "canonical_mutations" in payload_data:
+        allowed_tables = set(SNAPSHOT_TABLES) - {"events"}
+        conn.execute("pragma defer_foreign_keys = on")
+        for mutation in payload_data["canonical_mutations"]:
+            table = str(mutation.get("table", ""))
+            if table not in allowed_tables:
+                raise ValueError(f"event mutation table is not replayable: {table}")
+            key = mutation.get("key") or {}
+            if not isinstance(key, dict) or not key:
+                raise ValueError(f"event mutation has no key: {table}")
+            if mutation.get("op") == "delete":
+                clauses = " and ".join(f"{column} = ?" for column in key)
+                conn.execute(f"delete from {table} where {clauses}", tuple(key.values()))
+                continue
+            if mutation.get("op") != "upsert" or not isinstance(mutation.get("row"), dict):
+                raise ValueError(f"event mutation operation is invalid: {table}")
+            row = mutation["row"]
+            columns = [column for column in table_columns(conn, table) if column in row]
+            if not columns:
+                raise ValueError(f"event mutation row has no writable columns: {table}")
+            conflict_columns = list(key)
+            assignments = ", ".join(
+                f"{column}=excluded.{column}" for column in columns if column not in conflict_columns
+            )
+            conflict_action = f"do update set {assignments}" if assignments else "do nothing"
+            conn.execute(
+                f"insert into {table} ({','.join(columns)}) values ({','.join('?' for _ in columns)}) "
+                f"on conflict({','.join(conflict_columns)}) {conflict_action}",
+                [row[column] for column in columns],
+            )
+        return
     entity_type = payload_data.get("entity_type")
     after = payload_data.get("after")
     if not entity_type or after is None:
@@ -167,12 +204,14 @@ def apply_event_after(conn: sqlite3.Connection, event: sqlite3.Row) -> None:
     columns = [column for column in table_columns(conn, table) if column in after]
     if not columns:
         return
-    pk = "id"
+    cycle_local = table in {"requirements", "acceptance", "failure_modes", "tasks"}
+    conflict_columns = ("cycle_id", "id") if cycle_local else ("id",)
     values = [after.get(column) for column in columns]
-    assignments = ", ".join(f"{column}=excluded.{column}" for column in columns if column != pk)
+    immutable_columns = set(conflict_columns) | ({"uid"} if cycle_local else set())
+    assignments = ", ".join(f"{column}=excluded.{column}" for column in columns if column not in immutable_columns)
     conn.execute(
         f"insert into {table} ({','.join(columns)}) values ({','.join('?' for _ in columns)}) "
-        f"on conflict({pk}) do update set {assignments}",
+        f"on conflict({','.join(conflict_columns)}) do update set {assignments}",
         values,
     )
 
@@ -204,6 +243,11 @@ def rebuild_state_from_events(root: Path, to_sequence: int, out: Path) -> None:
         restore_snapshot(replay_conn, snapshot)
         for event in events:
             apply_event_after(replay_conn, event)
+            columns = list(event.keys())
+            replay_conn.execute(
+                f"insert into events ({','.join(columns)}) values ({','.join('?' for _ in columns)})",
+                [event[column] for column in columns],
+            )
         replay_conn.commit()
         completed = True
     except Exception:
