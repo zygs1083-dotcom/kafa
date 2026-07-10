@@ -2,20 +2,31 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = REPO_ROOT / "plugins/codex-project-harness/scripts/harness.py"
 AGENT_PROVIDER = REPO_ROOT / "plugins/codex-project-harness/core/agent_provider.py"
 TEST_COMMAND = "python3 -m unittest"
+PLUGIN_ROOT = REPO_ROOT / "plugins/codex-project-harness"
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+SCRIPTS_ROOT = PLUGIN_ROOT / "scripts"
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+from core import agent_provider as agent_provider_core
+import harness_db as harness_db_core
 
 
 def run_harness(root: Path, *args: str, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -98,6 +109,27 @@ def wait_for_sdk_events(log_path: Path, *, timeout: float = 5.0) -> list[dict[st
     return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
 
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    if sys.platform != "win32":
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], text=True, capture_output=True, check=False).stdout.strip()
+        if not state or state.startswith("Z"):
+            return False
+    return True
+
+
+def wait_for_pid_exit(pid: int, *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_is_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not pid_is_alive(pid)
+
+
 def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, Path]:
     package_root = temp / "fake_sdk"
     package_dir = package_root / "openai_codex"
@@ -112,6 +144,8 @@ def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, P
             import json
             import os
             import re
+            import subprocess
+            import sys
             import time
             from pathlib import Path
 
@@ -175,6 +209,23 @@ def fake_sdk_package(temp: Path, *, import_error: bool = False) -> tuple[Path, P
                 def run(self, input, *, cwd=None, sandbox=None, approval_mode=None, output_schema=None, model=None, **kwargs):
                     mode = os.environ.get("FAKE_CODEX_MODE", "success")
                     delay_seconds = float(os.environ.get("FAKE_CODEX_DELAY_SECONDS", "0"))
+                    child_pid_file = os.environ.get("FAKE_CODEX_CHILD_PID_FILE", "")
+                    if child_pid_file:
+                        late_child_file = os.environ.get("FAKE_CODEX_CHILD_SPAWN_ON_TERM_FILE", "")
+                        if late_child_file:
+                            child_code = (
+                                "import os,signal,subprocess,sys,time; "
+                                "handler=lambda *_: (lambda p: open(sys.argv[1],'w').write(str(p.pid)))("
+                                "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], start_new_session=True)); "
+                                "signal.signal(signal.SIGTERM, handler); time.sleep(60)"
+                            )
+                            child = subprocess.Popen([sys.executable, "-c", child_code, late_child_file], start_new_session=True)
+                        else:
+                            child = subprocess.Popen(
+                                [sys.executable, "-c", "import time; time.sleep(60)"],
+                                start_new_session=os.environ.get("FAKE_CODEX_CHILD_DETACHED", "") == "1",
+                            )
+                        Path(child_pid_file).write_text(str(child.pid), encoding="utf-8")
                     prompt = input
                     if delay_seconds:
                         time.sleep(delay_seconds)
@@ -440,6 +491,9 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertTrue(worktree_path.exists())
             self.assertTrue(session["provider_session_id"].startswith("host-codex:"))
             self.assertTrue(metadata["worker_pid"])
+            self.assertTrue(metadata["watchdog_pid"])
+            self.assertTrue(metadata["deadline_epoch"])
+            self.assertTrue(metadata["report_path_absolute"].endswith("/T1.json"))
             self.assertEqual(metadata["sdk"], "openai-codex")
             self.assertTrue(metadata["report_path"].endswith("/T1.json"))
             self.assertEqual(by_method["thread_start"]["cwd"], str(worktree_path.resolve()))
@@ -769,7 +823,7 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertEqual(reports, 0)
             self.assertEqual(attempts, 0)
 
-    def test_host_codex_cancel_terminates_running_worker_and_cleans_worktree(self) -> None:
+    def test_host_codex_cancel_terminates_known_tree_but_keeps_assignment_failed_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "repo"
@@ -787,19 +841,328 @@ class HostCodexProviderTest(unittest.TestCase):
             cancelled = run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
 
             collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
             assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
             worktree = db_one(root, "select status, cleaned_at from dispatch_worktrees where run_id = ?", (run_id,))
             reports = db_one(root, "select count(*) as count from agent_reports where run_id = ?", (run_id,))["count"]
             attempts = db_one(root, "select count(*) as count from task_attempts where run_id = ?", (run_id,))["count"]
-            self.assertIn("cancelled 1 provider session", cancelled.stdout)
+            self.assertIn("cancelled 0 provider session", cancelled.stdout)
             self.assertIn("collected 0 provider report", collected.stdout)
-            self.assertEqual(assignment["status"], "planned")
-            self.assertEqual(assignment["provider_session_id"], "")
-            self.assertFalse(worktree_path.exists())
-            self.assertEqual(worktree["status"], "cleaned")
-            self.assertTrue(worktree["cleaned_at"])
+            self.assertEqual(session["status"], "verification_failed")
+            self.assertIn("cannot be independently confirmed", session["last_error"])
+            self.assertEqual(assignment["status"], "verification_failed")
+            self.assertTrue(assignment["provider_session_id"])
+            self.assertTrue(worktree_path.exists())
+            self.assertEqual(worktree["status"], "active")
+            self.assertFalse(worktree["cleaned_at"])
             self.assertEqual(reports, 0)
             self.assertEqual(attempts, 0)
+
+    def test_host_codex_watchdog_times_out_without_collect_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path, timeout="0.2")
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            session = db_one(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))
+            worker_pid = int(json.loads(session["input_json"])["provider_metadata"]["worker_pid"])
+            report_path = root / ".ai-team/runtime/host-codex" / run_id / "T1.json"
+
+            deadline = time.monotonic() + 3
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            while time.monotonic() < deadline and report["status"] == "running":
+                time.sleep(0.05)
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("turn timeout", report["last_error"])
+            self.assertTrue(wait_for_pid_exit(worker_pid))
+            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+            session_after = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            evidence_count = db_one(root, "select count(*) as count from evidence")["count"]
+            self.assertIn("collected 0 provider report", collected.stdout)
+            self.assertEqual(session_after["status"], "verification_failed")
+            self.assertEqual(evidence_count, 0)
+
+    def test_host_codex_collect_detects_worker_exit_without_terminal_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            session = db_one(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))
+            worker_pid = int(json.loads(session["input_json"])["provider_metadata"]["worker_pid"])
+            os.kill(worker_pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+            self.assertTrue(wait_for_pid_exit(worker_pid))
+
+            collected = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+
+            session_after = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+            evidence_count = db_one(root, "select count(*) as count from evidence")["count"]
+            self.assertIn("collected 0 provider report", collected.stdout)
+            self.assertEqual(session_after["status"], "verification_failed")
+            self.assertIn("worker exited without terminal report", session_after["last_error"])
+            self.assertEqual(evidence_count, 0)
+
+    def test_host_codex_cancel_terminates_sdk_descendant_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            child_pid_file = temp_path / "child.pid"
+            late_child_pid_file = temp_path / "late-child.pid"
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            env["FAKE_CODEX_CHILD_PID_FILE"] = str(child_pid_file)
+            env["FAKE_CODEX_CHILD_DETACHED"] = "1"
+            env["FAKE_CODEX_CHILD_SPAWN_ON_TERM_FILE"] = str(late_child_pid_file)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not child_pid_file.exists():
+                time.sleep(0.05)
+            self.assertTrue(child_pid_file.exists())
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            self.addCleanup(lambda: os.kill(child_pid, signal.SIGKILL) if pid_is_alive(child_pid) else None)
+
+            cancelled = run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
+
+            self.assertIn("cancelled 0 provider session", cancelled.stdout)
+            self.assertTrue(wait_for_pid_exit(child_pid))
+            self.assertFalse(late_child_pid_file.exists())
+            session = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            self.assertEqual(session["status"], "verification_failed")
+
+    def test_host_codex_late_worker_cannot_overwrite_cancelled_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "0.3"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "operator stop")
+            time.sleep(0.5)
+
+            report_path = root / ".ai-team/runtime/host-codex" / run_id / "T1.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            evidence_count = db_one(root, "select count(*) as count from evidence")["count"]
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(evidence_count, 0)
+
+    def test_host_codex_watchdog_records_unconfirmed_termination_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "report.json"
+            report_path.write_text(
+                json.dumps({"status": "running", "last_error": "", "result_json": "", "metadata": {}}),
+                encoding="utf-8",
+            )
+
+            with patch.object(agent_provider_core, "_process_alive", return_value=True), patch.object(
+                agent_provider_core,
+                "_terminate_process_tree",
+                return_value=False,
+            ):
+                result = agent_provider_core._host_codex_watchdog(report_path, 12345, 0)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result, 1)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("termination unconfirmed", report["last_error"])
+
+    def test_host_codex_cancel_records_unconfirmed_termination_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "report.json"
+            metadata = {
+                "worker_pid": 12345,
+                "worker_pgid": 12345,
+                "watchdog_pid": 12346,
+                "report_path_absolute": str(report_path),
+            }
+            report_path.write_text(
+                json.dumps({"status": "running", "last_error": "", "result_json": "", "metadata": metadata}),
+                encoding="utf-8",
+            )
+            handle = agent_provider_core.AgentJobHandle("host-codex", "session", "job", "running", json.dumps(metadata))
+
+            with patch.object(agent_provider_core, "_terminate_process_tree", return_value=False):
+                result = agent_provider_core.HostCodexProvider().cancel(handle, "operator stop")
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.status, "cancel_failed")
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("termination not confirmed", report["last_error"])
+
+    def test_host_codex_collect_enforces_deadline_when_watchdog_dies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path, timeout="0.2")
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            session = db_one(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))
+            metadata = json.loads(session["input_json"])["provider_metadata"]
+            watchdog_pid = int(metadata["watchdog_pid"])
+            worker_pid = int(metadata["worker_pid"])
+            os.kill(watchdog_pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+            self.assertTrue(wait_for_pid_exit(watchdog_pid))
+            time.sleep(0.25)
+
+            run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
+
+            session_after = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            self.assertEqual(session_after["status"], "verification_failed")
+            self.assertTrue(wait_for_pid_exit(worker_pid))
+
+    def test_host_codex_collect_cannot_renew_session_cancelled_during_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+
+            def cancel_then_return_none(*_args, **_kwargs):
+                harness_db_core.dispatch_provider_cancel(root, run_id, task_id="T1", reason="race cancel")
+                return None
+
+            with patch.object(agent_provider_core.HostCodexProvider, "collect", side_effect=cancel_then_return_none):
+                collected = harness_db_core.dispatch_provider_collect(root, run_id)
+
+            session = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            assignment = db_one(root, "select status, provider_session_id from dispatch_assignments where run_id = ?", (run_id,))
+            self.assertEqual(collected, 0)
+            self.assertEqual(session["status"], "verification_failed")
+            self.assertEqual(assignment["status"], "verification_failed")
+            self.assertTrue(assignment["provider_session_id"])
+
+    def test_host_codex_verify_cannot_commit_evidence_after_concurrent_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            sentinel = temp_path / "verify.started"
+            (root / "verify_gate.py").write_text(
+                "import time, unittest\n"
+                f"open({str(sentinel)!r}, 'w').write('started')\n"
+                "time.sleep(0.5)\n"
+                "class GateTest(unittest.TestCase):\n"
+                "    def test_ok(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "verify_gate.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "add verification gate"], cwd=root, text=True, capture_output=True, check=True)
+            run_harness(root, "init")
+            run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
+            run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", "python3 -m unittest verify_gate.py")
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--owner", "developer", "--acceptance", "AC1")
+            run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
+            run_id = run_harness(root, "dispatch", "plan", "--scope", "Host Codex").stdout.strip().split()[-1]
+            package_root, log_path = fake_sdk_package(temp_path)
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=self.host_env(package_root, log_path))
+            collected = wait_for_collect(root, run_id, expected="collected 1 provider report")
+            if "collected 1 provider report" not in collected.stdout:
+                failed_session = db_one(root, "select status, last_error from agent_provider_sessions where run_id = ?", (run_id,))
+                self.fail(f"provider report was not collected: {dict(failed_session)}")
+            verify = subprocess.Popen(
+                ["python3", str(HARNESS), "--root", str(root), "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=os.environ.copy(),
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not sentinel.exists():
+                time.sleep(0.05)
+            if not sentinel.exists():
+                stdout, stderr = verify.communicate(timeout=10)
+                self.fail(f"verification command did not start target:\n{stdout}\n{stderr}")
+            run_harness(root, "dispatch", "provider", "cancel", "--run-id", run_id, "--task", "T1", "--reason", "race cancel")
+            stdout, stderr = verify.communicate(timeout=10)
+
+            session = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            evidence_count = db_one(root, "select count(*) as count from evidence")["count"]
+            self.assertNotEqual(verify.returncode, 0, stdout + stderr)
+            self.assertEqual(session["status"], "verification_failed")
+            self.assertEqual(evidence_count, 0)
+            self.assertIn("provider-session-stale", stdout + stderr)
+
+    def test_host_codex_reconcile_requires_confirmed_termination_and_refreshes_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "repo"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            package_root, log_path = fake_sdk_package(temp_path)
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+                conn.execute("update agent_provider_sessions set lease_expires_at = '2000-01-01T00:00:00+00:00' where run_id = ?", (run_id,))
+                conn.commit()
+
+            reconciled = harness_db_core.dispatch_provider_reconcile(root, run_id)
+
+            session = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            assignment = db_one(root, "select status from dispatch_assignments where run_id = ?", (run_id,))
+            dispatch_run = db_one(root, "select status from dispatch_runs where id = ?", (run_id,))
+            self.assertEqual(reconciled, 1)
+            self.assertEqual(session["status"], "verification_failed")
+            self.assertEqual(assignment["status"], "verification_failed")
+            self.assertEqual(dispatch_run["status"], "verification_failed")
+
+            root = temp_path / "repo-unconfirmed"
+            root.mkdir()
+            git_repo(root)
+            run_id = bootstrap(root)
+            second_sdk = temp_path / "second-sdk"
+            package_root, log_path = fake_sdk_package(second_sdk)
+            env = self.host_env(package_root, log_path)
+            env["FAKE_CODEX_DELAY_SECONDS"] = "5"
+            run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
+            session = db_one(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))
+            metadata = json.loads(session["input_json"])["provider_metadata"]
+            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+                conn.execute("update agent_provider_sessions set lease_expires_at = '2000-01-01T00:00:00+00:00' where run_id = ?", (run_id,))
+                conn.commit()
+            failed_cancel = agent_provider_core.AgentJobHandle("host-codex", "session", "job", "cancel_failed", "not confirmed")
+            with patch.object(agent_provider_core.HostCodexProvider, "cancel", return_value=failed_cancel):
+                harness_db_core.dispatch_provider_reconcile(root, run_id)
+            agent_provider_core._terminate_process_tree(int(metadata["worker_pid"]), expected_pgid=int(metadata["worker_pgid"]))
+            agent_provider_core._terminate_process_tree(int(metadata["watchdog_pid"]), expected_pgid=int(metadata["watchdog_pid"]))
+
+            failed_session = db_one(root, "select status from agent_provider_sessions where run_id = ?", (run_id,))
+            failed_assignment = db_one(root, "select status from dispatch_assignments where run_id = ?", (run_id,))
+            failed_run = db_one(root, "select status from dispatch_runs where id = ?", (run_id,))
+            self.assertEqual(failed_session["status"], "verification_failed")
+            self.assertEqual(failed_assignment["status"], "verification_failed")
+            self.assertEqual(failed_run["status"], "verification_failed")
 
 
 if __name__ == "__main__":

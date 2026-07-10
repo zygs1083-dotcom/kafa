@@ -21,6 +21,7 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Concrete model, reasoning, approval, sandbox, and task/thread/subagent/worktree lifecycle selection now belong to the native ChatGPT/Codex host; route advice no longer emits a model slug or legacy provider start command.
 - Without a higher-priority `HARNESS_CODEX_MODEL` override, legacy `spark-deterministic` compatibility now requires an explicit `HARNESS_CODEX_SPARK_MODEL`; Kafa no longer embeds a preview model name.
 - The legacy Host Codex bridge is disabled unless the operator explicitly accepts its fixed worktree/deny-all permission boundary with `HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all`.
+- Legacy Host Codex turns now have an autonomous deadline watchdog, dead-worker detection, recursive known-tree termination, DB/file terminal CAS, and no automatic replan after cancel/timeout because detached helper termination cannot be independently proven.
 
 ### Fixed
 

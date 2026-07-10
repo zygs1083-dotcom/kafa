@@ -229,41 +229,186 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _update_host_codex_report(path: Path, updates: dict[str, Any]) -> None:
-    data = _read_json_object(path)
-    metadata = data.get("metadata", {})
-    if not isinstance(metadata, dict):
-        metadata = {}
-    update_metadata = updates.pop("metadata", {})
-    if isinstance(update_metadata, dict):
-        metadata.update(update_metadata)
-    for key in [
-        "worker_pid",
-        "app_server_pid",
-        "thread_id",
-        "turn_id",
-        "app_server_command",
-        "sdk",
-        "sdk_sandbox",
-        "sdk_approval_mode",
-        "sdk_model",
-        "codex_bin",
-        "model_policy",
-        "selected_model",
-        "model_selection_reason",
-        "spark_eligible",
-        "legacy_host_policy",
-        "worktree_path",
-        "duration_seconds",
-        "job_path",
-        "report_path",
-        "timeout_seconds",
-    ]:
-        if key in updates:
-            metadata[key] = updates.pop(key)
-    data.update(updates)
-    data["metadata"] = metadata
-    _write_json_atomic(path, data)
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    if os.name != "nt":
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if state.returncode == 0 and (not state.stdout.strip() or state.stdout.strip().startswith("Z")):
+            return False
+    return True
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    if os.name == "nt":
+        return []
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,ppid="],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, parent_pid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append(pid)
+    descendants: list[int] = []
+    pending = list(children.get(root_pid, []))
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(children.get(pid, []))
+    return descendants
+
+
+def _terminate_process_tree(pid: int, *, expected_pgid: int = 0, grace_seconds: float = 1.0) -> bool:
+    if not _process_alive(pid):
+        return True
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        deadline = time.monotonic() + max(grace_seconds, 0.0) + 1.0
+        while time.monotonic() < deadline:
+            if not _process_alive(pid):
+                return True
+            time.sleep(0.02)
+        return not _process_alive(pid)
+    try:
+        process_group = os.getpgid(pid)
+        if expected_pgid and process_group != expected_pgid:
+            return False
+        os.killpg(process_group, signal.SIGSTOP)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    descendants: set[int] = set()
+    stable_scans = 0
+    for _ in range(20):
+        current = set(_descendant_pids(pid))
+        new_descendants = current - descendants
+        descendants.update(current)
+        for child_pid in new_descendants:
+            try:
+                os.kill(child_pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+        if new_descendants:
+            stable_scans = 0
+        else:
+            stable_scans += 1
+            if stable_scans >= 2:
+                break
+        time.sleep(0.01)
+    for child_pid in sorted(descendants, reverse=True):
+        if _process_alive(child_pid):
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if _process_alive(pid):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and (
+        _process_alive(pid) or any(_process_alive(child_pid) for child_pid in descendants)
+    ):
+        time.sleep(0.02)
+    return not _process_alive(pid) and all(not _process_alive(child_pid) for child_pid in descendants)
+
+
+def _update_host_codex_report(path: Path, updates: dict[str, Any], *, expected_status: str = "") -> bool:
+    lock_path = path.with_name(f"{path.name}.lock")
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            lock_path.mkdir()
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 1.0:
+                    lock_path.rmdir()
+                    continue
+            except (FileNotFoundError, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"host-codex report lock timeout: {path}")
+            time.sleep(0.01)
+    try:
+        data = _read_json_object(path)
+        if expected_status and str(data.get("status", "")) != expected_status:
+            return False
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        update_metadata = updates.pop("metadata", {})
+        if isinstance(update_metadata, dict):
+            metadata.update(update_metadata)
+        for key in [
+            "worker_pid",
+            "worker_pgid",
+            "watchdog_pid",
+            "deadline_epoch",
+            "app_server_pid",
+            "thread_id",
+            "turn_id",
+            "app_server_command",
+            "sdk",
+            "sdk_sandbox",
+            "sdk_approval_mode",
+            "sdk_model",
+            "codex_bin",
+            "model_policy",
+            "selected_model",
+            "model_selection_reason",
+            "spark_eligible",
+            "legacy_host_policy",
+            "worktree_path",
+            "duration_seconds",
+            "job_path",
+            "report_path",
+            "report_path_absolute",
+            "timeout_seconds",
+        ]:
+            if key in updates:
+                metadata[key] = updates.pop(key)
+        data.update(updates)
+        data["metadata"] = metadata
+        _write_json_atomic(path, data)
+        return True
+    finally:
+        try:
+            lock_path.rmdir()
+        except FileNotFoundError:
+            pass
 
 
 def _request_from_job(job: dict[str, Any]) -> AgentJobRequest:
@@ -399,6 +544,7 @@ class HostCodexProvider:
             )
         metadata = {
             "worker_pid": worker.pid,
+            "worker_pgid": worker.pid if os.name != "nt" else 0,
             "sdk": "openai-codex",
             "sdk_sandbox": "workspace_write",
             "sdk_approval_mode": "deny_all",
@@ -409,9 +555,47 @@ class HostCodexProvider:
             "worktree_path": request.worktree_path,
             "job_path": job_path.relative_to(request.root).as_posix(),
             "report_path": report_path.relative_to(request.root).as_posix(),
+            "report_path_absolute": str(report_path.resolve()),
             "timeout_seconds": timeout,
+            "deadline_epoch": time.time() + timeout,
         }
         _update_host_codex_report(report_path, dict(metadata))
+        watchdog_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "host-codex-watchdog",
+            str(report_path),
+            str(worker.pid),
+            str(timeout),
+        ]
+        try:
+            watchdog = subprocess.Popen(
+                watchdog_command,
+                cwd=request.root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - watchdog startup must fail closed.
+            _terminate_process_tree(worker.pid, expected_pgid=worker.pid if os.name != "nt" else 0)
+            _update_host_codex_report(
+                report_path,
+                {
+                    "status": "failed",
+                    "last_error": f"host-codex watchdog failed to start: {exc}",
+                    "result_json": "",
+                },
+                expected_status="running",
+            )
+            return AgentJobHandle(
+                provider=self.name,
+                provider_session_id=provider_session_id,
+                provider_job_id=request.task_id,
+                status="spawn_failed",
+                message=f"host-codex watchdog failed to start: {exc}",
+            )
+        metadata["watchdog_pid"] = watchdog.pid
+        _update_host_codex_report(report_path, {"watchdog_pid": watchdog.pid})
         return AgentJobHandle(
             provider=self.name,
             provider_session_id=provider_session_id,
@@ -421,10 +605,20 @@ class HostCodexProvider:
         )
 
     def status(self, handle: AgentJobHandle) -> AgentJobHandle:
+        metadata = self._handle_metadata(handle)
+        report_path = Path(str(metadata.get("report_path_absolute", ""))) if metadata.get("report_path_absolute") else None
+        if report_path is not None:
+            report = _read_json_object(report_path)
+            report_status = str(report.get("status", ""))
+            if report_status and report_status != "running":
+                return AgentJobHandle(handle.provider, handle.provider_session_id, handle.provider_job_id, report_status, str(report.get("last_error", "")))
+        worker_pid = int(metadata.get("worker_pid") or 0)
+        if worker_pid and not _process_alive(worker_pid):
+            return AgentJobHandle(handle.provider, handle.provider_session_id, handle.provider_job_id, "failed", "host-codex worker exited without terminal report")
         return handle
 
     def heartbeat(self, handle: AgentJobHandle) -> AgentJobHandle:
-        return handle
+        return self.status(handle)
 
     def collect(self, handle: AgentJobHandle, *, root: Path, run_id: str, task_id: str) -> AgentJobReport | None:
         path = self._report_path(root, run_id, task_id)
@@ -433,7 +627,39 @@ class HostCodexProvider:
         data = json.loads(path.read_text(encoding="utf-8"))
         status = str(data.get("status", "running"))
         if status == "running":
-            return None
+            metadata = data.get("metadata", {})
+            worker_pid = int(metadata.get("worker_pid") or 0) if isinstance(metadata, dict) else 0
+            worker_pgid = int(metadata.get("worker_pgid") or 0) if isinstance(metadata, dict) else 0
+            deadline_epoch = float(metadata.get("deadline_epoch") or 0) if isinstance(metadata, dict) else 0.0
+            if worker_pid and deadline_epoch and time.time() >= deadline_epoch:
+                terminated = _terminate_process_tree(worker_pid, expected_pgid=worker_pgid)
+                _update_host_codex_report(
+                    path,
+                    {
+                        "status": "failed",
+                        "last_error": (
+                            "host-codex turn timeout; known process tree terminated but detached helper termination unconfirmed"
+                            if terminated
+                            else "host-codex turn timeout; process tree termination unconfirmed"
+                        ),
+                        "result_json": "",
+                    },
+                    expected_status="running",
+                )
+            elif worker_pid and _process_alive(worker_pid):
+                return None
+            else:
+                _update_host_codex_report(
+                    path,
+                    {
+                        "status": "failed",
+                        "last_error": "host-codex worker exited without terminal report",
+                        "result_json": "",
+                    },
+                    expected_status="running",
+                )
+            data = _read_json_object(path)
+            status = str(data.get("status", "failed"))
         metadata = data.get("metadata", {})
         provider_job_id = handle.provider_job_id
         if isinstance(metadata, dict) and metadata.get("turn_id"):
@@ -448,19 +674,54 @@ class HostCodexProvider:
         )
 
     def cancel(self, handle: AgentJobHandle, reason: str) -> AgentJobHandle:
+        metadata = self._handle_metadata(handle)
+        report_path = Path(str(metadata.get("report_path_absolute", ""))) if metadata.get("report_path_absolute") else None
+        if report_path is not None:
+            report = _read_json_object(report_path)
+            report_metadata = report.get("metadata", {})
+            if isinstance(report_metadata, dict):
+                metadata.update(report_metadata)
+            if str(report.get("status", "running")) == "running":
+                _update_host_codex_report(
+                    report_path,
+                    {"status": "cancelled", "last_error": reason, "result_json": ""},
+                    expected_status="running",
+                )
+        worker_pid = int(metadata.get("worker_pid") or 0)
+        worker_pgid = int(metadata.get("worker_pgid") or 0)
+        watchdog_pid = int(metadata.get("watchdog_pid") or 0)
+        worker_stopped = _terminate_process_tree(worker_pid, expected_pgid=worker_pgid) if worker_pid else True
+        watchdog_stopped = _terminate_process_tree(watchdog_pid, expected_pgid=watchdog_pid if os.name != "nt" else 0) if watchdog_pid else True
+        termination_detail = (
+            "known process tree terminated but detached helper termination cannot be independently confirmed"
+            if worker_stopped and watchdog_stopped
+            else "process tree termination not confirmed"
+        )
+        if report_path is not None:
+            _update_host_codex_report(
+                report_path,
+                {
+                    "status": "failed",
+                    "last_error": f"{reason}; {termination_detail}",
+                    "result_json": "",
+                },
+                expected_status="cancelled",
+            )
+        return AgentJobHandle(
+            handle.provider,
+            handle.provider_session_id,
+            handle.provider_job_id,
+            "cancel_failed",
+            f"{reason}; {termination_detail}",
+        )
+
+    @staticmethod
+    def _handle_metadata(handle: AgentJobHandle) -> dict[str, Any]:
         try:
             metadata = json.loads(handle.message or "{}")
         except json.JSONDecodeError:
-            metadata = {}
-        worker_pid = metadata.get("worker_pid") if isinstance(metadata, dict) else None
-        if worker_pid:
-            try:
-                os.kill(int(worker_pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except OSError as exc:
-                return AgentJobHandle(handle.provider, handle.provider_session_id, handle.provider_job_id, "cancelled", f"{reason}; cancel signal failed: {exc}")
-        return AgentJobHandle(handle.provider, handle.provider_session_id, handle.provider_job_id, "cancelled", reason)
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
 
     def _run_sdk_turn(
         self,
@@ -636,7 +897,7 @@ def _host_codex_worker(job_path: Path) -> int:
             },
         )
         return 1
-    _write_json_atomic(
+    initialized = _update_host_codex_report(
         report_path,
         {
             "status": "running",
@@ -644,7 +905,10 @@ def _host_codex_worker(job_path: Path) -> int:
             "result_json": "",
             "metadata": base_metadata,
         },
+        expected_status="running",
     )
+    if not initialized:
+        return 0
 
     def state_update(values: dict[str, Any]) -> None:
         _update_host_codex_report(report_path, dict(values))
@@ -652,6 +916,8 @@ def _host_codex_worker(job_path: Path) -> int:
     try:
         result = provider._run_sdk_turn(request, codex_bin=codex_bin, model=model, state_update=state_update)
     except Exception as exc:  # noqa: BLE001 - worker failure is serialized for collect.
+        if str(_read_json_object(report_path).get("status", "running")) != "running":
+            return 0
         status = "cancelled" if "cancelled" in str(exc).lower() else "failed"
         _update_host_codex_report(
             report_path,
@@ -661,8 +927,11 @@ def _host_codex_worker(job_path: Path) -> int:
                 "result_json": "",
                 "duration_seconds": round(time.monotonic() - started, 6),
             },
+            expected_status="running",
         )
         return 1 if status != "cancelled" else 0
+    if str(_read_json_object(report_path).get("status", "running")) != "running":
+        return 0
     _update_host_codex_report(
         report_path,
         {
@@ -673,11 +942,54 @@ def _host_codex_worker(job_path: Path) -> int:
             "turn_id": result["turn_id"],
             "duration_seconds": round(time.monotonic() - started, 6),
         },
+        expected_status="running",
     )
     return 0
+
+
+def _host_codex_watchdog(report_path: Path, worker_pid: int, timeout: float) -> int:
+    started = time.monotonic()
+    deadline = started + max(timeout, 0.0)
+    while True:
+        report = _read_json_object(report_path)
+        status = str(report.get("status", "running"))
+        if status != "running":
+            return 0
+        if not _process_alive(worker_pid):
+            _update_host_codex_report(
+                report_path,
+                {
+                    "status": "failed",
+                    "last_error": "host-codex worker exited without terminal report",
+                    "result_json": "",
+                    "duration_seconds": round(time.monotonic() - started, 6),
+                },
+                expected_status="running",
+            )
+            return 1
+        if time.monotonic() >= deadline:
+            terminated = _terminate_process_tree(worker_pid, expected_pgid=worker_pid if os.name != "nt" else 0)
+            _update_host_codex_report(
+                report_path,
+                {
+                    "status": "failed",
+                    "last_error": (
+                        f"host-codex turn timeout after {timeout:g} seconds; known process tree terminated but detached helper termination unconfirmed"
+                        if terminated
+                        else f"host-codex turn timeout after {timeout:g} seconds; process tree termination unconfirmed"
+                    ),
+                    "result_json": "",
+                    "duration_seconds": round(time.monotonic() - started, 6),
+                },
+                expected_status="running",
+            )
+            return 0 if terminated else 1
+        time.sleep(0.05)
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "host-codex-worker":
         raise SystemExit(_host_codex_worker(Path(sys.argv[2])))
-    raise SystemExit("usage: agent_provider.py host-codex-worker <job-path>")
+    if len(sys.argv) == 5 and sys.argv[1] == "host-codex-watchdog":
+        raise SystemExit(_host_codex_watchdog(Path(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])))
+    raise SystemExit("usage: agent_provider.py host-codex-worker <job-path> | host-codex-watchdog <report-path> <worker-pid> <timeout>")

@@ -8037,12 +8037,45 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
         if report is None:
             with transaction(root, touched=[("agent_provider_session", session["id"])]) as conn:
                 conn.execute(
-                    "update agent_provider_sessions set heartbeat_at = ?, lease_expires_at = ? where id = ?",
+                    "update agent_provider_sessions set heartbeat_at = ?, lease_expires_at = ? where id = ? and status = 'running'",
                     (now_iso(), lease_deadline(), session["id"]),
                 )
             continue
+        if report.status == "timed_out":
+            timeout_error = report.last_error or "provider session timed out"
+            with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                current = conn.execute("select status from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+                if not current or current["status"] != "running":
+                    continue
+                record_integration_finding(conn, run_id, f"provider session timed out for {session['task_id']}: {timeout_error}")
+                conn.execute(
+                    "update agent_provider_sessions set status = 'timed_out', last_error = ?, collected_at = ?, finished_at = ? where id = ?",
+                    (timeout_error, now_iso(), now_iso(), session["id"]),
+                )
+                if session["agent_session_id"]:
+                    conn.execute(
+                        "update agent_sessions set status = 'timed_out', ended_at = ? where session_id = ?",
+                        (now_iso(), session["agent_session_id"]),
+                    )
+                conn.execute(
+                    """
+                    update dispatch_assignments
+                    set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                        lease_expires_at = null, updated_at = ?
+                    where run_id = ? and task_id = ? and status != 'completed'
+                    """,
+                    (now_iso(), run_id, session["task_id"]),
+                )
+                refresh_dispatch_run_status(conn, run_id)
+                provider_event(conn, session, "timed_out", {"last_error": timeout_error})
+            if session["provider"] == "host-codex":
+                cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
+            continue
         if report.status != "success" or report.last_error:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                current = conn.execute("select status from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+                if not current or current["status"] != "running":
+                    continue
                 record_integration_finding(conn, run_id, f"provider report failed for {session['task_id']}: {report.last_error or report.status}")
                 conn.execute(
                     "update agent_provider_sessions set status = 'verification_failed', last_error = ?, collected_at = ?, finished_at = ? where id = ?",
@@ -8058,6 +8091,9 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
             result = json.loads(report.result_json)
         except json.JSONDecodeError as exc:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                current = conn.execute("select status from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+                if not current or current["status"] != "running":
+                    continue
                 record_integration_finding(conn, run_id, f"provider report invalid for {session['task_id']}: {exc.msg}")
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", (exc.msg, now_iso(), session["id"]))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
@@ -8075,6 +8111,9 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
             issues = codex_report_issues(root, conn, expected, result, strict_evidence_fields=session["provider"] == "host-codex")
         if issues:
             with transaction(root, touched=[("agent_provider_session", session["id"]), ("finding", session["task_id"])]) as conn:
+                current = conn.execute("select status from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+                if not current or current["status"] != "running":
+                    continue
                 record_integration_finding(conn, run_id, f"provider report rejected for {session['task_id']}: {'; '.join(issues[:5])}")
                 conn.execute("update agent_provider_sessions set status = 'verification_failed', last_error = ?, finished_at = ? where id = ?", ("; ".join(issues[:5]), now_iso(), session["id"]))
                 conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, session["task_id"]))
@@ -8088,6 +8127,14 @@ def dispatch_provider_collect(root: Path, run_id: str) -> int:
         head_commit = git_ref_commit(root, result["branch_name"])
         tree_sha = git_ref_tree(root, result["branch_name"])
         with transaction(root, touched=[("agent_provider_session", session["id"]), ("task_attempt", attempt_id)]) as conn:
+            current = conn.execute("select status, provider_session_id, fence from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+            if (
+                not current
+                or current["status"] != "running"
+                or current["provider_session_id"] != session["provider_session_id"]
+                or int(current["fence"]) != int(session["fence"])
+            ):
+                continue
             assignment = conn.execute(
                 "select cycle_id from dispatch_assignments where run_id = ? and task_id = ?",
                 (run_id, session["task_id"]),
@@ -8176,32 +8223,48 @@ def dispatch_provider_cancel(root: Path, run_id: str, *, task_id: str = "", reas
     cancelled = 0
     for session in sessions:
         provider = provider_for(session["provider"])
-        provider.cancel(provider_handle_from_row(session), reason)
-        if session["provider"] == "host-codex":
-            cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
+        cancel_result = provider.cancel(provider_handle_from_row(session), reason)
+        cancel_confirmed = cancel_result.status == "cancelled"
         with transaction(root, touched=[("agent_provider_session", session["id"])]) as conn:
+            current = conn.execute("select status from agent_provider_sessions where id = ?", (session["id"],)).fetchone()
+            if not current or current["status"] not in {"spawning", "running", "reported"}:
+                continue
             if reason:
                 record_integration_finding(conn, run_id, f"provider session cancelled for {session['task_id']}: {reason}")
+            if not cancel_confirmed:
+                record_integration_finding(conn, run_id, f"provider cancellation unconfirmed for {session['task_id']}: {cancel_result.message}")
+            terminal_status = "cancelled" if cancel_confirmed else "verification_failed"
+            terminal_error = reason if cancel_confirmed else cancel_result.message
             conn.execute(
-                "update agent_provider_sessions set status = 'cancelled', last_error = ?, cancelled_at = ?, finished_at = ? where id = ?",
-                (reason, now_iso(), now_iso(), session["id"]),
+                "update agent_provider_sessions set status = ?, last_error = ?, cancelled_at = ?, finished_at = ? where id = ?",
+                (terminal_status, terminal_error, now_iso(), now_iso(), session["id"]),
             )
             if session["agent_session_id"]:
                 conn.execute(
-                    "update agent_sessions set status = 'cancelled', ended_at = ? where session_id = ?",
-                    (now_iso(), session["agent_session_id"]),
+                    "update agent_sessions set status = ?, ended_at = ? where session_id = ?",
+                    (terminal_status, now_iso(), session["agent_session_id"]),
                 )
-            conn.execute(
-                """
-                update dispatch_assignments
-                set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
-                    lease_expires_at = null, updated_at = ?
-                where run_id = ? and task_id = ? and status != 'completed'
-                """,
-                (now_iso(), run_id, session["task_id"]),
-            )
-            provider_event(conn, session, "cancelled", {"reason": reason})
-        cancelled += 1
+            if cancel_confirmed:
+                conn.execute(
+                    """
+                    update dispatch_assignments
+                    set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                        lease_expires_at = null, updated_at = ?
+                    where run_id = ? and task_id = ? and status != 'completed'
+                    """,
+                    (now_iso(), run_id, session["task_id"]),
+                )
+            else:
+                conn.execute(
+                    "update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ? and status != 'completed'",
+                    (now_iso(), run_id, session["task_id"]),
+                )
+            refresh_dispatch_run_status(conn, run_id)
+            provider_event(conn, session, terminal_status, {"reason": terminal_error})
+        if session["provider"] == "host-codex" and cancel_confirmed:
+            cleanup_dispatch_worktrees(root, run_id, session["task_id"], session["agent_id"])
+        if cancel_confirmed:
+            cancelled += 1
     return cancelled
 
 
@@ -8219,31 +8282,48 @@ def dispatch_provider_reconcile(root: Path, run_id: str) -> int:
         ).fetchall()
     for row in rows:
         try:
-            provider_for(row["provider"]).cancel(provider_handle_from_row(row), "provider session timed out")
-        except Exception:
-            pass
-        if row["provider"] == "host-codex":
+            cancel_result = provider_for(row["provider"]).cancel(provider_handle_from_row(row), "provider session timed out")
+        except Exception as exc:  # noqa: BLE001 - reconciliation records unconfirmed termination.
+            cancel_result = None
+            cancel_error = str(exc)
+        else:
+            cancel_error = cancel_result.message
+        termination_confirmed = cancel_result is not None and cancel_result.status == "cancelled"
+        if row["provider"] == "host-codex" and termination_confirmed:
             cleanup_dispatch_worktrees(root, run_id, row["task_id"], row["agent_id"])
         with transaction(root, touched=[("dispatch_run", run_id), ("agent_provider_session", row["id"])]) as conn:
+            current = conn.execute("select status from agent_provider_sessions where id = ?", (row["id"],)).fetchone()
+            if not current or current["status"] not in {"spawning", "running"}:
+                continue
+            terminal_status = "timed_out" if termination_confirmed else "verification_failed"
+            terminal_error = "provider session timed out" if termination_confirmed else f"provider timeout termination unconfirmed: {cancel_error}"
             conn.execute(
-                "update agent_provider_sessions set status = 'timed_out', last_error = 'provider session timed out', finished_at = ? where id = ?",
-                (now_iso(), row["id"]),
+                "update agent_provider_sessions set status = ?, last_error = ?, finished_at = ? where id = ?",
+                (terminal_status, terminal_error, now_iso(), row["id"]),
             )
             if row["agent_session_id"]:
                 conn.execute(
-                    "update agent_sessions set status = 'timed_out', ended_at = ? where session_id = ?",
-                    (now_iso(), row["agent_session_id"]),
+                    "update agent_sessions set status = ?, ended_at = ? where session_id = ?",
+                    (terminal_status, now_iso(), row["agent_session_id"]),
                 )
-            conn.execute(
-                """
-                update dispatch_assignments
-                set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
-                    lease_expires_at = null, updated_at = ?
-                where run_id = ? and task_id = ? and status != 'completed'
-                """,
-                (now_iso(), run_id, row["task_id"]),
-            )
-            provider_event(conn, row, "timed_out", {})
+            if termination_confirmed:
+                conn.execute(
+                    """
+                    update dispatch_assignments
+                    set status = 'planned', agent_id = '', provider_session_id = '', heartbeat_at = null,
+                        lease_expires_at = null, updated_at = ?
+                    where run_id = ? and task_id = ? and status != 'completed'
+                    """,
+                    (now_iso(), run_id, row["task_id"]),
+                )
+            else:
+                conn.execute(
+                    "update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ? and status != 'completed'",
+                    (now_iso(), run_id, row["task_id"]),
+                )
+                record_integration_finding(conn, run_id, f"provider timeout termination unconfirmed for {row['task_id']}: {cancel_error}")
+            refresh_dispatch_run_status(conn, run_id)
+            provider_event(conn, row, terminal_status, {"last_error": terminal_error})
     if rows:
         with transaction(root, touched=[("dispatch_run", run_id)]) as conn:
             emit_event(conn, "agent_provider_sessions_reconciled", payload(run_id=run_id, count=len(rows)))
@@ -8269,6 +8349,34 @@ def record_attempt_failure(conn: sqlite3.Connection, run_id: str, task_id: str, 
     conn.execute("update task_attempts set status = 'verification_failed', finished_at = ? where id = ?", (now_iso(), attempt_id))
     conn.execute("update dispatch_assignments set status = 'verification_failed', updated_at = ? where run_id = ? and task_id = ?", (now_iso(), run_id, task_id))
     refresh_dispatch_run_status(conn, run_id)
+
+
+def require_attempt_verification_current(conn: sqlite3.Connection, attempt: sqlite3.Row, run_id: str, task_id: str) -> None:
+    current_attempt = conn.execute("select status, fence from task_attempts where id = ?", (attempt["id"],)).fetchone()
+    if not current_attempt or current_attempt["status"] != "reported" or int(current_attempt["fence"]) != int(attempt["fence"]):
+        raise HarnessError(f"attempt-stale: {attempt['id']}")
+    task = conn.execute("select fence from tasks where cycle_id = ? and id = ?", (attempt["cycle_id"], task_id)).fetchone()
+    if task and int(task["fence"]) != int(attempt["fence"]):
+        raise HarnessError(f"fence-stale: {task_id} expected={attempt['fence']} actual={task['fence']}")
+    if not attempt["provider_session_id"]:
+        return
+    provider_session = conn.execute(
+        "select status from agent_provider_sessions where provider_session_id = ? and run_id = ? and task_id = ?",
+        (attempt["provider_session_id"], run_id, task_id),
+    ).fetchone()
+    if not provider_session or provider_session["status"] not in {"reported", "receipt_imported"}:
+        status = provider_session["status"] if provider_session else "missing"
+        raise HarnessError(f"provider-session-stale: {attempt['provider_session_id']} status={status}")
+    assignment = conn.execute(
+        "select status, provider_session_id from dispatch_assignments where run_id = ? and task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if (
+        not assignment
+        or assignment["status"] != "reported"
+        or assignment["provider_session_id"] != attempt["provider_session_id"]
+    ):
+        raise HarnessError(f"provider-session-stale: {attempt['provider_session_id']} assignment changed")
 
 
 def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: str = "local", container_image: str = "") -> str:
@@ -8399,6 +8507,7 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
         issues.append("source tree hash unavailable")
     if issues:
         with transaction(root, touched=[("task_attempt", attempt["id"]), ("finding", task_id)]) as conn:
+            require_attempt_verification_current(conn, attempt, run_id, task_id)
             if sandbox_execution_id:
                 conn.execute(
                     """
@@ -8434,6 +8543,7 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
     validation_id = f"CODEX-VAL-{uuid.uuid4().hex[:8]}"
     acceptance_id = acceptance["acceptance_id"] if acceptance else ""
     with transaction(root, touched=[("task_attempt", attempt["id"]), ("evidence", evidence_id), ("validation", validation_id), ("task", task_id)]) as conn:
+        require_attempt_verification_current(conn, attempt, run_id, task_id)
         conn.execute(
             """
             insert into evidence
