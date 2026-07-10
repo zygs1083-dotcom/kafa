@@ -192,7 +192,7 @@ def marketplace_locations(repo: Path, scope: str) -> tuple[Path, Path, str]:
     return (
         user_root / "marketplace.json",
         user_root / PLUGIN_NAME,
-        "./codex-project-harness",
+        "./.agents/plugins/codex-project-harness",
     )
 
 

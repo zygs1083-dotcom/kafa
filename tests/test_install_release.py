@@ -105,7 +105,7 @@ class InstallReleaseTest(unittest.TestCase):
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn("target plugin already exists", blocked.stderr)
             self.assertEqual(copied.read_text(encoding="utf-8"), "second\n")
-            self.assertEqual(marketplace["plugins"][0]["source"]["path"], "./codex-project-harness")
+            self.assertEqual(marketplace["plugins"][0]["source"]["path"], "./.agents/plugins/codex-project-harness")
 
     def test_uninstall_removes_marketplace_entry_and_optionally_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
