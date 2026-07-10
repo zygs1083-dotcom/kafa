@@ -5,11 +5,18 @@
   "required": ["id", "surface", "severity", "status", "summary", "created_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
+    "candidate_sha": { "type": "string" },
     "surface": { "type": "string" },
     "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
     "status": { "type": "string", "enum": ["open", "resolved", "accepted", "false-positive"] },
     "summary": { "type": "string" },
     "evidence_id": { "type": "string" },
+    "waived_by": { "type": "string" },
+    "waiver_reason": { "type": "string" },
+    "waiver_scope": { "type": "string" },
+    "waived_revision": { "type": ["integer", "null"] },
+    "waiver_expires_at": { "type": "string" },
     "created_at": { "type": "string" }
   },
   "additionalProperties": true

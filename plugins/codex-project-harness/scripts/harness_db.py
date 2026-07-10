@@ -809,11 +809,18 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         create table if not exists findings (
             id text primary key,
+            cycle_id text not null default '',
+            candidate_sha text not null default '',
             surface text not null,
             severity text not null,
             status text not null,
             summary text not null,
             evidence_id text not null default '',
+            waived_by text not null default '',
+            waiver_reason text not null default '',
+            waiver_scope text not null default '',
+            waived_revision integer,
+            waiver_expires_at text not null default '',
             created_at text not null
         );
         create table if not exists decisions (
@@ -1213,6 +1220,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "reviewer_session_id", "text not null default ''")
     ensure_column(conn, "quality_gates", "reviewer_attestation_id", "text not null default ''")
     ensure_column(conn, "quality_gates", "review_trust_level", "text not null default 'local-only'")
+    ensure_column(conn, "findings", "cycle_id", "text not null default ''")
+    ensure_column(conn, "findings", "candidate_sha", "text not null default ''")
+    ensure_column(conn, "findings", "waived_by", "text not null default ''")
+    ensure_column(conn, "findings", "waiver_reason", "text not null default ''")
+    ensure_column(conn, "findings", "waiver_scope", "text not null default ''")
+    ensure_column(conn, "findings", "waived_revision", "integer")
+    ensure_column(conn, "findings", "waiver_expires_at", "text not null default ''")
     ensure_column(conn, "validations", "head_commit", "text not null default ''")
     ensure_column(conn, "validations", "cycle_id", "text not null default ''")
     ensure_column(conn, "validations", "candidate_sha", "text not null default ''")
@@ -3915,18 +3929,45 @@ def record_test(root: Path, test_id: str, surface: str, command: str, result: st
     render_all(root)
 
 
-def record_finding(root: Path, finding_id: str, surface: str, severity: str, status: str, summary: str, *, evidence_id: str = "") -> None:
+def record_finding(
+    root: Path,
+    finding_id: str,
+    surface: str,
+    severity: str,
+    status: str,
+    summary: str,
+    *,
+    evidence_id: str = "",
+    waived_by: str = "",
+    waiver_reason: str = "",
+    waiver_scope: str = "",
+    waived_revision: int | None = None,
+    waiver_expires_at: str = "",
+) -> None:
     with transaction(root) as conn:
         if evidence_id and not conn.execute("select id from evidence where id = ?", (evidence_id,)).fetchone():
             raise HarnessError(f"missing evidence: {evidence_id}")
+        cycle_id = current_cycle_id(conn)
+        candidate_sha = current_candidate_sha(root)
+        if status == "accepted" and not all(
+            [waived_by, waiver_reason, waiver_scope, waived_revision, waiver_expires_at]
+        ):
+            raise HarnessError("accepted finding requires actor, reason, scope, revision, and expiry")
         conn.execute(
             """
-            insert into findings (id, surface, severity, status, summary, evidence_id, created_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+            insert into findings
+            (id, cycle_id, candidate_sha, surface, severity, status, summary, evidence_id,
+             waived_by, waiver_reason, waiver_scope, waived_revision, waiver_expires_at, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set surface=excluded.surface, severity=excluded.severity, status=excluded.status,
-              summary=excluded.summary, evidence_id=excluded.evidence_id, created_at=excluded.created_at
+              cycle_id=excluded.cycle_id, candidate_sha=excluded.candidate_sha,
+              summary=excluded.summary, evidence_id=excluded.evidence_id,
+              waived_by=excluded.waived_by, waiver_reason=excluded.waiver_reason,
+              waiver_scope=excluded.waiver_scope, waived_revision=excluded.waived_revision,
+              waiver_expires_at=excluded.waiver_expires_at, created_at=excluded.created_at
             """,
-            (finding_id, surface, severity, status, summary, evidence_id, now_iso()),
+            (finding_id, cycle_id, candidate_sha, surface, severity, status, summary, evidence_id,
+             waived_by, waiver_reason, waiver_scope, waived_revision, waiver_expires_at, now_iso()),
         )
         emit_event(conn, "finding_recorded", payload(id=finding_id, severity=severity, status=status))
     render_all(root)

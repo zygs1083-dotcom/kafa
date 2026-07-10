@@ -459,6 +459,11 @@ def build_parser() -> argparse.ArgumentParser:
     finding_record.add_argument("--status", required=True, choices=["open", "resolved", "accepted", "false-positive"])
     finding_record.add_argument("--summary", required=True)
     finding_record.add_argument("--evidence", default="")
+    finding_record.add_argument("--waived-by", default="")
+    finding_record.add_argument("--waiver-reason", default="")
+    finding_record.add_argument("--waiver-scope", default="")
+    finding_record.add_argument("--waived-revision", type=int)
+    finding_record.add_argument("--waiver-expires-at", default="")
     add_request_id(finding_record)
 
     gate = sub.add_parser("gate")
@@ -1030,7 +1035,12 @@ def main() -> int:
         elif args.command == "test" and args.test_command == "record":
             mutate("test.record", lambda: (record_test(root, args.id, args.surface, args.test_command_text, args.result, evidence_id=args.evidence), f"OK: test recorded {args.id}")[1])
         elif args.command == "finding" and args.finding_command == "record":
-            mutate("finding.record", lambda: (record_finding(root, args.id, args.surface, args.severity, args.status, args.summary, evidence_id=args.evidence), f"OK: finding recorded {args.id}")[1])
+            mutate("finding.record", lambda: (record_finding(
+                root, args.id, args.surface, args.severity, args.status, args.summary,
+                evidence_id=args.evidence, waived_by=args.waived_by,
+                waiver_reason=args.waiver_reason, waiver_scope=args.waiver_scope,
+                waived_revision=args.waived_revision, waiver_expires_at=args.waiver_expires_at,
+            ), f"OK: finding recorded {args.id}")[1])
         elif args.command == "gate" and args.gate_command == "record":
             mutate(
                 "gate.record",

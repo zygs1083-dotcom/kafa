@@ -345,6 +345,37 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
             issues.append(f"latest quality gate is not pass: {latest_gate['gate']}={latest_gate['result']}")
         if latest_gate["blocking_findings"]:
             issues.append(f"latest quality gate has blocking findings: {latest_gate['blocking_findings']}")
+        linked_findings = conn.execute(
+            """
+            select f.* from quality_gate_findings qgf
+            join findings f on f.id = qgf.finding_id
+            where qgf.gate_id = ? and f.severity in ('high', 'critical')
+              and (f.cycle_id = ? or f.cycle_id = '')
+              and (f.candidate_sha = ? or f.candidate_sha = '')
+            order by f.id
+            """,
+            (latest_gate["id"], cycle_id, current_source_hash),
+        ).fetchall()
+        for finding in linked_findings:
+            if finding["status"] in {"resolved", "false-positive"}:
+                continue
+            if finding["status"] == "accepted":
+                waiver_complete = all(
+                    [
+                        finding["waived_by"], finding["waiver_reason"], finding["waiver_scope"],
+                        finding["waived_revision"], finding["waiver_expires_at"],
+                    ]
+                )
+                waiver_matches = (
+                    finding["cycle_id"] == cycle_id
+                    and finding["candidate_sha"] == current_source_hash
+                    and int(finding["waived_revision"] or 0) == int(latest_gate["project_revision"])
+                )
+                if waiver_complete and waiver_matches and not is_expired(finding["waiver_expires_at"]):
+                    continue
+            issues.append(
+                f"linked {finding['severity']} finding blocks delivery: {finding['id']} status={finding['status']}"
+            )
         high_risk_present = conn.execute("select 1 from failure_modes where cycle_id = ? and risk in ('high', 'critical') limit 1", (cycle_id,)).fetchone()
         if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
             issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")

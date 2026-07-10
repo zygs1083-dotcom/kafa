@@ -325,6 +325,51 @@ class StopShipRegressionTest(unittest.TestCase):
         )
         self.assertIn("latest quality gate is not pass", output)
 
+    def test_dt_001_resolved_finding_does_not_block_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_delivery_candidate(root)
+            run_harness(root, "finding", "record", "--id", "F-resolved", "--surface", "delivery", "--severity", "critical", "--status", "resolved", "--summary", "Closed")
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-resolved")
+
+            readiness = move_to_delivery_readiness(root)
+
+        self.assertEqual(readiness.returncode, 0, readiness.stdout + readiness.stderr)
+
+    def test_dt_001_expired_finding_waiver_blocks_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_delivery_candidate(root)
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                revision = conn.execute("select revision from project where id = 1").fetchone()[0]
+            run_harness(
+                root, "finding", "record", "--id", "F-waived", "--surface", "delivery",
+                "--severity", "high", "--status", "accepted", "--summary", "Temporary waiver",
+                "--waived-by", "release-owner", "--waiver-reason", "time-boxed",
+                "--waiver-scope", "candidate", "--waived-revision", str(revision),
+                "--waiver-expires-at", "2000-01-01T00:00:00Z",
+            )
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-waived")
+
+            readiness = move_to_delivery_readiness(root)
+
+        self.assertNotEqual(readiness.returncode, 0)
+        self.assertIn("F-waived", readiness.stdout + readiness.stderr)
+
+    def test_dt_001_old_cycle_finding_does_not_block_current_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_delivery_candidate(root)
+            run_harness(root, "finding", "record", "--id", "F-old", "--surface", "delivery", "--severity", "critical", "--status", "open", "--summary", "Old cycle")
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute("update findings set cycle_id = 'CYCLE-old' where id = 'F-old'")
+                conn.commit()
+            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-old")
+
+            readiness = move_to_delivery_readiness(root)
+
+        self.assertEqual(readiness.returncode, 0, readiness.stdout + readiness.stderr)
+
     def test_cy_001_reusing_local_ids_does_not_move_old_cycle_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
