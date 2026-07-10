@@ -60,6 +60,8 @@ from core.store import DB_PATH, SqliteStore, Store
 
 SCHEMA_VERSION = 28
 RUNTIME_VERSION = "4.18.0"
+MIN_MIGRATABLE_SCHEMA_VERSION = 6
+REGISTERED_SCHEMA_SOURCES = frozenset(range(MIN_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION))
 DEFAULT_CYCLE_ID = "CYCLE-current"
 LEGACY_CYCLE_ID = "CYCLE-legacy"
 LEASE_TTL_SECONDS = 3600
@@ -251,6 +253,10 @@ class HarnessError(Exception):
     """User-facing runtime error."""
 
 
+class _MigrationAlreadyApplied(Exception):
+    """Internal control flow for idempotent post-migration recovery."""
+
+
 @dataclass
 class ConnectorStats:
     tool: str
@@ -426,8 +432,25 @@ def run_idempotent(root: Path, request_id: str | None, command: str, args: dict[
     return result
 
 
+def execute_transactional_script(conn: sqlite3.Connection, script: str) -> None:
+    if not conn.in_transaction:
+        raise HarnessError("schema SQL requires an active transaction")
+    statement = ""
+    for character in script:
+        statement += character
+        if character != ";" or not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip()
+        if sql:
+            conn.execute(sql)
+        statement = ""
+    if statement.strip():
+        raise HarnessError("incomplete schema SQL statement")
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    execute_transactional_script(
+        conn,
         """
         create table if not exists project (
             id integer primary key check (id = 1),
@@ -1480,26 +1503,23 @@ def runtime_snapshot(conn: sqlite3.Connection, *, include_events: bool = True) -
 
 def restore_snapshot(conn: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
     create_schema(conn)
-    conn.execute("pragma foreign_keys = off")
-    try:
-        for table in reversed(SNAPSHOT_TABLES):
-            if table in snapshot:
-                conn.execute(f"delete from {table}")
-        for table in SNAPSHOT_TABLES:
-            rows = snapshot.get(table, [])
-            if not rows:
-                continue
-            columns = table_columns(conn, table)
-            writable = [column for column in columns if column in rows[0]]
-            placeholders = ",".join("?" for _ in writable)
-            column_sql = ",".join(writable)
-            for row in rows:
-                conn.execute(
-                    f"insert into {table} ({column_sql}) values ({placeholders})",
-                    [row.get(column) for column in writable],
-                )
-    finally:
-        conn.execute("pragma foreign_keys = on")
+    conn.execute("pragma defer_foreign_keys = on")
+    for table in reversed(SNAPSHOT_TABLES):
+        if table in snapshot:
+            conn.execute(f"delete from {table}")
+    for table in SNAPSHOT_TABLES:
+        rows = snapshot.get(table, [])
+        if not rows:
+            continue
+        columns = table_columns(conn, table)
+        writable = [column for column in columns if column in rows[0]]
+        placeholders = ",".join("?" for _ in writable)
+        column_sql = ",".join(writable)
+        for row in rows:
+            conn.execute(
+                f"insert into {table} ({column_sql}) values ({placeholders})",
+                [row.get(column) for column in writable],
+            )
 
 
 def baseline_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -1972,10 +1992,16 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
     if dry_run:
         return report
 
-    backup_dir = backup_runtime(root, "markdown-v1")
+    backup_runtime(root, "markdown-v1")
     try:
         with transaction(root, validate_invariants=False) as conn:
             create_schema(conn)
+            already_applied = conn.execute(
+                "select 1 from migrations where from_version = 1 and to_version = ? limit 1",
+                (SCHEMA_VERSION,),
+            ).fetchone()
+            if already_applied:
+                raise _MigrationAlreadyApplied
             initialize_project(conn)
             for cells in acceptance_rows:
                 if len(cells) < 2:
@@ -2153,12 +2179,18 @@ def migrate_markdown_v1(root: Path, *, dry_run: bool = False) -> dict[str, Any]:
             ensure_delivery_cycles(conn)
             emit_event(conn, "markdown_v1_migrated", payload(to=SCHEMA_VERSION))
             require_full_invariants(conn, root, "migration")
+    except _MigrationAlreadyApplied:
+        pass
     except Exception:
-        restore_runtime_backup(root, backup_dir)
         raise
-    render_all(root)
-    write_migration_report(root, report)
-    install_agents(root)
+    try:
+        render_all(root)
+        write_migration_report(root, report)
+        install_agents(root)
+    except Exception as exc:
+        raise HarnessError(
+            f"markdown migration committed but projection rebuild failed; rerun migrate --from-version markdown-v1 --to-version {SCHEMA_VERSION}: {exc}"
+        ) from exc
     return report
 
 
@@ -7663,34 +7695,93 @@ def dispatch_status(root: Path) -> list[str]:
     return lines
 
 
+def validated_migration_path(root: Path, from_version: str, to_version: int) -> tuple[int, list[tuple[int, int]]]:
+    try:
+        requested_from = int(from_version)
+    except ValueError as exc:
+        raise HarnessError(f"invalid migration source version: {from_version}") from exc
+    if not db_file(root).exists():
+        raise HarnessError("migration requires an initialized runtime")
+    current_schema_issues: list[str] = []
+    with connection(root) as conn:
+        project_exists = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'project'").fetchone()
+        if not project_exists:
+            raise HarnessError("migration requires an initialized runtime")
+        row = conn.execute("select schema_version from project where id = 1").fetchone()
+        if not row:
+            raise HarnessError("migration requires project state")
+        actual = int(row["schema_version"])
+        if actual == SCHEMA_VERSION:
+            try:
+                current_schema_issues = runtime_schema_issues(conn)
+            except sqlite3.Error as exc:
+                current_schema_issues = [f"schema inspection failed: {exc}"]
+    if requested_from != actual:
+        raise HarnessError(f"migration source mismatch: expected database schema {actual}, received {requested_from}")
+    if to_version < actual:
+        raise HarnessError(f"schema downgrade is not supported: {actual}->{to_version}")
+    if to_version != SCHEMA_VERSION:
+        raise HarnessError(f"unregistered migration target: {actual}->{to_version}; supported target is {SCHEMA_VERSION}")
+    if actual == SCHEMA_VERSION:
+        if current_schema_issues:
+            raise HarnessError("current schema is incomplete: " + "; ".join(current_schema_issues[:5]))
+        return actual, []
+    if actual not in REGISTERED_SCHEMA_SOURCES:
+        raise HarnessError(f"unregistered migration source: {actual}")
+    return actual, [(actual, SCHEMA_VERSION)]
+
+
 def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = False) -> dict[str, Any] | None:
     if from_version == "markdown-v1":
+        if to_version != SCHEMA_VERSION:
+            raise HarnessError(f"markdown-v1 target must be current schema {SCHEMA_VERSION}, received {to_version}")
         return migrate_markdown_v1(root, dry_run=dry_run)
+    actual_version, path = validated_migration_path(root, from_version, to_version)
     if dry_run:
         return {
             "dry_run": True,
-            "imported": {"schema_migration": 1},
+            "imported": {"schema_migration": len(path)},
             "skipped": {},
             "unrecognized": [],
         }
-    backup_dir = backup_runtime(root, "migrate")
-    from_version_int = int(from_version)
+    if not path:
+        render_all(root)
+        return None
+    backup_runtime(root, "migrate")
     try:
         with transaction(root, validate_invariants=False) as conn:
+            current = conn.execute("select schema_version from project where id = 1").fetchone()
+            if not current or int(current["schema_version"]) != actual_version:
+                observed = "missing" if not current else str(current["schema_version"])
+                raise HarnessError(f"migration source changed concurrently: expected {actual_version}, actual {observed}")
             create_schema(conn)
             initialize_project(conn)
             ensure_connector_project_key(conn, root)
+            source_version, target_version = path[0]
             conn.execute(
                 "insert into migrations (from_version, to_version, applied_at) values (?, ?, ?)",
-                (from_version_int, to_version, now_iso()),
+                (source_version, target_version, now_iso()),
             )
-            conn.execute("update project set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ? where id = 1", (to_version, RUNTIME_VERSION, now_iso()))
-            emit_event(conn, "migration_applied", payload(**{"from": from_version_int, "to": to_version}))
+            updated = conn.execute(
+                """
+                update project
+                set schema_version = ?, runtime_version = ?, revision = revision + 1, updated_at = ?
+                where id = 1 and schema_version = ?
+                """,
+                (target_version, RUNTIME_VERSION, now_iso(), source_version),
+            )
+            if updated.rowcount != 1:
+                raise HarnessError(f"migration source changed concurrently: expected {source_version}")
+            emit_event(conn, "migration_applied", payload(**{"from": source_version, "to": target_version}))
             require_full_invariants(conn, root, "migration")
     except Exception:
-        restore_runtime_backup(root, backup_dir)
         raise
-    render_all(root)
+    try:
+        render_all(root)
+    except Exception as exc:
+        raise HarnessError(
+            f"migration committed but projection rebuild failed; rerun migrate --from-version {SCHEMA_VERSION} --to-version {SCHEMA_VERSION}: {exc}"
+        ) from exc
     return None
 
 

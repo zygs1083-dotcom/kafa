@@ -197,10 +197,19 @@ def rebuild_state_from_events(root: Path, to_sequence: int, out: Path) -> None:
         out.unlink()
     replay_conn = sqlite3.connect(out)
     replay_conn.row_factory = sqlite3.Row
+    completed = False
     try:
+        replay_conn.execute("pragma foreign_keys = on")
+        replay_conn.execute("begin immediate")
         restore_snapshot(replay_conn, snapshot)
         for event in events:
             apply_event_after(replay_conn, event)
         replay_conn.commit()
+        completed = True
+    except Exception:
+        replay_conn.rollback()
+        raise
     finally:
         replay_conn.close()
+        if not completed:
+            out.unlink(missing_ok=True)

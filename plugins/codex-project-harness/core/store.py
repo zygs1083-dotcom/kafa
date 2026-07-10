@@ -9,6 +9,7 @@ This module must not import harness_db or core business modules.
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
@@ -57,12 +58,27 @@ class SqliteStore:
     def _connect(self) -> sqlite3.Connection:
         path = self._db_file()
         ensure_parent(path)
-        conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("pragma journal_mode = wal")
-        conn.execute("pragma foreign_keys = on")
-        conn.execute("pragma busy_timeout = 5000")
-        return conn
+        deadline = time.monotonic() + 5.0
+        last_error: sqlite3.OperationalError | None = None
+        while True:
+            remaining = max(0.1, deadline - time.monotonic())
+            conn = sqlite3.connect(path, timeout=remaining)
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"pragma busy_timeout = {int(remaining * 1000)}")
+            try:
+                conn.execute("pragma journal_mode = wal")
+            except sqlite3.OperationalError as exc:
+                conn.close()
+                if "locked" not in str(exc).lower():
+                    raise
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+                continue
+            conn.execute("pragma foreign_keys = on")
+            return conn
+        raise last_error or sqlite3.OperationalError("database is locked")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

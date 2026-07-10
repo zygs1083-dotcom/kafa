@@ -58,3 +58,55 @@ FAILED (failures=6)
 - backup、dry-run、apply、恢复路径；
 - 并发 migration 的确定 winner 或明确冲突；
 - schema 28 -> 29 cycle identity、gate sequence 和 legacy trust downgrade 的无损迁移矩阵。
+
+## DB-001 / DB-002 修复证据
+
+本节记录后续实现切片的结果；schema 29 迁移仍未开始。
+
+实现结果：
+
+- `create_schema()` 不再使用会隐式提交的 `executescript()`；SQL 由 `sqlite3.complete_statement()` 划分，并要求调用者已开启事务。
+- file-backed 和 in-memory Store 在 schema DDL 后注入异常时均完整 rollback。
+- numeric migration 从数据库读取 actual version，CLI `--from-version` 只作为 expected-version CAS。
+- 仅注册历史 schema `6..27 -> current 28`；未知目标、降级、错误 source 和错误 markdown target 均 fail-closed。
+- current `28 -> 28` 是校验 schema 后的 projection rebuild；缺表不能伪装成健康 no-op。
+- numeric 和 markdown migration 都具备并发单 winner / 幂等恢复语义，不再由 loser 恢复旧文件覆盖 winner。
+- DB 已提交但 projection 失败时返回明确恢复命令；重试不会重复业务 row 或 migration marker。
+- checkpoint restore 使用 deferred FK，并覆盖 `task_test_targets` 关系 round-trip。
+- event replay 显式开启事务；失败 rollback 并删除部分输出数据库。
+- WAL 初始化锁遵守五秒总 deadline；stability contention 未泄漏 `database is locked`。
+
+定向矩阵：
+
+```text
+python3 -m unittest tests/test_schema_lifecycle.py tests/test_store_seam.py
+Ran 21 tests in 3.154s
+OK
+
+历史 schema 14/15/21/24、markdown、checkpoint 和 repair 定向矩阵
+Ran 27 tests in 20.119s
+OK
+```
+
+Stability E2E：
+
+```text
+scenario_count=12
+failed_count=0
+false_pass_count=0
+sqlite_lock_error_count=0
+human_intervention_count=0
+sqlite_contention_stress.pass=true
+doctor_returncode=0
+invariant_returncode=0
+```
+
+最终完整回归：
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+Ran 265 tests in 433.259s
+FAILED (failures=6)
+```
+
+六个失败全部是 `test_stop_ship_regressions.py` 中尚待 Wave 2/3 修复的 P0 基线；DB-001/DB-002 和普通回归没有额外失败。两轮独立对抗审查发现的 checkpoint FK、event replay、numeric/markdown concurrency、no-op corruption 和 projection recovery 缺口均已增加测试并关闭。

@@ -490,7 +490,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             doctor_before = run_harness(root, "doctor", check=False)
             repair_result = run_harness(root, "repair")
-            run_harness(root, "migrate", "--from-version", "6", "--to-version", "28")
+            run_harness(root, "migrate", "--from-version", "28", "--to-version", "28")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -829,7 +829,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "13", "--dry-run")
+            migrate = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "28", "--dry-run")
             repair_plan = run_harness(root, "repair", "--dry-run")
 
             self.assertEqual(migrate.returncode, 0, migrate.stdout + migrate.stderr)
@@ -1006,7 +1006,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "13")
+            result = run_harness(root, "migrate", "--from-version", "markdown-v1", "--to-version", "28")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 acceptance = conn.execute("select criterion from acceptance where id = 'AC1'").fetchone()[0]
