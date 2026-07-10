@@ -16,6 +16,7 @@ Check the repository:
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
 python3 -m pip install -e .
 kafa --version
+kafa plugin install --repo .
 kafa doctor --repo .
 ```
 
@@ -56,7 +57,11 @@ User scope copies the plugin to `~/.agents/plugins/codex-project-harness` and wr
 ```bash
 python3 -m pip install -e .
 kafa plugin install --scope user --repo .
+codex plugin add codex-project-harness@kafa-local
+kafa doctor --scope user --repo .
 ```
+
+The user-scope doctor is fail-closed: it statically verifies the marketplace entry, copied plugin identity and content, hook definition, Codex cache, and `codex plugin list --json` registration. Creating the marketplace file alone is not reported as a completed Codex installation. Real hook execution is reserved for the isolated CI smoke after Codex installs and trusts the plugin.
 
 Use `--force` only when you intentionally want to replace an existing copied user plugin:
 

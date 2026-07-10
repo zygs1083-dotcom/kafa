@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tomllib
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,49 @@ DEFAULT_MARKETPLACE_NAME = "kafa-local"
 DISPLAY_NAME = "Kafa Local Plugins"
 PLUGIN_CATEGORY = "Developer Tools"
 REPO_VERSION_FILE = Path(__file__).resolve().parents[1] / "VERSION"
+
+REQUIRED_SKILLS = (
+    "project-harness",
+    "project-bootstrap",
+    "project-runtime",
+    "requirement-baseline",
+    "team-architecture",
+    "minimal-safe-change",
+    "test-first-delivery",
+    "bug-fix-loop",
+    "independent-quality-gate",
+    "delivery-readiness",
+    "harness-audit",
+    "project-retrospective",
+)
+REQUIRED_REFERENCES = ("collaboration-tools.md", "tool-adapters.md")
+REQUIRED_CORE = (
+    "__init__.py", "api.py", "connector_trust.py", "scheduler.py", "gate_engine.py", "lock_manager.py",
+    "schema_guard.py", "event_bus.py", "executor.py", "agent_runner.py", "agent_provider.py",
+    "invariant_checker.py", "projections.py", "store.py",
+)
+REQUIRED_SCRIPTS = (
+    "init_project_harness.py", "validate_structure.py", "harness_lib.py", "harness_wrapper.py",
+    "harness_status.py", "update_phase.py", "add_acceptance.py", "add_failure_mode.py", "add_task.py",
+    "update_task.py", "record_decision.py", "record_validation.py", "record_quality_gate.py",
+    "record_delivery.py", "validate_harness_state.py", "harness_db.py", "harness.py",
+    "run_runtime_smoke.py", "run_forward_eval.py", "run_skill_eval.py", "run_agent_e2e_eval.py",
+)
+REQUIRED_HOOKS = ("hooks.json", "harness_hook.py")
+REQUIRED_SCHEMAS = (
+    "project-state.schema.json", "delivery-cycle.schema.json", "requirement.schema.json",
+    "acceptance.schema.json", "task.schema.json", "task-attempt.schema.json", "task-test-target.schema.json",
+    "event.schema.json", "quality-gate.schema.json", "failure-mode.schema.json", "validation.schema.json",
+    "evidence.schema.json", "test.schema.json", "test-target.schema.json", "finding.schema.json",
+    "invalidation.schema.json", "delivery.schema.json", "adapter.schema.json", "adapter-action.schema.json",
+    "connector-budget.schema.json", "connector-profile.schema.json", "advisory-fallback.schema.json",
+    "ci-verification.schema.json", "command-log.schema.json", "codex-fanout-export.schema.json",
+    "external-session-verification.schema.json", "agent.schema.json", "agent-session.schema.json",
+    "session-attestation.schema.json", "baseline.schema.json", "dispatch-run.schema.json",
+    "dispatch-assignment.schema.json", "dispatch-worktree.schema.json", "task-file-claim.schema.json",
+    "agent-report.schema.json", "agent-provider-session.schema.json", "agent-provider-event.schema.json",
+    "sandbox-execution.schema.json", "integration-attempt.schema.json", "runtime-snapshot.schema.json",
+)
 
 
 class KafaError(RuntimeError):
@@ -319,26 +365,363 @@ def doctor_report(repo: Path, scope: str) -> dict[str, Any]:
     source = plugin_source(repo, "")
     manifest = source / ".codex-plugin" / "plugin.json"
     add_check(checks, "plugin manifest", manifest.exists(), str(manifest))
+    source_metadata: dict[str, Any] = {}
     if manifest.exists():
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("plugin manifest root must be an object")
+            source_metadata = data
             version = (repo / "VERSION").read_text(encoding="utf-8").strip() if (repo / "VERSION").exists() else ""
             add_check(checks, "plugin name", data.get("name") == PLUGIN_NAME, str(data.get("name", "")))
             add_check(checks, "plugin version", not version or data.get("version") == version, f"plugin={data.get('version', '')} repo={version}")
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             add_check(checks, "plugin metadata", False, str(exc))
-    validate = source / "scripts" / "validate_structure.py"
-    if validate.exists():
-        completed = subprocess.run([sys.executable, str(validate), str(source)], text=True, capture_output=True, check=False)
-        add_check(checks, "plugin structure", completed.returncode == 0, (completed.stdout or completed.stderr).strip())
-    else:
-        add_check(checks, "plugin structure", False, f"missing {validate}")
+    structure_ok, structure_details = static_plugin_structure(source)
+    add_check(checks, "plugin structure", structure_ok, structure_details)
     contract_ok, contract_details = control_plane_contract(source)
     add_check(checks, "control plane contract", contract_ok, contract_details)
     add_check(checks, "connector namespace boundary", True, "installer does not create external workspaces; per-project connector profile lives in harness runtime state")
-    marketplace_path, _target, _source_path = marketplace_locations(repo, scope)
-    add_check(checks, "marketplace path", True, str(marketplace_path))
+    add_install_health_checks(checks, repo, scope, source, source_metadata)
     return {"ok": all(check["ok"] for check in checks), "scope": scope, "repo": str(repo), "checks": checks}
+
+
+def add_install_health_checks(
+    checks: list[dict[str, Any]],
+    repo: Path,
+    scope: str,
+    source: Path,
+    source_metadata: dict[str, Any],
+) -> None:
+    marketplace_path, plugin_target, expected_source_path = marketplace_locations(repo, scope)
+    marketplace: dict[str, Any] = {}
+    marketplace_error = ""
+    try:
+        parsed = json.loads(marketplace_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("marketplace root must be an object")
+        marketplace = parsed
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        marketplace_error = str(exc)
+    add_check(
+        checks,
+        "marketplace manifest",
+        bool(marketplace),
+        str(marketplace_path) if marketplace else f"{marketplace_path}: {marketplace_error or 'unreadable'}",
+    )
+
+    entries = marketplace.get("plugins", []) if isinstance(marketplace.get("plugins", []), list) else []
+    matching_entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == PLUGIN_NAME]
+    entry_ok = len(matching_entries) == 1
+    add_check(checks, "marketplace plugin entry", entry_ok, f"found {len(matching_entries)} {PLUGIN_NAME} entries")
+    entry_source = matching_entries[0].get("source") if entry_ok else None
+    expected_source = {"source": "local", "path": expected_source_path}
+    source_ok = entry_source == expected_source
+    add_check(checks, "marketplace source", source_ok, f"actual={entry_source!r} expected={expected_source!r}")
+
+    installed_tree_safe = managed_tree_is_safe(plugin_target)
+    installed_manifest = plugin_target / ".codex-plugin" / "plugin.json"
+    installed_metadata: dict[str, Any] = {}
+    installed_error = ""
+    if installed_tree_safe:
+        try:
+            parsed = json.loads(installed_manifest.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("plugin manifest root must be an object")
+            installed_metadata = parsed
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            installed_error = str(exc)
+    else:
+        installed_error = "plugin tree contains a symlink or junction"
+    add_check(
+        checks,
+        "installed plugin manifest",
+        bool(installed_metadata),
+        str(installed_manifest) if installed_metadata else f"{installed_manifest}: {installed_error or 'unreadable'}",
+    )
+    identity_ok = bool(installed_metadata) and all(
+        installed_metadata.get(field) == source_metadata.get(field) for field in ["name", "version"]
+    )
+    add_check(
+        checks,
+        "installed plugin identity",
+        identity_ok,
+        f"installed={installed_metadata.get('name', '')}@{installed_metadata.get('version', '')} "
+        f"source={source_metadata.get('name', '')}@{source_metadata.get('version', '')}",
+    )
+
+    source_digest = plugin_tree_digest(source)
+    installed_digest = plugin_tree_digest(plugin_target) if installed_tree_safe else ""
+    content_ok = bool(source_digest) and source_digest == installed_digest
+    add_check(
+        checks,
+        "installed plugin content",
+        content_ok,
+        f"installed={installed_digest or 'unavailable'} source={source_digest or 'unavailable'}",
+    )
+    hook_ok, hook_details = static_hook_definition(plugin_target) if content_ok else (False, "not checked: installed content does not match source")
+    add_check(checks, "hook definition", hook_ok, hook_details)
+    if scope == "user":
+        registration_ok, registration_details, cache_ok, cache_details = codex_plugin_health(
+            repo,
+            plugin_target,
+            str(marketplace.get("name", "")),
+            str(installed_metadata.get("version", "")),
+        )
+        add_check(checks, "codex plugin registration", registration_ok, registration_details)
+        add_check(checks, "codex plugin cache", cache_ok, cache_details)
+
+
+def plugin_tree_digest(root: Path) -> str:
+    if not managed_tree_is_safe(root):
+        return ""
+    digest = hashlib.sha256()
+    try:
+        files = sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}
+        )
+        for path in files:
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def managed_tree_is_safe(root: Path) -> bool:
+    if not root.is_dir() or path_is_link(root):
+        return False
+    try:
+        return not any(path_is_link(path) for path in root.rglob("*"))
+    except OSError:
+        return False
+
+
+def path_is_link(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(is_junction and is_junction())
+    except OSError:
+        return True
+
+
+def static_plugin_structure(source: Path) -> tuple[bool, str]:
+    errors: list[str] = []
+    repo_root = source.parent.parent
+    manifest_path = source / ".codex-plugin" / "plugin.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("plugin manifest root must be an object")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return False, f"invalid plugin manifest: {exc}"
+
+    version_path = repo_root / "VERSION"
+    version = read_text(version_path).strip()
+    if manifest.get("name") != PLUGIN_NAME:
+        errors.append(f"plugin name must be {PLUGIN_NAME}")
+    if version and manifest.get("version") != version:
+        errors.append("plugin version must match root VERSION")
+    if "schema_version" in manifest or "display_name" in manifest:
+        errors.append("plugin manifest contains legacy fields")
+    if not isinstance(manifest.get("author"), dict):
+        errors.append("plugin author must be an object")
+    if manifest.get("skills") != "./skills/":
+        errors.append("plugin skills must be ./skills/")
+    interface = manifest.get("interface")
+    interface_fields = {
+        "displayName", "shortDescription", "longDescription", "developerName",
+        "category", "capabilities", "defaultPrompt",
+    }
+    if not isinstance(interface, dict) or not interface_fields.issubset(interface):
+        errors.append("plugin interface metadata is incomplete")
+    elif not isinstance(interface.get("capabilities"), list) or not isinstance(interface.get("defaultPrompt"), list):
+        errors.append("plugin interface list fields are invalid")
+
+    pyproject_path = repo_root / "pyproject.toml"
+    try:
+        package = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        raw_project = package.get("project", {}) if isinstance(package, dict) else {}
+        project = raw_project if isinstance(raw_project, dict) else {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        errors.append(f"invalid pyproject.toml: {exc}")
+        project = {}
+    expected_package_version = version.replace("-beta.", "b") if "-beta." in version else version
+    if project.get("name") != "kafa":
+        errors.append("pyproject project.name must be kafa")
+    if version and project.get("version") != expected_package_version:
+        errors.append("pyproject version must match root VERSION")
+    if project.get("requires-python") != ">=3.11":
+        errors.append("pyproject requires-python must be >=3.11")
+    dependencies = project.get("dependencies", [])
+    if not isinstance(dependencies, list) or "openai-codex>=0.1.0b3" not in dependencies:
+        errors.append("pyproject dependencies must include openai-codex>=0.1.0b3")
+    if not isinstance(project.get("scripts"), dict) or project["scripts"].get("kafa") != "kafa.cli:main":
+        errors.append("pyproject must expose kafa = kafa.cli:main")
+
+    skills_root = source / "skills"
+    for skill in REQUIRED_SKILLS:
+        skill_root = skills_root / skill
+        skill_md = skill_root / "SKILL.md"
+        text = read_text(skill_md)
+        if not text or path_is_link(skill_md):
+            errors.append(f"missing skill file: {skill}")
+            continue
+        front_matter = text.split("---", 2)
+        if not text.startswith("---") or len(front_matter) < 3:
+            errors.append(f"missing skill front matter: {skill}")
+        elif (f'name: "{skill}"' not in text and f"name: {skill}" not in text) or "description:" not in front_matter[1]:
+            errors.append(f"invalid skill metadata: {skill}")
+        ui_metadata = read_text(skill_root / "agents" / "openai.yaml")
+        if not all(marker in ui_metadata for marker in ["interface:", "display_name:", "short_description:", "default_prompt:"]):
+            errors.append(f"invalid skill UI metadata: {skill}")
+    actual_skills = directory_names(skills_root)
+    if actual_skills != set(REQUIRED_SKILLS):
+        errors.append(f"skill inventory mismatch: {sorted(actual_skills ^ set(REQUIRED_SKILLS))}")
+
+    for reference in REQUIRED_REFERENCES:
+        if not (source / "references" / reference).is_file():
+            errors.append(f"missing reference: {reference}")
+    check_exact_file_inventory(errors, source / "core", REQUIRED_CORE, ".py", "core")
+    check_exact_file_inventory(errors, source / "scripts", REQUIRED_SCRIPTS, ".py", "scripts")
+    check_exact_file_inventory(errors, source / "hooks", REQUIRED_HOOKS, "", "hooks")
+    check_exact_file_inventory(errors, source / "schemas", REQUIRED_SCHEMAS, ".json", "schemas")
+    if not (source / "skills" / "project-runtime" / "scripts" / "harness.py").is_file():
+        errors.append("missing project-runtime self-contained CLI")
+    for schema in REQUIRED_SCHEMAS:
+        try:
+            json.loads((source / "schemas" / schema).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"invalid schema {schema}: {exc}")
+    try:
+        json.loads((source / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"invalid hooks.json: {exc}")
+    if (source / "skills" / "release-readiness" / "SKILL.md").exists() or (source / "templates" / "agents" / "release-engineer.toml").exists():
+        errors.append("stale delivery-only replacement exists")
+
+    return (not errors, "complete static plugin contract" if not errors else "; ".join(errors[:6]))
+
+
+def directory_names(root: Path) -> set[str]:
+    try:
+        return {path.name for path in root.iterdir() if path.is_dir() and not path_is_link(path)}
+    except OSError:
+        return set()
+
+
+def check_exact_file_inventory(
+    errors: list[str],
+    root: Path,
+    required: tuple[str, ...],
+    suffix: str,
+    label: str,
+) -> None:
+    try:
+        actual = {
+            path.name for path in root.iterdir()
+            if path.is_file() and not path_is_link(path) and (not suffix or path.suffix == suffix)
+        }
+    except OSError:
+        actual = set()
+    expected = set(required)
+    if actual != expected:
+        errors.append(f"{label} inventory mismatch: {sorted(actual ^ expected)}")
+
+
+def static_hook_definition(plugin_root: Path) -> tuple[bool, str]:
+    hooks_path = plugin_root / "hooks" / "hooks.json"
+    try:
+        payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"invalid hooks.json: {exc}"
+    hooks = payload.get("hooks", {}) if isinstance(payload, dict) else {}
+    expected = {"SessionStart", "SubagentStart", "PreToolUse", "PostToolUse", "Stop"}
+    if set(hooks) != expected:
+        return False, f"hook events={sorted(hooks)} expected={sorted(expected)}"
+    for event, groups in hooks.items():
+        if not isinstance(groups, list) or not groups:
+            return False, f"{event}: no hook groups"
+        for group in groups:
+            entries = group.get("hooks", []) if isinstance(group, dict) else []
+            if not isinstance(entries, list) or not entries:
+                return False, f"{event}: no command hooks"
+            for hook in entries:
+                if not isinstance(hook, dict):
+                    return False, f"{event}: invalid hook entry"
+                if "${PLUGIN_ROOT}" not in str(hook.get("command", "")):
+                    return False, f"{event}: POSIX command does not use PLUGIN_ROOT"
+                if "%PLUGIN_ROOT%" not in str(hook.get("commandWindows", "")):
+                    return False, f"{event}: Windows command does not use PLUGIN_ROOT"
+    return True, "five lifecycle events use installed PLUGIN_ROOT commands"
+
+
+def codex_plugin_health(
+    repo: Path,
+    plugin_root: Path,
+    marketplace_name: str,
+    version: str,
+) -> tuple[bool, str, bool, str]:
+    codex = shutil.which("codex")
+    if not codex:
+        return False, "codex CLI not found", False, "not checked: codex CLI not found"
+    completed = subprocess.run(
+        [codex, "plugin", "list", "--json"],
+        text=True,
+        capture_output=True,
+        cwd=repo,
+        check=False,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout).strip()[:500] or f"codex plugin list exited {completed.returncode}"
+        return False, details, False, "not checked: plugin registration unavailable"
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return False, f"invalid codex plugin list JSON: {exc}", False, "not checked: invalid plugin list JSON"
+    installed = payload.get("installed", []) if isinstance(payload, dict) else []
+    expected_id = f"{PLUGIN_NAME}@{marketplace_name}" if marketplace_name else ""
+    for entry in installed if isinstance(installed, list) else []:
+        if not isinstance(entry, dict) or entry.get("pluginId") != expected_id:
+            continue
+        source_path = entry.get("source", {}).get("path") if isinstance(entry.get("source"), dict) else ""
+        source_matches = bool(source_path) and Path(str(source_path)).expanduser().resolve() == plugin_root.resolve()
+        ok = (
+            entry.get("installed") is True
+            and entry.get("enabled") is True
+            and entry.get("version") == version
+            and source_matches
+        )
+        registration_details = (
+            f"id={entry.get('pluginId')} installed={entry.get('installed')} enabled={entry.get('enabled')} "
+            f"version={entry.get('version')} source={source_path}"
+        )
+        cache_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "plugins" / "cache"
+        cache_path = cache_root / marketplace_name / PLUGIN_NAME / version
+        try:
+            cache_safe = cache_path.resolve().is_relative_to(cache_root.resolve())
+        except OSError:
+            cache_safe = False
+        plugin_digest = plugin_tree_digest(plugin_root)
+        cache_digest = plugin_tree_digest(cache_path) if cache_safe else ""
+        cache_ok = ok and bool(plugin_digest) and cache_digest == plugin_digest
+        cache_details = (
+            f"path={cache_path} cache={cache_digest or 'unavailable'} installed={plugin_digest or 'unavailable'}"
+            if cache_safe
+            else f"unsafe cache path derived from marketplace={marketplace_name!r} version={version!r}"
+        )
+        return ok, registration_details, cache_ok, cache_details
+    missing = f"missing enabled installation {expected_id or PLUGIN_NAME}"
+    return False, missing, False, "not checked: plugin registration missing"
 
 
 def project_doctor_report(repo: Path) -> dict[str, Any]:

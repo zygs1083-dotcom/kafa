@@ -72,7 +72,11 @@ For user-scope installation:
 ```bash
 python3 -m pip install -e .
 kafa plugin install --scope user --repo .
+codex plugin add codex-project-harness@kafa-local
+kafa doctor --scope user --repo .
 ```
+
+`kafa doctor --scope user` reports an error until Codex lists the plugin as installed and enabled and its cache matches the managed copy; a copied plugin directory or marketplace entry alone is not enough. Doctor performs static checks and does not execute untrusted checkout or hook code.
 
 Use `kafa plugin upgrade --repo .` after pulling a new release and `kafa plugin uninstall --repo .` to remove only the marketplace entry. See `INSTALL.md` for Windows, migration, uninstall, and troubleshooting details.
 

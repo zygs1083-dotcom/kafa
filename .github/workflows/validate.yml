@@ -12,12 +12,15 @@ jobs:
         include:
           - os: ubuntu-latest
             python: python3
+            python_version: "3.11"
             e2e: stability
           - os: macos-latest
             python: python3
+            python_version: "3.12"
             e2e: fixture
           - os: windows-latest
             python: python
+            python_version: "3.11"
             e2e: fixture
     runs-on: ${{ matrix.os }}
     defaults:
@@ -30,7 +33,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: ${{ matrix.python_version }}
 
       - name: Provide python3 shim on Windows
         if: matrix.os == 'windows-latest'
@@ -55,10 +58,123 @@ jobs:
       - name: Install kafa package
         run: ${{ matrix.python }} -m pip install -e .
 
+      - name: Install pinned Codex CLI for plugin smoke
+        run: npm install --global "@openai/codex@0.143.0"
+
       - name: Check kafa package
         run: |
           kafa --version
+          kafa plugin install --repo .
           kafa doctor --repo .
+          rm -rf .agents
+
+      - name: Isolated user plugin install smoke
+        run: |
+          ${{ matrix.python }} - <<'PY'
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import venv
+          from pathlib import Path
+
+          source_repo = Path.cwd()
+          codex = shutil.which("codex")
+          assert codex, "pinned Codex CLI is not on PATH"
+
+          def run(command, *, env, cwd=source_repo):
+              completed = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False)
+              assert completed.returncode == 0, completed.stdout + completed.stderr
+              return completed.stdout
+
+          with tempfile.TemporaryDirectory() as temp:
+              root = Path(temp)
+              clean_env = os.environ.copy()
+              clean_env.pop("PYTHONPATH", None)
+              release_repo = root / "release-source"
+              shutil.copytree(
+                  source_repo,
+                  release_repo,
+                  ignore=shutil.ignore_patterns(".git", ".venv", ".ai-team", "build", "*.egg-info", "__pycache__", "*.pyc"),
+              )
+              dist = root / "dist"
+              dist.mkdir()
+              run(
+                  [sys.executable, "-m", "pip", "wheel", "--no-deps", ".", "--wheel-dir", str(dist)],
+                  env=clean_env,
+                  cwd=release_repo,
+              )
+              wheel = next(dist.glob("kafa-*.whl"))
+
+              venv_root = root / "venv"
+              venv.EnvBuilder(with_pip=True).create(venv_root)
+              venv_python = venv_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+              run([str(venv_python), "-m", "pip", "install", "--no-deps", str(wheel)], env=clean_env, cwd=root)
+              imported_from = Path(run(
+                  [str(venv_python), "-c", "import kafa; print(kafa.__file__)"],
+                  env=clean_env,
+                  cwd=root,
+              ).strip()).resolve()
+              assert imported_from.is_relative_to(venv_root.resolve()), imported_from
+              codex_version = run([codex, "--version"], env=clean_env, cwd=root).strip()
+              assert codex_version == "codex-cli 0.143.0", codex_version
+
+              env = clean_env.copy()
+              env["HOME"] = str(root / "home")
+              env["CODEX_HOME"] = str(root / "codex-home")
+              Path(env["HOME"]).mkdir()
+              Path(env["CODEX_HOME"]).mkdir()
+              kafa = [str(venv_python), "-m", "kafa.cli"]
+
+              run([*kafa, "plugin", "install", "--scope", "user", "--repo", str(release_repo)], env=env, cwd=root)
+              marketplaces = json.loads(run([codex, "plugin", "marketplace", "list", "--json"], env=env, cwd=root))
+              assert any(item.get("name") == "kafa-local" for item in marketplaces["marketplaces"]), marketplaces
+              available = json.loads(run([codex, "plugin", "list", "--available", "--json"], env=env, cwd=root))
+              assert any(item.get("pluginId") == "codex-project-harness@kafa-local" for item in available["available"]), available
+
+              added = json.loads(run([codex, "plugin", "add", "codex-project-harness@kafa-local", "--json"], env=env, cwd=root))
+              cache_root = Path(added["installedPath"])
+              installed = json.loads(run([codex, "plugin", "list", "--json"], env=env, cwd=root))["installed"]
+              assert any(
+                  item.get("pluginId") == "codex-project-harness@kafa-local"
+                  and item.get("installed") is True
+                  and item.get("enabled") is True
+                  for item in installed
+              ), installed
+
+              doctor = json.loads(run([*kafa, "doctor", "--scope", "user", "--repo", str(release_repo), "--json"], env=env, cwd=root))
+              assert doctor["ok"] is True, doctor
+              checks = {item["name"]: item for item in doctor["checks"]}
+              assert checks["hook definition"]["ok"] is True, checks["hook definition"]
+              assert checks["codex plugin registration"]["ok"] is True, checks["codex plugin registration"]
+              assert checks["codex plugin cache"]["ok"] is True, checks["codex plugin cache"]
+
+              hook = json.loads((cache_root / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]["SessionStart"][0]["hooks"][0]
+              command = hook["commandWindows"] if os.name == "nt" else hook["command"]
+              business_repo = root / "business"
+              business_repo.mkdir()
+              run(["git", "init"], env=env, cwd=business_repo)
+              hook_env = env.copy()
+              hook_env["PLUGIN_ROOT"] = str(cache_root)
+              hook_result = subprocess.run(
+                  command,
+                  input=json.dumps({"source": "ci-install-smoke"}),
+                  text=True,
+                  capture_output=True,
+                  cwd=business_repo,
+                  env=hook_env,
+                  shell=True,
+                  check=False,
+              )
+              assert hook_result.returncode == 0, hook_result.stdout + hook_result.stderr
+              assert "version: 1.25.0-beta.1" in hook_result.stdout, hook_result.stdout
+
+              run([codex, "plugin", "remove", "codex-project-harness@kafa-local", "--json"], env=env, cwd=root)
+              removed = json.loads(run([codex, "plugin", "list", "--json"], env=env, cwd=root))["installed"]
+              assert not any(item.get("pluginId") == "codex-project-harness@kafa-local" for item in removed), removed
+          PY
 
       - name: Run install release tests
         run: ${{ matrix.python }} -m unittest tests/test_install_release.py

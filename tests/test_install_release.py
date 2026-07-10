@@ -32,6 +32,44 @@ def copy_release_repo(target: Path) -> Path:
     return target
 
 
+def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-local") -> dict[str, str]:
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "installed": [
+            {
+                "pluginId": f"codex-project-harness@{marketplace_name}",
+                "name": "codex-project-harness",
+                "marketplaceName": marketplace_name,
+                "version": "1.25.0-beta.1",
+                "installed": True,
+                "enabled": True,
+                "source": {"source": "local", "path": str(plugin_root)},
+            }
+        ]
+    }
+    script = bin_dir / "fake_codex.py"
+    script.write_text(
+        "import json, sys\n"
+        f"payload = {payload!r}\n"
+        "if sys.argv[1:] == ['plugin', 'list', '--json']:\n"
+        "    print(json.dumps(payload))\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        (bin_dir / "codex.bat").write_text(
+            f'@"{sys.executable}" "%~dp0fake_codex.py" %*\n',
+            encoding="utf-8",
+        )
+    else:
+        launcher = bin_dir / "codex"
+        launcher.write_text(f'#!{sys.executable}\nexec(open({str(script)!r}).read())\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    return {"PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", "")}
+
+
 class InstallReleaseTest(unittest.TestCase):
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
@@ -40,6 +78,7 @@ class InstallReleaseTest(unittest.TestCase):
     def test_doctor_reports_repo_health_as_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
+            run_kafa("plugin", "install", "--repo", str(root))
 
             result = run_kafa("doctor", "--repo", str(root), "--json")
             report = json.loads(result.stdout)
@@ -47,6 +86,218 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["scope"], "repo")
         self.assertIn("plugin structure", {check["name"] for check in report["checks"]})
+
+    def test_user_doctor_fails_when_plugin_is_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            result = run_kafa(
+                "doctor",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                "--json",
+                env={"HOME": str(home), "CODEX_HOME": str(home / ".codex")},
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(report["ok"])
+        self.assertFalse(checks["marketplace manifest"]["ok"])
+        self.assertFalse(checks["installed plugin manifest"]["ok"])
+        self.assertFalse(checks["hook definition"]["ok"])
+        self.assertFalse(checks["codex plugin registration"]["ok"])
+
+    def test_doctor_does_not_execute_repository_validation_or_hook_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            marker = Path(temp) / "doctor-executed-untrusted-code"
+            injection = f"\n__import__('pathlib').Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+            for relative in ["scripts/validate_structure.py", "hooks/harness_hook.py"]:
+                path = root / "plugins" / "codex-project-harness" / relative
+                text = path.read_text(encoding="utf-8")
+                path.write_text(text.replace("from __future__ import annotations\n", "from __future__ import annotations\n" + injection, 1), encoding="utf-8")
+            run_kafa("plugin", "install", "--repo", str(root))
+
+            result = run_kafa("doctor", "--repo", str(root), "--json", check=False)
+
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+
+    def test_doctor_static_structure_rejects_missing_required_core_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            (root / "plugins" / "codex-project-harness" / "core" / "store.py").unlink()
+            run_kafa("plugin", "install", "--repo", str(root))
+
+            result = run_kafa("doctor", "--repo", str(root), "--json", check=False)
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["plugin structure"]["ok"])
+        self.assertIn("core inventory mismatch", checks["plugin structure"]["details"])
+
+    def test_doctor_static_structure_matches_dependency_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            pyproject = root / "pyproject.toml"
+            pyproject.write_text(
+                pyproject.read_text(encoding="utf-8").replace('  "openai-codex>=0.1.0b3"\n', ""),
+                encoding="utf-8",
+            )
+            run_kafa("plugin", "install", "--repo", str(root))
+
+            result = run_kafa("doctor", "--repo", str(root), "--json", check=False)
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["plugin structure"]["ok"])
+        self.assertIn("dependencies must include", checks["plugin structure"]["details"])
+
+    def test_user_doctor_validates_installed_copy_and_hook_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            installed = home / ".agents" / "plugins" / "codex-project-harness"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / "1.25.0-beta.1"
+            shutil.copytree(installed, cache)
+            env.update(fake_codex_env(Path(temp), installed))
+            result = run_kafa("doctor", "--scope", "user", "--repo", str(root), "--json", env=env)
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertTrue(report["ok"], report)
+        for name in [
+            "marketplace manifest",
+            "marketplace plugin entry",
+            "marketplace source",
+            "installed plugin manifest",
+            "installed plugin identity",
+            "installed plugin content",
+            "hook definition",
+            "codex plugin registration",
+            "codex plugin cache",
+        ]:
+            self.assertTrue(checks[name]["ok"], checks[name])
+
+    def test_user_doctor_detects_same_version_installed_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            installed_hook = home / ".agents" / "plugins" / "codex-project-harness" / "hooks" / "hooks.json"
+            installed_hook.write_text(installed_hook.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+            result = run_kafa(
+                "doctor",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                "--json",
+                env=env,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["installed plugin content"]["ok"])
+
+    def test_user_doctor_rejects_symlinked_installed_plugin_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            installed = home / ".agents" / "plugins" / "codex-project-harness"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            shutil.rmtree(installed)
+            source = root / "plugins" / "codex-project-harness"
+            if os.name == "nt":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(installed), str(source)], check=True, capture_output=True)
+            else:
+                installed.symlink_to(source, target_is_directory=True)
+
+            result = run_kafa(
+                "doctor",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                "--json",
+                env=env,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["installed plugin manifest"]["ok"])
+        self.assertFalse(checks["installed plugin content"]["ok"])
+
+    def test_user_doctor_detects_enabled_codex_cache_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            installed = home / ".agents" / "plugins" / "codex-project-harness"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / "1.25.0-beta.1"
+            shutil.copytree(installed, cache)
+            cached_hook = cache / "hooks" / "hooks.json"
+            cached_hook.write_text(cached_hook.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            env.update(fake_codex_env(Path(temp), installed))
+
+            result = run_kafa(
+                "doctor",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                "--json",
+                env=env,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(checks["codex plugin registration"]["ok"])
+        self.assertFalse(checks["codex plugin cache"]["ok"])
+
+    def test_user_doctor_rejects_marketplace_source_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            marketplace_path = home / ".agents" / "plugins" / "marketplace.json"
+            marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+            marketplace["plugins"][0]["source"]["path"] = "./plugins/another-project"
+            marketplace_path.write_text(json.dumps(marketplace), encoding="utf-8")
+
+            result = run_kafa(
+                "doctor",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                "--json",
+                env=env,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            checks = {check["name"]: check for check in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["marketplace source"]["ok"])
 
     def test_project_doctor_checks_business_project_without_plugin_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

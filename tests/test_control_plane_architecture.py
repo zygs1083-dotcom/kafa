@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -79,13 +82,28 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
         self.assertIn("forged_evidence_block_count", eval_runner)
 
     def test_kafa_doctor_reports_control_plane_contract(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "-m", "kafa.cli", "doctor", "--repo", str(REPO_ROOT), "--json"],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        report = json.loads(result.stdout)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(PLUGIN_ROOT, root / "plugins" / "codex-project-harness")
+            shutil.copyfile(REPO_ROOT / "VERSION", root / "VERSION")
+            shutil.copyfile(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(REPO_ROOT)
+            subprocess.run(
+                [sys.executable, "-m", "kafa.cli", "plugin", "install", "--repo", str(root)],
+                text=True,
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+            result = subprocess.run(
+                [sys.executable, "-m", "kafa.cli", "doctor", "--repo", str(root), "--json"],
+                text=True,
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+            report = json.loads(result.stdout)
         checks = {check["name"]: check for check in report["checks"]}
 
         self.assertTrue(report["ok"], report)
