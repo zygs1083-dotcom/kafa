@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 
@@ -103,6 +104,26 @@ def validate_adapter_action(tool: str, mode: str, artifact: str, action: str, pa
         json.loads(payload_json)
     except json.JSONDecodeError as exc:
         raise SchemaGuardError(f"adapter action payload must be valid JSON: {exc.msg}") from exc
+
+
+def adapter_action_payload_hash(tool: str, mode: str, artifact: str, action: str, payload_json: str) -> str:
+    try:
+        payload_value: object = {"kind": "valid-json", "value": json.loads(payload_json)}
+    except json.JSONDecodeError:
+        payload_value = {"kind": "invalid-legacy", "raw": payload_json}
+    canonical = json.dumps(
+        {
+            "tool": tool,
+            "mode": mode,
+            "artifact": artifact,
+            "action": action,
+            "payload": payload_value,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def validate_test_target(

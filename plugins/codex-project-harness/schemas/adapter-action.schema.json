@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["id", "tool", "mode", "artifact", "action", "payload_json", "status", "idempotency_key", "attempt_count", "next_retry_at", "connector_status", "blocked_reason", "execution_fence", "claimed_at", "claim_expires_at", "last_recovery_at", "remote_recovery_count", "created_at", "updated_at"],
+  "required": ["id", "tool", "mode", "artifact", "action", "payload_json", "payload_hash", "status", "idempotency_key", "attempt_count", "next_retry_at", "connector_status", "blocked_reason", "execution_fence", "claimed_at", "claim_expires_at", "last_recovery_at", "remote_recovery_count", "created_at", "updated_at"],
   "properties": {
     "id": { "type": "string" },
     "tool": { "type": "string" },
@@ -9,6 +9,7 @@
     "artifact": { "type": "string" },
     "action": { "type": "string" },
     "payload_json": { "type": "string" },
+    "payload_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "status": { "type": "string", "enum": ["planned", "draft", "confirmed", "executing", "completed", "retryable_failed", "unknown", "blocked"] },
     "confirmation": { "type": "string" },
     "external_id": { "type": "string" },

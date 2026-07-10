@@ -720,7 +720,18 @@ def main() -> int:
     root = Path(args.root).resolve()
 
     def semantic_args() -> dict[str, object]:
-        return {key: value for key, value in vars(args).items() if key not in {"root", "request_id"}}
+        values = {key: value for key, value in vars(args).items() if key not in {"root", "request_id"}}
+        if args.command == "adapter" and getattr(args, "adapter_command", "") == "plan":
+            try:
+                values["payload_json"] = json.dumps(
+                    json.loads(str(values.get("payload_json", "{}"))),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except json.JSONDecodeError:
+                pass
+        return values
 
     def mutate(command: str, fn) -> None:
         print(run_idempotent(root, getattr(args, "request_id", None), command, semantic_args(), fn))

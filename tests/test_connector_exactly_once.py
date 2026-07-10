@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +16,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = REPO_ROOT / "plugins/codex-project-harness/scripts/harness.py"
+PLUGIN_ROOT = REPO_ROOT / "plugins/codex-project-harness"
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
 
 
 def run_harness(root: Path, *args: str, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -44,8 +48,11 @@ def db_all(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sqli
         return conn.execute(query, params).fetchall()
 
 
-def plan_slack_action(root: Path, *, key: str = "exactly-once:slack") -> str:
-    payload = json.dumps({"execute": True, "operation": "slack.message.post", "params": {"channel": "C123", "text": "Ship it"}}, sort_keys=True)
+def plan_slack_action(root: Path, *, key: str = "exactly-once:slack", text: str = "Ship it", payload_json: str = "") -> str:
+    payload = payload_json or json.dumps(
+        {"execute": True, "operation": "slack.message.post", "params": {"channel": "C123", "text": text}},
+        sort_keys=True,
+    )
     result = run_harness(
         root,
         "adapter",
@@ -150,6 +157,333 @@ class FakeSlackServer:
 
 
 class ConnectorExactlyOnceTest(unittest.TestCase):
+    def test_valid_json_cannot_collide_with_invalid_legacy_payload_hash(self) -> None:
+        from core.schema_guard import adapter_action_payload_hash
+
+        invalid_hash = adapter_action_payload_hash("slack", "write-confirm", "Slack update", "slack.message.post", "not-json")
+        valid_hash = adapter_action_payload_hash(
+            "slack",
+            "write-confirm",
+            "Slack update",
+            "slack.message.post",
+            '{"invalid_legacy_payload":"not-json"}',
+        )
+
+        self.assertNotEqual(valid_hash, invalid_hash)
+
+    def test_same_idempotency_key_and_semantic_payload_reuses_action_without_mutation(self) -> None:
+        key = "exactly-once:payload-same"
+        canonical = json.dumps(
+            {"execute": True, "operation": "slack.message.post", "params": {"channel": "C123", "text": "Ship it"}},
+            sort_keys=True,
+        )
+        reordered = '{"params":{"text":"Ship it","channel":"C123"},"operation":"slack.message.post","execute":true}'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            first = plan_slack_action(root, key=key, payload_json=canonical)
+            second = plan_slack_action(root, key=key, payload_json=reordered)
+            row = db_one(
+                root,
+                "select id, payload_json, payload_hash, status from adapter_actions where tool = 'slack' and idempotency_key = ?",
+                (key,),
+            )
+            events = db_one(
+                root,
+                "select count(*) as count from events where type = 'adapter_action_planned' and idempotency_key = ?",
+                (key,),
+            )["count"]
+
+        self.assertEqual(second, first)
+        self.assertEqual(row["payload_json"], canonical)
+        self.assertEqual(len(row["payload_hash"]), 64)
+        self.assertEqual(row["status"], "planned")
+        self.assertEqual(events, 1)
+
+    def test_request_id_uses_canonical_payload_semantics(self) -> None:
+        key = "exactly-once:canonical-request"
+        request_id = "REQ-CANONICAL-PAYLOAD"
+        first_payload = '{"execute":true,"operation":"slack.message.post","params":{"channel":"C123","text":"Ship it"}}'
+        second_payload = '{"params":{"text":"Ship it","channel":"C123"},"operation":"slack.message.post","execute":true}'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            first = run_harness(
+                root,
+                "adapter",
+                "plan",
+                "--tool",
+                "slack",
+                "--mode",
+                "write-confirm",
+                "--artifact",
+                "Slack update",
+                "--action",
+                "slack.message.post",
+                "--payload-json",
+                first_payload,
+                "--idempotency-key",
+                key,
+                "--request-id",
+                request_id,
+            )
+            second = run_harness(
+                root,
+                "adapter",
+                "plan",
+                "--tool",
+                "slack",
+                "--mode",
+                "write-confirm",
+                "--artifact",
+                "Slack update",
+                "--action",
+                "slack.message.post",
+                "--payload-json",
+                second_payload,
+                "--idempotency-key",
+                key,
+                "--request-id",
+                request_id,
+            )
+
+        self.assertEqual(second.stdout, first.stdout)
+
+    def test_same_idempotency_key_with_different_payload_conflicts(self) -> None:
+        key = "exactly-once:payload-conflict"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            action = plan_slack_action(root, key=key, text="Ship it")
+            before = db_one(root, "select * from adapter_actions where id = ?", (action,))
+            conflict = run_harness(
+                root,
+                "adapter",
+                "plan",
+                "--tool",
+                "slack",
+                "--mode",
+                "write-confirm",
+                "--artifact",
+                "Slack update",
+                "--action",
+                "slack.message.post",
+                "--payload-json",
+                json.dumps(
+                    {"execute": True, "operation": "slack.message.post", "params": {"channel": "C123", "text": "Different"}},
+                    sort_keys=True,
+                ),
+                "--idempotency-key",
+                key,
+                check=False,
+            )
+            after = db_one(root, "select * from adapter_actions where id = ?", (action,))
+
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("idempotency-conflict", conflict.stdout + conflict.stderr)
+        self.assertEqual(dict(after), dict(before))
+
+    def test_completed_action_is_immutable_under_replan(self) -> None:
+        key = "exactly-once:completed-immutable"
+        with tempfile.TemporaryDirectory() as temp, FakeSlackServer() as server:
+            root = Path(temp)
+            run_harness(root, "init")
+            set_slack_profile(root)
+            action = plan_slack_action(root, key=key)
+            run_harness(
+                root,
+                "adapter",
+                "confirm",
+                "--id",
+                action,
+                env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url},
+            )
+            before = db_one(root, "select * from adapter_actions where id = ?", (action,))
+            conflict = run_harness(
+                root,
+                "adapter",
+                "plan",
+                "--tool",
+                "slack",
+                "--mode",
+                "write-confirm",
+                "--artifact",
+                "Slack update",
+                "--action",
+                "slack.message.post",
+                "--payload-json",
+                json.dumps(
+                    {"execute": True, "operation": "slack.message.post", "params": {"channel": "C123", "text": "Overwrite"}},
+                    sort_keys=True,
+                ),
+                "--idempotency-key",
+                key,
+                check=False,
+            )
+            after = db_one(root, "select * from adapter_actions where id = ?", (action,))
+
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("idempotency-conflict", conflict.stdout + conflict.stderr)
+        self.assertEqual(after["status"], "completed")
+        self.assertEqual(after["external_id"], before["external_id"])
+        self.assertEqual(dict(after), dict(before))
+
+    def test_existing_schema29_action_backfills_missing_payload_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            action = plan_slack_action(root, key="exactly-once:legacy-hash")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update adapter_actions set payload_hash = '' where id = ?", (action,))
+                conn.commit()
+
+            retried = plan_slack_action(root, key="exactly-once:legacy-hash")
+            row = db_one(root, "select payload_hash from adapter_actions where id = ?", (action,))
+
+        self.assertEqual(retried, action)
+        self.assertEqual(len(row["payload_hash"]), 64)
+
+    def test_structural_upgrade_backfills_hash_only_when_column_was_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            action = plan_slack_action(root, key="exactly-once:structural-upgrade")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("alter table adapter_actions drop column payload_hash")
+                conn.commit()
+
+            run_harness(root, "connector", "profile", "status", "--json")
+            row = db_one(root, "select payload_hash from adapter_actions where id = ?", (action,))
+
+        self.assertEqual(len(row["payload_hash"]), 64)
+
+    def test_payload_hash_tampering_blocks_remote_execution_and_invariant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, FakeSlackServer() as server:
+            root = Path(temp)
+            run_harness(root, "init")
+            set_slack_profile(root)
+            action = plan_slack_action(root, key="exactly-once:tamper")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    "update adapter_actions set payload_json = ? where id = ?",
+                    (
+                        json.dumps(
+                            {
+                                "execute": True,
+                                "operation": "slack.message.post",
+                                "params": {"channel": "C123", "text": "Tampered"},
+                            },
+                            sort_keys=True,
+                        ),
+                        action,
+                    ),
+                )
+                conn.commit()
+
+            confirmed = run_harness(
+                root,
+                "adapter",
+                "confirm",
+                "--id",
+                action,
+                env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url},
+                check=False,
+            )
+            invariant = run_harness(root, "invariant", "validate", check=False)
+            row = db_one(root, "select status from adapter_actions where id = ?", (action,))
+
+        self.assertNotEqual(confirmed.returncode, 0)
+        self.assertIn("payload hash mismatch", confirmed.stdout + confirmed.stderr)
+        self.assertEqual(server.requests, [])
+        self.assertEqual(row["status"], "planned")
+        self.assertNotEqual(invariant.returncode, 0)
+        self.assertIn("payload hash mismatch", invariant.stdout + invariant.stderr)
+
+    def test_blank_payload_hash_is_not_self_healed_before_remote_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, FakeSlackServer() as server:
+            root = Path(temp)
+            run_harness(root, "init")
+            set_slack_profile(root)
+            action = plan_slack_action(root, key="exactly-once:blank-hash-tamper")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute(
+                    "update adapter_actions set payload_json = ?, payload_hash = '' where id = ?",
+                    (
+                        json.dumps(
+                            {
+                                "execute": True,
+                                "operation": "slack.message.post",
+                                "params": {"channel": "C123", "text": "Tampered and blanked"},
+                            },
+                            sort_keys=True,
+                        ),
+                        action,
+                    ),
+                )
+                conn.commit()
+
+            confirmed = run_harness(
+                root,
+                "adapter",
+                "confirm",
+                "--id",
+                action,
+                env={"SLACK_BOT_TOKEN": "token", "HARNESS_SLACK_API_URL": server.base_url},
+                check=False,
+            )
+            row = db_one(root, "select status, payload_hash from adapter_actions where id = ?", (action,))
+
+        self.assertNotEqual(confirmed.returncode, 0)
+        self.assertIn("payload hash mismatch", confirmed.stdout + confirmed.stderr)
+        self.assertEqual(server.requests, [])
+        self.assertEqual(row["status"], "planned")
+        self.assertEqual(row["payload_hash"], "")
+
+    def test_completed_action_cannot_be_reopened_or_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            action = plan_slack_action(root, key="exactly-once:completed-transition")
+            run_harness(root, "adapter", "complete", "--id", action, "--external-id", "MSG-1", "--external-link", "https://example.invalid/MSG-1")
+
+            reopened = run_harness(root, "adapter", "draft", "--id", action, check=False)
+            rewritten = run_harness(
+                root,
+                "adapter",
+                "complete",
+                "--id",
+                action,
+                "--external-id",
+                "MSG-2",
+                "--external-link",
+                "https://example.invalid/MSG-2",
+                check=False,
+            )
+            row = db_one(root, "select status, external_id, external_link from adapter_actions where id = ?", (action,))
+
+        self.assertNotEqual(reopened.returncode, 0)
+        self.assertIn("immutable after completion", reopened.stdout + reopened.stderr)
+        self.assertNotEqual(rewritten.returncode, 0)
+        self.assertIn("immutable after completion", rewritten.stdout + rewritten.stderr)
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["external_id"], "MSG-1")
+        self.assertEqual(row["external_link"], "https://example.invalid/MSG-1")
+
+    def test_reconcile_rejects_completed_action_with_tampered_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_harness(root, "init")
+            action = plan_slack_action(root, key="exactly-once:completed-reconcile")
+            run_harness(root, "adapter", "complete", "--id", action, "--external-id", "MSG-1")
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                conn.execute("update adapter_actions set payload_json = '{\"tampered\":true}' where id = ?", (action,))
+                conn.commit()
+
+            reconciled = run_harness(root, "adapter", "reconcile", check=False)
+
+        self.assertNotEqual(reconciled.returncode, 0)
+        self.assertIn("payload hash mismatch", reconciled.stdout + reconciled.stderr)
+
     def test_concurrent_confirm_claims_action_once_before_remote_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp, FakeSlackServer(mode="slow-write") as server:
             root = Path(temp)

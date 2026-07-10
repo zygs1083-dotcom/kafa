@@ -54,6 +54,7 @@ from core.schema_guard import (
     STACK_PROFILES,
     TASK_STATUSES,
     TEST_TARGET_KINDS,
+    adapter_action_payload_hash,
 )
 from core.store import DB_PATH, SqliteStore, Store
 
@@ -456,6 +457,9 @@ def execute_transactional_script(conn: sqlite3.Connection, script: str) -> None:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
+    adapter_action_columns_before = {
+        str(row[1]) for row in conn.execute("pragma table_info(adapter_actions)").fetchall()
+    }
     execute_transactional_script(
         conn,
         """
@@ -850,6 +854,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             artifact text not null,
             action text not null,
             payload_json text not null default '{}',
+            payload_hash text not null default '',
             status text not null,
             confirmation text not null default '',
             external_id text not null default '',
@@ -1323,6 +1328,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "agent_reports", "provider_session_id", "text not null default ''")
     ensure_column(conn, "agent_provider_sessions", "agent_session_id", "text not null default ''")
     ensure_column(conn, "adapter_actions", "attempt_count", "integer not null default 0")
+    ensure_column(conn, "adapter_actions", "payload_hash", "text not null default ''")
+    if adapter_action_columns_before and "payload_hash" not in adapter_action_columns_before:
+        backfill_adapter_action_payload_hashes(conn)
     ensure_column(conn, "adapter_actions", "next_retry_at", "text not null default ''")
     ensure_column(conn, "adapter_actions", "connector_status", "text not null default 'available'")
     ensure_column(conn, "adapter_actions", "blocked_reason", "text not null default ''")
@@ -1563,6 +1571,31 @@ def stable_json(value: object) -> str:
 
 def stable_digest(value: object) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def backfill_adapter_action_payload_hashes(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "select id, tool, mode, artifact, action, payload_json from adapter_actions where payload_hash = ''"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "update adapter_actions set payload_hash = ? where id = ? and payload_hash = ''",
+            (
+                adapter_action_payload_hash(
+                    str(row["tool"]),
+                    str(row["mode"]),
+                    str(row["artifact"]),
+                    str(row["action"]),
+                    str(row["payload_json"]),
+                ),
+                row["id"],
+            ),
+        )
+
+
+def ensure_adapter_action_payload_hash_state(root: Path) -> None:
+    with transaction(root) as conn:
+        ensure_column(conn, "adapter_actions", "payload_hash", "text not null default ''")
 
 
 def row_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -4803,6 +4836,16 @@ def mark_connector_blocked(root: Path, action_id: str, stats: ConnectorStats, re
 
 
 def load_connector_payload(row: sqlite3.Row) -> dict[str, Any]:
+    expected_hash = adapter_action_payload_hash(
+        str(row["tool"]),
+        str(row["mode"]),
+        str(row["artifact"]),
+        str(row["action"]),
+        str(row["payload_json"]),
+    )
+    stored_hash = str(row["payload_hash"] or "") if "payload_hash" in row.keys() else ""
+    if stored_hash != expected_hash:
+        raise HarnessError(f"adapter action payload hash mismatch: {row['id']}")
     try:
         payload_value = json.loads(row["payload_json"] or "{}")
     except json.JSONDecodeError as exc:
@@ -5693,34 +5736,74 @@ def adapter_plan(root: Path, tool: str, mode: str, artifact: str, action: str, *
     guard_schema("validate_adapter_action", tool, mode, artifact, action, payload_json, "planned")
     action_id = str(uuid.uuid4())
     key = idempotency_key or f"codex-project-harness:adapter-action:{tool}:{artifact}:{action}"
+    payload_hash = adapter_action_payload_hash(tool, mode, artifact, action, payload_json)
+    created = False
     with transaction(root) as conn:
-        conn.execute(
-            """
-            insert into adapter_actions
-            (id, tool, mode, artifact, action, payload_json, status, idempotency_key, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)
-            on conflict(tool, idempotency_key) do update set mode=excluded.mode, artifact=excluded.artifact,
-              action=excluded.action, payload_json=excluded.payload_json, updated_at=excluded.updated_at
-            """,
-            (action_id, tool, mode, artifact, action, payload_json, key, now_iso(), now_iso()),
-        )
-        row = conn.execute("select id from adapter_actions where tool = ? and idempotency_key = ?", (tool, key)).fetchone()
-        action_id = row["id"]
-        emit_event(conn, "adapter_action_planned", payload(id=action_id, tool=tool, mode=mode), idempotency_key=key)
-    render_tooling_map(root)
+        ensure_column(conn, "adapter_actions", "payload_hash", "text not null default ''")
+        existing = conn.execute(
+            "select * from adapter_actions where tool = ? and idempotency_key = ?",
+            (tool, key),
+        ).fetchone()
+        if existing:
+            existing_hash = str(existing["payload_hash"] or "")
+            calculated_existing_hash = adapter_action_payload_hash(
+                str(existing["tool"]),
+                str(existing["mode"]),
+                str(existing["artifact"]),
+                str(existing["action"]),
+                str(existing["payload_json"]),
+            )
+            if not existing_hash:
+                if calculated_existing_hash != payload_hash:
+                    raise HarnessError(
+                        f"idempotency-conflict: adapter action key {key!r} is already bound to a different payload"
+                    )
+                conn.execute(
+                    "update adapter_actions set payload_hash = ? where id = ? and payload_hash = ''",
+                    (calculated_existing_hash, existing["id"]),
+                )
+                existing_hash = calculated_existing_hash
+            if existing_hash != payload_hash:
+                raise HarnessError(
+                    f"idempotency-conflict: adapter action key {key!r} is already bound to a different payload"
+                )
+            action_id = str(existing["id"])
+        else:
+            now = now_iso()
+            conn.execute(
+                """
+                insert into adapter_actions
+                (id, tool, mode, artifact, action, payload_json, payload_hash, status, idempotency_key, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)
+                """,
+                (action_id, tool, mode, artifact, action, payload_json, payload_hash, key, now, now),
+            )
+            emit_event(conn, "adapter_action_planned", payload(id=action_id, tool=tool, mode=mode), idempotency_key=key)
+            created = True
+    if created:
+        render_tooling_map(root)
     return action_id
 
 
 def adapter_transition(root: Path, action_id: str, status: str, *, confirmation: str = "", external_id: str = "", external_link: str = "") -> None:
     if status not in ADAPTER_ACTION_STATUSES:
         raise HarnessError(f"invalid adapter action status: {status}")
+    ensure_adapter_action_payload_hash_state(root)
+    with connection(root) as conn:
+        existing = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
+    if not existing:
+        raise HarnessError(f"missing adapter action: {action_id}")
+    load_connector_payload(existing)
+    if existing["status"] == "completed":
+        if status != "completed":
+            raise HarnessError(f"adapter action is immutable after completion: {action_id}")
+        supplied_external_id = external_id or str(existing["external_id"] or "")
+        supplied_external_link = external_link or str(existing["external_link"] or "")
+        if supplied_external_id != str(existing["external_id"] or "") or supplied_external_link != str(existing["external_link"] or ""):
+            raise HarnessError(f"adapter action is immutable after completion: {action_id}")
+        return
     if status == "confirmed":
-        with connection(root) as conn:
-            current = conn.execute("select * from adapter_actions where id = ?", (action_id,)).fetchone()
-        if not current:
-            raise HarnessError(f"missing adapter action: {action_id}")
-        if current["status"] == "completed":
-            return
+        current = existing
         if current["status"] == "blocked":
             reason = current["blocked_reason"] or "connector action is blocked"
             raise HarnessError(f"connector execution failed: {reason}")
@@ -5785,9 +5868,15 @@ def adapter_transition(root: Path, action_id: str, status: str, *, confirmation:
 
 def adapter_reconcile(root: Path) -> list[str]:
     issues: list[str] = []
+    ensure_adapter_action_payload_hash_state(root)
     with connection(root) as conn:
         completed = conn.execute("select * from adapter_actions where status = 'completed' order by tool, artifact").fetchall()
         for action in completed:
+            try:
+                load_connector_payload(action)
+            except HarnessError as exc:
+                issues.append(str(exc))
+                continue
             adapter = conn.execute(
                 "select * from adapters where tool = ? and idempotency_key = ?",
                 (action["tool"], action["idempotency_key"]),

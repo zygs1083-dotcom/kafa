@@ -55,7 +55,7 @@ def plan_action(root: Path, tool: str, mode: str, operation: str, params: dict[s
         "--payload-json",
         payload,
         "--idempotency-key",
-        f"connector-test:{tool}:{operation}",
+        f"connector-test:{tool}:{mode}:{operation}",
     )
     return action_id(result.stdout)
 
@@ -185,7 +185,10 @@ class RealConnectorAdaptersTest(unittest.TestCase):
             second = run_harness(root, "adapter", "confirm", "--id", action, "--request-id", "REQ-GH-1", env=env)
 
             row = db_one(root, "select status, external_id, external_link from adapter_actions where id = ?", (action,))
-            adapter = db_one(root, "select external_id, external_link from adapters where idempotency_key = 'connector-test:github:github.issue.create'")
+            adapter = db_one(
+                root,
+                "select external_id, external_link from adapters where idempotency_key = 'connector-test:github:write-confirm:github.issue.create'",
+            )
             calls = log_path.read_text(encoding="utf-8").splitlines()
             self.assertIn("OK: adapter action confirmed", first.stdout)
             self.assertEqual(second.stdout, first.stdout)

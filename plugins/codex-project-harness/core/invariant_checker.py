@@ -9,7 +9,7 @@ from typing import Iterable
 
 from .event_bus import validate_replay_compatible_events
 from .lock_manager import is_expired
-from .schema_guard import FAILURE_MODE_STATUSES, TASK_STATUSES
+from .schema_guard import FAILURE_MODE_STATUSES, TASK_STATUSES, adapter_action_payload_hash
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,38 @@ def check_runtime_invariants(
         linked_acceptance = conn.execute("select 1 from delivery_acceptance where delivery_id = ? limit 1", (row["id"],)).fetchone()
         if not linked_acceptance:
             issues.append(issue("delivery-missing-acceptance-link", "delivery", row["id"], f"invariant failed: delivery has no linked acceptance {row['id']}"))
+
+    if scope is None or full:
+        adapter_columns = {row[1] for row in conn.execute("pragma table_info(adapter_actions)")}
+        if "payload_hash" not in adapter_columns:
+            issues.append(
+                issue(
+                    "adapter-payload-hash-column",
+                    "adapter_action",
+                    "",
+                    "invariant failed: adapter_actions payload_hash column is missing",
+                )
+            )
+        else:
+            for row in conn.execute(
+                "select id, tool, mode, artifact, action, payload_json, payload_hash from adapter_actions order by id"
+            ):
+                expected_hash = adapter_action_payload_hash(
+                    str(row["tool"]),
+                    str(row["mode"]),
+                    str(row["artifact"]),
+                    str(row["action"]),
+                    str(row["payload_json"]),
+                )
+                if row["payload_hash"] != expected_hash:
+                    issues.append(
+                        issue(
+                            "adapter-payload-hash-mismatch",
+                            "adapter_action",
+                            row["id"],
+                            f"invariant failed: adapter action payload hash mismatch {row['id']}",
+                        )
+                    )
 
     if scope is None or full:
         issues.extend(issue("event-payload", "event", "", str(event_issue)) for event_issue in validate_replay_compatible_events(conn))
