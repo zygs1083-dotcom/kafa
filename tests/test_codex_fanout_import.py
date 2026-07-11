@@ -130,8 +130,9 @@ class CodexFanoutImportTest(unittest.TestCase):
 
             self.assertIn("OK: dispatch attempt verified", verified.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                evidence = conn.execute("select executed_count_source, code_ref, tree_sha, verified_by from evidence where id like 'CODEX-%'").fetchone()
-                validation = conn.execute("select code_ref, tree_sha, verified_by from validations where id like 'CODEX-%'").fetchone()
+                evidence = conn.execute("select executed_count_source, code_ref, tree_sha, verified_by, source_tree_hash from evidence where id like 'CODEX-%'").fetchone()
+                validation = conn.execute("select code_ref, tree_sha, verified_by, cycle_id, candidate_sha from validations where id like 'CODEX-%'").fetchone()
+                attempt_cycle = conn.execute("select cycle_id from task_attempts where run_id = ? and task_id = 'T1'", (run_id,)).fetchone()[0]
                 assignment = conn.execute("select status, evidence from dispatch_assignments where run_id = ? and task_id = 'T1'", (run_id,)).fetchone()
                 task = conn.execute("select status, evidence, submitted_by from tasks where id = 'T1'").fetchone()
                 worktree = conn.execute("select branch_name from dispatch_worktrees where run_id = ?", (run_id,)).fetchone()
@@ -141,6 +142,9 @@ class CodexFanoutImportTest(unittest.TestCase):
             self.assertEqual(evidence[2], validation[1])
             self.assertEqual(evidence[3], "controller-local")
             self.assertEqual(validation[2], "controller-local")
+            self.assertEqual(validation[3], attempt_cycle)
+            self.assertEqual(validation[4], evidence[4])
+            self.assertTrue(validation[4])
             self.assertEqual(assignment[0], "completed")
             self.assertTrue(assignment[1].startswith("CODEX-"))
             self.assertEqual(task[0], "submitted")

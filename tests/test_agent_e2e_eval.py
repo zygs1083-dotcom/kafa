@@ -79,6 +79,12 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertNotEqual(regression["integrate_returncode"], 0)
         self.assertEqual(regression["status"], "verification_failed")
         self.assertTrue(regression["finding_recorded"])
+        self.assertNotEqual(regression["test_exit_code"], 0)
+        self.assertGreater(regression["executed_count"], 0)
+        self.assertEqual(regression["executed_count_source"], "parsed")
+        self.assertIn("test_no_integration_regression", regression["test_output_tail"])
+        self.assertNotIn("no passing validation for current candidate", regression["stdout_tail"])
+        self.assertNotIn("requires a quality gate record", regression["stdout_tail"])
 
     def test_live_command_without_command_is_skipped(self) -> None:
         report = run_eval("--mode", "live-command", env={"CODEX_AGENT_EVAL_CMD": ""})
