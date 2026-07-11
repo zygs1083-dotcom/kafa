@@ -41,6 +41,13 @@ python3 /path/to/kafa/plugins/codex-project-harness/scripts/harness.py --root . 
 
 `quickstart minimal --execute` still uses controller-local command evidence and the normal delivery gate. A `validation record` without evidence is audit-only and will not satisfy delivery readiness.
 
+After execution, rerun `kafa project quickstart --repo <project> status`. Its
+`next_commands` use the active Python interpreter and resolved installed Plugin
+path, carry the actual task/target IDs, and follow the legal phase order. The
+copy-paste local path records `same-context-degraded`; a `fresh` quality gate
+requires an explicitly attested reviewer session and cannot be inferred from a
+role label.
+
 For long-running projects, check the current Delivery Cycle before recording new delivery evidence:
 
 ```bash

@@ -1123,7 +1123,7 @@ class HostCodexProviderTest(unittest.TestCase):
             env = self.host_env(package_root, log_path)
             env["FAKE_CODEX_DELAY_SECONDS"] = "5"
             run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
-            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update agent_provider_sessions set lease_expires_at = '2000-01-01T00:00:00+00:00' where run_id = ?", (run_id,))
                 conn.commit()
 
@@ -1148,7 +1148,7 @@ class HostCodexProviderTest(unittest.TestCase):
             run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
             session = db_one(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))
             metadata = json.loads(session["input_json"])["provider_metadata"]
-            with sqlite3.connect(root / ".ai-team/state/harness.db") as conn:
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update agent_provider_sessions set lease_expires_at = '2000-01-01T00:00:00+00:00' where run_id = ?", (run_id,))
                 conn.commit()
             failed_cancel = agent_provider_core.AgentJobHandle("host-codex", "session", "job", "cancel_failed", "not confirmed")

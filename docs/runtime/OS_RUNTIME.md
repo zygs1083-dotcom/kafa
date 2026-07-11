@@ -611,12 +611,17 @@ Use:
 
 ```bash
 harness.py --root . gate record \
-  --reviewer-context fresh \
+  --reviewer-context same-context-degraded \
   --result pass \
   --commands "npm test" \
   --evidence "QA reviewed acceptance and failure modes" \
   --finding F1
 ```
+
+This local form is intentionally degraded. A `fresh` gate must use the
+session-aware form above with both `--reviewer-session-id` and
+`--reviewer-attestation-id`; storage-level delivery validation repeats that
+identity check.
 
 ## Adapter Records
 

@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -113,7 +114,7 @@ class DispatchRouteAdviceTest(unittest.TestCase):
             run_id = run_harness(root, "dispatch", "plan", "--scope", "Read-only advice").stdout.strip().split()[-1]
             db = root / ".ai-team/state/harness.db"
 
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 before = {
                     "assignment": conn.execute(
                         "select status, agent_id, provider_session_id from dispatch_assignments where run_id = ?",
@@ -124,7 +125,7 @@ class DispatchRouteAdviceTest(unittest.TestCase):
                 }
             json_report = run_harness(root, "dispatch", "route-advice", "--run-id", run_id, "--json")
             text_report = run_harness(root, "dispatch", "route-advice", "--run-id", run_id)
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 after = {
                     "assignment": conn.execute(
                         "select status, agent_id, provider_session_id from dispatch_assignments where run_id = ?",

@@ -25,7 +25,10 @@ REQUIRED_MARKERS = [
     "--target",
     "--trust-anchor",
     "harness.py --root . validation record",
+    "harness.py --root . session attest",
     "harness.py --root . gate record",
+    "--reviewer-session-id",
+    "--reviewer-attestation-id",
     "harness.py --root . phase delivery_readiness",
     "harness.py --root . delivery record",
 ]

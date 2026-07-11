@@ -181,7 +181,7 @@ def record_fail_validation(root: Path, *, acceptance: str = "AC1") -> None:
 
 
 def record_gate(root: Path, result: str = "pass") -> None:
-    run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", result, "--commands", DEFAULT_TEST_COMMAND, "--evidence", "reviewed")
+    run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", result, "--commands", DEFAULT_TEST_COMMAND, "--evidence", "reviewed")
 
 
 def move_to_delivery_readiness(root: Path) -> subprocess.CompletedProcess[str]:

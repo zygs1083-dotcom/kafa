@@ -2982,6 +2982,8 @@ def record_gate(
     reviewer_attestation_id: str = "",
 ) -> None:
     guard_schema("validate_gate", reviewer_context, result, gate)
+    if reviewer_context == "fresh" and (not reviewer_session_id or not reviewer_attestation_id):
+        raise HarnessError("fresh reviewer context requires reviewer session and attestation")
     current_sha = git_head_sha(root) or "no-git"
     base_commit = git_base_commit(root) or current_sha
     source_hash = git_source_tree_hash(root) or ""
@@ -3013,6 +3015,19 @@ def record_gate(
                 )
                 if not ok:
                     raise HarnessError(f"session connector HMAC invalid: {reason}")
+        if reviewer_context == "fresh":
+            producer = conn.execute(
+                """
+                select id from tasks
+                where cycle_id = ? and submitted_session_id = ? and submitted_session_id != ''
+                limit 1
+                """,
+                (cycle_id, reviewer_session_id),
+            ).fetchone()
+            if producer:
+                raise HarnessError(
+                    f"fresh reviewer session matches producer session: {reviewer_session_id} task={producer['id']}"
+                )
         gate_id = str(uuid.uuid4())
         sequence = int(conn.execute("select coalesce(max(sequence), 0) + 1 from quality_gates").fetchone()[0])
         previous_gate = conn.execute(
@@ -8380,9 +8395,13 @@ def validate_runtime(root: Path, *, delivery: bool = False) -> list[str]:
     return issues
 
 
+def _render_harness_command(root: Path, *args: str) -> str:
+    command = [sys.executable, str(Path(__file__).resolve().with_name("harness.py")), "--root", str(root), *args]
+    return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+
+
 def quickstart_status(root: Path) -> dict[str, Any]:
     if not runtime_initialized(root):
-        harness_py = Path(__file__).resolve().with_name("harness.py")
         return {
             "initialized": False,
             "ready_for_delivery": False,
@@ -8391,8 +8410,8 @@ def quickstart_status(root: Path) -> dict[str, Any]:
             "cycle_id": "",
             "cycle_status": "",
             "next_commands": [
-                f"python3 {harness_py} --root {root} init",
-                f"python3 {harness_py} --root {root} quickstart status",
+                _render_harness_command(root, "init"),
+                _render_harness_command(root, "quickstart", "status"),
             ],
         }
     missing: list[str] = []
@@ -8402,7 +8421,11 @@ def quickstart_status(root: Path) -> dict[str, Any]:
         cycle = current_cycle_row(conn)
         cycle_id = cycle["id"]
         requirement_count = conn.execute("select count(*) from requirements where cycle_id = ? and status != 'cancelled'", (cycle_id,)).fetchone()[0]
-        acceptance_count = conn.execute("select count(*) from acceptance where cycle_id = ?", (cycle_id,)).fetchone()[0]
+        acceptance_rows = conn.execute(
+            "select id from acceptance where cycle_id = ? order by id",
+            (cycle_id,),
+        ).fetchall()
+        acceptance_count = len(acceptance_rows)
         trace_count = conn.execute(
             """
             select count(*) from requirement_acceptance ra
@@ -8412,14 +8435,47 @@ def quickstart_status(root: Path) -> dict[str, Any]:
             """,
             (cycle_id,),
         ).fetchone()[0]
-        task_count = conn.execute("select count(*) from tasks where cycle_id = ?", (cycle_id,)).fetchone()[0]
-        target_count = conn.execute("select count(*) from test_targets").fetchone()[0]
+        task_rows = conn.execute(
+            "select id, status, accepted_session_id from tasks where cycle_id = ? order by id",
+            (cycle_id,),
+        ).fetchall()
+        task_count = len(task_rows)
+        target_rows = conn.execute("select id, command_template from test_targets order by id").fetchall()
+        target_count = len(target_rows)
         linked_target_count = conn.execute("select count(*) from task_test_targets where cycle_id = ?", (cycle_id,)).fetchone()[0]
-        evidence_count = conn.execute("select count(*) from evidence").fetchone()[0]
-        accepted_count = conn.execute("select count(*) from tasks where cycle_id = ? and status = 'accepted'", (cycle_id,)).fetchone()[0]
+        candidate_sha = current_candidate_sha(root)
+        linked_evidence_rows = conn.execute(
+            """
+            select distinct e.id from validations v
+            join validation_evidence ve on ve.validation_id = v.id
+            join evidence e on e.id = ve.evidence_id
+            where v.cycle_id = ? and v.candidate_sha = ? and v.validation_status = 'active'
+              and e.verified_by like 'controller%'
+            order by e.created_at desc, e.id desc
+            """,
+            (cycle_id, candidate_sha),
+        ).fetchall()
+        candidate_evidence_rows = conn.execute(
+            """
+            select distinct e.id, e.created_at from evidence e
+            left join dispatch_assignments da
+              on da.evidence = e.id and da.cycle_id = ?
+            left join task_attempts ta
+              on ta.id = e.attempt_id and ta.cycle_id = ?
+            where (da.evidence is not null or ta.id is not null)
+              and e.source_tree_hash = ? and e.verified_by like 'controller%'
+            order by e.created_at desc, e.id desc
+            """,
+            (cycle_id, cycle_id, candidate_sha),
+        ).fetchall()
+        evidence_count = len(linked_evidence_rows)
+        accepted_count = sum(1 for row in task_rows if row["status"] == "accepted")
         quality_gate_count = conn.execute(
-            "select count(*) from quality_gates where cycle_id = ? and candidate_sha = ? and result = 'pass'",
-            (cycle_id, current_candidate_sha(root)),
+            """
+            select count(*) from quality_gates
+            where cycle_id = ? and candidate_sha = ? and gate_status = 'active' and result = 'pass'
+            """,
+            (cycle_id, candidate_sha),
         ).fetchone()[0]
         delivery_count = conn.execute("select count(*) from deliveries where cycle_id = ?", (cycle_id,)).fetchone()[0]
         validation_count = conn.execute(
@@ -8427,44 +8483,173 @@ def quickstart_status(root: Path) -> dict[str, Any]:
             select count(*) from validations v
             where v.cycle_id = ? and v.candidate_sha = ? and v.validation_status = 'active' and v.result = 'pass'
             """,
-            (cycle_id, current_candidate_sha(root)),
+            (cycle_id, candidate_sha),
         ).fetchone()[0]
         baseline_missing = baseline_issues(conn)
         delivery_issues = validate_delivery(conn, root, require_phase=False)
 
     if requirement_count == 0:
         missing.append("requirement")
-        next_commands.append("harness.py requirement add --id REQ1 --kind functional --body '...'")
+        next_commands.append(_render_harness_command(root, "requirement", "add", "--id", "REQ1", "--kind", "functional", "--body", "..."))
     if acceptance_count == 0:
         missing.append("acceptance")
-        next_commands.append("harness.py acceptance add --id AC1 --criterion '...'")
+        next_commands.append(_render_harness_command(root, "acceptance", "add", "--id", "AC1", "--criterion", "..."))
     if trace_count == 0:
         missing.append("requirement_acceptance_link")
-        next_commands.append("harness.py requirement link --requirement REQ1 --acceptance AC1")
+        next_commands.append(_render_harness_command(root, "requirement", "link", "--requirement", "REQ1", "--acceptance", "AC1"))
+    suggested_task_id = task_rows[0]["id"] if task_rows else "T1"
     if task_count == 0:
         missing.append("task")
-        next_commands.append("harness.py task add --id T1 --task '...' --acceptance AC1")
+        next_commands.append(_render_harness_command(root, "task", "add", "--id", suggested_task_id, "--task", "...", "--acceptance", "AC1"))
     if target_count == 0 or linked_target_count == 0:
         missing.append("test_target")
-        next_commands.append("harness.py test-target add --id UNIT --kind unit --command-template 'python3 -m unittest'")
+        suggested_target_id = target_rows[0]["id"] if target_rows else "UNIT"
+        if not target_rows:
+            next_commands.append(
+                _render_harness_command(
+                    root,
+                    "test-target",
+                    "add",
+                    "--id",
+                    suggested_target_id,
+                    "--kind",
+                    "unit",
+                    "--command-template",
+                    "python3 -m unittest",
+                )
+            )
+        if linked_target_count == 0:
+            next_commands.append(
+                _render_harness_command(
+                    root,
+                    "test-target",
+                    "link",
+                    "--task",
+                    suggested_task_id,
+                    "--target",
+                    suggested_target_id,
+                )
+            )
     if baseline_missing:
         missing.append("baseline")
-        next_commands.append("harness.py baseline freeze --id BL1 --summary 'current scope'")
+        next_commands.append(_render_harness_command(root, "baseline", "freeze", "--id", "BL1", "--summary", "current scope"))
     if evidence_count == 0:
         missing.append("controller_evidence")
-        next_commands.append("harness.py dispatch plan --scope quickstart && harness.py dispatch run developer '...' --target UNIT")
+        if not candidate_evidence_rows:
+            target_id = target_rows[0]["id"] if target_rows else "UNIT"
+            target_command = target_rows[0]["command_template"] if target_rows else "python3 -m unittest"
+            next_commands.append(_render_harness_command(root, "dispatch", "plan", "--scope", "quickstart"))
+            next_commands.append(
+                _render_harness_command(
+                    root,
+                    "dispatch",
+                    "run",
+                    "--agent",
+                    "developer",
+                    "--target",
+                    target_id,
+                    "--command",
+                    target_command,
+                )
+            )
     if validation_count == 0:
         missing.append("validation")
-        next_commands.append("harness.py validation record --acceptance AC1 --evidence EXEC-... --result pass")
+        if candidate_evidence_rows:
+            acceptance_row = acceptance_rows[0] if acceptance_rows else None
+            target_id = target_rows[0]["id"] if target_rows else "UNIT"
+            if acceptance_row:
+                next_commands.append(
+                    _render_harness_command(
+                        root,
+                        "validation",
+                        "record",
+                        "--surface",
+                        "quickstart",
+                        "--acceptance",
+                        acceptance_row["id"],
+                        "--commands",
+                        target_rows[0]["command_template"] if target_rows else "python3 -m unittest",
+                        "--findings",
+                        "passed",
+                        "--result",
+                        "pass",
+                        "--evidence",
+                        candidate_evidence_rows[0]["id"],
+                        "--target",
+                        target_id,
+                    )
+                )
     if task_count and accepted_count < task_count:
         missing.append("accepted_task")
-        next_commands.append("harness.py task accept-ready --id T1 --agent qa-reviewer --evidence 'reviewed'")
+        for task_row in task_rows:
+            if task_row["status"] != "accepted":
+                next_commands.append(
+                    _render_harness_command(
+                        root,
+                        "task",
+                        "accept-ready",
+                        "--id",
+                        task_row["id"],
+                        "--agent",
+                        "qa-reviewer",
+                        "--evidence",
+                        "reviewed",
+                    )
+                )
+    facts_ready = all(
+        [
+            requirement_count > 0,
+            acceptance_count > 0,
+            trace_count > 0,
+            task_count > 0,
+            target_count > 0,
+            linked_target_count > 0,
+            not baseline_missing,
+        ]
+    )
     if quality_gate_count == 0:
         missing.append("quality_gate")
-        next_commands.append("harness.py gate record --reviewer-context fresh --result pass")
+        if candidate_evidence_rows:
+            next_commands.append(
+                _render_harness_command(
+                    root,
+                    "gate",
+                    "record",
+                    "--reviewer-context",
+                    "same-context-degraded",
+                    "--result",
+                    "pass",
+                    "--residual-risk",
+                    "independent reviewer session not attested",
+                )
+            )
     if delivery_count == 0:
         missing.append("delivery")
-        next_commands.append("harness.py phase delivery_readiness && harness.py delivery record --scope '...'")
+        if facts_ready and candidate_evidence_rows:
+            phase = project["phase"]
+            canonical_paths = {
+                "intake": ["project_bootstrap", "requirement_baseline", "confirmation", "planning", "implementation", "qa", "delivery_readiness"],
+                "project_bootstrap": ["requirement_baseline", "confirmation", "planning", "implementation", "qa", "delivery_readiness"],
+                "requirement_baseline": ["confirmation", "planning", "implementation", "qa", "delivery_readiness"],
+                "confirmation": ["planning", "implementation", "qa", "delivery_readiness"],
+                "team_architecture": ["planning", "implementation", "qa", "delivery_readiness"],
+                "planning": ["implementation", "qa", "delivery_readiness"],
+                "implementation": ["qa", "delivery_readiness"],
+                "qa": ["delivery_readiness"],
+                "delivery_readiness": [],
+            }
+            scope_confirmed = project["scope_status"] == "confirmed"
+            if not scope_confirmed and phase in {"confirmation", "team_architecture", "planning", "implementation", "qa", "delivery_readiness"}:
+                next_commands.append(_render_harness_command(root, "scope", "confirm", "--by", "quickstart", "--summary", "quickstart scope"))
+                scope_confirmed = True
+            for next_phase in canonical_paths.get(phase, []):
+                next_commands.append(_render_harness_command(root, "phase", next_phase))
+                phase = next_phase
+                if phase == "confirmation" and not scope_confirmed:
+                    next_commands.append(_render_harness_command(root, "scope", "confirm", "--by", "quickstart", "--summary", "quickstart scope"))
+                    scope_confirmed = True
+            if phase in {"delivery_readiness", "retrospective"}:
+                next_commands.append(_render_harness_command(root, "delivery", "record", "--scope", "quickstart delivery"))
     return {
         "initialized": True,
         "ready_for_delivery": not delivery_issues and project["phase"] in {"delivery_readiness", "retrospective"} and cycle["status"] in {"active", "delivered"},
@@ -8548,7 +8733,11 @@ def quickstart_minimal(root: Path, quickstart_id: str, goal: str, acceptance: st
     )
     lines.append(f"OK: dispatch run {run_id} evidence {evidence_id}")
     lines.append(f"OK: quickstart minimal verified setup {normalized_id}")
-    lines.append(f"NEXT: independent reviewer must review and accept {task_id}, then record the quality gate and delivery")
+    lines.append(
+        f"NEXT: reviewer must review and accept {task_id}; fresh requires an attested independent session, "
+        "otherwise record same-context-degraded"
+    )
+    lines.append(f"NEXT: {_render_harness_command(root, 'quickstart', 'status')}")
     return lines
 
 

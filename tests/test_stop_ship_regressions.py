@@ -257,7 +257,7 @@ class StopShipRegressionTest(unittest.TestCase):
                 "gate",
                 "record",
                 "--reviewer-context",
-                "fresh",
+                "same-context-degraded",
                 "--result",
                 "pass",
                 "--commands",
@@ -297,7 +297,7 @@ class StopShipRegressionTest(unittest.TestCase):
                     "gate",
                     "record",
                     "--reviewer-context",
-                    "fresh",
+                    "same-context-degraded",
                     "--result",
                     result,
                     "--commands",
@@ -330,7 +330,7 @@ class StopShipRegressionTest(unittest.TestCase):
             root = Path(temp)
             prepare_delivery_candidate(root)
             run_harness(root, "finding", "record", "--id", "F-resolved", "--surface", "delivery", "--severity", "critical", "--status", "resolved", "--summary", "Closed")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-resolved")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-resolved")
 
             readiness = move_to_delivery_readiness(root)
 
@@ -349,7 +349,7 @@ class StopShipRegressionTest(unittest.TestCase):
                 "--waiver-scope", "candidate", "--waived-revision", str(revision),
                 "--waiver-expires-at", "2000-01-01T00:00:00Z",
             )
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-waived")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-waived")
 
             readiness = move_to_delivery_readiness(root)
 
@@ -364,7 +364,7 @@ class StopShipRegressionTest(unittest.TestCase):
             with closing(sqlite3.connect(db_path(root))) as conn:
                 conn.execute("update findings set cycle_id = 'CYCLE-old' where id = 'F-old'")
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--finding", "F-old")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-old")
 
             readiness = move_to_delivery_readiness(root)
 
@@ -503,6 +503,120 @@ class StopShipRegressionTest(unittest.TestCase):
             (True, True, True, True),
             "QS-001: quickstart must stop at verified setup and print the independent reviewer next step",
         )
+
+    def test_qs_001_fresh_gate_requires_bound_reviewer_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_delivery_candidate(root)
+
+            rejected = run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                DEFAULT_TEST_COMMAND,
+                "--evidence",
+                "reviewed",
+                check=False,
+            )
+            attested = run_harness(
+                root,
+                "session",
+                "attest",
+                "--session-id",
+                "S-qa",
+                "--agent",
+                "qa-reviewer",
+                "--role",
+                "qa-reviewer",
+                "--context-id",
+                "ctx-qa",
+                "--origin",
+                "manual",
+            )
+            attestation_id = stdout_field(attested.stdout, "attestation")
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute("update tasks set submitted_session_id = 'S-qa'")
+                conn.commit()
+            producer_rejected = run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--reviewer-session-id",
+                "S-qa",
+                "--reviewer-attestation-id",
+                attestation_id,
+                check=False,
+            )
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute("update tasks set submitted_session_id = ''")
+                conn.commit()
+            accepted = run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--result",
+                "pass",
+                "--commands",
+                DEFAULT_TEST_COMMAND,
+                "--evidence",
+                "reviewed",
+                "--reviewer-session-id",
+                "S-qa",
+                "--reviewer-attestation-id",
+                attestation_id,
+            )
+
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                gates = conn.execute(
+                    "select reviewer_context, reviewer_session_id, reviewer_attestation_id from quality_gates"
+                ).fetchall()
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("fresh reviewer context requires", rejected.stdout + rejected.stderr)
+        self.assertNotEqual(producer_rejected.returncode, 0)
+        self.assertIn("fresh reviewer session matches producer session", producer_rejected.stdout + producer_rejected.stderr)
+        self.assertIn("OK: quality gate recorded", accepted.stdout)
+        self.assertEqual(gates, [("fresh", "S-qa", attestation_id)])
+
+    def test_qs_001_delivery_rejects_unbound_fresh_gate_if_storage_is_tampered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepare_delivery_candidate(root)
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "same-context-degraded",
+                "--result",
+                "pass",
+                "--commands",
+                DEFAULT_TEST_COMMAND,
+                "--evidence",
+                "reviewed",
+            )
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                conn.execute(
+                    "update quality_gates set reviewer_context = 'fresh', reviewer_session_id = '', "
+                    "reviewer_attestation_id = '', review_trust_level = 'local-only'"
+                )
+                conn.commit()
+
+            result = move_to_delivery_readiness(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fresh quality gate requires", result.stdout + result.stderr)
 
     def test_in_001_user_marketplace_source_resolves_to_copied_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

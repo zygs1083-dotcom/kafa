@@ -18,27 +18,32 @@ def main() -> int:
     parser.add_argument("--commands", default="")
     parser.add_argument("--evidence", default="")
     parser.add_argument("--residual-risk", default="")
+    parser.add_argument("--reviewer-session-id", default="")
+    parser.add_argument("--reviewer-attestation-id", default="")
     args = parser.parse_args()
-    return run_harness(
-        [
-            "gate",
-            "record",
-            "--gate",
-            args.gate,
-            "--reviewer-context",
-            args.reviewer_context,
-            "--result",
-            args.result,
-            "--blocking-findings",
-            args.blocking_findings,
-            "--commands",
-            args.commands,
-            "--evidence",
-            args.evidence,
-            "--residual-risk",
-            args.residual_risk,
-        ]
-    )
+    command = [
+        "gate",
+        "record",
+        "--gate",
+        args.gate,
+        "--reviewer-context",
+        args.reviewer_context,
+        "--result",
+        args.result,
+        "--blocking-findings",
+        args.blocking_findings,
+        "--commands",
+        args.commands,
+        "--evidence",
+        args.evidence,
+        "--residual-risk",
+        args.residual_risk,
+    ]
+    if args.reviewer_session_id:
+        command.extend(["--reviewer-session-id", args.reviewer_session_id])
+    if args.reviewer_attestation_id:
+        command.extend(["--reviewer-attestation-id", args.reviewer_attestation_id])
+    return run_harness(command)
 
 
 if __name__ == "__main__":

@@ -147,7 +147,7 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             status,
         )
 
-    def add_quality_gate(self, root: Path, result: str = "pass", reviewer_context: str = "fresh") -> None:
+    def add_quality_gate(self, root: Path, result: str = "pass", reviewer_context: str = "same-context-degraded") -> None:
         run_script(
             root,
             "record_quality_gate.py",

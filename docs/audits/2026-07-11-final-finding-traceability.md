@@ -29,7 +29,7 @@ live execution, source-string inspection, or model-authored evidence.
 | DT-002 | closed | Database sequence and explicit supersession define the latest gate; same-second pass then fail is covered by `test_dt_002_same_second_newer_fail_gate_wins` and replay supersession tests. | `fc7c59e` | Wave 1/schema 29 green; final 363-test run |
 | CY-001 | closed | Cycle facts have immutable internal identity plus `(cycle_id, local_id)` semantics; local-ID reuse and event replay are covered by stop-ship, schema 29 migration, and schema lifecycle tests. | `800f724`, `fc7c59e` | Wave 1/schema 29 green; final 363-test run |
 | TR-001 | closed | Kernel CLI verifies externally supplied connector receipts and cannot self-issue trust; empty-token and legacy downgrade paths are covered by stop-ship, session-attestation, and operating-system tests. | `0149ad2`, `fc48617` | Wave 1/schema 29 green; final 363-test run |
-| QS-001 | closed | Quickstart stops before independent review, gate, and delivery and prints the reviewer next step; covered by `test_qs_001_*` and cold-start guided-loop tests. | `4177b6d` | Wave 1/schema 29 green; final 363-test run |
+| QS-001 | closed | Quickstart stops before review; `fresh` gates require a distinct reviewer session plus matching attestation at write and delivery-decision boundaries, while local guidance uses `same-context-degraded`. Covered by `test_qs_001_*` and executable cold-start guided-loop tests. | `4177b6d` plus 2026-07-11 local follow-up | Wave 1/schema 29 green; overall-simulation follow-up; final 368-test run |
 | IN-001 | closed | User marketplace source resolves to the managed copied plugin; path mismatch and end-to-end isolated install are covered by stop-ship/install tests and real Codex smoke. | `a23d988`, `eedf373` | Wave 3 green; Wave 6 real install; final isolated smoke |
 
 ## P1 Findings
@@ -41,7 +41,7 @@ live execution, source-string inspection, or model-authored evidence.
 | CN-001 | closed | Notion create forces searchable dual markers; ambiguous success recovers without a second POST and marker miss remains unknown. Covered by `tests/test_notion_ambiguous_recovery.py`. | `094003b` | Wave 4 green; stability E2E 12/12 |
 | CN-002 | closed | Linear comment/update fetches and validates remote team/project scope before search or mutation; cross-project, missing metadata, and unknown recovery are covered by `tests/test_linear_scope_isolation.py`. | `68dfe99` | Wave 4 green; final 363-test run |
 | CN-003 | closed | Canonical immutable payload hash binds each idempotency key; semantic reuse, conflict, tampering, blank hash, and completed immutability are covered by `tests/test_connector_exactly_once.py`. | `1b053fd` | Wave 4 green; stability exactly-once recovery |
-| IN-002 | closed | `kafa project init/status/quickstart` resolves installed runtime outside source repos and unhealthy doctor returns nonzero; covered by project launcher/doctor install tests. | `9cd0e74` | Wave 3 green; final 62-test contract group |
+| IN-002 | closed | `kafa project init/status/quickstart` resolves installed runtime outside source repos; quickstart emits executable resolved-runtime commands with actual IDs and legal phase order; unhealthy doctor returns nonzero. | `9cd0e74` plus 2026-07-11 local follow-up | Wave 3 green; overall-simulation follow-up |
 | IN-003 | closed | Hooks use installed `PLUGIN_ROOT`, manifest version, session cwd, and valid host JSON; fallback and real Stop Hook behavior are covered by `tests/test_codex_hooks.py`. | `85dbb6a`, `cdb3919` | Wave 3 green; Wave 6 real Hook execution |
 | IN-004 | closed | Doctor validates marketplace, installed content, cache identity, Hook definitions, and drift; isolated smoke verifies real app-server discovery of exact Plugin, 12 Skills, and five Hooks. | `63cd7f3`, `eedf373`, `4fa890b` | Wave 3 and Wave 6 green; final isolated smoke/doctor |
 | RL-001 | closed | `release.json` aligns version, package, tag, notes, runtime/schema, artifacts, and compatibility prerequisites; conflicting notes and missing live gate fail closed. | `8d2e80e`, `9d7c594`, `2852f2e` | Wave 3 and Wave 6 green; final release contract `ok=true` |
@@ -66,15 +66,16 @@ live execution, source-string inspection, or model-authored evidence.
 
 ## Final Evidence Matrix
 
-The assembled implementation at `f300232` produced:
+The original assembled implementation at `f300232`, plus the verified
+2026-07-11 follow-up working tree based on `a95848b`, produced:
 
 ```text
 py_compile: exit 0
 validate_structure.py: exit 0
-unittest discover: 363 tests in 563.030s, exit 0
+unittest discover with ResourceWarning promoted to error: 368 tests in 592.501s, exit 0
 runtime smoke: 3/3
 forward eval: 3/3 wrapper
-skill eval: 15 markers
+skill eval: 18 markers
 fixture E2E: 5/5
 stability E2E: 12/12
 isolated install smoke: codex-cli 0.143.0, passed

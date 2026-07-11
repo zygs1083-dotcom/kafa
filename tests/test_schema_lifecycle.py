@@ -379,8 +379,8 @@ class SchemaLifecycleTest(unittest.TestCase):
             out = root / "gate-replayed.db"
             harness_db.init_runtime(root)
             harness_db.create_checkpoint(root, "before-gates")
-            harness_db.record_gate(root, "fresh", "pass")
-            harness_db.record_gate(root, "fresh", "fail")
+            harness_db.record_gate(root, "same-context-degraded", "pass")
+            harness_db.record_gate(root, "same-context-degraded", "fail")
             with harness_db.connection(root) as conn:
                 sequence = int(conn.execute("select max(sequence) from events").fetchone()[0])
                 live = conn.execute(

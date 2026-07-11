@@ -383,7 +383,7 @@ harness.py --root . dispatch run --agent developer --target UNIT --command "pyte
 harness.py --root . test record --id TEST1 --surface "Example" --command "pytest" --result pass --evidence <executor-evidence-id>
 harness.py --root . finding record --id F1 --surface "Example" --severity medium --status open --summary "Follow-up needed"
 harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass --test TEST1 --evidence <executor-evidence-id> --target UNIT --trust-anchor external-session --trust-anchor-id <session-id>
-harness.py --root . gate record --reviewer-context fresh --result pass --commands "test command" --finding F1
+harness.py --root . gate record --reviewer-context same-context-degraded --result pass --commands "test command" --finding F1
 harness.py --root . checkpoint create --label before-delivery
 harness.py --root . checkpoint export --out checkpoint.json
 harness.py --root . event validate
@@ -468,9 +468,14 @@ Residual Risk:
 
 `Reviewer Context` 支持：
 
-- `fresh`：尽量独立的新上下文审查。
+- `fresh`：已绑定 reviewer session 与对应 attestation 的独立新上下文审查；缺少任一身份记录时 fail-closed。
 - `same-context-degraded`：实现者所在上下文内的降级审查，需要更严格说明风险。
 - `external`：外部 reviewer 或外部系统审查。
+
+`fresh` 不能只靠字符串声明。记录时必须同时传入
+`--reviewer-session-id` 与 `--reviewer-attestation-id`，并且 reviewer
+session 不能与已知 producer session 相同。没有独立 session 时应如实使用
+`same-context-degraded`；high/critical 风险仍要求 connector-origin trust。
 
 如果 QA 之后代码又变了，应该为新的 commit 或 revision 重新记录质量门。
 

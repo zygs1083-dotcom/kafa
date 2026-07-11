@@ -32,6 +32,7 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Stop-ship correctness hardening now covers transactional schema migration/replay, cycle-local identities, monotonic quality gates, structured critical findings, external trust receipts, safe quickstart handoff, user marketplace resolution, location-independent project launchers, installed hooks, and layered installed-plugin/cache doctor checks.
 - Fixture delivery validation, real plugin/Skill/Hook discovery, real Hook execution, native receipt import, controller verification, and integration now have truthful compatibility coverage without counting `not-run`, `blocked`, mock, or skipped profiles as live success.
 - README, Quickstart, Installation, Runtime, Control Plane, and project-runtime Skill guidance now describe current schema 29 behavior instead of embedding stale version chronology.
+- `fresh` quality gates now require a bound reviewer session and matching attestation at both write and delivery-decision boundaries; quickstart emits executable absolute commands with real task/target IDs, legal phase transitions, and current-cycle evidence guidance.
 
 ### Boundaries
 

@@ -17,16 +17,18 @@ $ harness.py --root . scope confirm --by project-manager --summary "Scope confir
 $ harness.py --root . baseline freeze --id B1 --summary "Confirmed task creation scope"
 $ harness.py --root . phase planning
 $ harness.py --root . phase implementation
+$ harness.py --root . session attest --session-id S-dev --agent developer --role developer --context-id ctx-dev
 $ harness.py --root . task claim T1 --agent developer --expected-revision 1
 $ harness.py --root . task start T1 --agent developer --lease-token TOKEN --expected-revision 2
-$ harness.py --root . task submit T1 --agent developer --lease-token TOKEN --expected-revision 3 --evidence "Code and tests updated"
+$ harness.py --root . task submit T1 --agent developer --lease-token TOKEN --expected-revision 3 --evidence "Code and tests updated" --session-id S-dev
 $ harness.py --root . phase qa
-$ harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4
-$ harness.py --root . task accept T1 --agent qa-reviewer --lease-token REVIEW --expected-revision 5 --evidence "Reviewed"
+$ harness.py --root . session attest --session-id S-qa --agent qa-reviewer --role qa-reviewer --context-id ctx-qa --origin connector --verification-token HOST-HMAC
+$ harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4 --session-id S-qa
+$ harness.py --root . task accept T1 --agent qa-reviewer --lease-token REVIEW --expected-revision 5 --evidence "Reviewed" --session-id S-qa
 $ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m unittest" --description "Unit test suite"
 $ harness.py --root . dispatch run --agent developer --target UNIT --command "python3 -m unittest"
 $ harness.py --root . test record --id TEST1 --surface "Task creation" --command "unit test" --result pass --evidence EXEC-123
 $ harness.py --root . validation record --surface "Task creation" --acceptance AC1 --commands "unit test" --findings passed --result pass --failure-mode FM1 --test TEST1 --evidence EXEC-123 --target UNIT --trust-anchor external-session --trust-anchor-id fresh-session-1
-$ harness.py --root . gate record --reviewer-context fresh --result pass --commands "review" --evidence "reviewed"
+$ harness.py --root . gate record --reviewer-context fresh --reviewer-session-id S-qa --reviewer-attestation-id SESSION-ATTESTATION-ID --result pass --commands "review" --evidence "reviewed"
 $ harness.py --root . phase delivery_readiness
 $ harness.py --root . delivery record --scope "Task creation" --acceptance AC1 --validation "unit test passed" --qa "gate passed" --failure-mode-coverage "FM1 covered" --quality-gate pass

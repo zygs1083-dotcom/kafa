@@ -501,7 +501,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             claim_start_submit(root, "T1")
             review_accept(root, "T1")
             record_pass_validation(root)
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "true", "--evidence", "reviewed")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "true", "--evidence", "reviewed")
             confirm_and_freeze(root)
             move_to_delivery_readiness(root)
             run_harness(
@@ -649,14 +649,14 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             review_accept(root, "T1")
             confirm_and_freeze(root)
             record_pass_validation(root, failure_mode="FM1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "test", "--evidence", "review")
             before = run_harness(root, "validate", "--delivery")
 
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Changed acceptance")
             stale = run_harness(root, "validate", "--delivery", check=False)
             confirm_and_freeze(root, "B2")
             record_pass_validation(root, failure_mode="FM1", suffix="2")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "test", "--evidence", "review")
             after = run_harness(root, "validate", "--delivery")
 
             self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
@@ -731,7 +731,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             review_accept(root, "T1")
             confirm_and_freeze(root)
             record_pass_validation(root)
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "test", "--evidence", "review")
             validate = run_harness(root, "validate", "--delivery", check=False)
 
             self.assertNotEqual(missing_scope.returncode, 0)
@@ -790,7 +790,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             claim_start_submit(root, "T1")
             review_accept(root, "T1")
             record_pass_validation(root)
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "test", "--evidence", "review")
 
             blocked = run_harness(root, "validate", "--delivery", check=False)
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
@@ -899,7 +899,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             (root / "app.txt").write_text("v2\n", encoding="utf-8")
             subprocess.run(["git", "add", "app.txt"], cwd=root, text=True, capture_output=True, check=True)
             subprocess.run(["git", "commit", "-m", "change app"], cwd=root, text=True, capture_output=True, check=True)
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -959,7 +959,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, text=True, capture_output=True, check=True)
             run_harness(root, "init")
 
-            gate = run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "true", "--evidence", "review")
+            gate = run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "true", "--evidence", "review")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 row = conn.execute("select reviewed_commit, base_commit, head_commit, diff_hash, tracked_diff_hash, project_revision from quality_gates").fetchone()
@@ -1074,7 +1074,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             claim_start_submit(root, "T1")
             run_harness(root, "phase", "qa")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "test", "--findings", "failed", "--result", "fail", "--failure-mode", "FM1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "fail", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "fail", "--commands", "test", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
             transition = run_harness(root, "phase", "delivery_readiness", check=False)
@@ -1140,7 +1140,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             review_accept(root, "T1")
             confirm_and_freeze(root)
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "test", "--findings", "passed", "--result", "pass")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "test", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "test", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1161,7 +1161,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "free text only")
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", "pytest", "--result", "pass", "--evidence", "EV1")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "pytest", "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1224,7 +1224,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 artifact_path,
                 check=False,
             )
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1249,7 +1249,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "mismatch", "--command", "python3 -c 'print(\"wrong\")'", "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", "python3 -c 'print(\"wrong\")'", "--result", "pass", "--evidence", "EV1")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "wrong", "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", "python3 -c 'print(\"wrong\")'", "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1272,7 +1272,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "zero count", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "0")
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "0")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1288,7 +1288,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "command", "--summary", "manual", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "EV1")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "TARGET1", "--executed-count", "1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1315,7 +1315,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 conn.commit()
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", "echo ok", "--result", "pass", "--evidence", "EV1")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", "echo ok", "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", "EV1", "--target", "ECHO")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1330,7 +1330,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             prepare_basic_delivery_project(root, failure_mode_risk="high")
             record_pass_validation(root, failure_mode="FM1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1405,7 +1405,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             evidence_id = run_executor_evidence(root, target_id="TARGET1", code_identity="")
             run_harness(root, "test", "record", "--id", "TEST1", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", evidence_id)
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "passed", "--result", "pass", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1417,7 +1417,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             root = Path(temp)
             prepare_basic_delivery_project(root)
             record_pass_validation(root)
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery")
 
@@ -1431,7 +1431,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update validations set source_tree_hash = ''")
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             missing_hash = run_harness(root, "validate", "--delivery", check=False)
             self.assertNotEqual(missing_hash.returncode, 0)
@@ -1453,7 +1453,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.execute("update validations set trust_anchor = 'external-session', trust_anchor_id = 'fake-session'")
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1689,7 +1689,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "evidence", "record", "--id", "BAD-EV", "--kind", "command", "--summary", "manual bad", "--command", DEFAULT_TEST_COMMAND, "--exit-code", "0", "--stdout-sha256", stdout_sha, "--artifact-path", artifact_path, "--target", "BAD", "--executed-count", "1", "--code-identity", "content-hash")
             run_harness(root, "test", "record", "--id", "BAD-TEST", "--surface", "Example", "--command", DEFAULT_TEST_COMMAND, "--result", "pass", "--evidence", "BAD-EV")
             run_harness(root, "validation", "record", "--surface", "Example", "--acceptance", "AC1", "--commands", DEFAULT_TEST_COMMAND, "--findings", "manual latest", "--result", "pass", "--test", "BAD-TEST", "--evidence", "BAD-EV", "--target", "BAD", "--code-identity", "content-hash")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "review")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "review")
 
             validate = run_harness(root, "validate", "--delivery", check=False)
 
@@ -1718,7 +1718,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "init")
             run_harness(root, "evidence", "record", "--id", "EV1", "--kind", "review", "--summary", "manual review")
             run_harness(root, "finding", "record", "--id", "F1", "--surface", "API", "--severity", "low", "--status", "resolved", "--summary", "Resolved", "--evidence", "EV1")
-            run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "review", "--evidence", "EV1", "--finding", "F1")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--commands", "review", "--evidence", "EV1", "--finding", "F1")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 linked = conn.execute("select gate_id, finding_id from quality_gate_findings").fetchone()

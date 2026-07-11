@@ -287,9 +287,14 @@ Record the independent quality gate before handoff:
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
   --reviewer-context fresh \
+  --reviewer-session-id S-qa \
+  --reviewer-attestation-id <session-attestation-id> \
   --result pass \
   --commands "npm test"
 ```
+
+If no independent reviewer session and matching attestation exist, record
+`same-context-degraded` instead. Never label a same-session review as `fresh`.
 
 Record delivery when QA has acceptable evidence:
 

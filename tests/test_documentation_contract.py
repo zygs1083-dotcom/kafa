@@ -41,6 +41,8 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("native-host-small-verified", quickstart)
         self.assertNotIn("host-codex-spark", quickstart)
         self.assertIn("dispatch native-export", quickstart)
+        self.assertIn("same-context-degraded", quickstart)
+        self.assertIn("resolved installed Plugin", quickstart)
 
     def test_install_docs_distinguish_discovery_from_live_hook_execution(self) -> None:
         install = self.read("INSTALL.md")
@@ -65,6 +67,18 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("explicit public API", changelog)
         self.assertIn("Cycle Ledger", changelog)
         self.assertIn("Schema Lifecycle", changelog)
+
+    def test_fresh_quality_gate_guidance_requires_reviewer_identity(self) -> None:
+        readme = self.read("README.md")
+        runtime = self.read("docs/runtime/OS_RUNTIME.md")
+        skill = self.read("plugins/codex-project-harness/skills/project-runtime/SKILL.md")
+        fixture = self.read("docs/runtime/skill-eval-transcript-fixture.txt")
+
+        self.assertIn("`fresh` 不能只靠字符串声明", readme)
+        for text in [runtime, skill, fixture]:
+            self.assertIn("--reviewer-context fresh", text)
+            self.assertIn("--reviewer-session-id", text)
+            self.assertIn("--reviewer-attestation-id", text)
 
 
 if __name__ == "__main__":

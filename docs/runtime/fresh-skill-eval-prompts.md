@@ -18,7 +18,7 @@ The harness validates that a transcript includes these flow markers:
 - task creation and lifecycle
 - registered test target
 - validation with linked test/evidence, executor evidence, target, and trust anchor
-- quality gate
+- quality gate bound to an attested independent reviewer session
 - delivery readiness
 - delivery record
 
@@ -46,7 +46,10 @@ Expected evidence:
 - `--target`
 - `--trust-anchor`
 - `harness.py --root . validation record`
+- `harness.py --root . session attest`
 - `harness.py --root . gate record`
+- `--reviewer-session-id`
+- `--reviewer-attestation-id`
 - `harness.py --root . phase delivery_readiness`
 - `harness.py --root . delivery record`
 

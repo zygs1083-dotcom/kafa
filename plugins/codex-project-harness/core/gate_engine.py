@@ -20,6 +20,10 @@ from .cycle_ledger import (
 from .executor import command_matches_template
 
 
+ACTIVE_REVIEWER_SESSION_STATUSES = {"active", "running", "reported", "verified"}
+REVIEWER_SESSION_ROLES = {"qa-reviewer", "reviewer", "architect", "security"}
+
+
 @dataclass(frozen=True)
 class DeliveryDecisionServices:
     """Non-ledger policy required by the delivery decision module."""
@@ -29,6 +33,41 @@ class DeliveryDecisionServices:
 
 def _value(row: sqlite3.Row, field: str) -> object:
     return row[field] if field in row.keys() else None
+
+
+def _fresh_reviewer_issues(conn: sqlite3.Connection, gate: sqlite3.Row, cycle_id: str) -> list[str]:
+    if str(_value(gate, "reviewer_context") or "") != "fresh":
+        return []
+    session_id = str(_value(gate, "reviewer_session_id") or "")
+    attestation_id = str(_value(gate, "reviewer_attestation_id") or "")
+    issues: list[str] = []
+    if not session_id or not attestation_id:
+        return ["fresh quality gate requires reviewer session and attestation"]
+    session = conn.execute("select * from agent_sessions where session_id = ?", (session_id,)).fetchone()
+    if not session:
+        issues.append(f"fresh quality gate reviewer session missing: {session_id}")
+    else:
+        if session["status"] not in ACTIVE_REVIEWER_SESSION_STATUSES:
+            issues.append(f"fresh quality gate reviewer session inactive: {session_id} status={session['status']}")
+        if session["role"] not in REVIEWER_SESSION_ROLES:
+            issues.append(f"fresh quality gate reviewer role invalid: {session_id} role={session['role']}")
+    attestation = conn.execute(
+        "select * from session_attestations where id = ? and session_id = ?",
+        (attestation_id, session_id),
+    ).fetchone()
+    if not attestation:
+        issues.append(f"fresh quality gate reviewer attestation missing or mismatched: {attestation_id}")
+    producer = conn.execute(
+        """
+        select id from tasks
+        where cycle_id = ? and submitted_session_id = ? and submitted_session_id != ''
+        limit 1
+        """,
+        (cycle_id, session_id),
+    ).fetchone()
+    if producer:
+        issues.append(f"fresh quality gate reviewer session matches producer session: {session_id}")
+    return issues
 
 
 def _artifact_digest(root: Path, artifact_path: str) -> tuple[bool, str, str]:
@@ -402,6 +441,7 @@ def evaluate_delivery_readiness(
             issues.append(
                 f"linked {finding['severity']} finding blocks delivery: {finding['id']} status={finding['status']}"
             )
+        issues.extend(_fresh_reviewer_issues(conn, latest_gate, cycle_id))
         high_risk_present = conn.execute("select 1 from failure_modes where cycle_id = ? and risk in ('high', 'critical') limit 1", (cycle_id,)).fetchone()
         if high_risk_present and latest_gate["reviewer_context"] == "same-context-degraded":
             issues.append("high/critical risk delivery requires fresh or external quality gate reviewer context")
