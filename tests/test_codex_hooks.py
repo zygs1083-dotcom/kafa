@@ -211,9 +211,12 @@ class CodexHooksTest(unittest.TestCase):
             strict = self._run_hook("Stop", root, {}, extra_env={"HARNESS_HOOK_STRICT": "1"})
 
         self.assertEqual(warn.returncode, 0)
-        self.assertIn("validation failed", warn.stdout.lower())
+        warn_output = json.loads(warn.stdout)
+        self.assertTrue(warn_output["continue"])
+        self.assertIn("validation failed", warn_output["systemMessage"].lower())
         self.assertNotEqual(strict.returncode, 0)
-        self.assertIn("strict mode", strict.stdout.lower())
+        self.assertEqual(strict.stdout, "")
+        self.assertIn("strict mode", strict.stderr.lower())
 
     def test_stop_skips_uninitialized_project_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -222,8 +225,10 @@ class CodexHooksTest(unittest.TestCase):
             result = self._run_hook("Stop", root, {}, extra_env={"HARNESS_HOOK_STRICT": "1"})
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("readiness command: skipped", result.stdout)
-        self.assertIn("not initialized", result.stdout)
+        output = json.loads(result.stdout)
+        self.assertTrue(output["continue"])
+        self.assertIn("readiness command: skipped", output["systemMessage"])
+        self.assertIn("not initialized", output["systemMessage"])
         self.assertNotIn("traceback", result.stdout.lower() + result.stderr.lower())
 
     def test_stop_delivery_flag_runs_delivery_validation(self) -> None:
@@ -231,7 +236,9 @@ class CodexHooksTest(unittest.TestCase):
             result = self._run_hook("Stop", root, {}, extra_env={"HARNESS_HOOK_DELIVERY": "1"})
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("validate --delivery", result.stdout)
+        output = json.loads(result.stdout)
+        self.assertTrue(output["continue"])
+        self.assertIn("validate --delivery", output["systemMessage"])
 
     def test_hook_output_does_not_include_secret_like_stdin(self) -> None:
         secret = "HARNESS_CONNECTOR_KEY=super-secret"

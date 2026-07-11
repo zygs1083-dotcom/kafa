@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     payload, payload_ok = read_payload()
     strict = os.environ.get("HARNESS_HOOK_STRICT") == "1"
 
+    if event == "Stop":
+        return stop(plugin_root, repo_root, strict)
+
     print(f"Codex Project Harness hook: {event}")
     print(f"repo: {repo_root}")
 
@@ -47,8 +50,6 @@ def main(argv: list[str] | None = None) -> int:
         return pre_tool_use(repo_root, payload, strict)
     if event == "PostToolUse":
         return post_tool_use(repo_root)
-    if event == "Stop":
-        return stop(plugin_root, repo_root, strict)
     return 0
 
 
@@ -163,22 +164,45 @@ def post_tool_use(repo_root: Path) -> int:
 
 
 def stop(plugin_root: Path, repo_root: Path, strict: bool) -> int:
+    lines = [
+        "Codex Project Harness hook: Stop",
+        f"repo: {repo_root}",
+    ]
     if not harness_db_exists(repo_root):
-        print("readiness command: skipped")
-        print("readiness result:")
-        print("- harness is not initialized in this project")
+        lines.extend(
+            [
+                "readiness command: skipped",
+                "readiness result:",
+                "- harness is not initialized in this project",
+            ]
+        )
+        print(stop_output(lines))
         return 0
     delivery = os.environ.get("HARNESS_HOOK_DELIVERY") == "1"
     args = ["validate", "--delivery"] if delivery else ["validate"]
-    print(f"readiness command: harness {' '.join(args)}")
+    lines.append(f"readiness command: harness {' '.join(args)}")
     result = run_harness(plugin_root, repo_root, args, check=False)
-    print_block("readiness result", result)
+    lines.extend(block_lines("readiness result", result))
     if result.returncode != 0:
-        print("validation failed; hook is warn-only unless HARNESS_HOOK_STRICT=1.")
+        lines.append("validation failed; hook is warn-only unless HARNESS_HOOK_STRICT=1.")
         if strict:
-            print("strict mode: blocking stop on failed harness validation.")
-            return result.returncode or 1
+            lines.append("strict mode: blocking stop on failed harness validation.")
+            print("\n".join(lines), file=sys.stderr)
+            return 2
+    print(stop_output(lines))
     return 0
+
+
+def stop_output(lines: list[str]) -> str:
+    return json.dumps(
+        {
+            "continue": True,
+            "systemMessage": "\n".join(lines),
+            "suppressOutput": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def run_harness(plugin_root: Path, repo_root: Path, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -196,16 +220,22 @@ def harness_db_exists(repo_root: Path) -> bool:
 
 
 def print_block(title: str, result: subprocess.CompletedProcess[str], *, max_lines: int = MAX_LINES) -> None:
-    print(f"{title}:")
+    for line in block_lines(title, result, max_lines=max_lines):
+        print(line)
+
+
+def block_lines(title: str, result: subprocess.CompletedProcess[str], *, max_lines: int = MAX_LINES) -> list[str]:
+    lines = [f"{title}:"]
     text = (result.stdout or result.stderr or "").strip()
     if not text:
-        print("- no output")
-        return
+        lines.append("- no output")
+        return lines
     for line in text.splitlines()[:max_lines]:
-        print(sanitize_line(line))
+        lines.append(sanitize_line(line))
     remaining = len(text.splitlines()) - max_lines
     if remaining > 0:
-        print(f"... {remaining} more line(s)")
+        lines.append(f"... {remaining} more line(s)")
+    return lines
 
 
 def project_state(repo_root: Path) -> dict[str, str]:
