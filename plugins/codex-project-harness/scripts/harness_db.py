@@ -8587,20 +8587,33 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
             ),
         )
         project_revision = int(project_row(conn)["revision"])
+        previous_validation = None
+        if acceptance_id:
+            previous_validation = conn.execute(
+                """
+                select id from validations
+                where cycle_id = ? and candidate_sha = ? and acceptance_id = ? and validation_status = 'active'
+                order by created_at desc, id desc limit 1
+                """,
+                (attempt["cycle_id"], source_hash, acceptance_id),
+            ).fetchone()
         conn.execute(
             """
             insert into validations
-            (id, surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
+            (id, cycle_id, candidate_sha, validation_status, superseded_by,
+             surface, acceptance_id, commands, command, exit_code, stdout_sha256, artifact_path,
              target_id, executed_count, executed_count_source, result_format, result_path, semantic_status,
              allow_unlisted, no_network, policy_status,
              policy_reason, sandbox_profile, sandbox_status, sandbox_execution_id, sandbox_engine, container_image, allow_unlisted_reason, trust_anchor, trust_anchor_id,
              findings, result, residual_risk, head_commit, source_tree_hash, attempt_id, tree_sha, code_ref,
              verified_by, tracked_diff_hash, project_revision, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
+            values (?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, '', 'local-only', '',
                     'controller verification passed', 'pass', '', ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
                 validation_id,
+                attempt["cycle_id"],
+                source_hash,
                 f"dispatch {task_id}",
                 acceptance_id,
                 result.command,
@@ -8632,6 +8645,11 @@ def dispatch_verify_attempt(root: Path, run_id: str, task_id: str, *, runner: st
                 now_iso(),
             ),
         )
+        if previous_validation:
+            conn.execute(
+                "update validations set validation_status = 'superseded', superseded_by = ? where id = ? and validation_status = 'active'",
+                (validation_id, previous_validation["id"]),
+            )
         conn.execute("insert into validation_evidence (validation_id, evidence_id) values (?, ?)", (validation_id, evidence_id))
         if sandbox_execution_id:
             conn.execute(

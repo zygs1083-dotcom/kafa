@@ -22,7 +22,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -445,7 +445,8 @@ def collect_and_verify(root: Path, run_id: str, branches: dict[str, str]) -> Non
         run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", task_id)
 
 
-def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> list[str]:
+@contextmanager
+def integration_candidate(root: Path, run_id: str, branches: dict[str, str]):
     original_branch = run_git(root, "branch", "--show-current")
     preview_branch = f"e2e-preview/{run_id}"
     subprocess.run(["git", "switch", "-C", preview_branch, original_branch], cwd=root, check=True, capture_output=True)
@@ -460,6 +461,14 @@ def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[st
             )
             if merge.returncode != 0:
                 raise AssertionError(merge.stdout + merge.stderr)
+        yield
+    finally:
+        subprocess.run(["git", "switch", original_branch], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-D", preview_branch], cwd=root, check=False, capture_output=True)
+
+
+def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> list[str]:
+    with integration_candidate(root, run_id, branches):
         evidence_id = run_harness(
             root,
             "dispatch",
@@ -507,9 +516,71 @@ def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[st
         if validation.returncode == 0:
             return []
         return [line for line in (validation.stdout + validation.stderr).splitlines() if line.strip()]
-    finally:
-        subprocess.run(["git", "switch", original_branch], cwd=root, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-D", preview_branch], cwd=root, check=False, capture_output=True)
+
+
+def record_failing_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> dict[str, Any]:
+    with integration_candidate(root, run_id, branches):
+        execution = run_harness(
+            root,
+            "dispatch",
+            "run",
+            "--agent",
+            "controller",
+            "--target",
+            "UNIT",
+            "--command",
+            TEST_COMMAND,
+            check=False,
+        )
+        output = execution.stdout + execution.stderr
+        if "evidence=" not in output:
+            raise AssertionError(f"failed controller execution did not record evidence: {output}")
+        evidence_id = output.split("evidence=", 1)[1].split(None, 1)[0].strip()
+        evidence = db_rows(root, "select * from evidence where id = ?", (evidence_id,))[0]
+        artifact = root / evidence["artifact_path"]
+        test_output = artifact.read_text(encoding="utf-8", errors="replace")
+        run_harness(
+            root,
+            "validation",
+            "record",
+            "--surface",
+            "Agent E2E merged regression candidate",
+            "--acceptance",
+            "AC1",
+            "--commands",
+            TEST_COMMAND,
+            "--findings",
+            "merged candidate test failed",
+            "--result",
+            "fail",
+            "--evidence",
+            evidence_id,
+            "--target",
+            "UNIT",
+        )
+        run_harness(
+            root,
+            "gate",
+            "record",
+            "--reviewer-context",
+            "fresh",
+            "--result",
+            "fail",
+            "--commands",
+            TEST_COMMAND,
+            "--evidence",
+            "merged candidate regression observed",
+            "--blocking-findings",
+            "merged integration test failed",
+        )
+        validation = run_harness(root, "validate", "--delivery", check=False)
+        return {
+            "test_exit_code": int(evidence["exit_code"]),
+            "executed_count": int(evidence["executed_count"]),
+            "executed_count_source": evidence["executed_count_source"],
+            "test_output_tail": test_output[-2000:],
+            "preintegration_validation": (validation.stdout + validation.stderr)[-2000:],
+        }
 
 
 def wait_for_provider_collect(root: Path, run_id: str, *, expected: str = "collected 1 provider report", timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
@@ -687,7 +758,7 @@ def scenario_integration_regression_blocked() -> dict[str, Any]:
         collect_and_verify(root, run_id, branches)
         for task_id in branches:
             accept_task_via_cli(root, task_id)
-        run_harness(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", TEST_COMMAND, "--evidence", "fixture review")
+        regression = record_failing_integration_candidate_gate(root, run_id, branches)
         result = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
         status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
         finding = db_rows(root, "select summary from findings where surface = 'dispatch-integration' order by created_at desc limit 1")
@@ -702,6 +773,7 @@ def scenario_integration_regression_blocked() -> dict[str, Any]:
                 "finding_recorded": bool(finding),
                 "stdout_tail": result.stdout[-500:],
                 "stderr_tail": result.stderr[-500:],
+                **regression,
             },
         )
 

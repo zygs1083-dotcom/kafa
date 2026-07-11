@@ -83,7 +83,7 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertGreater(regression["executed_count"], 0)
         self.assertEqual(regression["executed_count_source"], "parsed")
         self.assertIn("test_no_integration_regression", regression["test_output_tail"])
-        self.assertNotIn("no passing validation for current candidate", regression["stdout_tail"])
+        self.assertNotIn("delivery requires validation evidence", regression["stdout_tail"])
         self.assertNotIn("requires a quality gate record", regression["stdout_tail"])
 
     def test_live_command_without_command_is_skipped(self) -> None:
