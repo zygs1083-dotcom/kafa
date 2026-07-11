@@ -142,6 +142,19 @@ class AppServerClient:
         self.close()
 
 
+def _hook_command_paths(command: str, cache_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for token in shlex.split(command, posix=False):
+        value = token.strip('"').replace("\\", "/")
+        if not value.lower().endswith("/hooks/harness_hook.py"):
+            continue
+        expanded = value.replace("${PLUGIN_ROOT}", cache_root.as_posix()).replace(
+            "%PLUGIN_ROOT%", cache_root.as_posix()
+        )
+        paths.append(Path(expanded).resolve())
+    return paths
+
+
 def validate_app_server_discovery(
     discovery: dict[str, Any],
     *,
@@ -209,11 +222,7 @@ def validate_app_server_discovery(
         )
     for hook in hooks:
         source_path = Path(str(hook.get("sourcePath", ""))).resolve()
-        command_paths = [
-            Path(token.strip('"')).resolve()
-            for token in shlex.split(str(hook.get("command", "")), posix=False)
-            if token.strip('"').lower().endswith("harness_hook.py")
-        ]
+        command_paths = _hook_command_paths(str(hook.get("command", "")), cache_root)
         if (
             hook.get("enabled") is not True
             or hook.get("source") != "plugin"

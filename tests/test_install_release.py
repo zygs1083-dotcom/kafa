@@ -150,7 +150,7 @@ class InstallReleaseTest(unittest.TestCase):
                                 "source": "plugin",
                                 "pluginId": "codex-project-harness@kafa-local",
                                 "sourcePath": str(cache_root / "hooks" / "hooks.json"),
-                                "command": f'python3 "{cache_root / "hooks" / "harness_hook.py"}" {event}',
+                                "command": f'python "%PLUGIN_ROOT%\\hooks\\harness_hook.py" {event}',
                             }
                             for event in sorted(expected_events)
                         ],
