@@ -9,7 +9,7 @@
     "agent_id": { "type": "string" },
     "branch_name": { "type": "string" },
     "worktree_path": { "type": "string" },
-    "status": { "type": "string", "enum": ["active", "cleaned", "failed"] },
+    "status": { "type": "string", "enum": ["active", "host-managed", "cleaned", "failed"] },
     "created_at": { "type": "string" },
     "cleaned_at": { "type": "string" }
   }

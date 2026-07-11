@@ -168,6 +168,7 @@ class NativeCodexReceiptTest(unittest.TestCase):
             receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
             result = run_harness(root, "dispatch", "native-import", run_id, "--receipt", str(receipt_path))
+            doctor = run_harness(root, "kernel", "doctor", check=False)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 conn.row_factory = sqlite3.Row
                 session = conn.execute("select * from agent_provider_sessions where run_id = ? and provider = 'native-codex'", (run_id,)).fetchone()
@@ -183,6 +184,8 @@ class NativeCodexReceiptTest(unittest.TestCase):
         self.assertEqual(attempt["head_commit_sha"], head)
         self.assertEqual(report_count, 1)
         self.assertEqual(evidence_count, 0)
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assertNotIn("schema contract failed", doctor.stdout + doctor.stderr)
 
     def test_import_rejects_placeholder_identity_and_wrong_package_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
