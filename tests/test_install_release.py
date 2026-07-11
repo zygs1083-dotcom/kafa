@@ -11,7 +11,7 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path
 
-from tests.run_isolated_install_smoke import validate_app_server_discovery
+from kafa.codex_app_server import AppServerClient, validate_app_server_discovery
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +75,27 @@ def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-
 
 
 class InstallReleaseTest(unittest.TestCase):
+    def test_app_server_client_uses_utf8_for_stdio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            server = root / "utf8_app_server.py"
+            server.write_text(
+                "import sys\n"
+                "sys.stdin.readline()\n"
+                "sys.stdout.buffer.write(b'{\"id\":1,\"result\":{\"message\":\"\\xc2\\x8d\"}}\\n')\n"
+                "sys.stdout.buffer.flush()\n",
+                encoding="utf-8",
+            )
+            client = AppServerClient([sys.executable, str(server)], env=os.environ.copy(), cwd=root, timeout=2)
+            try:
+                result = client.request("utf8/check", {})
+                stdout_encoding = str(client.process.stdout.encoding if client.process.stdout else "")
+            finally:
+                client.close()
+
+        self.assertEqual(stdout_encoding.lower().replace("-", ""), "utf8")
+        self.assertEqual(result, {"message": "\u008d"})
+
     def test_app_server_discovery_requires_exact_plugin_skills_and_hooks(self) -> None:
         cache_root = Path("/tmp/codex-home/plugins/cache/kafa-local/codex-project-harness/1.25.0-beta.1")
         expected_skills = {

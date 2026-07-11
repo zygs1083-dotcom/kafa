@@ -22,6 +22,8 @@ class AppServerClient:
             cwd=cwd,
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -119,14 +121,19 @@ class AppServerClient:
             except OSError:
                 pass
         try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+        finally:
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    stream.close()
 
     def __enter__(self) -> "AppServerClient":
         return self
