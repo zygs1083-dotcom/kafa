@@ -80,8 +80,60 @@ jobs:
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 
+  real_host_compatibility:
+    name: Real Codex host compatibility
+    runs-on: [self-hosted, kafa-codex-live]
+    environment: codex-live-release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Codex CLI for the live profile
+        run: |
+          codex_version="$(python -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
+          npm install --prefix "$RUNNER_TEMP/kafa-codex-cli" "@openai/codex@$codex_version"
+          echo "$RUNNER_TEMP/kafa-codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Validate tagged source and authenticated host
+        run: |
+          python -m kafa.release --require-tag
+          codex --version
+          codex login status
+
+      - name: Run real Codex host compatibility profile
+        env:
+          HARNESS_E2E_ENABLE_LIVE_CODEX: "1"
+          HARNESS_E2E_LIVE_TIMEOUT_SECONDS: "900"
+        run: python plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode live-codex --out "$RUNNER_TEMP/kafa-live-codex-report.json"
+
+      - name: Preserve real-host compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-codex-host-compatibility
+          path: ${{ runner.temp }}/kafa-live-codex-report.json
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
-    needs: verify
+    needs:
+      - verify
+      - real_host_compatibility
     runs-on: ubuntu-latest
     permissions:
       contents: write

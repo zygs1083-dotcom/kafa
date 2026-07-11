@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -147,11 +148,29 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertIn("v*", workflow)
         self.assertIn("python -m kafa.release --require-tag", workflow)
         self.assertIn("run_isolated_install_smoke.py", workflow)
-        self.assertIn("needs: verify", workflow)
+        self.assertIn("- verify", workflow)
+        self.assertIn("- real_host_compatibility", workflow)
         self.assertIn("--wheel dist/*.whl", workflow)
         self.assertIn("--source-archive dist/*-source.tar.gz", workflow)
         self.assertIn("gh release create", workflow)
         self.assertIn("--prerelease", workflow)
+
+    def test_publish_requires_a_non_optional_real_host_compatibility_profile(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("\n  real_host_compatibility:", workflow)
+        compatibility = workflow.split("\n  real_host_compatibility:", 1)[1].split("\n  publish:", 1)[0]
+        publish = workflow.split("\n  publish:", 1)[1]
+
+        self.assertIn("runs-on: [self-hosted, kafa-codex-live]", compatibility)
+        self.assertIn("environment: codex-live-release", compatibility)
+        self.assertIn('HARNESS_E2E_ENABLE_LIVE_CODEX: "1"', compatibility)
+        self.assertIn("run_agent_e2e_eval.py --mode live-codex --out", compatibility)
+        self.assertIn("actions/upload-artifact@v4", compatibility)
+        self.assertNotIn("continue-on-error: true", compatibility)
+        self.assertRegex(
+            publish,
+            re.compile(r"\n    needs:\s*\n      - verify\s*\n      - real_host_compatibility\s*\n"),
+        )
 
     def test_install_smoke_wraps_windows_npm_command_shims(self) -> None:
         command = codex_command(r"C:\npm\codex.cmd", "plugin", "list", "--json", platform_name="nt")
