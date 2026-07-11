@@ -216,7 +216,16 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     tmp.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.01)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

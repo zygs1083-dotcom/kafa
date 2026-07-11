@@ -280,6 +280,27 @@ class HostCodexProviderTest(unittest.TestCase):
             "PYTHONPATH": str(package_root),
         }
 
+    def test_host_codex_atomic_report_write_retries_sharing_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "report.json"
+            original_replace = Path.replace
+            attempts = 0
+
+            def replace_after_transient_failure(source: Path, target: Path) -> Path:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError("simulated Windows sharing violation")
+                return original_replace(source, target)
+
+            with patch.object(Path, "replace", new=replace_after_transient_failure):
+                agent_provider_core._write_json_atomic(report_path, {"status": "failed"})
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(report, {"status": "failed"})
+
     def test_host_codex_requires_explicit_legacy_permission_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
