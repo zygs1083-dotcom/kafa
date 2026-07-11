@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import sqlite3
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from harness_lib import git_dirty, git_head_sha
 from .connector_trust import agent_session_payload, ci_payload, external_session_payload, verify_connector_record
+from .cycle_ledger import (
+    baseline_issues,
+    current_candidate_sha,
+    current_cycle_row,
+    traceability_issues,
+    validation_has_test_or_evidence,
+)
 from .executor import command_matches_template
+
+
+@dataclass(frozen=True)
+class DeliveryDecisionServices:
+    """Non-ledger policy required by the delivery decision module."""
+
+    is_expired: Callable[[str], bool]
 
 
 def _value(row: sqlite3.Row, field: str) -> object:
@@ -197,9 +213,11 @@ def validation_trusted_command_issues(
     return issues
 
 
-def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[str]:
-    from harness_db import baseline_issues, current_candidate_sha, current_cycle_row, is_expired, traceability_issues, validation_has_test_or_evidence
-
+def evaluate_delivery_readiness(
+    conn: sqlite3.Connection,
+    root: Path,
+    services: DeliveryDecisionServices,
+) -> list[str]:
     issues: list[str] = []
     try:
         cycle = current_cycle_row(conn)
@@ -307,7 +325,7 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
         if failure_mode["status"] in {"accepted", "exempt"}:
             if not failure_mode["accepted_by"] or not failure_mode["acceptance_reason"] or not failure_mode["acceptance_scope"] or not failure_mode["accepted_revision"] or not failure_mode["expires_at"]:
                 issues.append(f"{failure_mode['risk']} failure mode acceptance is incomplete: {failure_mode['id']}")
-            elif is_expired(failure_mode["expires_at"]):
+            elif services.is_expired(failure_mode["expires_at"]):
                 issues.append(f"{failure_mode['risk']} failure mode risk acceptance expired: {failure_mode['id']} expires_at={failure_mode['expires_at']}")
             continue
         covered = conn.execute(
@@ -379,7 +397,7 @@ def evaluate_delivery_readiness(conn: sqlite3.Connection, root: Path) -> list[st
                     and finding["candidate_sha"] == current_source_hash
                     and int(finding["waived_revision"] or 0) == int(latest_gate["project_revision"])
                 )
-                if waiver_complete and waiver_matches and not is_expired(finding["waiver_expires_at"]):
+                if waiver_complete and waiver_matches and not services.is_expired(finding["waiver_expires_at"]):
                     continue
             issues.append(
                 f"linked {finding['severity']} finding blocks delivery: {finding['id']} status={finding['status']}"

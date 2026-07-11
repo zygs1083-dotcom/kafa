@@ -1,38 +1,222 @@
-"""Runtime API facade for Codex Harness Kernel v3.0.
-
-The CLI imports this module as the public runtime API. Existing legacy scripts
-continue to execute the CLI, while older direct imports from ``harness_db`` remain
-available as compatibility facades.
-"""
+"""Explicit public runtime API for Codex Project Harness."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from harness_db import (
+    DB_PATH,
+    HarnessError,
+    accept_ready_task,
+    accept_task,
+    adapter_plan,
+    adapter_reconcile,
+    adapter_transition,
+    add_acceptance,
+    add_agent_capability,
+    add_executor_prefix,
+    add_failure_mode,
+    add_requirement,
+    add_task,
+    add_test_target,
+    baseline_diff,
+    baseline_validate,
+    block_task,
+    claim_task,
+    close_agent_session,
+    complete_task,
+    confirm_scope,
+    connection,
+    connector_profile_status,
+    create_checkpoint,
+    cycle_close,
+    cycle_start,
+    cycle_status,
+    dispatch_claim_next,
+    dispatch_export_csv,
+    dispatch_export_native,
+    dispatch_file_claim_add,
+    dispatch_file_claim_list,
+    dispatch_file_claim_release,
+    dispatch_import_csv,
+    dispatch_import_native,
+    dispatch_integrate,
+    dispatch_plan,
+    dispatch_provider_cancel,
+    dispatch_provider_collect,
+    dispatch_provider_reconcile,
+    dispatch_provider_start,
+    dispatch_provider_status,
+    dispatch_recover_stale,
+    dispatch_route_advice,
+    dispatch_route_advice_lines,
+    dispatch_run,
+    dispatch_status,
+    dispatch_verify_attempt,
+    doctor,
+    export_checkpoint,
+    export_events,
+    freeze_baseline,
+    get_store,
+    heartbeat_task,
+    import_checkpoint,
+    init_runtime,
+    install_agents,
+    link_requirement_acceptance,
+    link_task_test_target,
+    list_checkpoints,
+    list_executor_prefixes,
+    list_test_targets,
+    migrate,
+    quickstart_minimal,
+    quickstart_status,
+    quickstart_status_lines,
+    ready_tasks,
+    record_adapter,
+    record_ci_verification,
+    record_decision,
+    record_delivery,
+    record_evidence,
+    record_external_session_verification,
+    record_finding,
+    record_gate,
+    record_session_attestation,
+    record_test,
+    record_validation,
+    recover_stale_leases,
+    release_task,
+    repair,
+    review_task,
+    run_idempotent,
+    runtime_initialized,
+    session_status_lines,
+    set_connector_profile,
+    set_store_factory,
+    start_task,
+    status_lines,
+    submit_task,
+    sweep_expired_risks,
+    trace_show,
+    trace_validate,
+    transaction,
+    transition_phase,
+    uninitialized_lines,
+    unset_connector_profile,
+    update_task,
+    validate_events,
+    validate_runtime,
+)
 
-import harness_db as _db
 
-
-for _name in dir(_db):
-    if not _name.startswith("_"):
-        globals()[_name] = getattr(_db, _name)
-
-
-HarnessError = _db.HarnessError
-
-
-def __getattr__(name: str) -> Any:
-    return getattr(_db, name)
-
-
-def import_checkpoint(root: Path, file_path: Path, *, apply: bool = False) -> list[str]:
-    return _db.import_checkpoint(root, file_path, apply=apply)
+__all__ = (
+    "DB_PATH",
+    "HarnessError",
+    "accept_ready_task",
+    "accept_task",
+    "adapter_plan",
+    "adapter_reconcile",
+    "adapter_transition",
+    "add_acceptance",
+    "add_agent_capability",
+    "add_executor_prefix",
+    "add_failure_mode",
+    "add_requirement",
+    "add_task",
+    "add_test_target",
+    "baseline_diff",
+    "baseline_validate",
+    "block_task",
+    "claim_task",
+    "close_agent_session",
+    "complete_task",
+    "confirm_scope",
+    "connection",
+    "connector_profile_status",
+    "create_checkpoint",
+    "cycle_close",
+    "cycle_start",
+    "cycle_status",
+    "dispatch_claim_next",
+    "dispatch_export_csv",
+    "dispatch_export_native",
+    "dispatch_file_claim_add",
+    "dispatch_file_claim_list",
+    "dispatch_file_claim_release",
+    "dispatch_import_csv",
+    "dispatch_import_native",
+    "dispatch_integrate",
+    "dispatch_plan",
+    "dispatch_provider_cancel",
+    "dispatch_provider_collect",
+    "dispatch_provider_reconcile",
+    "dispatch_provider_start",
+    "dispatch_provider_status",
+    "dispatch_recover_stale",
+    "dispatch_route_advice",
+    "dispatch_route_advice_lines",
+    "dispatch_run",
+    "dispatch_status",
+    "dispatch_verify_attempt",
+    "doctor",
+    "export_checkpoint",
+    "export_events",
+    "freeze_baseline",
+    "get_store",
+    "heartbeat_task",
+    "import_checkpoint",
+    "init_runtime",
+    "install_agents",
+    "invariant_validate",
+    "kernel_doctor",
+    "link_requirement_acceptance",
+    "link_task_test_target",
+    "list_checkpoints",
+    "list_executor_prefixes",
+    "list_test_targets",
+    "migrate",
+    "projection_rebuild",
+    "quickstart_minimal",
+    "quickstart_status",
+    "quickstart_status_lines",
+    "ready_tasks",
+    "record_adapter",
+    "record_ci_verification",
+    "record_decision",
+    "record_delivery",
+    "record_evidence",
+    "record_external_session_verification",
+    "record_finding",
+    "record_gate",
+    "record_session_attestation",
+    "record_test",
+    "record_validation",
+    "recover_stale_leases",
+    "release_task",
+    "repair",
+    "review_task",
+    "run_idempotent",
+    "runtime_initialized",
+    "session_status_lines",
+    "set_connector_profile",
+    "set_store_factory",
+    "start_task",
+    "status_lines",
+    "submit_task",
+    "sweep_expired_risks",
+    "trace_show",
+    "trace_validate",
+    "transaction",
+    "transition_phase",
+    "uninitialized_lines",
+    "unset_connector_profile",
+    "update_task",
+    "validate_events",
+    "validate_runtime",
+)
 
 
 def invariant_validate(root):
     from core.invariant_checker import check_runtime_invariants
 
-    with _db.connection(root) as conn:
+    with connection(root) as conn:
         return check_runtime_invariants(conn, root)
 
 
@@ -43,4 +227,4 @@ def projection_rebuild(root):
 
 
 def kernel_doctor(root):
-    return _db.doctor(root)
+    return doctor(root)

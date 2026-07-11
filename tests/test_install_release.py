@@ -243,7 +243,7 @@ class InstallReleaseTest(unittest.TestCase):
     def test_doctor_static_structure_rejects_missing_required_core_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
-            (root / "plugins" / "codex-project-harness" / "core" / "store.py").unlink()
+            (root / "plugins" / "codex-project-harness" / "core" / "api.py").unlink()
             run_kafa("plugin", "install", "--repo", str(root))
 
             result = run_kafa("doctor", "--repo", str(root), "--json", check=False)

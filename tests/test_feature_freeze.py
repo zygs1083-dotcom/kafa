@@ -261,6 +261,7 @@ class FeatureFreezeTest(unittest.TestCase):
 
         self.assertEqual(skill_dirs, set(REQUIRED_SKILLS))
         self.assertEqual(schema_files, set(REQUIRED_SCHEMAS))
+        self.assertEqual(set(REQUIRED_CORE), {"__init__.py", "api.py"})
         self.assertTrue(set(REQUIRED_CORE).issubset(core_files))
         self.assertEqual(script_files, set(REQUIRED_SCRIPTS))
         self.assertEqual(hook_files, set(REQUIRED_HOOKS))

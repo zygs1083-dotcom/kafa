@@ -41,9 +41,7 @@ REQUIRED_SKILLS = (
 )
 REQUIRED_REFERENCES = ("collaboration-tools.md", "tool-adapters.md")
 REQUIRED_CORE = (
-    "__init__.py", "api.py", "connector_trust.py", "scheduler.py", "gate_engine.py", "lock_manager.py",
-    "schema_guard.py", "event_bus.py", "executor.py", "agent_runner.py", "agent_provider.py",
-    "invariant_checker.py", "projections.py", "store.py",
+    "__init__.py", "api.py",
 )
 REQUIRED_SCRIPTS = (
     "init_project_harness.py", "validate_structure.py", "harness_lib.py", "harness_wrapper.py",
