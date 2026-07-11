@@ -252,7 +252,7 @@ class FeatureFreezeTest(unittest.TestCase):
     def test_feature_freeze_rejects_cli_surface_growth(self) -> None:
         self.assertEqual(_cli_surface(harness.build_parser()), EXPECTED_CLI_SURFACE)
 
-    def test_feature_freeze_rejects_extra_skill_schema_core_script_hook_files(self) -> None:
+    def test_feature_freeze_protects_public_files_and_required_kernel_contracts(self) -> None:
         skill_dirs = {path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()}
         schema_files = {path.name for path in (PLUGIN_ROOT / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
         core_files = {path.name for path in (PLUGIN_ROOT / "core").iterdir() if path.is_file() and path.suffix == ".py"}
@@ -261,7 +261,7 @@ class FeatureFreezeTest(unittest.TestCase):
 
         self.assertEqual(skill_dirs, set(REQUIRED_SKILLS))
         self.assertEqual(schema_files, set(REQUIRED_SCHEMAS))
-        self.assertEqual(core_files, set(REQUIRED_CORE))
+        self.assertTrue(set(REQUIRED_CORE).issubset(core_files))
         self.assertEqual(script_files, set(REQUIRED_SCRIPTS))
         self.assertEqual(hook_files, set(REQUIRED_HOOKS))
 
@@ -302,6 +302,32 @@ class FeatureFreezeTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected hook file", result.stdout)
+
+    def test_internal_core_modules_are_not_frozen_by_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            plugin_copy = temp_root / "plugins" / "codex-project-harness"
+            plugin_copy.parent.mkdir(parents=True)
+            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copyfile(REPO_ROOT / "VERSION", temp_root / "VERSION")
+            shutil.copyfile(REPO_ROOT / "pyproject.toml", temp_root / "pyproject.toml")
+            (plugin_copy / "core" / "internal_delivery_module.py").write_text(
+                '"""Private Kernel implementation module."""\n',
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            from kafa.cli import static_plugin_structure
+
+            structure_ok, structure_details = static_plugin_structure(plugin_copy)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(structure_ok, structure_details)
 
 
 def _cli_surface(parser: argparse.ArgumentParser) -> set[str]:

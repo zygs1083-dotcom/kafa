@@ -595,7 +595,7 @@ def static_plugin_structure(source: Path) -> tuple[bool, str]:
     for reference in REQUIRED_REFERENCES:
         if not (source / "references" / reference).is_file():
             errors.append(f"missing reference: {reference}")
-    check_exact_file_inventory(errors, source / "core", REQUIRED_CORE, ".py", "core")
+    check_required_file_inventory(errors, source / "core", REQUIRED_CORE, ".py", "core")
     check_exact_file_inventory(errors, source / "scripts", REQUIRED_SCRIPTS, ".py", "scripts")
     check_exact_file_inventory(errors, source / "hooks", REQUIRED_HOOKS, "", "hooks")
     check_exact_file_inventory(errors, source / "schemas", REQUIRED_SCHEMAS, ".json", "schemas")
@@ -640,6 +640,25 @@ def check_exact_file_inventory(
     expected = set(required)
     if actual != expected:
         errors.append(f"{label} inventory mismatch: {sorted(actual ^ expected)}")
+
+
+def check_required_file_inventory(
+    errors: list[str],
+    root: Path,
+    required: tuple[str, ...],
+    suffix: str,
+    label: str,
+) -> None:
+    try:
+        actual = {
+            path.name for path in root.iterdir()
+            if path.is_file() and not path_is_link(path) and (not suffix or path.suffix == suffix)
+        }
+    except OSError:
+        actual = set()
+    missing = set(required) - actual
+    if missing:
+        errors.append(f"{label} required files missing: {sorted(missing)}")
 
 
 def static_hook_definition(plugin_root: Path) -> tuple[bool, str]:

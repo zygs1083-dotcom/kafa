@@ -240,9 +240,6 @@ def main() -> int:
         core_path = root / "core" / core_file
         if not core_path.exists():
             errors.append(f"missing kernel core file: {core_path}")
-    core_files = {path.name for path in (root / "core").iterdir() if path.is_file() and path.suffix == ".py"}
-    for core_file in sorted(core_files - set(REQUIRED_CORE)):
-        errors.append(f"unexpected kernel core file: {root / 'core' / core_file}")
 
     for script in REQUIRED_SCRIPTS:
         script_path = root / "scripts" / script

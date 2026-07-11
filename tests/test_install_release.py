@@ -252,7 +252,7 @@ class InstallReleaseTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(checks["plugin structure"]["ok"])
-        self.assertIn("core inventory mismatch", checks["plugin structure"]["details"])
+        self.assertIn("core required files missing", checks["plugin structure"]["details"])
 
     def test_doctor_static_structure_requires_host_codex_optional_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
