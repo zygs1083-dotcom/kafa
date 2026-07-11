@@ -11,6 +11,8 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path
 
+from tests.run_isolated_install_smoke import validate_app_server_discovery
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
@@ -73,6 +75,116 @@ def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-
 
 
 class InstallReleaseTest(unittest.TestCase):
+    def test_app_server_discovery_requires_exact_plugin_skills_and_hooks(self) -> None:
+        cache_root = Path("/tmp/codex-home/plugins/cache/kafa-local/codex-project-harness/1.25.0-beta.1")
+        expected_skills = {
+            f"codex-project-harness:{path.parent.name}"
+            for path in PLUGIN_ROOT.glob("skills/*/SKILL.md")
+        }
+        expected_events = {"sessionStart", "subagentStart", "preToolUse", "postToolUse", "stop"}
+        discovery = {
+            "plugin": {
+                "marketplaces": [
+                    {
+                        "name": "kafa-local",
+                        "plugins": [
+                            {
+                                "id": "codex-project-harness@kafa-local",
+                                "localVersion": "1.25.0-beta.1",
+                                "installed": True,
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ],
+                "marketplaceLoadErrors": [],
+            },
+            "skills": {
+                "data": [
+                    {
+                        "cwd": "/tmp/business",
+                        "errors": [],
+                        "skills": [
+                            {
+                                "name": name,
+                                "enabled": True,
+                                "scope": "user",
+                                "path": str(cache_root / "skills" / name.split(":", 1)[1] / "SKILL.md"),
+                            }
+                            for name in sorted(expected_skills)
+                        ],
+                    }
+                ]
+            },
+            "hooks": {
+                "data": [
+                    {
+                        "cwd": "/tmp/business",
+                        "errors": [],
+                        "warnings": [],
+                        "hooks": [
+                            {
+                                "eventName": event,
+                                "enabled": True,
+                                "source": "plugin",
+                                "pluginId": "codex-project-harness@kafa-local",
+                                "sourcePath": str(cache_root / "hooks" / "hooks.json"),
+                                "command": f'python3 "{cache_root / "hooks" / "harness_hook.py"}" {event}',
+                            }
+                            for event in sorted(expected_events)
+                        ],
+                    }
+                ]
+            },
+        }
+
+        report = validate_app_server_discovery(
+            discovery,
+            cache_root=cache_root,
+            plugin_id="codex-project-harness@kafa-local",
+            version="1.25.0-beta.1",
+            expected_skills=expected_skills,
+            expected_hook_events=expected_events,
+        )
+
+        self.assertEqual(report["skill_count"], 12)
+        self.assertEqual(set(report["skill_names"]), expected_skills)
+        self.assertEqual(set(report["hook_events"]), expected_events)
+        self.assertEqual(report["plugin_local_version"], "1.25.0-beta.1")
+
+    def test_app_server_discovery_rejects_missing_skill_or_hook(self) -> None:
+        cache_root = Path("/tmp/cache")
+        discovery = {
+            "plugin": {
+                "marketplaces": [
+                    {
+                        "name": "kafa-local",
+                        "plugins": [
+                            {
+                                "id": "codex-project-harness@kafa-local",
+                                "localVersion": "1.25.0-beta.1",
+                                "installed": True,
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ],
+                "marketplaceLoadErrors": [],
+            },
+            "skills": {"data": [{"cwd": "/tmp/business", "errors": [], "skills": []}]},
+            "hooks": {"data": [{"cwd": "/tmp/business", "errors": [], "warnings": [], "hooks": []}]},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "skill discovery mismatch"):
+            validate_app_server_discovery(
+                discovery,
+                cache_root=cache_root,
+                plugin_id="codex-project-harness@kafa-local",
+                version="1.25.0-beta.1",
+                expected_skills={"codex-project-harness:project-harness"},
+                expected_hook_events={"sessionStart"},
+            )
+
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
         self.assertEqual(result.stdout.strip(), "1.25.0-beta.1")
