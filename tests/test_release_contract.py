@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -15,10 +16,15 @@ from tests.run_isolated_install_smoke import codex_command
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_release(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_release(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    command_env = os.environ.copy()
+    command_env.pop("GITHUB_REF_NAME", None)
+    if env:
+        command_env.update(env)
     return subprocess.run(
         [sys.executable, "-m", "kafa.release", "--repo", str(repo), "--json", *args],
         cwd=REPO_ROOT,
+        env=command_env,
         text=True,
         capture_output=True,
         check=False,
@@ -91,11 +97,16 @@ class ReleaseContractTest(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "release"], cwd=root, check=True, capture_output=True)
             subprocess.run(["git", "tag", "v1.25.0-beta.1"], cwd=root, check=True)
 
-            result = run_release(root, "--require-tag")
+            result = run_release(root, "--require-tag", env={"GITHUB_REF_NAME": "v1.25.0-beta.1"})
             report = json.loads(result.stdout)
+            mismatched = run_release(root, "--require-tag", env={"GITHUB_REF_NAME": "main"})
+            mismatched_report = json.loads(mismatched.stdout)
+            mismatched_checks = {item["name"]: item for item in mismatched_report["checks"]}
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(report["ok"], report)
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertFalse(mismatched_checks["workflow tag"]["ok"])
 
     def test_require_tag_rejects_dirty_worktree_after_tag(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
