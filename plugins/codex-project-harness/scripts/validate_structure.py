@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import tomllib
@@ -228,6 +229,7 @@ def main() -> int:
         core_path = root / "core" / core_file
         if not core_path.exists():
             errors.append(f"missing kernel core file: {core_path}")
+    errors.extend(local_python_import_errors(root))
 
     for script in REQUIRED_SCRIPTS:
         script_path = root / "scripts" / script
@@ -291,6 +293,42 @@ def main() -> int:
 
     print("OK: plugin structure is valid")
     return 0
+
+
+def local_python_import_errors(root: Path) -> list[str]:
+    core_root = root / "core"
+    available_core = {path.stem for path in core_root.glob("*.py") if path.is_file()}
+    source_paths = [
+        *core_root.glob("*.py"),
+        *(root / "scripts").glob("*.py"),
+        *(root / "hooks").glob("*.py"),
+    ]
+    errors: set[str] = set()
+    for path in source_paths:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            errors.add(f"invalid Python source: {path.relative_to(root)}: {exc}")
+            continue
+        for node in ast.walk(tree):
+            module = ""
+            if isinstance(node, ast.ImportFrom):
+                if node.level and path.parent == core_root and node.module:
+                    module = node.module.split(".", 1)[0]
+                elif node.module and node.module.startswith("core."):
+                    module = node.module.split(".", 2)[1]
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("core."):
+                        module = alias.name.split(".", 2)[1]
+                        if module not in available_core:
+                            errors.add(
+                                f"missing local Python import: core.{module} referenced by {path.relative_to(root)}"
+                            )
+                continue
+            if module and module not in available_core:
+                errors.add(f"missing local Python import: core.{module} referenced by {path.relative_to(root)}")
+    return sorted(errors)
 
 
 if __name__ == "__main__":

@@ -330,6 +330,26 @@ class FeatureFreezeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(structure_ok, structure_details)
 
+    def test_validate_structure_rejects_a_missing_imported_core_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            plugin_copy = temp_root / "plugins" / "codex-project-harness"
+            plugin_copy.parent.mkdir(parents=True)
+            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copyfile(REPO_ROOT / "VERSION", temp_root / "VERSION")
+            shutil.copyfile(REPO_ROOT / "pyproject.toml", temp_root / "pyproject.toml")
+            (plugin_copy / "core" / "store.py").unlink()
+
+            result = subprocess.run(
+                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing local Python import: core.store", result.stdout)
+
 
 def _cli_surface(parser: argparse.ArgumentParser) -> set[str]:
     surface: set[str] = set()

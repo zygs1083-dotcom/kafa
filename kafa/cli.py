@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -594,6 +595,7 @@ def static_plugin_structure(source: Path) -> tuple[bool, str]:
         if not (source / "references" / reference).is_file():
             errors.append(f"missing reference: {reference}")
     check_required_file_inventory(errors, source / "core", REQUIRED_CORE, ".py", "core")
+    errors.extend(local_python_import_errors(source))
     check_exact_file_inventory(errors, source / "scripts", REQUIRED_SCRIPTS, ".py", "scripts")
     check_exact_file_inventory(errors, source / "hooks", REQUIRED_HOOKS, "", "hooks")
     check_exact_file_inventory(errors, source / "schemas", REQUIRED_SCHEMAS, ".json", "schemas")
@@ -657,6 +659,47 @@ def check_required_file_inventory(
     missing = set(required) - actual
     if missing:
         errors.append(f"{label} required files missing: {sorted(missing)}")
+
+
+def local_python_import_errors(source: Path) -> list[str]:
+    core_root = source / "core"
+    available_core = {
+        path.stem for path in core_root.glob("*.py")
+        if path.is_file() and not path_is_link(path)
+    }
+    source_paths = [
+        *core_root.glob("*.py"),
+        *(source / "scripts").glob("*.py"),
+        *(source / "hooks").glob("*.py"),
+    ]
+    errors: set[str] = set()
+    for path in source_paths:
+        if path_is_link(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            errors.add(f"invalid Python source: {path.relative_to(source)}: {exc}")
+            continue
+        for node in ast.walk(tree):
+            module = ""
+            if isinstance(node, ast.ImportFrom):
+                if node.level and path.parent == core_root and node.module:
+                    module = node.module.split(".", 1)[0]
+                elif node.module and node.module.startswith("core."):
+                    module = node.module.split(".", 2)[1]
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("core."):
+                        module = alias.name.split(".", 2)[1]
+                        if module not in available_core:
+                            errors.add(
+                                f"missing local Python import: core.{module} referenced by {path.relative_to(source)}"
+                            )
+                continue
+            if module and module not in available_core:
+                errors.add(f"missing local Python import: core.{module} referenced by {path.relative_to(source)}")
+    return sorted(errors)
 
 
 def static_hook_definition(plugin_root: Path) -> tuple[bool, str]:
