@@ -11,6 +11,8 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Read-only `dispatch route-advice [--run-id] [--json]` to export host-neutral capability and risk hints before native task execution.
 - Native task package/receipt exchange through `dispatch native-export` and `dispatch native-import`, with real host task/thread/worktree identities and controller verification kept separate.
 - Explicit routing buckets for `native-host-small-verified`, `native-host-general`, `main-model-or-manual`, and `blocked-not-ready`.
+- A mandatory real-host compatibility release job using an authenticated self-hosted Codex runner, with JSON evidence retained for every tag attempt.
+- Deep Kernel contracts: an explicit public API, transactional **Schema Lifecycle**, cycle-scoped **Cycle Ledger**, and decoupled **Delivery Decision**.
 
 ### Changed
 
@@ -22,10 +24,14 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Without a higher-priority `HARNESS_CODEX_MODEL` override, legacy `spark-deterministic` compatibility now requires an explicit `HARNESS_CODEX_SPARK_MODEL`; Kafa no longer embeds a preview model name.
 - The legacy Host Codex bridge is disabled unless the operator explicitly accepts its fixed worktree/deny-all permission boundary with `HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all`.
 - Legacy Host Codex turns now have an autonomous deadline watchdog, dead-worker detection, recursive known-tree termination, DB/file terminal CAS, and no automatic replan after cancel/timeout because detached helper termination cannot be independently proven.
+- Feature freeze now protects public CLI, migration, trust, plugin, Hook/Skill, runtime-script, install, and release contracts while allowing internal core modules to be split or renamed.
+- The Apps/MCP receipt boundary records that Codex CLI 0.143.0 exposes tool-call correlation and approval but no result-bound host-verifiable receipt; `legacy-direct` remains an explicit accepted risk and connector output stays non-evidentiary.
 
 ### Fixed
 
 - Stop-ship correctness hardening now covers transactional schema migration/replay, cycle-local identities, monotonic quality gates, structured critical findings, external trust receipts, safe quickstart handoff, user marketplace resolution, location-independent project launchers, installed hooks, and layered installed-plugin/cache doctor checks.
+- Fixture delivery validation, real plugin/Skill/Hook discovery, real Hook execution, native receipt import, controller verification, and integration now have truthful compatibility coverage without counting `not-run`, `blocked`, mock, or skipped profiles as live success.
+- README, Quickstart, Installation, Runtime, Control Plane, and project-runtime Skill guidance now describe current schema 29 behavior instead of embedding stale version chronology.
 
 ### Boundaries
 

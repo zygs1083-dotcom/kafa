@@ -47,14 +47,15 @@ For long-running projects, check the current Delivery Cycle before recording new
 python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
 ```
 
-Before splitting work into Host Codex or Spark-capable subagent tasks, ask the runtime for route advice:
+Before splitting work into native Codex tasks or subagents, ask the runtime for route advice:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch plan --scope "next implementation slice"
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --run-id <run-id> --json
+python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch native-export <run-id>
 ```
 
-Only tasks reported as `host-codex-spark` should be considered for Spark execution, and Spark still requires explicit `HARNESS_CODEX_MODEL_POLICY=spark-deterministic` plus Host Codex Provider start. All other tasks remain with the main model, manual review, or default Host Codex.
+`native-host-small-verified` means the task is a candidate for a small, fast native-host coding model or subagent because controller verification is available; it is not a model slug and does not start work. The host chooses the concrete model, reasoning, sandbox, approval, thread, and worktree policy. `native-host-general` remains a native-host task without the small-task hint; `main-model-or-manual` stays with the controlling model or human workflow. Importing any host receipt remains audit-only until `dispatch verify-attempt` succeeds.
 
 For real connector writes, bind the project to existing external targets first. This does not create external workspaces, projects, channels, files, or repos:
 

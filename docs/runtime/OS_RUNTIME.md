@@ -4,7 +4,7 @@ This document describes the executable runtime layer for Codex Project Harness. 
 
 The runtime stops at verified code handoff. Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation are out of scope.
 
-Kernel v4.18.0 is an architecture generation for runtime consistency, semantic evidence, external trust anchors, safer local execution, task lease fencing, command idempotency, isolated agent dispatch, native Codex subagent exchange files, controller-side fan-out verification, auditable AgentProvider lifecycle tracking, session attestation for independent QA, real container-backed controller verification, hardened integration, deterministic Agent E2E evaluation, Phase 0 feature-freeze guardrails, a real Codex Host Bridge using the Python Codex SDK, real connector adapter execution with resilience/fallback governance, Codex lifecycle hook guardrails, an offline stability matrix for release gating, a local installation/release helper, a verified architecture control plane contract, a local advisory fallback layer, nonblocking Host Codex provider lifecycle, Host Codex worktree isolation, iterative Delivery Cycles, connector transactional outbox recovery, P1 reliability hardening for dispatch aggregation, structured test semantics, target sandbox policy, connector namespace isolation, conservative Host Codex model policy routing for low-risk developer tasks, a cold-start guided loop for new projects, and read-only route advice before Spark/provider execution. The repository release remains a beta release, while the runtime implementation version is `4.18.0` and the database schema version is `28`.
+Kernel v4.18.0 is the current verified-code delivery runtime. It provides transactional schema lifecycle, cycle-scoped facts, semantic command evidence, external trust anchors, fenced task and connector execution, native Codex receipt exchange, controller verification, hardened integration, and deterministic plus real-host compatibility evals. The repository remains a beta development candidate; the runtime implementation version is `4.18.0` and the database schema version is `29`.
 
 ## Fact Source
 
@@ -22,10 +22,12 @@ SQLite runs with WAL mode, foreign keys, unique constraints, task revisions, and
 
 The executable runtime is organized around `plugins/codex-project-harness/core/`:
 
-- `api.py` is the write facade used by the CLI and compatibility wrappers.
+- `api.py` is the explicit public API used by the CLI; internal functions are not dynamically exported.
+- `schema_lifecycle.py` is the **Schema Lifecycle** owner for transactional DDL and compatibility columns.
+- `cycle_ledger.py` is the **Cycle Ledger** owner for current-cycle, baseline, and traceability read models.
 - `scheduler.py` owns dependency resolution, ready queues, and cycle checks.
 - `lock_manager.py` owns task revision and lease validation.
-- `gate_engine.py` owns delivery readiness and delivery record barriers.
+- `gate_engine.py` is the **Delivery Decision** module for readiness and delivery record barriers.
 - `schema_guard.py` performs pre-write entity validation and reuses row-level schema checks.
 - `event_bus.py` emits, stores, validates, and dispatches audit events.
 - `executor.py` runs local commands through target/prefix policy and writes trusted command evidence artifacts.
@@ -36,7 +38,7 @@ SQLite state tables remain the primary runtime fact source. Events are audit sup
 
 ## Delivery Cycles
 
-Schema 25 adds first-class Delivery Cycles so long-lived projects can iterate without turning old validations into permanent blockers.
+The current Kernel has first-class Delivery Cycles so long-lived projects can iterate without turning old validations into permanent blockers.
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status --json
@@ -50,7 +52,7 @@ The gate remains fail-closed. A new cycle must record current acceptance/task st
 
 ## Cold-Start Guided Loop
 
-Schema 28 now includes guided runtime commands for first use without changing the delivery trust model:
+The current runtime includes guided commands for first use without changing the delivery trust model:
 
 ```bash
 kafa project doctor --repo /path/to/business-project
@@ -62,7 +64,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . quickstart min
 
 ## Native Host Route Advice
 
-Schema 28 also includes read-only dispatch routing advice:
+The current runtime also includes read-only dispatch routing advice:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . dispatch route-advice --json
@@ -186,7 +188,7 @@ A stable example of the JSON output shape is stored at `docs/runtime/agent-e2e-e
 
 Real connector adapters remain workflow synchronization only. `adapter confirm` can execute GitHub, Linear, Notion, Figma, and Slack operations when `payload_json.execute` is true, but connector results do not create delivery-eligible evidence and do not satisfy controller verification, HMAC/session attestation, integration, or delivery gates.
 
-Schema 28 adds project-level connector namespace state. `project.connector_project_key` identifies the local project, and `connector_profiles` binds that project to existing external targets. Harness does not create Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories.
+Project-level connector namespace state uses `project.connector_project_key` to identify the local project and `connector_profiles` to bind that project to existing external targets. Harness does not create Notion workspaces, Linear workspaces/projects, Slack workspaces/channels, Figma files, or GitHub repositories.
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile status --json
@@ -211,13 +213,13 @@ When a connector action is blocked, the Advisory Fallback Layer writes a local M
 
 ## Target Profiles And Structured Test Semantics
 
-Schema 27 also records target execution policy on `test_targets`: `stack_profile`, `container_image`, `requires_sandbox`, `requires_no_network`, `result_format`, and `result_path`. `dispatch verify-attempt --runner container` resolves images by CLI override, target image, control file, then stack default. The container runner mounts source at `/src:ro`, copies it to writable `/workspace`, keeps `--network none`, and persists stdout plus structured result artifacts under `.ai-team/runtime`.
+Target execution policy is recorded on `test_targets`: `stack_profile`, `container_image`, `requires_sandbox`, `requires_no_network`, `result_format`, and `result_path`. `dispatch verify-attempt --runner container` resolves images by CLI override, target image, control file, then stack default. The container runner mounts source at `/src:ro`, copies it to writable `/workspace`, keeps `--network none`, and persists stdout plus structured result artifacts under `.ai-team/runtime`.
 
 `result_format=regex` remains the compatibility mode for low/medium confidence command evidence. Structured formats (`junit`, `pytest-json`, `jest-json`, `go-json`, `cargo-nextest-json`, `playwright-json`) must parse successfully, report more than zero tests, and have `semantic_status=pass` before controller verification writes trusted pass evidence. Targets that require sandbox or no-network cannot be satisfied by the local runner or unavailable containers.
 
 ## Feature Expansion Freeze
 
-The Phase 0 freeze remains active. New tables, commands, Skills, schema files, core modules, runtime scripts, and runtime states are blocked by `validate_structure.py` and `tests/test_feature_freeze.py` unless a later PR explicitly updates the freeze baseline. v1.11 intentionally extended the freeze baseline with the plugin hook bundle only; v1.12 changed eval, CI, tests, docs, and version metadata without expanding the frozen runtime surface. v1.13 added only root-level packaging and the `kafa` installer/release helper. v1.14 adds a control-plane contract document, root-level doctor checks, tests, and docs. v1.15 explicitly moved the schema baseline to 23 for connector budget/retry audit state; v1.16 moves it to 24 for advisory fallback audit state. v1.17 changes Host Codex provider lifecycle internals; v1.18 changes Host Codex provider execution internals and root package dependencies only. v1.19 intentionally moves the schema baseline to 25 and adds the `cycle` CLI surface for iterative delivery governance. v1.20 intentionally moves the schema baseline to 26 for connector transactional outbox fence and recovery audit state. v1.21 intentionally moves the schema baseline to 27 for target sandbox policy and structured test semantic evidence while only extending existing `test-target add` options. v1.22 intentionally moves the schema baseline to 28 and adds the `connector profile` CLI surface for per-project external target binding. v1.23 keeps schema 28 and adds only Host Codex internal model policy selection plus audit metadata. v1.24 keeps schema 28 and adds guided cold-start CLI surface (`quickstart` and `task accept-ready`) plus root-level `kafa project doctor`. v1.25 keeps schema 28 and adds read-only `dispatch route-advice` so the main model can decide Spark/provider/manual routing before execution. The current stop-ship correctness work moves the storage baseline to schema 29 for cycle-local identities, monotonic quality-gate ordering, and explicit legacy trust downgrade; it does not authorize release. Core files, plugin runtime scripts, Skills, hooks, and delivery trust shortcuts remain frozen.
+The Phase 0 freeze protects public CLI compatibility, schema migration compatibility, delivery/trust invariants, plugin manifest and Hook/Skill surfaces, runtime scripts, and the release installation contract. Internal `core/*.py` filenames are not a product surface: deep modules may be added, split, or renamed when behavior and public contracts remain covered. The current storage baseline is schema 29; changing tables, runtime states, commands, Skills, Hooks, schemas, or trust rules still requires an explicit contract update and migration evidence.
 
 ## Installation And Release Helper
 

@@ -209,23 +209,11 @@ This plugin also bundles Codex lifecycle hooks. Review and trust them with `/hoo
 
 `dispatch integrate` only merges active agent branches that have a verified task attempt, whose current branch head/tree still match that verified attempt, and whose changed files remain within active file claims. Unverified branches, branch drift, and file-claim violations are high findings and fail closed before merge.
 
-For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixture` for the deterministic control-plane regression and `run_agent_e2e_eval.py --mode stability` for the CI release gate. Stability adds fake Host Codex SDK, fake Spark policy routing, multi-role session lifecycle, connector mock server, crash/retry recovery, and SQLite contention stress. `run_agent_e2e_eval.py --mode live-codex` is opt-in only; a skipped live profile is not evidence that real Codex E2E passed. `run_skill_eval.py` is only a transcript marker check.
+For repository-level capability checks, use `run_agent_e2e_eval.py --mode fixture` for the deterministic control-plane regression and `run_agent_e2e_eval.py --mode stability` for the CI release gate. Stability adds fake Host Codex SDK, fake Spark policy routing, multi-role session lifecycle, connector mock server, crash/retry recovery, and SQLite contention stress. `run_agent_e2e_eval.py --mode live-codex` is an explicitly enabled real-host profile: disabled is `not-run`, missing authentication/capability is `blocked`, and neither counts as pass. `run_skill_eval.py` is only a transcript marker check.
 
-From v1.8.1, Phase 0 freezes feature expansion. Harness runtime changes must pass `tests/test_feature_freeze.py`; do not add new tables, commands, Skills, schema files, runtime scripts, core modules, or runtime states unless the PR explicitly updates the freeze baseline and explains why.
+Current maintenance policy freezes public CLI, schema migration, trust, Skill/Hook, runtime script, plugin manifest, installation, and release contracts. Internal core modules may be deepened or renamed when those contracts and regression evidence remain intact. Installation/release changes must pass install smoke, release contract, `kafa doctor`, and the real-host release gate; never make fixture or skipped live behavior stand in for compatibility.
 
-From v1.13.0, installation/release changes must also pass `tests/test_install_release.py`, `python3 -m pip install -e .`, `kafa --version`, and `kafa doctor --repo .`. Keep packaging changes at the repository root; do not use install work as a reason to expand the frozen plugin runtime surface.
-
-From v1.14.0, the harness is treated as an architecture control plane. Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must stay separate. `kafa doctor --repo .` includes a control-plane contract check; if it fails, restore the named boundary instead of weakening Kernel verification or delivery gates.
-
-From v1.15.0, connector adapters have retry/budget/fallback governance. If GitHub, Linear, Notion, Figma, or Slack is rate-limited or unavailable, inspect `adapter_actions.connector_status`, `blocked_reason`, and `connector_budgets`; keep using local `.ai-team/` facts for delivery progress. Connector records still cannot satisfy delivery evidence or replace controller verification.
-
-From v1.16.0, blocked connector actions also generate Advisory Fallback Layer artifacts. Inspect `.ai-team/control/advisory-fallbacks.md` and `docs/harness/advisory-fallbacks/<action-id>.md` for copy-ready GitHub, Linear, Notion, Product Design, or Slack handoff drafts. These are advisory local facts only; do not cite them as delivery evidence, validation, external writes, or HMAC/session trust anchors.
-
-From v1.20.0, connector writes are protected by a transactional outbox. `adapter confirm` must claim `adapter_actions.execution_fence` before calling external APIs, and `unknown` actions must recover by idempotency marker before retrying. Treat `unknown` as unresolved, not successful; connector records still cannot satisfy delivery evidence or replace controller verification.
-
-From v1.21.0, target execution policy is a Kernel fact. Use `test-target add --stack-profile ... --requires-sandbox --requires-no-network --result-format ... --result-path ...` when a target needs a specific stack, no-network container verification, or structured test semantics. Structured result formats must parse as pass with more than zero tests; local runner evidence cannot satisfy sandbox/no-network targets.
-
-From v1.22.0, connector namespace isolation is a Kernel fact. Configure per-project connector profiles before executable connector writes, expect double markers (`project-key` and `idempotency-key`) in external bodies, and treat old single-marker objects as audit candidates only. If a connector is blocked by missing profile, mismatch, token failure, rate limit, or unknown recovery, continue from local `.ai-team/` facts and advisory fallbacks instead of broadening the external scope.
+Connector retry budgets, advisory fallbacks, transactional outbox fences, namespace profiles, target sandbox policy, structured results, and cycle scope are current Kernel facts. Inspect and repair those facts rather than broadening external scope or converting raw connector/provider output into evidence.
 
 The native host owns model selection. The legacy Host Codex bridge may opt into `spark-deterministic` only with an explicit `HARNESS_CODEX_SPARK_MODEL` and an eligible controller-verifiable developer task. This compatibility hint is not a trust anchor.
 
@@ -238,7 +226,7 @@ python3 plugins/codex-project-harness/scripts/harness.py --root <project> dispat
 
 Treat `native-host-small-verified` as a capability hint, not a model slug. The host chooses the concrete model and execution policy; the report does not spawn subagents or create delivery evidence.
 
-From v1.24.0, prefer guided cold-start commands when a project is new or the user is confused about the first loop:
+Use the guided cold-start commands when a project is new or the user is confused about the first loop:
 
 ```bash
 kafa project doctor --repo <project>

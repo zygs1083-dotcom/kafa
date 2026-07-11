@@ -150,41 +150,23 @@ Harness 会在目标项目中维护一个结构化事实源，并生成两类 Ma
 
 这是 SQLite 数据库，保存 project、requirements、acceptance、failure modes、tasks、validations、evidence、tests、findings、invalidations、quality gates、deliveries、adapter mappings、agents、migrations 和 events。SQLite 使用事务、WAL、外键、唯一约束和 task revision/lease/heartbeat 来支持多会话和多 agent 协作。
 
-从 v0.7 开始，运行时引入 **Kernel v3** 一致性内核。CLI 和 legacy wrappers 会经过 `core.api`，写入路径统一经过 schema guard、调度/锁/门禁、事务、event bus、invariant checker 和 projections。SQLite 状态表仍是主事实源；event bus 用于审计和校验，可信恢复路径是 checkpoint snapshot export/import。
+当前运行时是 **Kernel v4.18.0 / schema 29**。它按稳定契约分层：
 
-从 v1.0 开始，交付门禁只接受执行器真实运行并解析出的语义可信证据：passing validation 必须引用 gateable test target，命令必须匹配目标模板，退出码必须为 `0`，`executed_count_source` 必须为 `parsed`，`executed_count` 必须大于 `0`，并保留 stdout SHA-256、artifact path、当前 source tree hash 和 trust anchor。旧自由文本或手填命令证据仍可审计记录，但不具备交付资格。
+- `core.api` 是显式 public API，不会自动暴露内部函数。
+- **Schema Lifecycle** 拥有事务化建表、兼容列与迁移前置条件。
+- **Cycle Ledger** 拥有当前 cycle、baseline identity 与 traceability read model。
+- **Delivery Decision** 只读取 Kernel facts，执行 fail-closed 交付判定。
+- Store、schema guard、event bus、executor、invariant checker 和 projections 分别负责持久化、写前约束、审计、执行证据、不变量和派生视图。
 
-从 v1.0.1 开始，门禁进一步 fail-closed：无 git 项目不会静默跳过代码身份校验，必须显式记录 `--code-identity content-hash`；用于交付的证据必须有非空且当前有效的 source hash；stdout artifact 会在门禁阶段重算 SHA-256；`ci` 与 `external-session` 高信任锚必须来自 connector-origin 契约，manual-origin 记录只作为审计事实。
+Delivery gate 只接受当前 cycle、当前 candidate 的有效事实。可信 command evidence 必须绑定 gateable target、真实退出码、正数执行计数、stdout artifact digest、当前代码身份和适用的 trust anchor；manual 文本、raw provider report、Hook 输出、Connector 结果、advisory fallback 和 eval 结果均不能冒充交付证据。High/critical 风险继续要求外部 CI/session receipt 或 connector(HMAC) reviewer attestation。
 
-从 v1.0.2 开始，connector-origin 不再只看 `verification_token` 是否非空，而是要求宿主保管的 HMAC key 参与校验。运行时从 `HARNESS_CONNECTOR_KEY` 或 `.ai-team/control/connector-key-path.txt` 指向的文件加载 key，并用该 key 计算 CI / external-session verification token。没有 key、token 不匹配、commit SHA 或 conclusion 被篡改时，该记录在门禁中降级为 manual/local-only 等价，不能覆盖 high/critical failure mode。key 本身不得写入 DB、事件、Markdown 或 Git；推荐放在已忽略的 `.ai-team/runtime/connector.key`。
+原生 ChatGPT/Codex 负责 task、thread、subagent、worktree、approval、model、cancel、steer 与 handoff。Kafa 通过 `dispatch route-advice` 输出风险/能力提示，通过 `dispatch native-export` 输出不可变任务包，并把 host receipt 作为 audit-only raw attempt 导入；只有 controller `dispatch verify-attempt` 可以生成 evidence。旧 `host-codex` SDK bridge 是显式、可选、fail-closed 的兼容入口，不是原生生命周期。
 
-从 v1.1.0 开始，任务 lease 使用 fencing 防止过期持有者覆写新持有者工作。`task claim` 和 `task review` 会输出 `fence=<n>`；`task start|heartbeat|submit|complete|accept|block|release` 可传 `--fence <n>`，当任务已被回收或重新交接导致 fence 过期时，写回会以 `fence-stale` 在事务内失败并回滚。
+Connector 写入使用项目 profile、transactional outbox、execution fence、双 marker 和 unknown recovery。Apps/MCP 是长期授权与外部动作边界，但 Codex 0.143.0 尚未公开 result-bound host-verifiable receipt，因此当前五个直连 adapter 明确标记为 `legacy-direct`，结果只用于 workflow sync。
 
-从 v1.1.1 开始，多数写命令支持 `--request-id` 命令幂等。首次执行会在业务事务内写入 `command_log`，重试同一 request id 与相同参数时直接返回首次 stdout，不重复应用业务变更；相同 request id 搭配不同参数会返回 `idempotency-conflict`。`init`、`migrate`、`repair`、`checkpoint create/import` 暂不支持 `--request-id`。
+仓库评测分三层：fixture/stability 是确定性 Kernel 矩阵；isolated install smoke 证明真实 Codex 的插件、Skill 与 Hook discovery；显式启用的 `live-codex` profile 才证明真实宿主 Hook execution、thread/turn、worktree、receipt、verify 与 integrate。`not-run`、`blocked` 或 skipped 不能算能力通过。
 
-从 v1.6.0 开始，独立 QA 不再只依赖 `developer` / `qa-reviewer` 这样的字符串角色。`session attest` 会记录 `agent_sessions` 和 `session_attestations`；connector-origin session attestation 使用宿主保管的 HMAC key 校验 `agent-session:{session_id}:{agent_id}:{role}:{context_id}`。`task submit --session-id` 会保存 producer session，`task review/accept --session-id` 会要求 reviewer session 活跃且与 producer session 不同。旧式不传 session 的流程仍兼容，但只具备 `local-only` 语义。高/critical 风险的最终 delivery gate 需要 connector(HMAC) reviewer session attestation；manual/local session 只能作为审计或 low/medium 风险路径。
-
-从 v1.7.0 开始，控制器复验可以显式使用真实容器执行：`dispatch verify-attempt --runner container [--container-image <image>]` 会在 agent branch 的只读代码副本中用 Docker/Podman 运行目标命令，默认断网、最小资源限制，不挂载宿主 HOME/SSH/Git 凭证，并把 stdout/stderr 由宿主写入 artifact。Docker/Podman 不可用时，container runner 以 `sandbox-unavailable` fail-closed，不会静默降级为 local。`dispatch integrate` 也会在 merge 前强制检查：每个 agent 分支必须有最新 `task_attempt.status=verified`，当前 head/tree 必须匹配复验证据，且 `git diff base..branch` 只能包含该 task/agent 的 active file claims。
-
-从 v1.8.0 开始，仓库新增真实 Agent E2E 评测脚本。`run_agent_e2e_eval.py --mode fixture` 会在临时 Git repo 中调用真实 CLI，覆盖并行成功、依赖阻塞、同文件 claim 冲突、伪造 worker evidence 阻断、集成后回归阻断五个场景，并输出稳定 JSON 指标。`run_skill_eval.py` 仍保留为 transcript marker 检查，但不再代表 Agent 能力评测。
-
-从 v1.12.0 开始，Agent E2E 升级为稳定性矩阵 runner。`--mode stability` 是 CI 发布闸，包含 fixture 五场景、fake Host Codex SDK、三角色 session lifecycle、connector mock server、crash/retry recovery 和 SQLite contention stress；`--mode live-codex` 是 opt-in 宿主真实 Codex profile，只有设置 `HARNESS_E2E_ENABLE_LIVE_CODEX=1` 且本机 Codex 可用时才进入真实 live 路径。未启用 live 时会明确输出 `live_skipped=true` 和 skip reason，这不代表真实 Codex E2E 通过。
-
-从 v1.13.0 开始，仓库新增根级 `kafa` 安装发行助手。`python3 -m pip install -e .` 会安装 stdlib-only 的 `kafa` console script；`kafa plugin install|upgrade|uninstall` 管理 Codex 官方 marketplace JSON，`kafa doctor` 做 Python/Git/manifest/structure 预检。只有使用 legacy Host Codex Provider 时才需要 `python3 -m pip install -e '.[host-codex]'`。该助手只管理本地安装入口，不发布 PyPI，不直接改 Codex cache，也不替代 runtime `harness.py`。
-
-从 v1.14.0 开始，项目将 Skill、Plugin、Hooks、Host Bridge、Kernel、Connectors、Evals 收束为可验证的 Architecture Control Plane。详见 [docs/runtime/CONTROL_PLANE.md](docs/runtime/CONTROL_PLANE.md)。`kafa doctor --repo .` 会检查 control-plane contract：Skill 只是自然语言入口，Hooks 是 advisory，Host/Connector 只产生 raw/audit 记录，可信交付仍由 Kernel controller verification、HMAC/session attestation、integration/delivery gate 决定。
-
-从 v1.15.0 开始，真实 connector adapter 增加韧性和兜底治理。GitHub、Linear、Notion、Figma、Slack 的 probe/write 都会记录 `connector_budgets`，处理 `Retry-After`、429/529 和常见 rate limit 信号；超过 retry budget 的 action 会标记 `blocked` 并写 finding，但本地 `.ai-team/` 事实源仍可继续支持交付流程。写入前会按 idempotency marker 尝试复用已有外部对象，降低外部成功但本地事务未提交后的重复写风险。Connector 结果仍只是 workflow sync，不是 delivery-eligible evidence。
-
-从 v1.16.0 开始，blocked connector 会自动进入 Advisory Fallback Layer：Harness 在本地生成 `docs/harness/advisory-fallbacks/<action-id>.md` 和 `.ai-team/control/advisory-fallbacks.md`，给出 GitHub 草稿、Linear 任务兜底、Notion 文档草稿、Product Design brief/visual QA checklist、Slack handoff summary 等二级替代分析。它只辅助人和 agent 继续推进，不调用真实官方插件，不冒充外部写入，也永远不能满足 delivery evidence。
-
-从 v1.19.0 开始，Kernel 支持持续迭代的 Delivery Cycle 模型。`cycle status --json` 查看当前 cycle；`cycle close --status delivered|archived` 关闭当前 cycle；`cycle start --id <cycle-id> --name <name> --goal <goal>` 开启下一轮。Delivery gate 只检查当前 cycle、当前 candidate 的 active validation、quality gate、invalidation、task 和 high/critical failure-mode coverage。旧 cycle 的失败验证、旧 quality gate 和 stale source hash 保留审计价值，但不会永久阻断新 cycle；新 cycle 也不会自动继承旧证据，必须重新建立当前 candidate 的可信验证。
-
-从 v1.20.0 开始，Connector 写操作使用 Transactional Outbox。`adapter confirm` 会先用短事务和 `execution_fence` claim action，再在事务外执行远程写入，最后用同一 fence CAS 写回 completed；并发 confirm 未抢到 claim 时不会调用远程 API。若写入结果未知，action 会进入 `unknown`，后续 confirm/reconcile 必须先按 idempotency marker 远程恢复，无法确认时 fail-closed。Connector 结果仍只是 workflow sync，不是 delivery-eligible evidence。
-
-从 v1.21.0 开始，Kernel 增加 P1 Reliability Hardening：dispatch run 状态由所有 assignment 聚合，不再被单个任务提前覆盖；`test-target add` 可以记录 `--stack-profile`、`--container-image`、`--requires-sandbox`、`--requires-no-network`、`--result-format` 和 `--result-path`；container verification 使用只读 `/src` 加可写 `/workspace` 的 no-network 沙箱；JUnit、pytest JSON、Jest JSON、go test JSON、cargo nextest JSON 和 Playwright JSON 可作为结构化测试语义证据。需要 sandbox/no-network 的 target 不能通过 local runner 生成可信 pass validation；结构化证据不放宽 HMAC/session attestation、integration 或 delivery gate。
-
-从 v1.22.0 开始，Connector Namespace Isolation 成为 Kernel 事实。每个项目会有 `connector_project_key`，真实 connector 写入前必须先通过 `connector profile set` 绑定已有 GitHub repo、Linear team/project、Notion parent page、Slack channel 或 Figma file。Harness 不自动创建外部 workspace、project、channel、file 或 repo；无 profile 或 scope mismatch 时，`execute=true` 写入 fail-closed，不调用外部 API。外部正文 marker 升级为 `project-key` + `idempotency-key` 双 marker，marker recovery、budget 和 advisory fallback 都按项目隔离。
+真实 Connector 写入前，先把当前项目绑定到允许写入的已有外部目标：
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile set \
@@ -198,18 +180,6 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . connector prof
 ```
 
 原生 ChatGPT/Codex 路径不由 Kafa 选择模型。`dispatch route-advice` 只输出任务风险和 `small_verified_candidate` 能力提示，宿主拥有具体模型、推理、沙箱、审批以及 task/thread/worktree 生命周期。旧 Host Codex Provider 仍保留显式兼容策略：`HARNESS_CODEX_MODEL` 是最高优先级硬覆盖；没有该覆盖时，`HARNESS_CODEX_MODEL_POLICY=spark-deterministic` 必须同时显式设置 `HARNESS_CODEX_SPARK_MODEL=<model>`，且只有满足低风险可复验规则的任务才会选该模型。Kafa 不内置 preview 模型名，模型选择也不是可信 evidence。
-
-从 v1.24.0 开始，冷启动路径分成两类诊断：`kafa doctor --repo <kafa-repo>` 只检查 Kafa/插件源码仓库和 marketplace 安装；`kafa project doctor --repo <business-project>` 检查普通业务项目是否已初始化 Harness，不再要求业务项目包含 `plugins/codex-project-harness/`。项目内可用 `harness.py --root . quickstart status` 查看缺失清单，或用 `quickstart minimal --execute` 在一个已有测试命令上跑通 requirement、acceptance、task、dispatch evidence、validation、quality gate 和 delivery 的最小闭环。
-
-从 v1.25.0 开始，执行前可以运行 `dispatch route-advice [--run-id] [--json]`。它只读分析 ready tasks、test target、failure mode risk 和 agent role，输出 `native-host-small-verified`、`native-host-general`、`main-model-or-manual` 或 `blocked-not-ready`。带 run id 时下一步是 `dispatch native-export`；它不会启动 provider、选择模型或生成 evidence。
-
-从 v1.8.1 开始，仓库进入 Phase 0 功能扩张冻结。该维护版不新增 schema、命令、Skills、状态或运行时抽象，而是通过结构验证和 `tests/test_feature_freeze.py` 固定 runtime surface。v1.15 显式把 schema baseline 提升到 23，允许 connector budget 表、adapter action retry/block 字段和对应 schema 文件；v1.16 显式把 schema baseline 提升到 24，允许 `advisory_fallbacks` 表和对应 schema 文件。v1.17 修复 Host Codex Provider 非阻塞生命周期；v1.18 在 schema 24 内把 Host Codex 执行固定到独立 git worktree 并迁移到 mandatory Codex SDK；v1.19 显式把 schema baseline 提升到 25 并允许 `cycle` CLI surface，用于修复一次性交付模型；v1.20 显式把 schema baseline 提升到 26，用于 connector outbox fence、claim lease 和 unknown recovery 审计；v1.21 显式把 schema baseline 提升到 27，用于 target sandbox policy、stack profile 和 structured test semantic evidence；v1.22 显式把 schema baseline 提升到 28 并允许 `connector profile` CLI surface，用于项目级外部空间边界；v1.23 只增加 legacy Host Codex 内部模型策略和审计元数据；v1.24 在 schema 28 内增加 cold-start guided loop 的 `quickstart` 和 `task accept-ready` 引导入口；v1.25 在 schema 28 内增加只读 `dispatch route-advice`，当前已收束为原生宿主的风险与能力提示。当前 stop-ship correctness 工作把存储基线迁移到 schema 29，为 cycle-local identity、gate sequence 和 legacy trust downgrade 提供可回滚契约；这不是发布声明。Skill/core/script/hook 文件集合仍保持冻结。后续若继续扩张 runtime surface，必须在对应 PR 中显式更新冻结基线并解释原因。
-
-从 v1.11.0 开始，插件自带 Codex lifecycle hooks。安装或更新插件后，用 `/hooks` 审核并信任它们；也可以用 `[features] hooks = false` 关闭 Codex hooks。默认 hooks 只做辅助护栏：`SessionStart` 注入项目状态，`SubagentStart` 提醒角色/任务/验收边界，`PreToolUse` 在需求未确认或无 active task 时提示写入风险，`PostToolUse` 汇总变更，`Stop` 运行 readiness 检查。若插件不在项目默认 `plugins/codex-project-harness` 路径下，设置 `CODEX_PROJECT_HARNESS_PLUGIN_ROOT`。Hooks 不生成可信 evidence，也不能替代 controller verification、integration gate、HMAC/session attestation 或 CI。
-
-从 v1.18.0 开始，现有 `dispatch provider start --provider host-codex` 是非阻塞、worktree-isolated 的 legacy Host Codex SDK 入口。该 provider 需要可选 extra `kafa[host-codex]`，且不能继承当前原生任务的完整权限模型，因此不是新任务的默认编排路径，并默认 fail-closed；只有显式设置 `HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all` 才接受固定的 sandbox/approval 兼容边界。独立 watchdog 执行真实 turn deadline，cancel 尽力终止已知 worker process tree，collect 不再给死亡 worker 续租。由于 detached/reparent helper 无法由 legacy bridge 独立证明已终止，cancel/timeout 一律保持 `verification_failed` 且不自动 replan；可信生命周期确认属于原生宿主。最终 JSON 仍只作为 raw provider report，交付资格仍必须由 controller 复验生成。
-
-从 v1.10.0 开始，现有 `adapter confirm` 在 `adapter_actions.payload_json` 含 `{"execute": true, "operation": "...", "params": {...}}` 时可以执行真实 connector adapter。GitHub 通过 `gh api` 执行；Linear、Notion、Figma、Slack 通过官方 HTTP API 和环境变量 token 执行。外部写入结果只进入 adapter/action 记录，不自动成为 delivery evidence，也不放宽 high/critical 的 HMAC 信任要求。
 
 长期 Connector 边界已在 [Apps/MCP Connector Receipt ADR](docs/runtime/APPS_MCP_RECEIPT_ADR.md) 中锁定：ChatGPT Apps/MCP 负责授权、workspace policy、tool approval 和外部动作，Kafa 只治理 project scope、immutable intent、outbox fence、receipt validation 与 fallback。当前 `gh`/HTTP 路径明确属于 `legacy-direct` 兼容模式；ADR 不代表 receipt runtime 已实现，也不会把 Apps/MCP 工具输出升级为 delivery evidence。
 
@@ -615,10 +585,13 @@ python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/d
 find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec python3 -m json.tool {} \; >/dev/null
 python3 -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
 python3 -m unittest tests/test_control_plane_architecture.py
+python3 -m unittest tests/test_kernel_module_architecture.py tests/test_documentation_contract.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 -m pip install -e .
 kafa --version
+kafa plugin install --repo .
 kafa doctor --repo .
+python3 tests/run_isolated_install_smoke.py --repo .
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
 python3 plugins/codex-project-harness/scripts/run_forward_eval.py
 python3 plugins/codex-project-harness/scripts/run_skill_eval.py
@@ -626,6 +599,8 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixtu
 python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 git diff --check
 ```
+
+发布候选还必须在受保护、已认证的真实宿主上显式运行 `HARNESS_E2E_ENABLE_LIVE_CODEX=1 ... --mode live-codex`。未启用、缺少认证、能力 blocked 或 scenario failed 都会阻止 tag publish。
 
 如果修改了 skill，建议对每个 skill 运行 Codex skill 校验工具。当前仓库的脚本、schema 和运行时单测均保持无第三方运行依赖，方便在普通 Python 环境中验证。
 
@@ -637,15 +612,12 @@ git diff --check
 
 它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译、packaging install、`kafa` doctor、运行时回归测试和 Agent E2E fixture。Ubuntu 额外运行 runtime smoke、forward wrapper、本地 skill eval fixture、Agent E2E stability matrix 和 Kernel 诊断烟测；macOS/Windows 跑可移植子集。
 
-## 版本状态
+## 当前状态
 
-当前 README 描述的是 v1.20 beta / Kernel v4.13 插件格式：
-
-- `plugin.json` 使用官方风格 `interface` 元数据。
-- `skills` 使用插件目录引用。
-- `hooks/hooks.json` 使用 Codex 原生 command hook 配置，并通过 `/hooks` 信任审核运行。
-- 每个 skill 包含 `agents/openai.yaml`。
-- 本地运行时包含 requirement、failure-mode、evidence、test、finding、invalidation、quality-gate 等机器可读 schema，并通过 core schema guard、gate engine、event bus、invariant checker、executor 和 projection 层统一执行。
+- 源码候选：`v1.25.0-beta.1`，`release_state=development`。
+- Kernel：`v4.18.0`；数据库：`schema 29`。
+- 插件包含 12 个 Skills 和 5 个 Codex lifecycle Hooks。
+- 发布仍处于 stop-ship；只有 deterministic matrix 与真实宿主 compatibility profile 同时通过后，tag workflow 才允许进入 publish。
 - 项目目标固定为 verified code delivery，不包含 deployment。
 
 ## License

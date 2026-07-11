@@ -1,6 +1,6 @@
 # Installation
 
-Codex Project Harness is distributed as a local Git/Codex plugin bundle. Phase 6 adds the `kafa` helper CLI for repeatable local marketplace setup; it does not publish to PyPI and does not mutate Codex plugin caches directly.
+Codex Project Harness is distributed as a local Git/Codex plugin bundle. The `kafa` helper CLI provides repeatable local marketplace setup; it does not publish to PyPI and does not mutate Codex plugin caches directly.
 
 `release.json` is the source/tag/package contract. A source checkout marked `release_state=development` is not a published release even when its `VERSION` is newer than the latest GitHub tag. Use `python3 -m kafa.release --json` to inspect that distinction.
 
@@ -71,7 +71,7 @@ codex plugin add codex-project-harness@kafa-local
 kafa doctor --scope user --repo .
 ```
 
-The user-scope doctor is fail-closed: it statically verifies the marketplace entry, copied plugin identity and content, hook definition, Codex cache, and `codex plugin list --json` registration. Creating the marketplace file alone is not reported as a completed Codex installation. Real hook execution is reserved for the isolated CI smoke after Codex installs and trusts the plugin.
+The user-scope doctor is fail-closed: it statically verifies the marketplace entry, copied plugin identity and content, hook definition, Codex cache, and `codex plugin list --json` registration. Creating the marketplace file alone is not reported as a completed Codex installation. The isolated install smoke proves discovery of the installed plugin, 12 Skills, and five Hooks; the authenticated `live-codex` profile proves host Hook execution through real `hook/started` and `hook/completed` events.
 
 Use `--force` only when you intentionally want to replace an existing copied user plugin:
 
@@ -96,6 +96,12 @@ kafa plugin upgrade --scope user --repo .
 ```
 
 Restart Codex after upgrading so it reloads plugin metadata and hooks.
+
+## Release Compatibility Gate
+
+Tag publication requires both the Linux/macOS/Windows deterministic matrix and an authenticated real Codex host profile. Configure a protected GitHub environment named `codex-live-release` and a self-hosted runner labelled `kafa-codex-live`. The runner must have file-based Codex authentication available to its account; credentials must not be committed to this repository or uploaded as evidence.
+
+The release job installs the Codex CLI version pinned by `release.json`, runs `run_agent_e2e_eval.py --mode live-codex`, and retains the JSON report. A missing runner, missing authentication, `not-run`, `blocked`, or failed live scenario prevents `publish`.
 
 ## Uninstall
 
