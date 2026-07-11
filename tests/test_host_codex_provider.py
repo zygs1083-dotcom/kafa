@@ -110,15 +110,7 @@ def wait_for_sdk_events(log_path: Path, *, timeout: float = 5.0) -> list[dict[st
 
 
 def pid_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    if sys.platform != "win32":
-        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], text=True, capture_output=True, check=False).stdout.strip()
-        if not state or state.startswith("Z"):
-            return False
-    return True
+    return agent_provider_core._process_alive(pid)
 
 
 def wait_for_pid_exit(pid: int, *, timeout: float = 5.0) -> bool:
@@ -493,7 +485,7 @@ class HostCodexProviderTest(unittest.TestCase):
             self.assertTrue(metadata["worker_pid"])
             self.assertTrue(metadata["watchdog_pid"])
             self.assertTrue(metadata["deadline_epoch"])
-            self.assertTrue(metadata["report_path_absolute"].endswith("/T1.json"))
+            self.assertEqual(Path(metadata["report_path_absolute"]).name, "T1.json")
             self.assertEqual(metadata["sdk"], "openai-codex")
             self.assertTrue(metadata["report_path"].endswith("/T1.json"))
             self.assertEqual(by_method["thread_start"]["cwd"], str(worktree_path.resolve()))

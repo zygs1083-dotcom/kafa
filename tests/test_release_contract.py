@@ -206,7 +206,8 @@ class ReleaseContractTest(unittest.TestCase):
     def test_install_smoke_wraps_windows_npm_command_shims(self) -> None:
         command = codex_command(r"C:\npm\codex.cmd", "plugin", "list", "--json", platform_name="nt")
 
-        self.assertEqual(command[:4], ["cmd.exe", "/d", "/s", "/c"])
+        self.assertEqual(Path(command[0]).name.lower(), "cmd.exe")
+        self.assertEqual(command[1:4], ["/d", "/s", "/c"])
         self.assertEqual(command[4:], [r"C:\npm\codex.cmd", "plugin", "list", "--json"])
 
 
