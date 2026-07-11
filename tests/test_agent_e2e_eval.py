@@ -31,6 +31,23 @@ def run_eval_process(*args: str, env: dict[str, str] | None = None) -> subproces
 
 
 class AgentE2EEvalTest(unittest.TestCase):
+    def test_git_porcelain_paths_preserve_leading_status_columns(self) -> None:
+        paths = run_agent_e2e_eval.git_porcelain_paths(" M app.py\n?? generated.txt\n")
+
+        self.assertEqual(paths, {"app.py", "generated.txt"})
+
+    def test_live_receipt_is_written_under_ignored_runtime_state(self) -> None:
+        root = Path("/tmp/business")
+
+        receipt = run_agent_e2e_eval.live_receipt_path(root, "RUN-1")
+
+        self.assertEqual(receipt.relative_to(root).as_posix(), ".ai-team/runtime/live-codex/RUN-1/native-receipt.json")
+
+    def test_live_file_claim_uses_native_effective_agent_identity(self) -> None:
+        assignment = {"agent_id": "", "capability": "developer", "owner": "agent-t1"}
+
+        self.assertEqual(run_agent_e2e_eval.effective_assignment_agent(assignment), "developer")
+
     def test_fixture_eval_runs_all_required_scenarios(self) -> None:
         report = run_eval("--mode", "fixture")
 
@@ -141,6 +158,30 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(report["summary"]["skipped_count"], 2)
         self.assertTrue(all(not scenario["pass"] for scenario in report["scenarios"]))
         self.assertIn("HARNESS_E2E_ENABLE_LIVE_CODEX", "; ".join(report["matrix"]["live_skipped_reasons"]))
+
+    def test_live_codex_enabled_without_authenticated_codex_is_blocked(self) -> None:
+        result = run_eval_process(
+            "--mode",
+            "live-codex",
+            env={
+                "HARNESS_E2E_ENABLE_LIVE_CODEX": "1",
+                "HARNESS_E2E_CODEX_BIN": sys.executable,
+            },
+        )
+        report = json.loads(result.stdout)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(report["live_skipped"])
+        self.assertEqual(report["live_status"], "blocked")
+        self.assertEqual(report["summary"]["passed_count"], 0)
+        self.assertGreaterEqual(report["summary"]["failed_count"], 1)
+        self.assertTrue(all(not scenario["skip_reason"] for scenario in report["scenarios"]))
+        self.assertTrue(all(scenario["details"]["capability_status"] == "blocked" for scenario in report["scenarios"]))
+
+    def test_live_codex_has_no_permanent_repository_profile_skip(self) -> None:
+        source = EVAL.read_text(encoding="utf-8")
+
+        self.assertNotIn("no repository-local live profile is configured", source)
 
     def test_should_fail_thresholds(self) -> None:
         base = {

@@ -23,6 +23,7 @@ import textwrap
 import threading
 import time
 from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -31,9 +32,11 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_ROOT = ROOT / "plugins" / "codex-project-harness"
 SCRIPTS_ROOT = PLUGIN_ROOT / "scripts"
-for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
+for path in [ROOT, PLUGIN_ROOT, SCRIPTS_ROOT]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+from kafa.codex_app_server import AppServerClient, validate_app_server_discovery  # noqa: E402
 
 HARNESS = SCRIPTS_ROOT / "harness.py"
 PYTHON = json.dumps(sys.executable)
@@ -66,6 +69,18 @@ def run_harness(
 def run_git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=True)
     return result.stdout.strip()
+
+
+def git_porcelain_paths(output: str) -> set[str]:
+    paths: set[str] = set()
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[1]
+        paths.add(path)
+    return paths
 
 
 def stdout_field(stdout: str, name: str) -> str:
@@ -641,7 +656,7 @@ def matrix_info(profile: str, *, live_skipped_reasons: list[str] | None = None) 
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "git_version": command_version(["git", "--version"]),
-        "codex_available": shutil.which("codex") is not None,
+        "codex_available": bool(live_codex_binary()) if profile == "live-codex" else shutil.which("codex") is not None,
         "container_available": shutil.which("docker") is not None or shutil.which("podman") is not None,
         "connector_mock": profile == "stability",
         "sqlite_stress": profile == "stability",
@@ -1180,6 +1195,7 @@ def summarize(
     *,
     live_skipped: bool = False,
     live_skipped_reasons: list[str] | None = None,
+    live_status: str = "",
 ) -> dict[str, Any]:
     skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
     passed = sum(1 for scenario in scenarios if scenario["pass"] and not scenario.get("skip_reason"))
@@ -1201,18 +1217,18 @@ def summarize(
         "human_intervention_count": 0,
         "duration_seconds": round(time.perf_counter() - started, 6),
     }
-    live_status = "not-applicable"
-    if mode in {"live-command", "live-codex"}:
+    resolved_live_status = live_status or "not-applicable"
+    if not live_status and mode in {"live-command", "live-codex"}:
         if live_skipped:
-            live_status = "not-run"
+            resolved_live_status = "not-run"
         elif failed:
-            live_status = "failed"
+            resolved_live_status = "failed"
         elif scenarios:
-            live_status = "passed"
+            resolved_live_status = "passed"
     return {
         "mode": mode,
         "live_skipped": live_skipped,
-        "live_status": live_status,
+        "live_status": resolved_live_status,
         "matrix": matrix_info(mode, live_skipped_reasons=live_skipped_reasons),
         "token_count": None,
         "estimated_cost": None,
@@ -1272,26 +1288,503 @@ def run_live_command() -> dict[str, Any]:
     return summarize("live-command", [scenario], started)
 
 
+class LiveCapabilityBlocked(RuntimeError):
+    pass
+
+
+def codex_cli_command(codex: str, *args: str) -> list[str]:
+    if os.name == "nt" and Path(codex).suffix.lower() in {".cmd", ".bat"}:
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", codex, *args]
+    return [codex, *args]
+
+
+def live_codex_binary() -> str:
+    configured = os.environ.get("HARNESS_E2E_CODEX_BIN", "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file():
+            return str(path.resolve())
+        return shutil.which(configured) or ""
+    return shutil.which("codex") or ""
+
+
+def run_live_preflight(codex: str) -> str:
+    try:
+        login = subprocess.run(
+            codex_cli_command(codex, "login", "status"),
+            cwd=ROOT,
+            env=os.environ.copy(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LiveCapabilityBlocked(f"Codex login capability is unavailable: {exc}") from exc
+    if login.returncode != 0:
+        detail = (login.stdout + login.stderr).strip()[-1000:]
+        raise LiveCapabilityBlocked(f"Codex is not authenticated: {detail or 'login status failed'}")
+    version = command_version(codex_cli_command(codex, "--version"))
+    expected = f"codex-cli {json.loads((ROOT / 'release.json').read_text(encoding='utf-8'))['codex_cli_smoke_version']}"
+    if version != expected:
+        raise LiveCapabilityBlocked(f"Codex CLI version mismatch: actual={version or '<missing>'} expected={expected}")
+    return version
+
+
+def prepare_live_codex_env(temp_path: Path, codex: str) -> dict[str, str]:
+    live_env = os.environ.copy()
+    live_env.pop("PYTHONPATH", None)
+    home = temp_path / "home"
+    codex_home = temp_path / "codex-home"
+    home.mkdir()
+    codex_home.mkdir()
+    live_env["HOME"] = str(home)
+    live_env["CODEX_HOME"] = str(codex_home)
+
+    configured_auth = os.environ.get("HARNESS_E2E_CODEX_AUTH_FILE", "").strip()
+    source_codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    auth_path = Path(configured_auth).expanduser() if configured_auth else source_codex_home / "auth.json"
+    if auth_path.is_file():
+        target = codex_home / "auth.json"
+        shutil.copyfile(auth_path, target)
+        target.chmod(0o600)
+    elif not os.environ.get("OPENAI_API_KEY"):
+        raise LiveCapabilityBlocked(
+            "live profile needs file-based Codex auth or OPENAI_API_KEY; set HARNESS_E2E_CODEX_AUTH_FILE for an explicit auth file"
+        )
+
+    login = subprocess.run(
+        codex_cli_command(codex, "login", "status"),
+        cwd=temp_path,
+        env=live_env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if login.returncode != 0:
+        raise LiveCapabilityBlocked("isolated Codex home could not use the supplied authentication")
+    return live_env
+
+
+def run_required(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 120) -> str:
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError((result.stdout + result.stderr)[-4000:])
+    return result.stdout
+
+
+def add_live_codex_fixture(root: Path) -> None:
+    (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "test_live_codex.py").write_text(
+        textwrap.dedent(
+            """\
+            import unittest
+
+            import app
+
+
+            class LiveCodexTest(unittest.TestCase):
+                def test_value(self):
+                    self.assertEqual(app.VALUE, 2)
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "app.py", "test_live_codex.py"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add live Codex fixture"], cwd=root, check=True, capture_output=True)
+
+
+def export_native_package(root: Path, run_id: str) -> tuple[Path, dict[str, Any]]:
+    exported = run_harness(root, "dispatch", "native-export", run_id)
+    manifest_path = Path(exported.stdout.strip().split()[-1])
+    if not manifest_path.is_absolute():
+        manifest_path = root / manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    package_path = root / str(manifest["packages"][0]["path"])
+    return package_path, json.loads(package_path.read_text(encoding="utf-8"))
+
+
+def rfc3339_timestamp(value: object) -> str:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        timestamp = time.time()
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def live_receipt_path(root: Path, run_id: str) -> Path:
+    return root / ".ai-team" / "runtime" / "live-codex" / run_id / "native-receipt.json"
+
+
+def effective_assignment_agent(assignment: dict[str, object]) -> str:
+    return str(assignment.get("agent_id") or assignment.get("capability") or assignment.get("owner") or "developer")
+
+
+def execute_live_codex_profile(codex: str, codex_version: str) -> dict[str, Any]:
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    plugin_id = "codex-project-harness@kafa-local"
+    expected_skills = {
+        f"codex-project-harness:{skill.parent.name}"
+        for skill in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")
+    }
+    expected_hook_events = {"sessionStart", "subagentStart", "preToolUse", "postToolUse", "stop"}
+    timeout = max(60, int(os.environ.get("HARNESS_E2E_LIVE_TIMEOUT_SECONDS", "600")))
+    with tempfile.TemporaryDirectory() as temp:
+        temp_path = Path(temp)
+        live_env = prepare_live_codex_env(temp_path, codex)
+        run_required(
+            [sys.executable, "-m", "kafa.cli", "plugin", "install", "--scope", "user", "--repo", str(ROOT)],
+            cwd=ROOT,
+            env=live_env,
+        )
+        added = json.loads(
+            run_required(codex_cli_command(codex, "plugin", "add", plugin_id, "--json"), cwd=temp_path, env=live_env)
+        )
+        cache_root = Path(str(added["installedPath"]))
+
+        root = temp_path / "business"
+        root.mkdir()
+        init_git_repo(root)
+        add_live_codex_fixture(root)
+        run_id = setup_basic_harness(root, ["T1"])
+        assignment = db_rows(
+            root,
+            """
+            select da.task_id, da.agent_id, da.capability, t.owner
+            from dispatch_assignments da
+            join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
+            where da.run_id = ? and da.task_id = 'T1'
+            """,
+            (run_id,),
+        )[0]
+        claim_agent = effective_assignment_agent(dict(assignment))
+        add_file_claim(root, run_id, "T1", claim_agent, "app.py", "", "")
+        _package_path, package = export_native_package(root, run_id)
+        branch = str(package["target_branch"])
+        base_sha = str(package["base_sha"])
+        worktree = temp_path / "codex-worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch, str(worktree), base_sha],
+            cwd=root,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["completed"]},
+                "summary": {"type": "string"},
+            },
+            "required": ["status", "summary"],
+            "additionalProperties": False,
+        }
+        prompt = textwrap.dedent(
+            f"""\
+            Complete one narrow compatibility task in this isolated git worktree.
+            Edit only app.py so `{TEST_COMMAND}` passes, then run exactly `{TEST_COMMAND}`.
+            Do not edit tests, .ai-team, .codex, docs, or git configuration.
+            Return the required JSON object. This is a live compatibility probe; Kafa will independently verify the branch.
+
+            Native package hash: {package['package_sha256']}
+            Target branch: {branch}
+            """
+        )
+        discovery: dict[str, Any]
+        thread_id = ""
+        turn_id = ""
+        turn_completed: dict[str, Any] = {}
+        hook_runs: list[dict[str, Any]] = []
+        thread_result: dict[str, Any] = {}
+        app_server_command = codex_cli_command(codex, "app-server", "--stdio")
+        with AppServerClient(app_server_command, env=live_env, cwd=worktree, timeout=timeout) as client:
+            initialized = client.request(
+                "initialize",
+                {
+                    "clientInfo": {"name": "kafa-live-compatibility", "version": "1"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            client.notify("initialized", {})
+            discovery = {
+                "initialize": initialized,
+                "skills": client.request("skills/list", {"cwds": [str(worktree)], "forceReload": True}),
+                "hooks": client.request("hooks/list", {"cwds": [str(worktree)]}),
+                "plugin": client.request("plugin/installed", {"cwds": [str(worktree)]}),
+            }
+            discovery_report = validate_app_server_discovery(
+                discovery,
+                cache_root=cache_root,
+                plugin_id=plugin_id,
+                version=version,
+                expected_skills=expected_skills,
+                expected_hook_events=expected_hook_events,
+            )
+            thread_result = client.request(
+                "thread/start",
+                {
+                    "cwd": str(worktree),
+                    "ephemeral": True,
+                    "approvalPolicy": "never",
+                    "sandbox": "workspace-write",
+                    "config": {"bypass_hook_trust": True},
+                },
+            )
+            thread_id = str(thread_result["thread"]["id"])
+            turn_result = client.request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": prompt}],
+                    "outputSchema": output_schema,
+                    "approvalPolicy": "never",
+                },
+                timeout=60,
+            )
+            turn_id = str(turn_result["turn"]["id"])
+            turn_completed = client.wait_for_notification(
+                "turn/completed",
+                predicate=lambda message: str(message.get("params", {}).get("turn", {}).get("id", "")) == turn_id,
+                timeout=timeout,
+            )
+            hook_runs = [
+                message["params"]["run"]
+                for message in client.notifications
+                if message.get("method") == "hook/completed"
+                and message.get("params", {}).get("run", {}).get("source") == "plugin"
+                and Path(str(message.get("params", {}).get("run", {}).get("sourcePath", ""))).resolve().is_relative_to(cache_root.resolve())
+            ]
+
+        turn = turn_completed.get("params", {}).get("turn", {})
+        if turn.get("status") != "completed":
+            error = turn.get("error", {})
+            message = str(error.get("message", error))
+            if any(token in message.lower() for token in ["unauthorized", "usage limit", "rate limit", "not available"]):
+                raise LiveCapabilityBlocked(f"live Codex turn capability blocked: {message[-1500:]}")
+            raise RuntimeError(f"live Codex turn failed: {message[-1500:]}")
+        required_host_hook_events = {"sessionStart", "preToolUse", "postToolUse", "stop"}
+        completed_hook_events = {
+            str(run.get("eventName", ""))
+            for run in hook_runs
+            if run.get("status") == "completed"
+        }
+        if not required_host_hook_events.issubset(completed_hook_events):
+            raise RuntimeError(
+                f"host Hook execution incomplete: completed={sorted(completed_hook_events)} runs={hook_runs}"
+            )
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        changed_paths = git_porcelain_paths(status.stdout)
+        if changed_paths != {"app.py"}:
+            raise RuntimeError(f"live Codex changed unexpected paths: {sorted(changed_paths)}")
+        if (worktree / "app.py").read_text(encoding="utf-8").strip() != "VALUE = 2":
+            raise RuntimeError("live Codex did not produce the expected app.py change")
+        subprocess.run(["git", "add", "app.py"], cwd=worktree, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "live Codex compatibility change"], cwd=worktree, check=True, capture_output=True)
+        head_sha = run_git(worktree, "rev-parse", "HEAD")
+        tree_sha = run_git(worktree, "rev-parse", "HEAD^{tree}")
+        worktree_id = "git-worktree-" + hashlib.sha256(str(worktree.resolve()).encode("utf-8")).hexdigest()[:20]
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, check=True, capture_output=True)
+
+        artifact = root / ".ai-team" / "runtime" / "live-codex" / run_id / "turn-completed.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact_payload = {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "turn_status": turn.get("status"),
+            "hook_events": sorted(completed_hook_events),
+        }
+        artifact.write_text(json.dumps(artifact_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        turn_digest = hashlib.sha256(json.dumps(turn_completed, sort_keys=True).encode("utf-8")).hexdigest()
+        receipt = {
+            "receipt_version": "1",
+            "package_sha256": package["package_sha256"],
+            "run_id": run_id,
+            "assignment_id": package["assignment_id"],
+            "host": {
+                "surface": "codex-app-server-live-eval",
+                "task_id": turn_id,
+                "thread_id": thread_id,
+                "parent_thread_id": "",
+                "worktree_id": worktree_id,
+                "worktree_path": str(worktree),
+                "worktree_owner": "live-eval-runner",
+                "handoff_id": "",
+            },
+            "policy": {
+                "approval_mode": "never",
+                "sandbox": "workspace-write",
+                "network": "disabled",
+                "selected_model": str(thread_result.get("model", "host-default")),
+                "reasoning": str(thread_result.get("reasoningEffort") or "host-default"),
+            },
+            "status": "completed",
+            "branch": branch,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "report": {
+                "command": TEST_COMMAND,
+                "exit_code": 0,
+                "stdout_sha256": turn_digest,
+                "artifact_path": artifact.relative_to(root).as_posix(),
+                "executed_count": 1,
+                "executed_count_source": "manual",
+                "source_tree_hash": tree_sha,
+                "branch_name": branch,
+                "status": "success",
+                "target_id": "UNIT",
+            },
+            "started_at": rfc3339_timestamp(turn.get("startedAt")),
+            "completed_at": rfc3339_timestamp(turn.get("completedAt")),
+            "provenance": {
+                "kind": "audit-only",
+                "issuer": "codex-app-server-live-eval",
+                "payload_sha256": turn_digest,
+                "signature": "",
+            },
+        }
+        receipt_path = live_receipt_path(root, run_id)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        evidence_before = len(db_rows(root, "select id from evidence"))
+        imported = run_harness(root, "dispatch", "native-import", run_id, "--receipt", str(receipt_path))
+        evidence_after_import = len(db_rows(root, "select id from evidence"))
+        verified = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
+        evidence_after_verify = len(db_rows(root, "select id from evidence"))
+        accept_task_via_cli(root, "T1")
+        delivery_issues = record_integration_candidate_gate(root, run_id, {"T1": branch})
+        integrated = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
+        target_branch = integrated.stdout.strip().rsplit(" ", 1)[-1] if integrated.returncode == 0 else ""
+        run_status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
+        integrated_value = run_git(root, "show", f"{target_branch}:app.py").strip() if target_branch else ""
+        if not (
+            evidence_before == 0
+            and evidence_after_import == 0
+            and evidence_after_verify > 0
+            and not delivery_issues
+            and integrated.returncode == 0
+            and run_status == "integrated"
+            and integrated_value == "VALUE = 2"
+        ):
+            raise RuntimeError(
+                "live native receipt delivery flow failed: "
+                f"evidence={evidence_before}/{evidence_after_import}/{evidence_after_verify} "
+                f"delivery_issues={delivery_issues} integrate={integrated.returncode} status={run_status} "
+                f"stdout={(integrated.stdout or '')[-1500:]} stderr={(integrated.stderr or '')[-1500:]}"
+            )
+
+        return {
+            "discovery": {
+                "codex_version": codex_version,
+                "plugin_id": discovery_report["plugin_id"],
+                "plugin_version": discovery_report["plugin_local_version"],
+                "skill_count": discovery_report["skill_count"],
+                "hook_events_discovered": discovery_report["hook_events"],
+                "hook_events_executed": sorted(completed_hook_events),
+                "host_hook_execution_observed": True,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "turn_status": turn.get("status"),
+                "sandbox": thread_result.get("sandbox"),
+                "approval_policy": thread_result.get("approvalPolicy"),
+            },
+            "delivery": {
+                "run_id": run_id,
+                "assignment_id": package["assignment_id"],
+                "branch": branch,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "worktree_id": worktree_id,
+                "worktree_owner": "live-eval-runner",
+                "receipt_provenance": "audit-only",
+                "native_subagent_observed": False,
+                "native_subagent_reason": "Codex app-server exposed a real thread/turn but no host child-subagent receipt was requested",
+                "import_stdout": imported.stdout.strip(),
+                "verify_stdout": verified.stdout.strip(),
+                "evidence_before": evidence_before,
+                "evidence_after_import": evidence_after_import,
+                "evidence_after_verify": evidence_after_verify,
+                "integration_returncode": integrated.returncode,
+                "integration_status": run_status,
+                "target_branch": target_branch,
+            },
+        }
+
+
 def run_live_codex() -> dict[str, Any]:
     started = time.perf_counter()
-    reasons: list[str] = []
     if os.environ.get("HARNESS_E2E_ENABLE_LIVE_CODEX") != "1":
-        reasons.append("HARNESS_E2E_ENABLE_LIVE_CODEX is not set to 1")
-    if shutil.which("codex") is None:
-        reasons.append("codex CLI is not available on PATH")
-    if reasons:
+        reasons = ["HARNESS_E2E_ENABLE_LIVE_CODEX is not set to 1"]
         scenarios = [
             skipped_scenario("live_codex_app_server_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
-            skipped_scenario("live_codex_subagent_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
+            skipped_scenario("live_codex_native_receipt_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
         ]
         return summarize("live-codex", scenarios, started, live_skipped=True, live_skipped_reasons=reasons)
-    scenario = skipped_scenario(
-        "live_codex_app_server_e2e",
-        "live Codex execution is enabled but no repository-local live profile is configured",
-        category="live-codex",
-        mode="live-codex",
-    )
-    return summarize("live-codex", [scenario], started, live_skipped=True, live_skipped_reasons=[scenario["skip_reason"]])
+    codex = live_codex_binary()
+    if not codex:
+        reason = "codex CLI is not available on PATH or HARNESS_E2E_CODEX_BIN"
+        scenarios = [
+            scenario_result(name, started, False, {"capability_status": "blocked", "reason": reason}, category="live-codex", mode="live-codex")
+            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+        ]
+        return summarize("live-codex", scenarios, started, live_status="blocked")
+    try:
+        codex_version = run_live_preflight(codex)
+        details = execute_live_codex_profile(codex, codex_version)
+    except LiveCapabilityBlocked as exc:
+        scenarios = [
+            scenario_result(
+                name,
+                started,
+                False,
+                {"capability_status": "blocked", "reason": str(exc)},
+                category="live-codex",
+                mode="live-codex",
+            )
+            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+        ]
+        return summarize("live-codex", scenarios, started, live_status="blocked")
+    except Exception as exc:  # noqa: BLE001 - live report must preserve the failing boundary.
+        scenarios = [
+            scenario_result(
+                name,
+                started,
+                False,
+                {"capability_status": "failed", "error": str(exc)},
+                category="live-codex",
+                mode="live-codex",
+            )
+            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+        ]
+        return summarize("live-codex", scenarios, started)
+    scenarios = [
+        scenario_result(
+            "live_codex_app_server_e2e",
+            started,
+            True,
+            {"capability_status": "passed", **details["discovery"]},
+            category="live-codex",
+            mode="live-codex",
+        ),
+        scenario_result(
+            "live_codex_native_receipt_e2e",
+            started,
+            True,
+            {"capability_status": "passed", **details["delivery"]},
+            category="live-codex",
+            mode="live-codex",
+        ),
+    ]
+    return summarize("live-codex", scenarios, started)
 
 
 def should_fail(report: dict[str, Any]) -> bool:
