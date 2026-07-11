@@ -67,6 +67,17 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
         self.assertIn("def execute_connector_action", runtime)
         self.assertIn("Connector results are workflow synchronization records, not trusted delivery evidence", docs)
 
+    def test_apps_mcp_receipt_gap_is_explicitly_blocked_not_faked(self) -> None:
+        adr = self.read(REPO_ROOT / "docs" / "runtime" / "APPS_MCP_RECEIPT_ADR.md")
+
+        self.assertIn("Blocked pending a host-verifiable tool-result receipt", adr)
+        self.assertIn("Codex CLI 0.143.0", adr)
+        self.assertIn("McpServerToolCallResponse", adr)
+        self.assertIn("McpToolCallThreadItem", adr)
+        self.assertIn("`attestation/generate` is not a connector result receipt", adr)
+        self.assertIn("No Apps/MCP action may", adr)
+        self.assertIn("outbox row to `completed`", adr)
+
     def test_stability_eval_covers_control_plane_boundaries(self) -> None:
         eval_runner = self.read(PLUGIN_ROOT / "scripts" / "run_agent_e2e_eval.py")
 

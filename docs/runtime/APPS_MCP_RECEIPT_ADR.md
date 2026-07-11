@@ -1,7 +1,8 @@
 # ADR: Apps/MCP Connector Receipt Boundary
 
-- Status: Accepted direction; runtime migration not yet implemented
+- Status: Blocked pending a host-verifiable tool-result receipt; accepted risk for `legacy-direct`
 - Date: 2026-07-10
+- Last verified: 2026-07-11 against Codex CLI 0.143.0
 - Scope: GitHub, Linear, Notion, Figma, and Slack connector execution
 - Finding: AP-001
 
@@ -27,6 +28,66 @@ Official references used for this direction:
 
 The `receipt` described below is a Kafa Kernel contract. It is not presented as
 an existing generic receipt API from OpenAI.
+
+## Wave 6 Host Capability Finding
+
+The Wave 6 compatibility audit generated the public app-server JSON schemas
+from Codex CLI 0.143.0 and inspected a real app-server process. The public
+surface proves that Codex owns Apps/MCP discovery, execution, results, and
+approval, but it does not expose the host-verifiable connector receipt required
+by this ADR.
+
+The relevant public shapes are:
+
+- `mcpServer/toolCall` accepts `threadId`, `server`, `tool`, `arguments`, and
+  optional `_meta` in `McpServerToolCallParams`;
+- `McpServerToolCallResponse` returns `content`, optional `structuredContent`,
+  optional `_meta`, and optional `isError`;
+- `McpToolCallThreadItem` exposes a host item `id`, `server`, `tool`,
+  `arguments`, `status`, `result`, `error`, `durationMs`, `pluginId`, and App
+  context such as `connectorId` and `resourceUri`;
+- `item/mcpToolCall/progress` binds progress to `threadId`, `turnId`, and
+  `itemId`;
+- MCP elicitation and auto-review notifications expose approval lifecycle and
+  decisions, but the generated schemas label parts of auto-review as unstable.
+
+Those fields are useful audit correlation, not cryptographic provenance. The
+tool-call response and thread item contain no signature, issuer, verification
+key, signed payload digest, or binding to Kafa's `action_id`, execution fence,
+project key, connector scope, idempotency key, or canonical request hash.
+
+Codex also exposes an opt-in `requestAttestation` initialize capability. It
+causes app-server to ask its client for `attestation/generate`, whose response
+contains one opaque client token for upstream `x-oai-attestation` use.
+`attestation/generate` is not a connector result receipt: the public schema
+does not attach that token to an MCP tool result or bind it to any connector
+operation, approval, scope, arguments, or returned object.
+
+Therefore a current Apps/MCP result remains audit-only. No Apps/MCP action may
+transition a Kafa outbox row to `completed` until a separately reviewed host
+adapter can verify a non-forgeable result envelope with all required bindings.
+Tool-call IDs, completion status, approval, and model-visible structured output
+do not independently satisfy that boundary.
+
+## Current Risk Acceptance
+
+AP-001 is accepted as a bounded compatibility risk for the current development
+release; it is not represented as an implemented Apps/MCP migration. The
+acceptance has these mandatory conditions:
+
+- the five direct connectors remain explicitly named `legacy-direct`;
+- no additional provider-specific direct connector may be added;
+- transactional outbox fences, project namespace profiles, double markers,
+  ambiguous-outcome recovery, and advisory fallback remain mandatory;
+- connector results remain workflow synchronization only and never become
+  delivery evidence;
+- release evidence must state that Apps/MCP host-attested receipt coverage is
+  unavailable on the pinned host contract;
+- the capability must be re-evaluated when Codex publishes a result-bound
+  attestation or when a separately trusted broker/verifier is designed.
+
+This risk acceptance does not authorize silent success, an unsigned receipt,
+or a Kafa-generated substitute for a host signature.
 
 ## Decision
 
@@ -191,10 +252,11 @@ immediate removal would create a compatibility gap and tempt false success.
 
 ## Migration plan
 
-1. Define a versioned receipt JSON schema and pure validator without changing
-   delivery trust.
-2. Add a host capability probe that reports whether tool-call IDs, approval,
-   scope, and host attestation are available.
+1. Re-run the host capability probe against each pinned Codex release and
+   require a documented verifier plus result-bound attestation fields.
+2. Define a versioned receipt JSON schema and pure validator without changing
+   delivery trust only after the host contract can supply the required
+   bindings.
 3. Implement one Apps/MCP receipt adapter behind an explicit compatibility
    profile, starting with a provider whose tool result exposes stable IDs.
 4. Run dual-path evals that compare direct and Apps/MCP scope, idempotency, and
