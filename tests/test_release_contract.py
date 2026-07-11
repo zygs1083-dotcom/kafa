@@ -131,7 +131,7 @@ class ReleaseContractTest(unittest.TestCase):
             root = copy_release_source(Path(temp) / "release")
             changelog = root / "CHANGELOG.md"
             changelog.write_text(
-                changelog.read_text(encoding="utf-8").replace("schema 29", "schema 28", 1),
+                changelog.read_text(encoding="utf-8").replace("schema 29", "schema 28"),
                 encoding="utf-8",
             )
             result = run_release(root)
@@ -140,6 +140,26 @@ class ReleaseContractTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(checks["release notes runtime facts"]["ok"])
+
+    def test_release_contract_rejects_conflicting_schema_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_source(Path(temp) / "release")
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(
+                changelog.read_text(encoding="utf-8").replace(
+                    "### Boundaries",
+                    "- This release also claims stale schema 28 compatibility.\n\n### Boundaries",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            result = run_release(root)
+            report = json.loads(result.stdout)
+            checks = {item["name"]: item for item in report["checks"]}
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(checks["release notes runtime facts"]["ok"])
+        self.assertIn("28", checks["release notes runtime facts"]["details"])
 
     def test_release_workflow_is_tag_gated_and_runs_real_install_smoke(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")

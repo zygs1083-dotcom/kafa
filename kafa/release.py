@@ -103,7 +103,15 @@ def release_report(repo: Path, *, require_tag: bool = False) -> dict[str, Any]:
         str(manifest.get("runtime_version", "")),
     ]
     missing_release_facts = [fact for fact in required_release_facts if fact and fact.lower() not in section.lower()]
-    add_check(checks, "release notes runtime facts", not missing_release_facts, f"missing={missing_release_facts}")
+    expected_schema = int(manifest.get("schema_version_runtime", 0) or 0)
+    schema_claims = {int(value) for value in re.findall(r"\bschema\s+`?(\d+)`?", section, re.IGNORECASE)}
+    unexpected_schema_claims = sorted(schema_claims - {expected_schema})
+    add_check(
+        checks,
+        "release notes runtime facts",
+        not missing_release_facts and not unexpected_schema_claims,
+        f"missing={missing_release_facts} unexpected_schema_claims={unexpected_schema_claims}",
+    )
 
     tag_points_at = git_output(repo, ["tag", "--points-at", "HEAD"]).splitlines()
     if state == "development":
