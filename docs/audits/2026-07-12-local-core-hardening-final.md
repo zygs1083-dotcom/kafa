@@ -84,12 +84,12 @@ different profile.
 
 | Gate | Current result |
 | --- | --- |
-| Complete strict unittest discovery | 375/375 in 137.684 s internal / 137.96 s wall; `ResourceWarning` promoted to error; no skip or expected-failure summary |
+| Complete strict unittest discovery | 375/375 in 138.358 s internal / 138.64 s wall; `ResourceWarning` promoted to error; no skip or expected-failure summary |
 | Install/release targeted suites | 47/47 |
 | Runtime smoke | 2/2; 15 lifecycle commands rc=0; directed/full invariant ratio 48.0696 vs 10x minimum |
 | Skill evaluation | 17/17 ordered markers |
-| Fixture E2E | 6/6 in 4.230512 s; skipped=0, false-pass=0, SQLite-lock=0 |
-| Stability E2E | 11/11 in 6.277928 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| Fixture E2E | 6/6 in 3.942650 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| Stability E2E | 11/11 in 6.307572 s; skipped=0, false-pass=0, SQLite-lock=0 |
 | OpenSpec | `local-core-slimming` and `local-core-hardening` both 4/4 artifacts and valid |
 | Structure/release | plugin structure valid; source release contract valid |
 | Repo-scoped source doctor | pass after `--help`, `--dry-run`, temporary repo install, and cleanup |
@@ -108,18 +108,18 @@ are the delivery authorities for this Kafa-source change.
 Both compact reports bind:
 
 - executable workspace SHA-256:
-  `4edfcdf365dff5e058a0badcfbf5185a7783b00a15d8636d54a8176106823f89`;
+  `a74c924029266b9295ddbe1ca7b327c201dd2df3ac74224f0157610c72120324`;
 - status SHA-256:
-  `b16a52dec1d25f1478e35748d1667f0df99b4f4563f791eb2343c0b4dbc5ccfa`;
-- status entries: 4;
+  `a31636ab32114ac4cc511121e00badad33512ca2e6ead646dfa43617d2d1ae57`;
+- status entries: 1;
 - Codex CLI: `0.143.0`;
 - Native binary SHA-256:
   `d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406`.
 
 | Profile | Result | Tokens | Native runtime | Controller verification |
 | --- | --- | ---: | ---: | --- |
-| Single | passed; only `candidate.py` integrated | 49,530 | 26.678560 s | one structured target, rc=0 |
-| Parallel | passed; disjoint `alpha.py` / `beta.py` producers | 99,918 | 27.004120 s; 26.636331 s producer overlap | two targeted plus combined verification, all rc=0 |
+| Single | passed; only `candidate.py` integrated | 49,929 | 36.823751 s | one structured target, rc=0 |
+| Parallel | passed; disjoint `alpha.py` / `beta.py` producers | 99,726 | 38.826727 s; 35.674098 s producer overlap | two targeted plus combined verification, all rc=0 |
 
 The parallel run demonstrates latency reduction for two disjoint ready tasks,
 not a universal token reduction. Its per-unit token use is essentially the same
@@ -135,10 +135,10 @@ and monetary cost are not exposed, so neither is inferred.
 | Runtime tables | 54 | 27 | 27 | exact |
 | Fresh DB | 552,960 B | 315,392 B | 315,392 B | within 320 KiB budget |
 | Plugin payload, caches excluded | 1,276 KiB | 752 KiB | 856 KiB | within 1.0 MiB budget |
-| Fresh init median | 0.310000 s | 0.114920 s | 0.094813 s | pass |
-| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004918 s | pass vs 0.050 s budget |
-| Full 13-view projection median | not recorded | 0.021977 s | 0.023758 s | measured, not thresholded |
-| Strict full suite | 370 / 406.72 s | 258 / 82.99 s | 375 / 137.684 s | pass vs 300 s local reference budget |
+| Fresh init median | 0.310000 s | 0.114920 s | 0.093471 s | pass |
+| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004703 s | pass vs 0.050 s budget |
+| Full 13-view projection median | not recorded | 0.021977 s | 0.023358 s | measured, not thresholded |
+| Strict full suite | 370 / 406.72 s | 258 / 82.99 s | 375 / 138.358 s | pass vs 300 s local reference budget |
 | In-scope Python LOC | 33,521 | 23,927 | 32,760 | 2.27% below baseline |
 | Test Python LOC | 13,251 | 8,940 | 14,720 | 11.09% above baseline |
 | Plugin Python LOC | 18,878 | 12,971 | 15,899 | 15.78% below baseline |
@@ -157,9 +157,9 @@ The final local artifact run used a real PEP 517 wheel and sdist in a temporary
 venv and temporary HOME:
 
 - wheel SHA-256:
-  `d93234ce395b709b52665cc4e0cfd789a78c857655bfd193a286d51eeb78c9cd`;
+  `38d982a6428a031bf660b09367d7e50765e27ec0a7ac2c27912d666db073e77d`;
 - sdist SHA-256:
-  `85bbb308caadfcb59fccea017865d314931f7290a102a8e3a27867a43f1bbf97`.
+  `8fbddb9c4efeb629c87b18ef4af0de39141a4986929939d12d1b045c79a0c72d`.
 
 It verified wheel import isolation, marketplace discovery, Codex app-server
 discovery, exact 7 Skills / 3 Hooks / 3 templates / 16 schemas / 7 runtime
@@ -208,7 +208,7 @@ same independent reviewers rechecked the incremental correction:
 - trust/source QA reran nine replace-ref, missing-object, gitlink, worktree, and
   Native identity cases; the writable-bit retry catches only `PermissionError`
   and does not weaken any fail-closed assertion; 9/9 PASS;
-- both latest Native reports bind source `4edfcdf3...` and pass strict current
+- both latest Native reports bind source `a74c9240...` and pass strict current
   source/binary/Git/matrix validation.
 
 One Low coverage observation remains: the permanent CRLF byte assertion names
@@ -223,9 +223,12 @@ PR: [#14](https://github.com/zygs1083-dotcom/kafa/pull/14).
 
 The first publication revision `cff9f4a` completed both Ubuntu and both macOS
 jobs successfully, including real artifact build/install. Both Windows jobs
-failed the hardening target with the four exact newline/read-only-fixture
-findings recorded above. Those failures are red evidence, not a pass. The
-corrected uncommitted candidate requires two entirely new matrices.
+failed the hardening target with four newline/read-only-fixture findings. The
+second revision `586929c` again passed both Ubuntu/macOS matrices but Windows
+retained one deterministic dirty-fixture failure: its temporary repository had
+inherited global `core.autocrlf=true` while production identity correctly
+isolated global config. These failures are red evidence, not passes. The current
+self-contained `core.autocrlf=false` fixture requires two entirely new matrices.
 
 | Required new revision | Push matrix | Pull-request matrix |
 | --- | --- | --- |

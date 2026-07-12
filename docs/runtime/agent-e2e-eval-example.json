@@ -2,9 +2,9 @@
   "agent_runtime_seconds": null,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T16:50:11+00:00",
+    "generated_at": "2026-07-12T17:02:40+00:00",
     "git_dirty": true,
-    "git_head": "cff9f4a2483405a76d72c19941ba4aa0c9bcb0d7",
+    "git_head": "586929ca8eae394f8a7b22eb478aaac584d52a34",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -17,9 +17,9 @@
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 4,
-    "status_sha256": "b16a52dec1d25f1478e35748d1667f0df99b4f4563f791eb2343c0b4dbc5ccfa",
-    "workspace_sha256": "4edfcdf365dff5e058a0badcfbf5185a7783b00a15d8636d54a8176106823f89"
+    "status_entry_count": 1,
+    "status_sha256": "a31636ab32114ac4cc511121e00badad33512ca2e6ead646dfa43617d2d1ae57",
+    "workspace_sha256": "a74c924029266b9295ddbe1ca7b327c201dd2df3ac74224f0157610c72120324"
   },
   "evidence_scope": "deterministic-local-runtime",
   "live_skipped": false,
@@ -51,7 +51,7 @@
           "qa-reviewer.toml"
         ]
       },
-      "duration_seconds": 0.170904,
+      "duration_seconds": 0.165578,
       "mode": "local",
       "name": "fresh_local_install_and_init",
       "pass": true,
@@ -68,7 +68,7 @@
         "task_status": "submitted",
         "validations": 1
       },
-      "duration_seconds": 0.337155,
+      "duration_seconds": 0.334116,
       "mode": "local",
       "name": "quickstart_stops_before_independent_review",
       "pass": true,
@@ -83,7 +83,7 @@
           "superseded"
         ]
       },
-      "duration_seconds": 0.547934,
+      "duration_seconds": 0.540592,
       "mode": "local",
       "name": "current_candidate_supersedes_stale_validation",
       "pass": true,
@@ -98,7 +98,7 @@
         "false_pass_count": 0,
         "forged_evidence_block_count": 1
       },
-      "duration_seconds": 0.975102,
+      "duration_seconds": 0.963087,
       "mode": "local",
       "name": "manual_evidence_cannot_satisfy_delivery",
       "pass": true,
@@ -111,7 +111,7 @@
         "false_pass_count": 0,
         "finding_block_count": 1
       },
-      "duration_seconds": 0.566912,
+      "duration_seconds": 0.557003,
       "mode": "local",
       "name": "open_high_finding_blocks_delivery",
       "pass": true,
@@ -125,7 +125,7 @@
         "false_pass_count": 0,
         "human_intervention_count": 0
       },
-      "duration_seconds": 1.251184,
+      "duration_seconds": 1.229006,
       "mode": "local",
       "name": "high_risk_requires_human_review",
       "pass": true,
@@ -139,7 +139,7 @@
         "policy_block_count": 2,
         "structured_zero_blocked": true
       },
-      "duration_seconds": 0.711853,
+      "duration_seconds": 0.684336,
       "mode": "local",
       "name": "structured_and_no_network_policy_fail_closed",
       "pass": true,
@@ -154,7 +154,7 @@
           "CYCLE-next"
         ]
       },
-      "duration_seconds": 0.417153,
+      "duration_seconds": 0.415638,
       "mode": "local",
       "name": "cycle_isolation",
       "pass": true,
@@ -170,7 +170,7 @@
         "sqlite_lock_error_count": 0,
         "thread_leak_count": 0
       },
-      "duration_seconds": 0.498609,
+      "duration_seconds": 0.607767,
       "mode": "local",
       "name": "sqlite_contention_stress",
       "pass": true,
@@ -195,7 +195,7 @@
         "schema27_success_version": 30,
         "schema27_target_version": 30
       },
-      "duration_seconds": 0.287961,
+      "duration_seconds": 0.299275,
       "mode": "local",
       "name": "schema27_29_migration_and_rollback",
       "pass": true,
@@ -212,7 +212,7 @@
         "skill_count": 7,
         "template_count": 3
       },
-      "duration_seconds": 0.482213,
+      "duration_seconds": 0.482113,
       "mode": "local",
       "name": "installed_plugin_surface",
       "pass": true,
@@ -220,7 +220,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 6.277928,
+    "duration_seconds": 6.307572,
     "expected_human_review_required_count": 1,
     "failed_count": 0,
     "false_pass_count": 0,

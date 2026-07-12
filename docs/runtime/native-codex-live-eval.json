@@ -1,10 +1,10 @@
 {
-  "agent_runtime_seconds": 26.67856,
+  "agent_runtime_seconds": 36.823751,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T16:50:18+00:00",
+    "generated_at": "2026-07-12T17:02:41+00:00",
     "git_dirty": true,
-    "git_head": "cff9f4a2483405a76d72c19941ba4aa0c9bcb0d7",
+    "git_head": "586929ca8eae394f8a7b22eb478aaac584d52a34",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -17,9 +17,9 @@
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 4,
-    "status_sha256": "b16a52dec1d25f1478e35748d1667f0df99b4f4563f791eb2343c0b4dbc5ccfa",
-    "workspace_sha256": "4edfcdf365dff5e058a0badcfbf5185a7783b00a15d8636d54a8176106823f89"
+    "status_entry_count": 1,
+    "status_sha256": "a31636ab32114ac4cc511121e00badad33512ca2e6ead646dfa43617d2d1ae57",
+    "workspace_sha256": "a74c924029266b9295ddbe1ca7b327c201dd2df3ac74224f0157610c72120324"
   },
   "evidence_scope": "live-codex",
   "live_skipped": false,
@@ -66,17 +66,17 @@
         ],
         "last_message_recorded": true,
         "native_returncode": 0,
-        "native_runtime_seconds": 26.67856,
+        "native_runtime_seconds": 36.823751,
         "native_runtime_source": "controller-wall-clock",
-        "native_token_count": 49530,
+        "native_token_count": 49929,
         "native_token_scope": "native-producers-only",
         "native_token_source": "codex-json-turn.completed",
         "native_usage": {
-          "cached_input_tokens": 18432,
-          "input_tokens": 49063,
-          "output_tokens": 467,
-          "reasoning_output_tokens": 14,
-          "token_count": 49530
+          "cached_input_tokens": 35840,
+          "input_tokens": 49312,
+          "output_tokens": 617,
+          "reasoning_output_tokens": 0,
+          "token_count": 49929
         },
         "pre_edit_returncode": 1,
         "producer_changed_files": [
@@ -94,7 +94,7 @@
         "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
         "workload_units": 1
       },
-      "duration_seconds": 27.940507,
+      "duration_seconds": 38.133121,
       "mode": "live-codex",
       "name": "native_codex_edit_and_controller_verify",
       "pass": true,
@@ -102,7 +102,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 27.940528,
+    "duration_seconds": 38.133152,
     "expected_human_review_required_count": 0,
     "failed_count": 0,
     "false_pass_count": 0,
@@ -114,12 +114,12 @@
     "skipped_count": 0,
     "sqlite_lock_error_count": 0
   },
-  "token_count": 49530,
+  "token_count": 49929,
   "token_usage": {
-    "cached_input_tokens": 18432,
-    "input_tokens": 49063,
-    "output_tokens": 467,
-    "reasoning_output_tokens": 14,
-    "token_count": 49530
+    "cached_input_tokens": 35840,
+    "input_tokens": 49312,
+    "output_tokens": 617,
+    "reasoning_output_tokens": 0,
+    "token_count": 49929
   }
 }

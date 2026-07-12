@@ -1033,25 +1033,28 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
             subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
             subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
                 ["git", "config", "user.email", "kafa@example.invalid"],
                 cwd=root,
                 check=True,
             )
-            (root / ".gitignore").write_text(
-                "\n".join(
-                    [
-                        *harness_db.RUNTIME_GITIGNORE_PATTERNS,
-                        "runtime_extension.py",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            (root / ".gitignore").write_bytes(
+                (
+                    "\n".join(
+                        [
+                            *harness_db.RUNTIME_GITIGNORE_PATTERNS,
+                            "runtime_extension.py",
+                        ]
+                    )
+                    + "\n"
+                ).encode("utf-8")
             )
-            (root / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "loader.py").write_text(
-                "import runtime_extension\n",
-                encoding="utf-8",
-            )
+            (root / "candidate.py").write_bytes(b"VALUE = 1\n")
+            (root / "loader.py").write_bytes(b"import runtime_extension\n")
             extension = root / "runtime_extension.py"
             extension.write_text("VALUE = 1\n", encoding="utf-8")
             subprocess.run(

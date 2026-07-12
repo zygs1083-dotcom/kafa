@@ -343,5 +343,5 @@
 ## 55. Windows newline and Git-object fixture portability follow-up
 
 - [x] 55.1 Main model: preserve the first new-HEAD Windows matrix failures proving projection text-mode writes produce CRLF bytes, a post-commit fixture rewrite fabricates a dirty candidate, and read-only loose Git objects cannot be removed by the missing-object tests.
-- [x] 55.2 Main model: publish projection and project-state content as explicit UTF-8 LF bytes, make the delivery fixture rewrite tracked source with exact LF bytes, and restore the user-write bit only when a Windows loose-object deletion reports `PermissionError`.
+- [x] 55.2 Main model: publish projection and project-state content as explicit UTF-8 LF bytes, make the delivery fixture a self-contained `core.autocrlf=false` repository with exact tracked LF bytes, and restore the user-write bit only when a Windows loose-object deletion reports `PermissionError`.
 - [ ] 55.3 Checkpoint: rerun projection determinism, delivery identity, missing/replace-object tests, complete strict regression, artifacts, both OpenSpec validations, fresh QA, and both complete new-HEAD three-platform matrices before merge.
