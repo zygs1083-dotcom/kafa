@@ -64,3 +64,8 @@
 - [x] 8.1 Main model: preserve the real Windows `WinError 32` log as red evidence and add a deterministic regression requiring the quickstart database reader to close its connection.
 - [x] 8.2 Main model: explicitly close the isolated-install SQLite reader without changing user installation scope or plugin behavior.
 - [ ] 8.3 Checkpoint: rerun install/release tests, full regression, Native reports, artifact smoke, OpenSpec validation, fresh QA, and the complete new three-platform CI matrix.
+
+## 9. Windows sentinel path-alias follow-up
+
+- [x] 9.1 Main model: preserve both `RUNNER~1` versus `runneradmin` CI failures and make the project-doctor regression compare the resolved sentinel path while retaining PID and operator-remediation assertions.
+- [ ] 9.2 Checkpoint: rerun install/release and full strict regression, update final audit evidence, and require both new three-platform matrices to pass before closing 8.3 or merging.

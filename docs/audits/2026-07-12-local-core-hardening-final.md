@@ -8,12 +8,12 @@
 - Baseline `main` and `origin/main`:
   `adba3691d859c0ffc93d75cc148d8f916314cc49`
 - Native evaluation `HEAD`:
-  `e44dbcec96ffd5d83795745143c2a3d41e26aedf`
+  `72da2f0661d4d821d5fa31fe1781ad483cba5a02`
 - Executable workspace SHA-256:
-  `ac50ee3e576347c5e794c7610dc5a78b1cb2ca186ba1ebb3c3ee2b1f076fdf60`
+  `05dbf61b46e5e3d177cae528568203f5b6b8b613f2d17aab0df3e3506acd587a`
 - Executable status SHA-256:
-  `b46aad3ed8e82b0c319c7e823790d0239f605d4e7513d9375697d12d811360c7`
-- Executable status entries: 2
+  `fd0c300989a9f6a3a40f438b72cb71e370f5c6f8152abba71fd4414c4069d269`
+- Executable status entries: 1
 - Schema/runtime: 30 / 5.0.0
 - Candidate source release: `2.0.0-beta.1` / `2.0.0b1`
 - Native evaluation state: intentionally uncommitted and dirty with an empty
@@ -21,10 +21,10 @@
   changes HEAD/status without changing the bound executable bytes.
 
 The hardening implementation and authorized local verification are complete.
-The OpenSpec checklist is 42/43: publication checkpoint 8.3 remains open until
-the current Windows handle fix completes both a push and pull-request
-Ubuntu/macOS/Windows matrix. The change closes the three original stop-ship
-findings, seven High and six Medium adversarial or publication-QA findings, and
+The OpenSpec checklist is 43/45: publication checkpoints 8.3 and 9.2 remain
+open until the current Windows path-alias fix completes both a push and
+pull-request Ubuntu/macOS/Windows matrix. The change closes the three original
+stop-ship findings, seven High and seven Medium adversarial or publication-QA findings, and
 the cross-platform defects exposed by the remote matrices. It adds no table,
 command, Skill, Hook, template, network
 dependency, Connector, or Host lifecycle. The source remains a local-only
@@ -68,7 +68,8 @@ production changes.
 | Medium | Delivery status did not persist/project the exact `same-context-degraded` or `accepted-risk` result | Delivery facts and Markdown projections now retain the evaluated decision status; `delivery.schema.json` and `quality-gate.schema.json` use exact enums. |
 | Medium | A committed Native report could never keep matching the current `HEAD/status`, because committing the report necessarily changes both | Report generation and `should_fail` keep strict current-Git validation. Persisted evidence may retain its historical Git metadata, but current executable bytes and source scope must still match exactly. Time must be timezone-aware ISO-8601 and Git identity must be a nonzero object-ID shape; source-digest changes remain blocking. |
 | Medium | Packaged Skill/template instructions implied that risk acceptance could waive structured execution or independent review prerequisites | All packaged operating instructions now require structured current-candidate execution, exact `reviewed-local`, and distinct non-empty contexts first; acceptance covers only each named remaining risk. |
-| Medium | The final audit retained the prior Native identity, 303-test count, benchmark, and an obsolete multi-agent optimization claim after the Windows handle follow-up | This revision binds the audit to the current executable digest, 304-test regression, current benchmark and Native reports. It no longer claims token savings and records only a 1.13% latency improvement with 13.61% more tokens per parallel unit in the latest comparable run. |
+| Medium | The final audit retained the prior Native identity, 303-test count, benchmark, and an obsolete multi-agent optimization claim after the Windows handle follow-up | The audit now binds to the current executable digest, 304-test regression, benchmark and Native reports. It records the paired cross-run range instead of selecting one favorable sample and makes no general token-saving claim. |
+| Medium | The audit claimed the Windows 8.3 short-path assertion had been fixed, but a shared install-release test still compared `RUNNER~1` with `runneradmin` lexically | The two `72da2f0` Windows failures are preserved below. The regression now compares `sentinel.resolve()` with the canonical diagnostic path and independently requires the migration code, sentinel filename, PID, and operator remediation. |
 
 Eight additional adversarial test methods produced 13 expected assertion
 failures plus one schema-contract `KeyError` before these corrections. All
@@ -157,12 +158,13 @@ profile.
 | Gate | Result |
 | --- | --- |
 | Final affected strict matrix | 73/73, `ResourceWarning` promoted to error |
-| Windows install/release targeted matrix | 45/45, 18.652 s internal / 18.76 s wall, `ResourceWarning` promoted to error |
-| Complete strict unittest discovery | 304/304, 82.479 s internal / 82.70 s wall, no skip or expected failure |
-| Runtime smoke | 2/2; directed/full invariant ratio 47.266x against the 10x minimum |
+| Windows handle install/release targeted matrix | 45/45, 18.652 s internal / 18.76 s wall, `ResourceWarning` promoted to error |
+| Windows path-alias install/release targeted matrix | 30/30, 17.573 s internal / 17.81 s wall, `ResourceWarning` promoted to error |
+| Complete strict unittest discovery | 304/304, 79.772 s internal / 80.02 s wall, no skip or expected failure |
+| Runtime smoke | 2/2; directed/full invariant ratio 47.126x against the 10x minimum |
 | Skill evaluation | 17/17 required markers |
-| Fixture E2E | 6/6 in 4.245 s; zero skip, false-pass, or SQLite-lock errors |
-| Stability E2E | 11/11 in 6.713 s; zero skip, false-pass, or SQLite-lock errors |
+| Fixture E2E | 6/6 in 4.373 s; zero skip, false-pass, or SQLite-lock errors |
+| Stability E2E | 11/11 in 6.742 s; zero skip, false-pass, or SQLite-lock errors |
 | Final migration QA | 61/61, including the Windows handle regression; no Critical, High, or Medium finding |
 | Final trust QA | 27/27 plus 5/5 caller/delta tests and three exploit probes |
 
@@ -182,16 +184,16 @@ context.
 | Metric | Schema 29 baseline | Pre-hardening schema 30 | Hardened schema 30 | Hardening delta |
 | --- | ---: | ---: | ---: | ---: |
 | Fresh DB | 552,960 B | 315,392 B | 315,392 B | 0 B |
-| Fresh init median | 0.310000 s | 0.114920 s | 0.097284 s | -15.35% |
-| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.005317 s | +21.12% |
-| Full 13-projection median | not recorded | 0.021977 s | 0.028242 s | +28.51% |
-| Full strict suite | 370 / 406.72 s | 258 / 82.99 s | 304 / 82.70 s | +46 tests; timings not workload-equivalent |
+| Fresh init median | 0.310000 s | 0.114920 s | 0.102425 s | -10.87% |
+| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.005680 s | +29.38% |
+| Full 13-projection median | not recorded | 0.021977 s | 0.026911 s | +22.45% |
+| Full strict suite | 370 / 406.72 s | 258 / 82.99 s | 304 / 80.02 s | +46 tests; timings not workload-equivalent |
 | Total Python LOC | 33,521 | 23,927 | 27,107 | +3,180 / +13.29% |
 | Test Python LOC | 13,251 | 8,940 | 11,045 | +2,105 / +23.55% |
 | Plugin Python LOC | 18,878 | 12,971 | 13,934 | +963 / +7.42% |
 
-The 5k mutation median is 0.005317 seconds, 89.4% below the mandatory
-0.050-second ceiling. Full projection is 0.028242 seconds. The safety
+The 5k mutation median is 0.005680 seconds, 88.6% below the mandatory
+0.050-second ceiling. Full projection is 0.026911 seconds. The safety
 tests and implementation increase LOC relative to the slimmer candidate, but
 the user-approved original slimming deviation remains unchanged in status: the
 35%-45% total/test reduction target was not met and is not relabeled as a pass.
@@ -212,33 +214,37 @@ an impossible self-referential commit hash.
 
 | Profile | Work | Tokens | Controller wall | Native producer wall | Verification |
 | --- | --- | ---: | ---: | ---: | --- |
-| Single | one isolated producer; only `candidate.py` changed | 49,863 | 32.706 s | 31.559 s | one targeted controller check, rc=0 |
-| Parallel | two isolated producers; only `alpha.py` and `beta.py` changed | 113,295 | 64.671 s | 62.038 s; 42.204 s overlap | two targeted plus one combined check, all rc=0 |
+| Single | one isolated producer; only `candidate.py` changed | 63,259 | 50.174 s | 48.974 s | one targeted controller check, rc=0 |
+| Parallel | two isolated producers; only `alpha.py` and `beta.py` changed | 99,364 | 39.826 s | 37.194 s; 33.437 s overlap | two targeted plus one combined check, all rc=0 |
 
-Two sequential single units project to 65.411 controller seconds. The current
-parallel profile takes 64.671 seconds, only a 1.13% latency reduction
-(`1.011x`) for this disjoint task. Its average is 56,647.5 tokens per unit,
-13.61% above the single run. Repeated profiles also show material run-to-run
-variance, so this result establishes neither a meaningful latency advantage
-nor a token saving. The evidence supports one producer or a shared-context
-batch as the token-conservative default. Parallel fan-out is justified only
-for ready, disjoint work with deterministic tests and an actual latency SLA;
-it does not support a claim that multiple agents lower token use by themselves.
+Two sequential current single units project to 100.348 controller seconds. The
+current parallel profile takes 39.826 seconds, a 60.31% latency reduction
+(`2.520x`), and averages 49,682 tokens per unit, 21.46% below this single run.
+The immediately preceding matched pair pointed the other way: only 1.13%
+latency improvement and 13.61% more tokens per parallel unit. An earlier pair
+showed a large latency gain but approximately equal per-unit tokens. Direction
+and magnitude are therefore not stable enough to claim a general token saving.
+The evidence supports one producer or a shared-context batch as the
+token-conservative default. Parallel fan-out is justified for ready, disjoint
+work with deterministic tests and a real latency SLA; task-level telemetry
+should decide whether its variable context duplication is worth paying.
 Actual model identity and monetary cost are not exposed and are not inferred.
 
 ## Artifact and installation evidence
 
-The previous hardened revision produced real source and wheel artifacts:
+The committed Windows handle-fix revision `72da2f0` produced real source and
+wheel artifacts:
 
 - wheel SHA-256:
-  `c3e701cef3bca7a46b35bc6fd38bdf4996533e59399f09069dbcd6178309dea0`
+  `49d3cd83910a0f46ca87d9392660b89e58a52193de9de96003ee5dffb01acb51`
 - source archive SHA-256:
-  `c93841e44711557a53c2e5df20db6d23560543f41c1a606b8e9fdeb407f72df2`
+  `58e593f43247d48ac71ee192832c64b21351ceba3f372d97bebcd40798051d1a`
 
-Those hashes predate the Windows isolated-install handle follow-up and are not
-presented as final artifacts for the current candidate. The current commit will
-be rebuilt and reinstalled before publication checkpoint 8.3 closes; its hashes
-replace these historical values in the final documentation-only closure.
+Those hashes predate the Windows path-alias regression correction and are not
+presented as final artifacts for the current candidate. The correction commit
+will be rebuilt and reinstalled before publication checkpoints 8.3 and 9.2
+close; its hashes replace these historical values in the final
+documentation-only closure.
 
 Each artifact passed installation in a temporary venv and temporary HOME. The
 installed payload had exactly 7 Skills, 3 Hooks, 3 templates, 16 schemas, and
@@ -271,7 +277,8 @@ runtime evidence in this delivery.
 ### Publication follow-up
 
 After the user authorized publication, PR #14's remote matrices exposed four
-additional portability defects rather than converting `not-run` into a pass:
+additional portability defects and one incomplete test remediation rather than
+converting `not-run` into a pass:
 
 - Windows rejected `os.fsync()` on read-only file descriptors during the
   verified backup path. The backup and migration file helpers now open existing
@@ -293,14 +300,23 @@ additional portability defects rather than converting `not-run` into a pass:
   `close()` exactly once. The red evidence is the
   [pull-request Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29185088379/job/86629628860)
   and [push Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29185087298/job/86629625806).
+- The published handle-fix revision `72da2f0` proved the isolated install smoke
+  itself on Windows, then both Windows jobs failed in the separate
+  install-release suite because one retained assertion still compared the 8.3
+  alias `RUNNER~1` with the canonical `runneradmin` path lexically. The runtime
+  diagnostic was already canonical and actionable. The regression now compares
+  `sentinel.resolve()` and separately requires the migration code, PID, and
+  operator instruction. Red evidence is the
+  [pull-request Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29186024025/job/86632147207)
+  and [push Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29186022910/job/86632144289).
 
 The portability and publication-QA fixes passed 304/304 local tests and
 regenerated both Native reports against the final executable digest above.
-At the current local checkpoint, the published `e44dbce` head has four passing
-Ubuntu/macOS jobs and the two Windows failures above. The handle fix is still
-unpublished, so its new push and pull-request six-job matrix is `not-run`, not
-passed. Remote follow-up results remain PR-owned evidence and are not
-backfilled into the historical pre-publication table.
+At the current local checkpoint, the published `72da2f0` head has four passing
+Ubuntu/macOS jobs and the two path-alias Windows failures above. The corrected
+assertion is still unpublished, so its new push and pull-request six-job matrix
+is `not-run`, not passed. Remote follow-up results remain PR-owned evidence and
+are not backfilled into the historical pre-publication table.
 
 ## Residual risks and explicit boundaries
 

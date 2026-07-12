@@ -573,7 +573,12 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertFalse(initialized["ok"])
         self.assertIn("migration-in-progress", initialized["details"])
-        self.assertIn(str(sentinel), initialized["details"])
+        self.assertIn(str(sentinel.resolve()), initialized["details"])
+        self.assertIn("pid=999999", initialized["details"])
+        self.assertIn(
+            "inspect the owner and remove it only after confirming no migration is active",
+            initialized["details"],
+        )
         self.assertEqual(report["next_commands"], [])
 
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
