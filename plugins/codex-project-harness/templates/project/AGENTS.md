@@ -17,7 +17,8 @@ This project uses Codex Project Harness.
 - Treat Native Codex/ChatGPT as the sole owner of task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle.
 - Subagents return code or review evidence through the Native Host without mutating Kafa state.
 - Independently verify the current local candidate before recording delivery facts; never substitute self-reported or fabricated evidence.
-- Require `human-review-required` for high or critical risk without verifiable provenance unless the user explicitly accepts and records the complete risk.
+- High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata.
+- If any high/critical prerequisite is missing, require `human-review-required`.
 - Separate producer and reviewer roles.
 - Stop at verified code handoff; deployment and production operations are outside this harness.
 - Report verification evidence with every completed task.

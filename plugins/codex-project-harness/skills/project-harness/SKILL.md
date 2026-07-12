@@ -189,7 +189,8 @@ harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
 
 Container verification must really run with no network when the target requires it. Unavailable container capability fails closed; do not call it sandbox verification.
 
-High or critical work without verifiable current-candidate execution provenance and distinct producer/reviewer context must return `human-review-required`, unless the user explicitly accepts every remaining risk with complete, current, unexpired metadata. Never fabricate Host, CI, HMAC, Connector, or receipt provenance.
+High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata. Never fabricate Host, CI, HMAC, Connector, or receipt provenance.
+If any prerequisite is missing, the result is `human-review-required`.
 
 ## Quality Review And Delivery Handoff
 

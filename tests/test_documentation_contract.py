@@ -153,6 +153,18 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("verify run", quality)
         self.assertIn("human-review-required", quality)
 
+    def test_high_risk_acceptance_cannot_waive_review_prerequisites(self) -> None:
+        for relative in [
+            "plugins/codex-project-harness/skills/project-harness/SKILL.md",
+            "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md",
+            "plugins/codex-project-harness/templates/project/AGENTS.md",
+        ]:
+            text = self.read(relative)
+            self.assertIn("structured current-candidate execution", text, relative)
+            self.assertIn("reviewed-local", text, relative)
+            self.assertIn("distinct non-empty producer/reviewer contexts", text, relative)
+            self.assertIn("Risk acceptance cannot waive these prerequisites", text, relative)
+
     def test_project_harness_defines_a_bounded_host_delegation_matrix(self) -> None:
         skill = self.read("plugins/codex-project-harness/skills/project-harness/SKILL.md")
         reference_path = "plugins/codex-project-harness/references/delegation-matrix.md"
@@ -350,6 +362,7 @@ class DocumentationContractTest(unittest.TestCase):
             self.assertEqual(
                 run_agent_e2e_eval.report_consistency_errors(
                     report,
+                    require_current_binary=False,
                     require_current_git_state=False,
                 ),
                 [],

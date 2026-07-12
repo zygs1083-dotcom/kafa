@@ -38,6 +38,28 @@ class InjectedLocalCoreMigrationFailure(LocalCoreMigrationError):
     """Deterministic failure used to prove migration rollback boundaries."""
 
 
+def _sqlite_integer(value: object) -> int | None:
+    return value if type(value) is int else None
+
+
+def _positive_sqlite_integer(value: object, *, field: str) -> int:
+    integer = _sqlite_integer(value)
+    if integer is None or integer <= 0:
+        raise LocalCoreMigrationError(
+            f"schema 29 {field} must be a positive SQLite integer: {value!r}"
+        )
+    return integer
+
+
+def _sqlite_flag(value: object, *, field: str) -> int:
+    integer = _sqlite_integer(value)
+    if integer not in {0, 1}:
+        raise LocalCoreMigrationError(
+            f"schema 29 {field} must be an exact SQLite flag (0 or 1): {value!r}"
+        )
+    return integer
+
+
 @dataclass(frozen=True)
 class LocalCoreStagingReport:
     source_version: int
@@ -334,7 +356,10 @@ def _copy_project(
             "status": str(project["status"]),
             "scope_status": str(project["scope_status"]),
             "current_owner": str(project["current_owner"]),
-            "revision": max(1, int(project["revision"])),
+            "revision": _positive_sqlite_integer(
+                project["revision"],
+                field="project.revision",
+            ),
             "updated_at": str(project["updated_at"]),
         },
     )
@@ -399,7 +424,10 @@ def _copy_tasks(
                 "evidence": row.get("evidence") or "",
                 "submitted_context_id": submitted_context_id,
                 "accepted_by": row.get("accepted_by") or "",
-                "revision": max(1, int(row.get("revision") or 1)),
+                "revision": _positive_sqlite_integer(
+                    row.get("revision"),
+                    field=f"task {row.get('id')}.revision",
+                ),
                 "updated_at": row["updated_at"],
             },
         )
@@ -461,7 +489,10 @@ def _copy_quality_gates(
                 "result": row["result"],
                 "blocking_findings": row.get("blocking_findings") or "",
                 "residual_risk": row.get("residual_risk") or "",
-                "reviewed_revision": int(row.get("project_revision") or 0),
+                "reviewed_revision": _positive_sqlite_integer(
+                    row.get("project_revision"),
+                    field=f"quality gate {row.get('id')}.project_revision",
+                ),
                 "created_at": row["created_at"],
             },
         )
@@ -516,15 +547,20 @@ def _eligible_execution(
         return False, "evidence is not a command execution"
     if not str(evidence.get("verified_by") or "").startswith("controller"):
         return False, "evidence was not written by the controller executor"
-    if target is None or not bool(int(target.get("gateable") or 0)):
+    if target is None:
         return False, "evidence target is missing or not gateable"
+    gateable = _sqlite_integer(target.get("gateable"))
+    if gateable != 1:
+        return False, "evidence target gateable flag is not the exact SQLite integer 1"
     command = str(evidence.get("command") or "")
     if not command or not command_matches_template(command, str(target.get("command_template") or "")):
         return False, "evidence command does not match target template"
-    if evidence.get("exit_code") is None or int(evidence["exit_code"]) != 0:
-        return False, "evidence exit code is not zero"
-    if int(evidence.get("executed_count") or 0) <= 0:
-        return False, "evidence executed count is not positive"
+    exit_code = _sqlite_integer(evidence.get("exit_code"))
+    if exit_code != 0:
+        return False, "evidence exit code is not the exact SQLite integer zero"
+    executed_count = _sqlite_integer(evidence.get("executed_count"))
+    if executed_count is None or executed_count <= 0:
+        return False, "evidence executed count is not a positive SQLite integer"
     if str(evidence.get("executed_count_source") or "") not in {"parsed", "structured"}:
         return False, "evidence count was not parsed from executor output"
     if str(evidence.get("policy_status") or "") not in {"allowed", "pass"}:
@@ -537,13 +573,17 @@ def _eligible_execution(
         return False, "evidence candidate does not match validation candidate"
     if not _artifact_matches(project_root, evidence.get("artifact_path"), evidence.get("stdout_sha256")):
         return False, "evidence artifact is missing or has a digest mismatch"
-    requires_sandbox = bool(int(target.get("requires_sandbox") or 0))
-    requires_no_network = bool(int(target.get("requires_no_network") or 0))
+    requires_sandbox = _sqlite_integer(target.get("requires_sandbox"))
+    requires_no_network = _sqlite_integer(target.get("requires_no_network"))
+    if requires_sandbox not in {0, 1} or requires_no_network not in {0, 1}:
+        return False, "evidence target policy flags are not exact SQLite flags"
     sandbox_status = str(evidence.get("sandbox_status") or "")
-    no_network = bool(int(evidence.get("no_network") or 0))
-    if requires_sandbox and sandbox_status != "available":
+    no_network = _sqlite_integer(evidence.get("no_network"))
+    if no_network not in {0, 1}:
+        return False, "evidence no_network is not an exact SQLite flag"
+    if requires_sandbox == 1 and sandbox_status != "available":
         return False, "target requires an available sandbox"
-    if requires_no_network and (sandbox_status != "available" or not no_network):
+    if requires_no_network == 1 and (sandbox_status != "available" or no_network != 1):
         return False, "target requires an available no-network sandbox"
     return True, "controller execution is migration-eligible"
 
@@ -612,7 +652,11 @@ def _copy_execution_validation_facts(
                 result_format = str(evidence.get("result_format") or target.get("result_format") or "regex")
                 semantic_status = str(evidence.get("semantic_status") or "") or "pass"
                 sandbox_status = str(evidence.get("sandbox_status") or "") or "not-requested"
-                runner = "container" if sandbox_status == "available" or bool(int(evidence.get("no_network") or 0)) else "local"
+                runner = (
+                    "container"
+                    if sandbox_status == "available" or evidence.get("no_network") == 1
+                    else "local"
+                )
                 _insert(
                     destination,
                     "executions",
@@ -622,15 +666,15 @@ def _copy_execution_validation_facts(
                         "candidate_sha": candidate_sha,
                         "target_id": target_id,
                         "command": evidence["command"],
-                        "exit_code": int(evidence["exit_code"]),
+                        "exit_code": evidence["exit_code"],
                         "stdout_sha256": str(evidence["stdout_sha256"]),
                         "artifact_path": str(evidence["artifact_path"]),
-                        "executed_count": int(evidence["executed_count"]),
+                        "executed_count": evidence["executed_count"],
                         "result_format": result_format,
                         "semantic_status": semantic_status,
                         "runner": runner,
                         "sandbox_status": sandbox_status,
-                        "no_network": int(evidence.get("no_network") or 0),
+                        "no_network": evidence.get("no_network"),
                         "policy_status": str(evidence.get("policy_status") or "allowed"),
                         "created_at": str(evidence["created_at"]),
                     },
@@ -801,7 +845,21 @@ def _copy_schema29_local_facts(
     _copy_tasks(source, destination, current_cycle_id, session_contexts)
     for relation in ("task_acceptance", "task_failure_modes", "task_dependencies"):
         _copy_intersection(source, destination, relation, transform=normalize_cycle)
-    _copy_intersection(source, destination, "test_targets")
+    def validate_test_target_flags(values: dict[str, object]) -> dict[str, object]:
+        target_id = values.get("id")
+        for field in ("gateable", "requires_sandbox", "requires_no_network"):
+            values[field] = _sqlite_flag(
+                values.get(field),
+                field=f"test target {target_id}.{field}",
+            )
+        return values
+
+    _copy_intersection(
+        source,
+        destination,
+        "test_targets",
+        transform=validate_test_target_flags,
+    )
     _copy_intersection(source, destination, "task_test_targets", transform=normalize_cycle)
     (
         converted_execution_count,
@@ -987,11 +1045,7 @@ def stage_schema29_to_schema30(
             for table, count in source_counts.items()
             if table not in SCHEMA30_TABLES
         }
-        descriptor = os.open(staging_path, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _fsync_path(staging_path)
         return LocalCoreStagingReport(
             source_version=29,
             target_version=SCHEMA30_VERSION,
@@ -1110,7 +1164,8 @@ def _timestamp() -> str:
 
 
 def _fsync_path(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows' CRT rejects os.fsync/_commit on a read-only descriptor.
+    with path.open("rb+") as handle:
         os.fsync(handle.fileno())
 
 
@@ -1209,6 +1264,22 @@ def _create_projection_backup(root: Path, backup_dir: Path) -> dict[str, object]
     }
 
 
+def _make_projection_writable(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        return
+    os.chmod(path, stat.S_IMODE(path.stat().st_mode) | stat.S_IWUSR)
+
+
+def _unlink_projection_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        if path.is_symlink() or not path.is_file():
+            raise
+        _make_projection_writable(path)
+        path.unlink()
+
+
 def _restore_projection_backup(root: Path, projection_backup: dict[str, object]) -> None:
     entries = projection_backup.get("entries")
     if not isinstance(entries, list):
@@ -1239,7 +1310,7 @@ def _restore_projection_backup(root: Path, projection_backup: dict[str, object])
                     raise LocalCoreMigrationError(
                         f"cannot remove projection path created during failed migration because it is a directory: {relative_path}"
                     )
-                target.unlink()
+                _unlink_projection_file(target)
                 _fsync_directory(target.parent)
             continue
         if existed is not True:
@@ -1267,16 +1338,34 @@ def _restore_projection_backup(root: Path, projection_backup: dict[str, object])
         ):
             raise LocalCoreMigrationError(f"projection recovery copy is missing or invalid: {relative_path}")
 
+        if (
+            not target.is_symlink()
+            and target.is_file()
+            and _sha256_file(target) == digest
+            and stat.S_IMODE(target.stat().st_mode) == mode
+        ):
+            continue
+
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
         try:
             shutil.copyfile(backup_path, temporary)
-            os.chmod(temporary, mode)
-            _fsync_path(temporary)
+            # Open while writable, then restore a possibly read-only mode and
+            # flush through the already-write-capable descriptor.  Reopening
+            # with rb+ after chmod fails for valid 0444 projections.
+            with temporary.open("rb+") as handle:
+                os.chmod(temporary, mode)
+                os.fsync(handle.fileno())
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    raise LocalCoreMigrationError(
+                        f"cannot replace projection rollback target because it is a directory: {relative_path}"
+                    )
+                _make_projection_writable(target)
             os.replace(temporary, target)
             _fsync_directory(target.parent)
         finally:
-            temporary.unlink(missing_ok=True)
+            _unlink_projection_file(temporary)
         if (
             target.is_symlink()
             or not target.is_file()

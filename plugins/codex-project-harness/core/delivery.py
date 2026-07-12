@@ -40,10 +40,20 @@ class LocalTrustDecision:
     reasons: tuple[str, ...]
 
 
+def _sqlite_integer(value: object) -> int | None:
+    return value if type(value) is int else None
+
+
 def _positive_integer(value: object) -> int | None:
-    if type(value) is not int or value <= 0:
+    integer = _sqlite_integer(value)
+    if integer is None or integer <= 0:
         return None
-    return value
+    return integer
+
+
+def _sqlite_flag(value: object) -> int | None:
+    integer = _sqlite_integer(value)
+    return integer if integer in {0, 1} else None
 
 
 def _timestamp(value: object) -> datetime | None:
@@ -318,9 +328,23 @@ def execution_issues(
     if target is None:
         issues.append(f"{label} has no registered test target")
     else:
-        if int(target["gateable"] or 0) != 1:
+        gateable = _sqlite_flag(target["gateable"])
+        requires_sandbox = _sqlite_flag(target["requires_sandbox"])
+        requires_no_network = _sqlite_flag(target["requires_no_network"])
+        if gateable != 1:
             issues.append(
-                f"{label} target is not gateable: {target_id} {target['gate_block_reason']}"
+                f"{label} target gateable must be the exact SQLite integer 1: "
+                f"{target_id} actual={target['gateable']!r} {target['gate_block_reason']}"
+            )
+        if requires_sandbox is None:
+            issues.append(
+                f"{label} target requires_sandbox is not an exact SQLite flag: "
+                f"{target['requires_sandbox']!r}"
+            )
+        if requires_no_network is None:
+            issues.append(
+                f"{label} target requires_no_network is not an exact SQLite flag: "
+                f"{target['requires_no_network']!r}"
             )
         if not command_matches_template(
             str(execution["command"] or ""),
@@ -329,17 +353,27 @@ def execution_issues(
             issues.append(f"{label} command does not match target {target_id}")
         if str(execution["result_format"] or "") != str(target["result_format"] or "regex"):
             issues.append(f"{label} result format does not match target {target_id}")
-        if int(target["requires_sandbox"] or 0) and str(execution["sandbox_status"] or "") != "available":
+        if requires_sandbox == 1 and str(execution["sandbox_status"] or "") != "available":
             issues.append(f"{label} target requires an available sandbox")
-        if int(target["requires_no_network"] or 0) and (
+        if requires_no_network == 1 and (
             str(execution["sandbox_status"] or "") != "available"
-            or int(execution["no_network"] or 0) != 1
+            or _sqlite_flag(execution["no_network"]) != 1
         ):
             issues.append(f"{label} target requires an available no-network sandbox")
-    if int(execution["exit_code"]) != 0:
-        issues.append(f"{label} exit_code={execution['exit_code']}")
-    if int(execution["executed_count"] or 0) <= 0:
-        issues.append(f"{label} executed_count={execution['executed_count']}")
+    if _sqlite_flag(execution["no_network"]) is None:
+        issues.append(
+            f"{label} no_network is not an exact SQLite flag: {execution['no_network']!r}"
+        )
+    if _sqlite_integer(execution["exit_code"]) != 0:
+        issues.append(
+            f"{label} exit_code is not the exact SQLite integer zero: "
+            f"{execution['exit_code']!r}"
+        )
+    if _positive_integer(execution["executed_count"]) is None:
+        issues.append(
+            f"{label} executed_count is not a positive SQLite integer: "
+            f"{execution['executed_count']!r}"
+        )
     if str(execution["semantic_status"] or "") != "pass":
         issues.append(f"{label} semantic_status={execution['semantic_status'] or 'empty'}")
     if str(execution["policy_status"] or "") not in {
@@ -573,6 +607,7 @@ def evaluate_schema30_delivery(
         ).fetchall()
     }
     risk_acceptances: list[dict[str, object]] = []
+    required_risk_ids = {str(row["id"]) for row in risky_modes}
     for failure_mode in risky_modes:
         if failure_mode["status"] in {"accepted", "exempt"}:
             risk_acceptances.append(
@@ -637,6 +672,23 @@ def evaluate_schema30_delivery(
         (cycle_id, candidate),
     ).fetchall()
     for finding in findings:
+        if finding["status"] not in {"resolved", "false-positive"}:
+            finding_risk_id = f"finding:{finding['id']}"
+            risk_levels.add(str(finding["severity"]))
+            required_risk_ids.add(finding_risk_id)
+            if finding["status"] == "accepted":
+                risk_acceptances.append(
+                    {
+                        "risk_id": finding_risk_id,
+                        "risk": finding["severity"],
+                        "status": finding["status"],
+                        "actor": finding["waived_by"],
+                        "reason": finding["waiver_reason"],
+                        "scope": finding["waiver_scope"],
+                        "revision": finding["waived_revision"],
+                        "expires_at": finding["waiver_expires_at"],
+                    }
+                )
         if _finding_blocks(
             finding,
             cycle_id=cycle_id,
@@ -706,7 +758,7 @@ def evaluate_schema30_delivery(
             root,
             validation,
             candidate,
-            require_structured=bool(risky_modes),
+            require_structured=bool(risk_levels & HIGH_RISK_LEVELS),
         )
         for validation in validations
         if validation["result"] == "pass"
@@ -718,7 +770,7 @@ def evaluate_schema30_delivery(
         reviewer_context_id=reviewer_context_id,
         review_status=review_status,
         risk_acceptances=risk_acceptances,
-        required_risk_ids={str(row["id"]) for row in risky_modes},
+        required_risk_ids=required_risk_ids,
         current_revision=revision,
         now=observed_at or now_iso(),
     )

@@ -46,3 +46,15 @@
 - [x] 6.3 Main model: remediate every critical/high finding and any unaccepted medium finding, then rerun affected tests and both reviews.
 - [x] 6.4 Main model: update the final audit with superseded findings, red/green evidence, before/after performance, installation truth, live status, remote-CI status, and remaining limitations.
 - [x] 6.5 Final checkpoint: confirm every `local-core-hardening` task is checked, both OpenSpec changes validate, the worktree contains only planned/user changes, and no commit, push, merge, tag, release, deploy, or active-user installation occurred.
+
+## 7. Publication QA revision integrity follow-up
+
+- [x] 7.1 Main model: add deterministic schema-27/28/29 staging red tests proving fractional, textual, zero, and negative project/gate revisions cannot be coerced into current schema-30 trust metadata.
+- [x] 7.2 Main model: add a red delivery integration proving an accepted high/critical finding still requires `reviewed-local` and cannot pass through `same-context-degraded`.
+- [x] 7.3 Main model: add a red documentation contract proving risk acceptance cannot waive structured execution, exact `reviewed-local`, or distinct non-empty contexts.
+- [x] 7.4 Main model: add a red migration test proving fractional command-result and policy flags cannot become immutable execution evidence.
+- [x] 7.5 Main model: replace migration trust coercion with exact SQLite-integer validation, include remaining high/critical findings in trust evaluation, align packaged instructions, and leave no activatable staging database on revision rejection.
+- [x] 7.6 Main model: add a red active-runtime regression proving fractional execution results and policy flags cannot pass delivery evaluation after direct SQLite tampering.
+- [x] 7.7 Main model: make schema-30 delivery evaluation require exact SQLite integers and flags for all gateable execution metadata.
+- [x] 7.8 Checkpoint: rerun migration/trust targeted suites, complete strict regression, Native identity checks, artifact install, and both independent reviews against the fixed workspace.
+- [x] 7.9 Publication gate: record the final audit evidence and retain the PR rule that the new pushed HEAD's complete Ubuntu/macOS/Windows matrix is required before merge.

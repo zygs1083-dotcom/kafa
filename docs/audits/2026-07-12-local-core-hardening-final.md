@@ -5,13 +5,15 @@
 - OpenSpec change: `local-core-hardening`
 - Parent change: `local-core-slimming`
 - Candidate branch: `v2-local-core-slimming`
-- `HEAD`, `main`, and `origin/main`:
+- Baseline `main` and `origin/main`:
   `adba3691d859c0ffc93d75cc148d8f916314cc49`
+- Native evaluation `HEAD`:
+  `2ac40a3e79ab2977a8ba3c841f0ed693ef25fd1f`
 - Executable workspace SHA-256:
-  `625faadd5af8e0247a8d053b088652c5d10d4dfe5a44488d3f9caf6c58b88c60`
+  `68dbed438a91b81f3a8d5ca8c3cbd3846cedf7b3207c63ab8bff2d737cbda6ee`
 - Executable status SHA-256:
-  `8666fc5b827d80cb35b10469fc936021a61bceb925ef0113dd7f683850ca0811`
-- Executable status entries: 181
+  `40852112f38c89647ca561b8215abbae2863d05169a702a982094ca6ae7e832b`
+- Executable status entries: 12
 - Schema/runtime: 30 / 5.0.0
 - Candidate source release: `2.0.0-beta.1` / `2.0.0b1`
 - Native evaluation state: intentionally uncommitted and dirty with an empty
@@ -19,9 +21,9 @@
   changes HEAD/status without changing the bound executable bytes.
 
 The hardening change is complete for the authorized local scope. It closes the
-three original stop-ship findings, the later three High and three Medium
-adversarial findings, and the publication-boundary evidence defect found during
-pre-push review. It adds no table, command, Skill, Hook, template, network
+three original stop-ship findings, seven High and five Medium adversarial or
+publication-QA findings, and the cross-platform defects exposed by the first CI
+matrix. It adds no table, command, Skill, Hook, template, network
 dependency, Connector, or Host lifecycle. The source remains a local-only
 verified delivery kernel.
 
@@ -53,11 +55,16 @@ production changes.
 | --- | --- | --- |
 | High | Schema 27/28/29 migration could use a legacy session ID as if it were producer/reviewer context | Migration now copies only real, non-empty context metadata. Missing or shared context remains empty and `same-context-degraded`; session identity never promotes review. |
 | High | Whitespace, case variants, or unknown `review_status` could cross a trust branch inconsistently | Only canonical `reviewed-local` and `same-context-degraded` values are accepted. Every noncanonical value fails closed; JSON schema enums match runtime behavior. |
-| High | SQLite REAL revision values such as `1.9` could be truncated with `int()` and appear current | Revision parsing now rejects non-integral REAL/TEXT/negative values across project, gate, accepted-risk, and finding checks. |
+| High | Active schema-30 REAL revision values such as `1.9` could be truncated with `int()` and appear current | Runtime revision parsing rejects non-integral REAL/TEXT/negative values across project, gate, accepted-risk, and finding checks. |
+| High | Schema 27/28/29 migration could truncate or clamp malformed project/gate revisions and make stale risk acceptance current | Project, task, and gate revisions now require exact positive SQLite integers; fractional, textual, zero, and negative values fail staging with no activatable database. |
+| High | A complete accepted high/critical finding was treated as nonblocking without making the trust path high-risk | Every unresolved or accepted high/critical finding now contributes a named risk; accepted metadata is revalidated, structured execution is required, degraded review remains blocked, and reviewed-local delivery is labeled `accepted-risk`. |
+| High | Fractional legacy `exit_code`, `executed_count`, or policy flags could be coerced into immutable schema-30 execution evidence | Migration now accepts only exact SQLite integers/flags; malformed evidence is ineligible and its validation is invalidated, while malformed target flags abort staging. |
+| High | Active delivery evaluation could similarly coerce fractional execution or target metadata after direct DB tampering | Delivery evaluation independently checks exact gateable/sandbox/no-network flags, exact zero exit code, and positive integer execution count before trusting an immutable execution. |
 | Medium | Invalidated legacy validations could lose a valid `superseded_by` chain | Schema 27/29 migration retains valid supersession edges while invalidating unauthoritative judgments. The published schema-28 fixture has no source `validations` table and therefore no chain to preserve. |
 | Medium | Unknown low/medium review state could be promoted to `reviewed-local` | Unknown state fails closed; canonical low/medium degraded review remains allowed only with the explicit degraded label. |
 | Medium | Delivery status did not persist/project the exact `same-context-degraded` or `accepted-risk` result | Delivery facts and Markdown projections now retain the evaluated decision status; `delivery.schema.json` and `quality-gate.schema.json` use exact enums. |
 | Medium | A committed Native report could never keep matching the current `HEAD/status`, because committing the report necessarily changes both | Report generation and `should_fail` keep strict current-Git validation. Persisted evidence may retain its historical Git metadata, but current executable bytes and source scope must still match exactly. Time must be timezone-aware ISO-8601 and Git identity must be a nonzero object-ID shape; source-digest changes remain blocking. |
+| Medium | Packaged Skill/template instructions implied that risk acceptance could waive structured execution or independent review prerequisites | All packaged operating instructions now require structured current-candidate execution, exact `reviewed-local`, and distinct non-empty contexts first; acceptance covers only each named remaining risk. |
 
 Eight additional adversarial test methods produced 13 expected assertion
 failures plus one schema-contract `KeyError` before these corrections. All
@@ -67,7 +74,14 @@ The publication-boundary regression first failed because the persisted-report
 mode did not exist, then the existing documentation contract failed on the old
 workspace digest after the focused fix changed executable source. After new
 real Native single and parallel runs, the focused report contract passed 2/2,
-the evaluator module passed, and the complete suite passed 296/296.
+the evaluator module passed, and that pre-push suite passed 296/296.
+
+Fresh publication QA then added six deterministic red methods. They produced
+19 intended assertion failures and five intended error paths across revision
+laundering, accepted-finding review, migrated command evidence, active runtime
+tampering, and instruction drift. After remediation, all cases were green and
+the complete strict suite passed 303/303. No negative trust or migration test
+was weakened or removed.
 
 ## Migration and recovery evidence
 
@@ -98,9 +112,10 @@ projection restore. Exact bytes, modes, SHA-256 values, absence/presence state,
 backup manifest paths, and schema 27/28/29 facts are checked. No operation lock,
 sentinel, partial, restore, or temporary database remains after handled runs.
 
-Independent migration QA reran 40 strict targeted tests in 3.058 seconds and
-the fork/context/supersession probes. It found no Critical, High, or Medium
-finding and changed no file.
+Independent migration QA reran 60 strict operation-lock, schema migration,
+schema lifecycle, backup, store, and doctor tests plus three read-only
+projection probes. It found no remaining Critical, High, or Medium finding and
+changed no file.
 
 ## Delivery-trust and ownership evidence
 
@@ -117,10 +132,10 @@ remains `human-review-required` even with distinct-looking IDs and complete
 risk acceptance. Only a canonical fresh distinct `reviewed-local` gate can
 enter the procedural `accepted-risk` path.
 
-Independent trust QA reran four targeted groups totaling 46 tests, an
-independent Native-report validator, a malformed SQLite matrix, and an
-execution-tampering probe. It found no Critical, High, Medium, or Low finding
-and changed no file.
+Independent trust QA reran the complete 27-test delivery-policy suite, five
+focused caller/delta tests, three original exploit probes, and an AST audit of
+all 13 `evaluate_local_trust` call sites. It found no remaining Critical, High,
+or Medium finding and changed no file.
 
 Native Codex/ChatGPT remains sole owner of task execution, subagents,
 worktrees, approvals, model selection, cancellation, and handoff. Kafa owns
@@ -137,16 +152,16 @@ profile.
 
 | Gate | Result |
 | --- | --- |
-| Affected strict matrix | 144/144, `ResourceWarning` promoted to error |
-| Complete strict unittest discovery | 296/296, 94.492 s internal / 94.78 s wall, no skip or expected failure |
+| Final affected strict matrix | 73/73, `ResourceWarning` promoted to error |
+| Complete strict unittest discovery | 303/303, 82.569 s internal / 82.76 s wall, no skip or expected failure |
 | Runtime smoke | 2/2 |
 | Skill evaluation | 17/17 required markers |
 | Fixture E2E | 6/6; zero skip, false-pass, or SQLite-lock errors |
 | Stability E2E | 11/11; zero skip, false-pass, or SQLite-lock errors |
-| Final migration QA | 40/40 plus bounded fork/context probes |
-| Final trust QA | 46/46 plus report/tamper probes |
+| Final migration QA | 60/60 plus three read-only projection probes |
+| Final trust QA | 27/27 plus 5/5 caller/delta tests and three exploit probes |
 
-Python compilation, release and plugin structure validation, all 24 JSON
+Python compilation, release and plugin structure validation, all 25 JSON
 documents, both OpenSpec changes, both Native report consistency checks, and
 `git diff --check` all passed again at the final checkpoint.
 The hardening benchmark is persisted in
@@ -162,16 +177,16 @@ context.
 | Metric | Schema 29 baseline | Pre-hardening schema 30 | Hardened schema 30 | Hardening delta |
 | --- | ---: | ---: | ---: | ---: |
 | Fresh DB | 552,960 B | 315,392 B | 315,392 B | 0 B |
-| Fresh init median | 0.310000 s | 0.114920 s | 0.123897 s | +7.81% |
-| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004956 s | +12.89% |
-| Full 13-projection median | not recorded | 0.021977 s | 0.024376 s | +10.92% |
-| Full strict suite | 370 / 406.72 s | 258 / 82.99 s | 296 / 94.78 s | +38 tests; timings not workload-equivalent |
-| Total Python LOC | 33,521 | 23,927 | 26,641 | +2,714 / +11.34% |
-| Test Python LOC | 13,251 | 8,940 | 10,733 | +1,793 / +20.06% |
-| Plugin Python LOC | 18,878 | 12,971 | 13,780 | +809 / +6.24% |
+| Fresh init median | 0.310000 s | 0.114920 s | 0.098336 s | -14.43% |
+| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.005152 s | +17.36% |
+| Full 13-projection median | not recorded | 0.021977 s | 0.026044 s | +18.51% |
+| Full strict suite | 370 / 406.72 s | 258 / 82.99 s | 303 / 82.76 s | +45 tests; timings not workload-equivalent |
+| Total Python LOC | 33,521 | 23,927 | 27,107 | +3,180 / +13.29% |
+| Test Python LOC | 13,251 | 8,940 | 11,045 | +2,105 / +23.55% |
+| Plugin Python LOC | 18,878 | 12,971 | 13,934 | +963 / +7.42% |
 
-The 5k mutation median is 0.004956 seconds, 90.1% below the mandatory
-0.050-second ceiling. Full projection remains 0.024376 seconds. The safety
+The 5k mutation median is 0.005152 seconds, 89.7% below the mandatory
+0.050-second ceiling. Full projection remains 0.026044 seconds. The safety
 tests and implementation increase LOC relative to the slimmer candidate, but
 the user-approved original slimming deviation remains unchanged in status: the
 35%-45% total/test reduction target was not met and is not relabeled as a pass.
@@ -192,13 +207,14 @@ an impossible self-referential commit hash.
 
 | Profile | Work | Tokens | Controller wall | Native producer wall | Verification |
 | --- | --- | ---: | ---: | ---: | --- |
-| Single | one isolated producer; only `candidate.py` changed | 49,936 | 35.772 s | 34.379 s | one targeted controller check, rc=0 |
-| Parallel | two isolated producers; only `alpha.py` and `beta.py` changed | 112,657 | 43.852 s | 40.298 s; 34.784 s overlap | two targeted plus one combined check, all rc=0 |
+| Single | one isolated producer; only `candidate.py` changed | 49,248 | 36.518 s | 35.426 s | one targeted controller check, rc=0 |
+| Parallel | two isolated producers; only `alpha.py` and `beta.py` changed | 99,706 | 39.541 s | 36.983 s; 30.275 s overlap | two targeted plus one combined check, all rc=0 |
 
-Two sequential single units project to 71.544 controller seconds, so the
-parallel profile reduces latency by 38.71% (`1.631x`) for this disjoint task.
-It does not reduce tokens: the parallel average is 56,328.5 tokens per unit,
-12.80% above the single run. The evidence therefore supports one producer or a
+Two sequential single units project to 73.036 controller seconds, so the
+parallel profile reduces latency by 45.86% (`1.847x`) for this disjoint task.
+The parallel average is 49,853 tokens per unit, 1.23% above this single run,
+and repeated profiles have shown material run-to-run token variance. This does
+not establish a token saving. The evidence therefore supports one producer or a
 shared-context batch as the token-conservative default, and parallel fan-out
 only for ready, disjoint work with deterministic tests and a latency SLA. It
 does not support a claim that multiple models lower token use by themselves.
@@ -209,9 +225,14 @@ Actual model identity and monetary cost are not exposed and are not inferred.
 Real source and wheel artifacts were built from the hardened candidate:
 
 - wheel SHA-256:
-  `cdbc8f62a05623a1d385358aa21c1568755b45f7204a2671fcc5f24ffda0bb98`
+  `c3e701cef3bca7a46b35bc6fd38bdf4996533e59399f09069dbcd6178309dea0`
 - source archive SHA-256:
-  `e6677bf0367db7a638b9f22c30b9b2b4acb0bef6f510f469688977d68139f23a`
+  `c93841e44711557a53c2e5df20db6d23560543f41c1a606b8e9fdeb407f72df2`
+
+The archive was built from the frozen executable candidate immediately before
+this audit text and task checkboxes were finalized. Those later documentation-
+only edits do not change the executable identity bound by the Native reports;
+the archive hash is not presented as a self-referential final-commit hash.
 
 Each artifact passed installation in a temporary venv and temporary HOME. The
 installed payload had exactly 7 Skills, 3 Hooks, 3 templates, 16 schemas, and
@@ -240,6 +261,29 @@ had not yet been granted, so the recorded pre-publication statuses were:
 These are not passes. In particular, Windows `msvcrt.locking`, open-handle, and
 replace behavior has static coverage and a configured CI path, but no Windows
 runtime evidence in this delivery.
+
+### Publication follow-up
+
+After the user authorized publication, PR #14's first remote matrix exposed three
+additional portability defects rather than converting `not-run` into a pass:
+
+- Windows rejected `os.fsync()` on read-only file descriptors during the
+  verified backup path. The backup and migration file helpers now open existing
+  files update-capable before flushing; a regression locks this descriptor
+  contract. The resulting migration barrier timeouts were secondary failures.
+- Windows represented the same temporary directory once through its 8.3 alias
+  and once through its canonical user name. The sentinel regression now checks
+  the actionable error code, sentinel filename, PID, and operator instruction
+  instead of requiring lexical path identity.
+- Ubuntu correctly could not resolve the macOS Codex binary path recorded by a
+  historical Native report. Cross-host persisted validation now verifies the
+  binary metadata and digest shape without claiming that the historical binary
+  is installed locally; source digest and scope remain mandatory.
+
+The portability and publication-QA fixes passed 303/303 local tests and
+regenerated both Native reports against the final executable digest above.
+Remote follow-up results remain PR-owned
+evidence and are not backfilled into the pre-publication table.
 
 ## Residual risks and explicit boundaries
 

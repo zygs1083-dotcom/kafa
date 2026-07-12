@@ -217,6 +217,66 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
         self.assertFalse(decision.delivery_allowed)
         self.assertIn("reviewed-local", " ".join(decision.reasons))
 
+    def test_accepted_high_finding_still_requires_reviewed_local_gate(self) -> None:
+        delivery = delivery_module()
+        with tempfile.TemporaryDirectory() as temp:
+            degraded_root = Path(temp) / "degraded"
+            degraded_root.mkdir()
+            degraded_db = create_schema30_delivery_fixture(degraded_root)
+            reviewed_root = Path(temp) / "reviewed"
+            reviewed_root.mkdir()
+            reviewed_db = create_schema30_delivery_fixture(reviewed_root)
+
+            for db, review_status in (
+                (degraded_db, "same-context-degraded"),
+                (reviewed_db, "reviewed-local"),
+            ):
+                with closing(sqlite3.connect(db)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    candidate = conn.execute(
+                        "select candidate_sha from delivery_cycles where id='CYCLE-current'"
+                    ).fetchone()[0]
+                    conn.execute(
+                        "update quality_gates set review_status = ? where id = 'G1'",
+                        (review_status,),
+                    )
+                    conn.execute(
+                        """
+                        insert into findings
+                        (id, cycle_id, candidate_sha, surface, severity, status, summary,
+                         waived_by, waiver_reason, waiver_scope, waived_revision,
+                         waiver_expires_at, created_at)
+                        values ('F-accepted-high', 'CYCLE-current', ?, 'delivery', 'high',
+                                'accepted', 'accepted high finding remains high risk',
+                                'user', 'candidate-specific acceptance', 'candidate', 1,
+                                '2099-01-01T00:00:00Z', '2026-07-11T00:00:00Z')
+                        """,
+                        (candidate,),
+                    )
+                    conn.commit()
+
+            with closing(sqlite3.connect(degraded_db)) as conn:
+                conn.row_factory = sqlite3.Row
+                degraded_issues, degraded_decision = delivery.evaluate_schema30_delivery(
+                    conn,
+                    degraded_root,
+                    is_expired=lambda _: False,
+                    observed_at="2026-07-11T00:00:00Z",
+                )
+
+            self.assertEqual(degraded_decision.status, "human-review-required")
+            self.assertFalse(degraded_decision.delivery_allowed)
+            self.assertIn("reviewed-local", " ".join(degraded_issues))
+            with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
+                harness_db.record_delivery(degraded_root, "local")
+
+            harness_db.record_delivery(reviewed_root, "local")
+            with closing(sqlite3.connect(reviewed_db)) as conn:
+                reviewed_status = conn.execute(
+                    "select decision_status from deliveries"
+                ).fetchone()[0]
+            self.assertEqual(reviewed_status, "accepted-risk")
+
     def test_local_trust_states_are_explicit_and_non_cryptographic(self) -> None:
         delivery = delivery_module()
         cases = (
@@ -679,6 +739,38 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
 
                 issues = schema30_issues(root)
                 self.assertTrue(issues, f"fractional {case} revision was accepted")
+                with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
+                    harness_db.record_delivery(root, "local")
+
+    def test_fractional_execution_metadata_blocks_delivery(self) -> None:
+        cases = (
+            ("test_targets", "gateable", 1.9),
+            ("test_targets", "requires_sandbox", 1.9),
+            ("test_targets", "requires_no_network", 1.9),
+            ("executions", "exit_code", 0.9),
+            ("executions", "executed_count", 1.9),
+            ("executions", "no_network", 1.9),
+        )
+        for table, field, value in cases:
+            with self.subTest(table=table, field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                db = create_schema30_delivery_fixture(root)
+                with closing(sqlite3.connect(db)) as conn:
+                    conn.execute("pragma ignore_check_constraints = on")
+                    if table == "executions":
+                        conn.execute("drop trigger executions_no_update")
+                    row_id = "UNIT" if table == "test_targets" else "EX1"
+                    conn.execute(
+                        f"update {table} set {field} = ? where id = ?",
+                        (value, row_id),
+                    )
+                    conn.commit()
+
+                issues = schema30_issues(root)
+                self.assertTrue(
+                    issues,
+                    f"fractional {table}.{field} passed delivery evaluation",
+                )
                 with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
                     harness_db.record_delivery(root, "local")
 

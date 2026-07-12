@@ -30,7 +30,11 @@ from core.local_core_migration import (  # noqa: E402
     stage_schema29_to_schema30,
     stage_supported_schema_to_schema30,
 )
-from core.projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS  # noqa: E402
+from core.projections import (  # noqa: E402
+    PROJECTION_PATHS,
+    PROJECTION_ROLLBACK_PATHS,
+    render_executions,
+)
 from run_agent_e2e_eval import _create_schema27_fixture  # noqa: E402
 from tests.legacy_schema_fixtures import create_schema28_fixture  # noqa: E402
 
@@ -477,6 +481,48 @@ class Schema30StagingTests(unittest.TestCase):
             ],
         )
 
+    def test_schema29_staging_rejects_non_positive_or_non_integer_trust_revisions(self) -> None:
+        cases = (
+            ("project", 1.9),
+            ("project", "not-an-integer"),
+            ("project", 0),
+            ("project", -1),
+            ("quality-gate", 1.9),
+            ("quality-gate", "not-an-integer"),
+            ("quality-gate", 0),
+            ("quality-gate", -1),
+        )
+        for surface, revision in cases:
+            with self.subTest(surface=surface, revision=revision), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                init_schema29_fixture(root)
+                source = root / ".ai-team/state/harness.db"
+                with closing(sqlite3.connect(source)) as conn:
+                    if surface == "project":
+                        conn.execute("update project set revision = ? where id = 1", (revision,))
+                    else:
+                        conn.execute(
+                            """
+                            insert into quality_gates
+                            (id, sequence, cycle_id, candidate_sha, gate_status, gate,
+                             reviewed_commit, reviewer_context, result, project_revision,
+                             created_at)
+                            values ('G-invalid-revision', 1, 'CYCLE-current', 'candidate',
+                                    'active', 'independent_qa', 'candidate',
+                                    'same-context-degraded', 'pass', ?, 'now')
+                            """,
+                            (revision,),
+                        )
+                    conn.commit()
+
+                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "positive SQLite integer",
+                ):
+                    stage_schema29_to_schema30(source, staging)
+                self.assertFalse(staging.exists())
+
     def test_empty_session_contexts_never_become_reviewed_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -688,6 +734,120 @@ class Schema30StagingTests(unittest.TestCase):
         self.assertEqual(report.converted_validation_count, 1)
         self.assertEqual(report.invalidated_validation_count, 2)
 
+    def test_fractional_execution_metadata_cannot_become_immutable_execution(self) -> None:
+        cases = (
+            ("gateable", 1.9),
+            ("requires_sandbox", 1.9),
+            ("requires_no_network", 1.9),
+            ("exit_code", 0.9),
+            ("executed_count", 1.9),
+            ("no_network", 1.9),
+        )
+        for field, invalid_value in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                init_schema29_fixture(root)
+                artifact = root / ".ai-team/runtime/executions/fractional/stdout.txt"
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_text("Ran 1 test in 0.001s\nOK\n", encoding="utf-8")
+                candidate_sha = "a" * 64
+                target_values = {
+                    "gateable": 1,
+                    "requires_sandbox": 0,
+                    "requires_no_network": 0,
+                }
+                evidence_values = {
+                    "exit_code": 0,
+                    "executed_count": 1,
+                    "no_network": 1,
+                }
+                if field in target_values:
+                    target_values[field] = invalid_value
+                else:
+                    evidence_values[field] = invalid_value
+
+                source = root / ".ai-team/state/harness.db"
+                with closing(sqlite3.connect(source)) as conn:
+                    conn.execute(
+                        """
+                        insert into test_targets
+                        (id, kind, command_template, description, gateable,
+                         requires_sandbox, requires_no_network, result_format,
+                         created_at, updated_at)
+                        values ('UNIT-fractional', 'unit', 'python3 -m unittest',
+                                'fractional metadata must not be trusted', ?, ?, ?,
+                                'regex', 'now', 'now')
+                        """,
+                        (
+                            target_values["gateable"],
+                            target_values["requires_sandbox"],
+                            target_values["requires_no_network"],
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        insert into evidence
+                        (id, kind, summary, command, exit_code, stdout_sha256,
+                         artifact_path, source_tree_hash, target_id, executed_count,
+                         executed_count_source, result_format, semantic_status,
+                         no_network, sandbox_status, policy_status, verified_by,
+                         created_at)
+                        values ('EV-fractional', 'command', 'fractional metadata',
+                                'python3 -m unittest', ?, ?, ?, ?, 'UNIT-fractional',
+                                ?, 'parsed', 'regex', 'pass', ?, 'available',
+                                'allowed', 'controller-local', 'now')
+                        """,
+                        (
+                            evidence_values["exit_code"],
+                            sha256(artifact),
+                            artifact.relative_to(root).as_posix(),
+                            candidate_sha,
+                            evidence_values["executed_count"],
+                            evidence_values["no_network"],
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        insert into validations
+                        (id, cycle_id, candidate_sha, validation_status, surface,
+                         findings, result, residual_risk, source_tree_hash, created_at)
+                        values ('V-fractional', 'CYCLE-current', ?, 'active',
+                                'migration', '', 'pass', '', ?, 'now')
+                        """,
+                        (candidate_sha, candidate_sha),
+                    )
+                    conn.execute(
+                        """
+                        insert into validation_evidence (validation_id, evidence_id)
+                        values ('V-fractional', 'EV-fractional')
+                        """
+                    )
+                    conn.commit()
+
+                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+                if field in target_values:
+                    with self.assertRaisesRegex(
+                        LocalCoreMigrationError,
+                        "SQLite flag",
+                    ):
+                        stage_schema29_to_schema30(source, staging)
+                    self.assertFalse(staging.exists())
+                    continue
+
+                report = stage_schema29_to_schema30(source, staging)
+                with closing(sqlite3.connect(staging)) as conn:
+                    execution_count = conn.execute(
+                        "select count(*) from executions"
+                    ).fetchone()[0]
+                    validation_status = conn.execute(
+                        "select validation_status from validations where id='V-fractional'"
+                    ).fetchone()[0]
+
+                self.assertEqual(execution_count, 0)
+                self.assertEqual(validation_status, "invalidated")
+                self.assertEqual(report.converted_execution_count, 0)
+                self.assertEqual(report.invalidated_validation_count, 1)
+
 
 class Schema30LegacyStagingTests(unittest.TestCase):
     def _assert_legacy_fixture_migrates(self, source_version: int) -> None:
@@ -761,6 +921,27 @@ class Schema30LegacyStagingTests(unittest.TestCase):
 
     def test_development_schema28_uses_isolated_legacy_stage(self) -> None:
         self._assert_legacy_fixture_migrates(28)
+
+    def test_legacy_staging_rejects_fractional_project_revision(self) -> None:
+        for source_version, fixture in (
+            (27, _create_schema27_fixture),
+            (28, create_schema28_fixture),
+        ):
+            with self.subTest(source_version=source_version), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                fixture(root)
+                source = root / ".ai-team/state/harness.db"
+                with closing(sqlite3.connect(source)) as conn:
+                    conn.execute("update project set revision = 1.9 where id = 1")
+                    conn.commit()
+
+                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "positive SQLite integer",
+                ):
+                    stage_supported_schema_to_schema30(source, staging)
+                self.assertFalse(staging.exists())
 
     def test_legacy_session_ids_do_not_replace_shared_context_identity(self) -> None:
         for source_version, fixture in (
@@ -984,7 +1165,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             original.write_bytes(b"schema: 29\noriginal: true\n")
             retired_evidence.write_bytes(b"# Legacy evidence view\n")
             original.chmod(0o640)
-            retired_evidence.chmod(0o600)
+            retired_evidence.chmod(0o444)
             original_mode = original.stat().st_mode & 0o7777
             retired_mode = retired_evidence.stat().st_mode & 0o7777
             original_digest = sha256(original)
@@ -994,9 +1175,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 if render_root.resolve() != root.resolve():
                     return
                 original.write_bytes(b"schema: 30\npartial: true\n")
-                created_during_failure.parent.mkdir(parents=True, exist_ok=True)
-                created_during_failure.write_bytes(b"# Partial schema 30 executions\n")
-                retired_evidence.unlink()
+                render_executions(render_root)
                 raise harness_db.HarnessError("partial projection failure")
 
             with patch.object(harness_db, "render_all", side_effect=partially_render):

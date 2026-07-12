@@ -356,8 +356,14 @@ class MigrationOperationLockTests(unittest.TestCase):
                 with SqliteStore(root).connection():
                     self.fail("connection opened while migration sentinel existed")
 
-        self.assertIn(str(sentinel), str(caught.exception))
-        self.assertIn("pid=999999", str(caught.exception))
+            message = str(caught.exception)
+            reported_path = message.split("exists at ", 1)[1].split(" (", 1)[0]
+            self.assertEqual(
+                os.path.normcase(os.path.realpath(reported_path)),
+                os.path.normcase(os.path.realpath(sentinel)),
+            )
+            self.assertIn("pid=999999", message)
+            self.assertIn("inspect the owner", message)
 
     def test_writer_cannot_enter_fingerprint_to_replace_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

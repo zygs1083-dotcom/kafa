@@ -556,7 +556,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows' CRT rejects os.fsync/_commit on a read-only descriptor.
+    with path.open("rb+") as handle:
         os.fsync(handle.fileno())
 
 

@@ -69,7 +69,8 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 - Missing required validation fails or blocks the gate.
 - Medium findings require explicit residual-risk acceptance.
 - Same-context review can pass only with `reviewer_context: same-context-degraded`, a real context ID, and clear residual-risk notes.
-- High/critical work without verifiable current-candidate provenance and distinct producer/reviewer context returns `human-review-required` unless the user explicitly accepts complete, current, unexpired risk metadata.
+- High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata.
+- If any high/critical prerequisite is missing, the result is `human-review-required`.
 - Code changes after QA require a new gate record for the new commit or revision.
 - Requirement, acceptance, or failure-mode changes invalidate dependent validation and gate records until fresh evidence is recorded.
 

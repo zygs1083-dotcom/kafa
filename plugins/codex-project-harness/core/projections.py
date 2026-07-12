@@ -1,6 +1,8 @@
 """Markdown projection builder for SQLite runtime state."""
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -40,6 +42,16 @@ def write_view(root: Path, relpath: str, content: str) -> None:
     path = root / relpath
     ensure_parent(path)
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def _remove_retired_projection(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        if path.is_symlink() or not path.is_file():
+            raise
+        os.chmod(path, stat.S_IMODE(path.stat().st_mode) | stat.S_IWUSR)
+        path.unlink()
 
 
 def render_requirements(root: Path) -> None:
@@ -270,7 +282,7 @@ def render_executions(root: Path) -> None:
         for row in rows
     )
     write_view(root, "docs/harness/executions.md", "\n".join(lines))
-    (root / "docs/harness/evidence.md").unlink(missing_ok=True)
+    _remove_retired_projection(root / "docs/harness/evidence.md")
 
 
 def render_findings(root: Path) -> None:

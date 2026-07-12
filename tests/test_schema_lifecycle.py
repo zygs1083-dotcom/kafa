@@ -18,6 +18,7 @@ for path in (PLUGIN_ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 import harness_db  # noqa: E402
+from core import local_core_migration, schema_lifecycle  # noqa: E402
 from core.schema_lifecycle import (  # noqa: E402
     SCHEMA30_TABLES,
     SCHEMA30_VERSION,
@@ -46,6 +47,27 @@ def table_names(conn: sqlite3.Connection) -> set[str]:
 
 
 class SchemaLifecycleTest(unittest.TestCase):
+    def test_file_fsync_helpers_use_update_capable_descriptors(self) -> None:
+        class RecordingPath:
+            def __init__(self, target: Path, modes: list[str]) -> None:
+                self.target = target
+                self.modes = modes
+
+            def open(self, mode: str):
+                self.modes.append(mode)
+                return self.target.open(mode)
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "durable-file"
+            target.write_bytes(b"durable")
+            modes: list[str] = []
+            recorded = RecordingPath(target, modes)
+
+            schema_lifecycle._fsync_file(recorded)  # type: ignore[arg-type]
+            local_core_migration._fsync_path(recorded)  # type: ignore[arg-type]
+
+        self.assertEqual(modes, ["rb+", "rb+"])
+
     def test_create_schema30_rolls_back_with_the_caller_transaction(self) -> None:
         with closing(sqlite3.connect(":memory:")) as conn:
             conn.execute("begin immediate")

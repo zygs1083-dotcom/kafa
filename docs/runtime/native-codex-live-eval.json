@@ -1,10 +1,10 @@
 {
-  "agent_runtime_seconds": 34.378938,
+  "agent_runtime_seconds": 35.426216,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T06:38:49+00:00",
+    "generated_at": "2026-07-12T07:47:32+00:00",
     "git_dirty": true,
-    "git_head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "git_head": "2ac40a3e79ab2977a8ba3c841f0ed693ef25fd1f",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -16,9 +16,9 @@
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 181,
-    "status_sha256": "8666fc5b827d80cb35b10469fc936021a61bceb925ef0113dd7f683850ca0811",
-    "workspace_sha256": "625faadd5af8e0247a8d053b088652c5d10d4dfe5a44488d3f9caf6c58b88c60"
+    "status_entry_count": 12,
+    "status_sha256": "40852112f38c89647ca561b8215abbae2863d05169a702a982094ca6ae7e832b",
+    "workspace_sha256": "68dbed438a91b81f3a8d5ca8c3cbd3846cedf7b3207c63ab8bff2d737cbda6ee"
   },
   "evidence_scope": "live-codex",
   "live_skipped": false,
@@ -64,17 +64,17 @@
         ],
         "last_message_recorded": true,
         "native_returncode": 0,
-        "native_runtime_seconds": 34.378938,
+        "native_runtime_seconds": 35.426216,
         "native_runtime_source": "controller-wall-clock",
-        "native_token_count": 49936,
+        "native_token_count": 49248,
         "native_token_scope": "native-producers-only",
         "native_token_source": "codex-json-turn.completed",
         "native_usage": {
-          "cached_input_tokens": 38400,
-          "input_tokens": 49331,
-          "output_tokens": 605,
+          "cached_input_tokens": 28160,
+          "input_tokens": 48791,
+          "output_tokens": 457,
           "reasoning_output_tokens": 0,
-          "token_count": 49936
+          "token_count": 49248
         },
         "producer_changed_files": [
           "candidate.py"
@@ -90,7 +90,7 @@
         "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
         "workload_units": 1
       },
-      "duration_seconds": 35.771951,
+      "duration_seconds": 36.517793,
       "mode": "live-codex",
       "name": "native_codex_edit_and_controller_verify",
       "pass": true,
@@ -98,7 +98,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 35.77198,
+    "duration_seconds": 36.517817,
     "expected_human_review_required_count": 0,
     "failed_count": 0,
     "false_pass_count": 0,
@@ -110,12 +110,12 @@
     "skipped_count": 0,
     "sqlite_lock_error_count": 0
   },
-  "token_count": 49936,
+  "token_count": 49248,
   "token_usage": {
-    "cached_input_tokens": 38400,
-    "input_tokens": 49331,
-    "output_tokens": 605,
+    "cached_input_tokens": 28160,
+    "input_tokens": 48791,
+    "output_tokens": 457,
     "reasoning_output_tokens": 0,
-    "token_count": 49936
+    "token_count": 49248
   }
 }
