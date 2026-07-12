@@ -5,18 +5,19 @@
 - Change: `local-core-hardening`; parent: `local-core-slimming`.
 - Branch: `v2-local-core-slimming`.
 - First publication HEAD: `cff9f4a2483405a76d72c19941ba4aa0c9bcb0d7`.
+- Verified implementation HEAD:
+  `cab7c7d800c5e0167f8fa8b616b2f424d8b5e0cd`.
 - Baseline `main` / `origin/main` at implementation start:
   `adba3691d859c0ffc93d75cc148d8f916314cc49`.
 - Runtime / kernel / schema: `5.0.0` / `5.0.0` / `30`.
 - Source candidate: `2.0.0-beta.1` (`2.0.0b1`, development state).
-- OpenSpec checklist before the corrected publication: 138 checked, 48 open,
-  186 total.
+- OpenSpec checklist after the verified implementation matrices: 186 checked,
+  0 open, 186 total.
 
-All implementation items are complete. The 48 open items are publication
-checkpoints whose wording requires the final pushed revision, fresh QA, and the
-complete push and pull-request Ubuntu/macOS/Windows matrices. They remain open
-until those exact conditions are observed; old, skipped, cancelled, fixture-only,
-or not-run evidence is not reused.
+All implementation and publication checkpoints are complete. Each checkpoint
+closed only after fresh QA plus the exact implementation revision's complete
+push and pull-request Ubuntu/macOS/Windows matrices succeeded; old, skipped,
+cancelled, fixture-only, or not-run evidence was not reused.
 
 The earlier quality conclusion in
 `docs/audits/2026-07-12-local-core-slimming-final.md` is superseded for
@@ -233,21 +234,23 @@ Native/execution/runtime-smoke fixture portability cases. These failures are red
 evidence, not passes. The current fully self-contained fixtures require two
 entirely new matrices.
 
-| Required new revision | Push matrix | Pull-request matrix |
+| Verified implementation `cab7c7d` | Push matrix | Pull-request matrix |
 | --- | --- | --- |
-| Ubuntu | `not-run` | `not-run` |
-| macOS | `not-run` | `not-run` |
-| Windows | `not-run` | `not-run` |
+| Ubuntu | success, run `29202221018` | success, run `29202222074` |
+| macOS | success, run `29202221018` | success, run `29202222074` |
+| Windows | success, run `29202221018` | success, run `29202222074` |
 
 The validate workflow runs hardening targets, complete strict regression,
 fixture/stability evidence, and real artifact-mode install on the matrix. All
-six jobs for the exact pushed revision must pass before the 48 publication
-checkpoints close or PR merge occurs.
+six jobs for the exact implementation revision completed successfully. The
+docs-only closure commit that records this result must also complete both
+matrices before PR merge; its result is recorded in the final handoff rather
+than creating an infinite evidence-only commit cycle.
 
 ## Residual boundaries
 
-- Windows `msvcrt`, open-handle rollback, path, and CRLF behavior remains
-  platform-unverified for this unpushed candidate until the Windows matrices pass.
+- Windows `msvcrt`, open-handle rollback, path, CRLF, real artifact install, and
+  the complete 375-test suite are platform-verified for `cab7c7d`.
 - Local context IDs, accepted-risk metadata, and SQLite facts are procedural
   records, not cryptographic provenance; ambiguous high/critical delivery remains
   `human-review-required`.
@@ -257,6 +260,6 @@ checkpoints close or PR merge occurs.
 - No tag, release, deploy, production migration, secret change, or user-plugin
   replacement is authorized or performed.
 
-At this checkpoint local implementation and validation are green. Merge remains
-blocked on final independent QA, the exact new-HEAD push and PR matrices, and a
-post-CI audit/checklist update.
+At this checkpoint implementation, local validation, independent QA, checklist,
+and both three-platform matrices are green. Merge remains blocked only until
+the docs-only closure HEAD repeats both complete matrices successfully.
