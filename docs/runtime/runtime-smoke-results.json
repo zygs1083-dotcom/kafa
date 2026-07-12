@@ -1,6 +1,6 @@
 [
   {
-    "name": "full_project_runtime",
+    "name": "local_delivery_runtime",
     "pass": true,
     "commands": [
       0,
@@ -17,36 +17,20 @@
       0,
       0,
       0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
       0
-    ]
-  },
-  {
-    "name": "tool_mapping_runtime",
-    "pass": true,
-    "commands": [
-      0,
-      0,
-      0
-    ]
+    ],
+    "facts": {
+      "executions": 1,
+      "validations": 1,
+      "deliveries": 1
+    }
   },
   {
     "name": "directed_invariant_benchmark",
     "pass": true,
-    "full_seconds": 0.010201,
-    "directed_seconds": 0.000273,
-    "ratio": 37.43
+    "full_seconds": 0.003886457998305559,
+    "directed_seconds": 0.00010120891965925694,
+    "ratio": 38.40035059548321,
+    "minimum_ratio": 10.0
   }
 ]

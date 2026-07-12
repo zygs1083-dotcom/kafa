@@ -4,7 +4,64 @@ All notable repository releases are documented here.
 
 This project now uses Git tags for release points. Earlier commits remain in Git history, but formal release tagging starts at `v0.4.0-beta.1`.
 
-## v1.25.0-beta.1 - Unreleased
+## v2.0.0-beta.1 - Unreleased
+
+### Breaking
+
+- Kafa is now a local-only verified delivery Kernel. Direct business-project
+  integrations, Connector credentials and profiles, adapter/outbox state,
+  legacy Host SDK workers, provider/dispatch/worktree lifecycle, CSV/native
+  receipt exchange, and synthetic provenance have been removed.
+- Runtime and Kernel are now `5.0.0`, with active schema 30 containing exactly
+  27 local delivery tables. Existing v1 database versions 27/28/29 migrate
+  side by side through a verified SQLite backup and staging database; removed
+  remote and duplicate-lifecycle facts remain available only in the backup.
+- Task mutation is root-controller single-writer with
+  `planned -> active -> submitted -> accepted|blocked` plus cancellation.
+  Leases, heartbeats, fences, claims, stale recovery, and worker DB writes are
+  no longer supported.
+- Command proof is normalized into insert-only executions linked to validation
+  judgments. Manual evidence/test recording, copied command fields, database
+  replay checkpoints, and whole-database mutation snapshots are removed.
+- The public product surface is reduced to 53 CLI parser nodes, seven Skills,
+  three Hooks, three Native Codex role templates, 16 JSON schemas, and 21
+  runtime scripts.
+
+### Added
+
+- Recoverable schema 30 migration with source integrity checks, backup digest
+  and row-count manifest, staging validation, atomic activation, failure
+  injection coverage, and automatic verified-backup restore after a failed
+  activation check.
+- `verify run` for controller-owned local or no-network container execution,
+  structured-result parsing, artifact digests, immutable execution facts, and
+  atomic validation linkage.
+- Local-only fixture, stability, and opt-in real Native Codex compatibility
+  profiles that report blocked, skipped, not-run, and human-intervention states
+  without converting them into passes.
+
+### Changed
+
+- OpenSpec owns proposal, design, behavioral specs, tasks, and archive for
+  substantial work; Kafa stores only the local facts needed to verify the
+  resulting candidate.
+- Native Codex/ChatGPT is the sole owner of tasks, subagents, worktrees,
+  approvals, models, cancellation, steering, and handoff. Kafa does not start
+  or mirror a second Host lifecycle.
+- Audit events are compact append-only summaries and are not a recovery source.
+  Migration and administrator recovery use verified SQLite backups; normal
+  mutations rebuild only affected projections.
+
+### Boundaries
+
+- High/critical work without verifiable current-candidate provenance remains
+  `human-review-required`. Distinct local context metadata is procedural, not
+  cryptographic trust. Only a complete, explicit, current, unexpired user risk
+  acceptance can use the accepted-risk path.
+- This source remains `development`. No tag, release, deployment, or production
+  operation is implied by the version change.
+
+## v1.25.0-beta.1 - Superseded development snapshot
 
 ### Added
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -19,14 +21,27 @@ if str(PLUGIN_ROOT) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import harness_db  # noqa: E402
+import harness  # noqa: E402
+from core.execution import CommandResult, ContainerExecutor  # noqa: E402
 
 
 def run_harness(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(["python3", str(HARNESS), "--root", str(root), *args], text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        [sys.executable, str(HARNESS), "--root", str(root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     if check and result.returncode != 0:
         raise AssertionError(result.stdout + result.stderr)
     return result
+
+
+def run_cli_in_process(root: Path, *args: str) -> tuple[int, str]:
+    output = io.StringIO()
+    argv = [str(HARNESS), "--root", str(root), *args]
+    with mock.patch.object(sys, "argv", argv), redirect_stdout(output):
+        return harness.main(), output.getvalue()
 
 
 def git_repo(root: Path) -> None:
@@ -41,98 +56,236 @@ def git_repo(root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
 
 
-def make_reported_attempt(root: Path) -> tuple[str, str]:
+def register_target(
+    root: Path,
+    *,
+    container_image: str = "",
+    stack_profile: str = "python",
+) -> None:
     run_harness(root, "init")
-    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
-    run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", "python3 -m unittest test_sample.py")
-    run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
-    run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
-    run_id = run_harness(root, "dispatch", "plan", "--scope", "Sandbox").stdout.strip().split()[-1]
-    branch = f"agent/{run_id}/T1/developer"
-    subprocess.run(["git", "branch", branch, "HEAD"], cwd=root, check=True, capture_output=True)
-    head = subprocess.run(["git", "rev-parse", branch], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
-    tree = subprocess.run(["git", "rev-parse", f"{branch}^{{tree}}"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "sandboxed tests pass")
+    args = [
+        "test-target",
+        "add",
+        "--id",
+        "UNIT",
+        "--kind",
+        "unit",
+        "--command-template",
+        "python3 -B -m unittest test_sample.py",
+        "--stack-profile",
+        stack_profile,
+        "--requires-sandbox",
+        "--requires-no-network",
+    ]
+    if container_image:
+        args.extend(["--container-image", container_image])
+    run_harness(root, *args)
+
+
+def fact_counts(root: Path) -> tuple[int, int, int]:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-        conn.execute("update dispatch_assignments set agent_id = 'developer', status = 'reported' where run_id = ? and task_id = 'T1'", (run_id,))
-        conn.execute(
-            """
-            insert into task_attempts
-            (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
-             branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
-            values ('ATTEMPT1', ?, 'T1', 'developer', 0, ?, ?, ?, ?, 'UNIT', 'reported', '', '', '', '', 'now', '')
-            """,
-            (run_id, head, head, tree, branch),
+        return tuple(
+            int(conn.execute(f"select count(*) from {table}").fetchone()[0])
+            for table in ("executions", "validations", "validation_executions")
         )
-        conn.execute(
-            """
-            insert into dispatch_worktrees
-            (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
-            values ('WT1', ?, 'T1', 'developer', ?, '', 'active', 'now', '')
-            """,
-            (run_id, branch),
-        )
-        conn.commit()
-    return run_id, branch
+
+
+def successful_container_result(
+    executor: ContainerExecutor,
+    command: str,
+    *,
+    target_id: str,
+    result_format: str,
+    ordinal: int,
+) -> CommandResult:
+    payload = b"Ran 1 test in 0.001s\n\nOK\n"
+    artifact = (
+        executor.root
+        / ".ai-team"
+        / "runtime"
+        / "executions"
+        / f"container-test-{ordinal}"
+        / "stdout.txt"
+    )
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(payload)
+    return CommandResult(
+        command=command,
+        exit_code=0,
+        stdout_sha256=hashlib.sha256(payload).hexdigest(),
+        artifact_path=artifact.relative_to(executor.root).as_posix(),
+        target_id=target_id,
+        executed_count=1,
+        executed_count_source="parsed",
+        result_format=result_format,
+        semantic_status="pass",
+        no_network=True,
+        sandbox_profile="no-network",
+        sandbox_status="available",
+        policy_status="allowed",
+        policy_reason=f"target {target_id}",
+    )
 
 
 class SandboxExecutionTest(unittest.TestCase):
-    def test_container_verify_attempt_fails_closed_when_engine_unavailable(self) -> None:
+    def test_container_verify_run_fails_closed_when_engine_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             git_repo(root)
-            run_id, _branch = make_reported_attempt(root)
+            register_target(root)
 
-            with mock.patch("core.agent_runner.shutil.which", return_value=None):
-                with self.assertRaises(harness_db.HarnessError) as ctx:
-                    harness_db.dispatch_verify_attempt(root, run_id, "T1", runner="container")
+            with mock.patch("core.execution.shutil.which", return_value=None):
+                returncode, output = run_cli_in_process(
+                    root,
+                    "verify",
+                    "run",
+                    "--target",
+                    "UNIT",
+                    "--acceptance",
+                    "AC1",
+                    "--runner",
+                    "container",
+                )
 
-            self.assertIn("sandbox-unavailable", str(ctx.exception))
-            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                attempt = conn.execute("select status, evidence_id from task_attempts where id = 'ATTEMPT1'").fetchone()
-                evidence_count = conn.execute("select count(*) from evidence").fetchone()[0]
-                sandbox_count = conn.execute("select count(*) from sandbox_executions").fetchone()[0]
-            self.assertEqual(attempt, ("reported", ""))
-            self.assertEqual(evidence_count, 0)
-            self.assertEqual(sandbox_count, 0)
+            self.assertEqual(returncode, 1)
+            self.assertIn("sandbox-unavailable", output)
+            self.assertEqual(fact_counts(root), (0, 0, 0))
 
-    def test_container_image_precedence_cli_then_control_then_default(self) -> None:
+    def test_container_verify_run_records_one_immutable_no_network_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            run_harness(root, "init")
-            control = root / ".ai-team/control/container-image.txt"
-            control.write_text("python:3.11-slim\n", encoding="utf-8")
+            git_repo(root)
+            register_target(root, container_image="python:3.12-test")
+            observed_images: list[str] = []
 
-            self.assertEqual(harness_db.resolve_container_image(root, "python:3.10-slim"), "python:3.10-slim")
-            self.assertEqual(harness_db.resolve_container_image(root, ""), "python:3.11-slim")
-            control.write_text("\n", encoding="utf-8")
-            self.assertEqual(harness_db.resolve_container_image(root, ""), "python:3.12-slim")
+            def fake_run(
+                executor: ContainerExecutor,
+                command: str,
+                *,
+                target_id: str,
+                target_command_template: str,
+                container_image: str,
+                result_format: str,
+                result_path: str,
+                **_kwargs: object,
+            ) -> CommandResult:
+                self.assertEqual(command, target_command_template)
+                self.assertEqual(result_path, "")
+                observed_images.append(container_image)
+                return successful_container_result(
+                    executor,
+                    command,
+                    target_id=target_id,
+                    result_format=result_format,
+                    ordinal=len(observed_images),
+                )
 
-    def test_schema_21_migration_adds_sandbox_and_integration_audit(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            run_harness(root, "init")
+            with mock.patch.object(ContainerExecutor, "run", autospec=True, side_effect=fake_run):
+                returncode, output = run_cli_in_process(
+                    root,
+                    "verify",
+                    "run",
+                    "--target",
+                    "UNIT",
+                    "--acceptance",
+                    "AC1",
+                    "--runner",
+                    "container",
+                )
+
+            self.assertEqual(returncode, 0, output)
+            self.assertIn("OK: verification recorded execution=", output)
+            self.assertEqual(observed_images, ["python:3.12-test"])
+            self.assertEqual(fact_counts(root), (1, 1, 1))
+
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                conn.execute("drop table sandbox_executions")
-                conn.execute("drop table integration_attempts")
-                for table in ("evidence", "validations"):
-                    conn.execute(f"alter table {table} drop column sandbox_execution_id")
-                    conn.execute(f"alter table {table} drop column sandbox_engine")
-                    conn.execute(f"alter table {table} drop column container_image")
-                conn.execute("update project set schema_version = 21, runtime_version = '3.9.0'")
-                conn.commit()
+                execution = conn.execute(
+                    """
+                    select id, runner, sandbox_status, no_network, policy_status,
+                           semantic_status, executed_count
+                    from executions
+                    """
+                ).fetchone()
+                link = conn.execute(
+                    "select execution_id from validation_executions"
+                ).fetchone()
+                self.assertIsNotNone(execution)
+                self.assertEqual(execution[1:], ("container", "available", 1, "allowed", "pass", 1))
+                self.assertEqual(link, (execution[0],))
+                with self.assertRaisesRegex(sqlite3.DatabaseError, "executions are immutable"):
+                    conn.execute(
+                        "update executions set sandbox_status = 'unavailable' where id = ?",
+                        (execution[0],),
+                    )
+                preserved = conn.execute(
+                    "select sandbox_status, no_network from executions where id = ?",
+                    (execution[0],),
+                ).fetchone()
+                self.assertEqual(preserved, ("available", 1))
 
-            run_harness(root, "migrate", "--from-version", "21", "--to-version", "29")
+    def test_container_image_precedence_uses_cli_then_target_then_stack_profile(self) -> None:
+        cases = (
+            ("cli override", "python:target", "python", "python:cli", "python:cli"),
+            ("target image", "python:target", "python", "", "python:target"),
+            ("stack profile", "", "node", "", "node:22-bookworm-slim"),
+        )
+        for name, target_image, stack_profile, cli_image, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                git_repo(root)
+                register_target(
+                    root,
+                    container_image=target_image,
+                    stack_profile=stack_profile,
+                )
+                with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                    recorded_profile = conn.execute(
+                        "select stack_profile from test_targets where id = 'UNIT'"
+                    ).fetchone()[0]
+                self.assertEqual(recorded_profile, stack_profile)
+                observed: list[str] = []
 
-            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
-                evidence_columns = {row[1] for row in conn.execute("pragma table_info(evidence)")}
-                validation_columns = {row[1] for row in conn.execute("pragma table_info(validations)")}
-            doctor = run_harness(root, "doctor")
-            self.assertIn("sandbox_executions", tables)
-            self.assertIn("integration_attempts", tables)
-            self.assertIn("sandbox_execution_id", evidence_columns)
-            self.assertIn("container_image", validation_columns)
-            self.assertIn("OK: harness doctor passed", doctor.stdout)
+                def fake_run(
+                    executor: ContainerExecutor,
+                    command: str,
+                    *,
+                    target_id: str,
+                    container_image: str,
+                    result_format: str,
+                    **_kwargs: object,
+                ) -> CommandResult:
+                    observed.append(container_image)
+                    return successful_container_result(
+                        executor,
+                        command,
+                        target_id=target_id,
+                        result_format=result_format,
+                        ordinal=1,
+                    )
+
+                args = [
+                    "verify",
+                    "run",
+                    "--target",
+                    "UNIT",
+                    "--acceptance",
+                    "AC1",
+                    "--runner",
+                    "container",
+                ]
+                if cli_image:
+                    args.extend(["--container-image", cli_image])
+                with mock.patch.object(
+                    ContainerExecutor,
+                    "run",
+                    autospec=True,
+                    side_effect=fake_run,
+                ):
+                    returncode, output = run_cli_in_process(root, *args)
+
+                self.assertEqual(returncode, 0, output)
+                self.assertEqual(observed, [expected])
 
 
 if __name__ == "__main__":

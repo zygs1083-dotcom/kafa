@@ -1,5 +1,9 @@
 # Schema 29 Migration Contract
 
+> Historical migration record for the former schema 29 development runtime.
+> It is not the current upgrade guide. Schema 27/28/29 projects now migrate
+> side by side to schema 30; use INSTALL.md and the current migrate --help.
+
 ## Purpose
 
 Schema 29 provides the storage foundation for deterministic delivery truth. It does not relax any delivery or trust gate.

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -19,7 +20,11 @@ SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_REPO_ROOT))
 
-from kafa.codex_app_server import AppServerClient, validate_app_server_discovery
+from kafa.codex_app_server import (
+    APPROVED_AGENT_TEMPLATES,
+    AppServerClient,
+    validate_app_server_discovery,
+)
 
 
 PLUGIN_ID = "codex-project-harness@kafa-local"
@@ -79,6 +84,8 @@ def run_smoke(
 ) -> dict[str, Any]:
     manifest = json.loads((source_repo / "release.json").read_text(encoding="utf-8"))
     version = str(manifest["version"])
+    runtime_version = str(manifest["runtime_version"])
+    schema_version = int(manifest["schema_version_runtime"])
     expected_codex_version = f"codex-cli {manifest['codex_cli_smoke_version']}"
     codex = str(Path(codex_value).expanduser().resolve()) if codex_value else shutil.which("codex")
     if not codex:
@@ -147,6 +154,7 @@ def run_smoke(
         env = clean_env.copy()
         env["HOME"] = str(root / "home")
         env["CODEX_HOME"] = str(root / "codex-home")
+        env["PATH"] = str(venv_python.parent) + os.pathsep + env.get("PATH", "")
         Path(env["HOME"]).mkdir()
         Path(env["CODEX_HOME"]).mkdir()
         kafa = [str(venv_python), "-m", "kafa.cli"]
@@ -173,26 +181,62 @@ def run_smoke(
         business_repo = root / "business"
         business_repo.mkdir()
         run(["git", "init"], env=env, cwd=business_repo)
-        expected_skills = {
-            f"codex-project-harness:{skill.parent.name}"
-            for skill in (release_repo / "plugins" / "codex-project-harness" / "skills").glob("*/SKILL.md")
-        }
-        hook_definition = json.loads(
-            (release_repo / "plugins" / "codex-project-harness" / "hooks" / "hooks.json").read_text(encoding="utf-8")
-        )
-        expected_hook_events = {
-            event[:1].lower() + event[1:]
-            for event in hook_definition.get("hooks", {})
-        }
         discovery = discover_with_app_server(codex, env=env, cwd=business_repo)
         discovery_report = validate_app_server_discovery(
             discovery,
             cache_root=cache_root,
             plugin_id=PLUGIN_ID,
             version=version,
-            expected_skills=expected_skills,
-            expected_hook_events=expected_hook_events,
         )
+
+        project_init = run(
+            [*kafa, "project", "init", "--repo", str(business_repo)],
+            env=env,
+            cwd=business_repo,
+        )
+        project_status = run(
+            [*kafa, "project", "status", "--repo", str(business_repo)],
+            env=env,
+            cwd=business_repo,
+        )
+        if (
+            f"schema_version: {schema_version}" not in project_status
+            or f"runtime_version: {runtime_version}" not in project_status
+        ):
+            raise RuntimeError(
+                "installed project status does not match release.json: "
+                f"{project_status}"
+            )
+        installed_templates = {
+            path.name for path in (business_repo / ".codex/agents").glob("*.toml")
+        }
+        if installed_templates != APPROVED_AGENT_TEMPLATES:
+            raise RuntimeError(
+                f"project agent template inventory mismatch: actual={sorted(installed_templates)} "
+                f"expected={sorted(APPROVED_AGENT_TEMPLATES)}"
+            )
+
+        (business_repo / "test_quickstart.py").write_text(
+            "import unittest\n\nclass InstalledTest(unittest.TestCase):\n"
+            "    def test_installed_runtime(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        installed_harness = cache_root / "scripts" / "harness.py"
+        quickstart = run(
+            [str(venv_python), str(installed_harness), "--root", str(business_repo), "quickstart", "minimal", "--id", "INSTALL", "--goal", "verify installed runtime", "--acceptance", "installed test passes", "--task", "run installed verification", "--test-command", "python -m unittest test_quickstart.py", "--execute"],
+            env=env,
+            cwd=business_repo,
+        )
+        quickstart_status = json.loads(run(
+            [str(venv_python), str(installed_harness), "--root", str(business_repo), "quickstart", "status", "--json"],
+            env=env,
+            cwd=business_repo,
+        ))
+        with sqlite3.connect(business_repo / ".ai-team/state/harness.db") as conn:
+            quickstart_facts = tuple(conn.execute(f"select count(*) from {table}").fetchone()[0] for table in ("executions", "validations", "quality_gates", "deliveries"))
+            quickstart_task_status = conn.execute("select status from tasks where id='INSTALL-T1'").fetchone()[0]
+        if "OK: quickstart minimal verified setup INSTALL" not in quickstart or quickstart_facts != (1, 1, 0, 0) or quickstart_task_status != "submitted" or quickstart_status["ready_for_delivery"] or "controller_execution" in quickstart_status["missing"]:
+            raise RuntimeError(f"installed quickstart contract failed: facts={quickstart_facts} task={quickstart_task_status} status={quickstart_status} output={quickstart}")
 
         doctor = json.loads(run([*kafa, "doctor", "--scope", "user", "--repo", str(release_repo), "--json"], env=env, cwd=root))
         if doctor.get("ok") is not True:
@@ -240,6 +284,17 @@ def run_smoke(
             "app_server_skills": discovery_report["skill_names"],
             "app_server_hook_count": discovery_report["hook_count"],
             "app_server_hook_events": discovery_report["hook_events"],
+            "app_server_template_count": discovery_report["template_count"],
+            "app_server_templates": discovery_report["template_names"],
+            "app_server_runtime_script_count": discovery_report["runtime_script_count"],
+            "app_server_schema_count": discovery_report["schema_count"],
+            "app_server_runtime_anchor_count": discovery_report["runtime_anchor_count"],
+            "retired_runtime_absent": discovery_report["retired_runtime_absent"],
+            "project_init_ok": "OK: project harness initialized" in project_init,
+            "project_status_ok": True,
+            "installed_quickstart_ok": True,
+            "installed_quickstart_task_status": quickstart_task_status,
+            "project_agent_templates": sorted(installed_templates),
             "doctor_ok": True,
             "cache_hook_ok": True,
             "direct_hook_handler_ok": True,

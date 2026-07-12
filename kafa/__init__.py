@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .version import release_version
+
 __all__ = ["__version__"]
 
-__version__ = "1.25.0-beta.1"
+__version__ = release_version()

@@ -9,7 +9,6 @@
     "cycle_id": { "type": "string" },
     "criterion": { "type": "string" },
     "priority": { "type": "string" },
-    "tool_link": { "type": "string" },
     "status": { "type": "string" },
     "revision": { "type": "integer" }
   },

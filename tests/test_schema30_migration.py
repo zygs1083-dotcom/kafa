@@ -1,0 +1,1599 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import sys
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
+SCRIPTS = PLUGIN_ROOT / "scripts"
+
+for path in (PLUGIN_ROOT, SCRIPTS):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+import harness_db  # noqa: E402
+from core import local_core_migration  # noqa: E402
+from core.event_bus import validate_audit_events  # noqa: E402
+from core.schema_lifecycle import SchemaLifecycleError, backup_sqlite_database  # noqa: E402
+from core.local_core_migration import (  # noqa: E402
+    InjectedLocalCoreMigrationFailure,
+    LocalCoreMigrationError,
+    migrate_project_to_schema30,
+    stage_schema29_to_schema30,
+    stage_supported_schema_to_schema30,
+)
+from core.projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS  # noqa: E402
+from run_agent_e2e_eval import _create_schema27_fixture  # noqa: E402
+from tests.legacy_schema_fixtures import create_schema28_fixture  # noqa: E402
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def init_schema29_fixture(root: Path) -> None:
+    db = root / ".ai-team/state/harness.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma foreign_keys = on")
+        conn.execute("begin immediate")
+        harness_db.create_schema29(conn)
+        conn.execute(
+            """
+            insert into project
+            (id, project_id, schema_version, runtime_version, phase, current_cycle_id,
+             status, scope_status, current_owner, revision, updated_at)
+            values (1, 'schema29-fixture', 29, '4.18.0', 'intake', 'CYCLE-current',
+                    'draft', 'unconfirmed', 'project-manager', 1, 'now')
+            """
+        )
+        harness_db.ensure_delivery_cycles(conn)
+        conn.commit()
+
+
+def add_retired_schema29_fixture_surface(conn: sqlite3.Connection) -> None:
+    """Recreate only the retired columns/tables needed to test v1 -> v2 filtering."""
+    conn.execute("alter table requirements add column tool_link text not null default ''")
+    conn.execute("alter table acceptance add column tool_link text not null default ''")
+    conn.execute("drop table tasks")
+    conn.execute(
+        """
+        create table tasks (
+            uid text primary key default (lower(hex(randomblob(16)))),
+            id text not null,
+            cycle_id text not null default '',
+            task text not null,
+            owner text not null,
+            status text not null,
+            evidence text not null default '',
+            tool_link text not null default '',
+            submitted_by text not null default '',
+            submitted_session_id text not null default '',
+            accepted_by text not null default '',
+            accepted_session_id text not null default '',
+            lease_agent text,
+            lease_token text,
+            lease_heartbeat_at text,
+            lease_expires_at text,
+            retry_count integer not null default 0,
+            retry_budget integer not null default 2,
+            fence integer not null default 0,
+            revision integer not null default 1,
+            updated_at text not null,
+            unique(cycle_id, id)
+        )
+        """
+    )
+    conn.execute("alter table evidence add column trust_anchor text not null default ''")
+    conn.execute("alter table evidence add column trust_anchor_id text not null default ''")
+    conn.execute(
+        """
+        create table connector_profiles (
+            id text primary key,
+            tool text not null,
+            project_key text not null,
+            status text not null,
+            scope_json text not null,
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+
+
+class Schema30BackupTests(unittest.TestCase):
+    def test_backup_records_safe_recovery_metadata_and_preserves_complete_database(self) -> None:
+        secret = "connector-token-must-not-enter-manifest"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                conn.execute(
+                    "insert into decisions (id, decision, reason, created_at) values ('D-secret', 'private', ?, 'now')",
+                    (secret,),
+                )
+                conn.commit()
+            markdown_before = {
+                path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+                for path in root.rglob("*.md")
+            }
+
+            manifest = backup_sqlite_database(
+                root,
+                expected_source_version=29,
+                created_at="2026-07-11T01:02:03Z",
+            )
+            backup = Path(manifest.backup_path)
+            manifest_path = Path(manifest.manifest_path)
+            payload_text = manifest_path.read_text(encoding="utf-8")
+            payload = json.loads(payload_text)
+            backup_digest = sha256(backup)
+            backup_files = {path.name for path in backup.parent.iterdir()}
+            markdown_after = {
+                path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+                for path in root.rglob("*.md")
+            }
+            with closing(sqlite3.connect(backup)) as conn:
+                restored_reason = conn.execute("select reason from decisions where id='D-secret'").fetchone()[0]
+                backup_version = int(conn.execute("select schema_version from project where id=1").fetchone()[0])
+
+        self.assertEqual(manifest.source_version, 29)
+        self.assertEqual(manifest.target_version, 30)
+        self.assertEqual(manifest.sha256, backup_digest)
+        self.assertEqual(payload["sha256"], manifest.sha256)
+        self.assertGreater(payload["row_counts"]["project"], 0)
+        self.assertEqual(payload["source_integrity_check"], ["ok"])
+        self.assertEqual(payload["backup_integrity_check"], ["ok"])
+        self.assertEqual(payload["source_foreign_key_issue_count"], 0)
+        self.assertEqual(payload["backup_foreign_key_issue_count"], 0)
+        self.assertNotIn(secret, payload_text)
+        self.assertEqual(markdown_after, markdown_before)
+        self.assertEqual(backup_files, {"harness.db", "backup-manifest.json"})
+        self.assertEqual(restored_reason, secret)
+        self.assertEqual(backup_version, 29)
+
+    def test_backup_rejects_schema_version_cas_mismatch_without_partial_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            with self.assertRaisesRegex(SchemaLifecycleError, "source schema changed before backup"):
+                backup_sqlite_database(
+                    root,
+                    expected_source_version=28,
+                    created_at="2026-07-11T01:02:03Z",
+                )
+            backups = list((root / ".ai-team/backups").glob("**/*")) if (root / ".ai-team/backups").exists() else []
+
+        self.assertEqual(backups, [])
+
+
+class Schema30StagingTests(unittest.TestCase):
+    def test_schema29_native_submitted_context_survives_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            staging = root / ".ai-team/runtime/migration/schema30-context.db"
+            with closing(sqlite3.connect(source)) as conn:
+                conn.execute(
+                    """
+                    insert into tasks
+                    (id, cycle_id, task, owner, status, submitted_context_id, updated_at)
+                    values ('T-context', 'CYCLE-current', 'preserve producer context',
+                            'developer', 'submitted', 'ctx-must-survive', 'now')
+                    """
+                )
+                conn.commit()
+
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                task = conn.execute(
+                    """
+                    select status, submitted_context_id from tasks
+                    where id='T-context' and cycle_id='CYCLE-current'
+                    """
+                ).fetchone()
+
+        self.assertEqual(task, ("submitted", "ctx-must-survive"))
+
+    def test_retained_legacy_event_gets_complete_compact_audit_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                conn.execute(
+                    """
+                    insert into events
+                    (id, schema_version, type, source, target, correlation_id, payload_json, created_at)
+                    values ('E-local', 29, 'requirement_recorded', 'runtime',
+                            'requirement:R1', '', '{}', '2026-07-11T00:00:00Z')
+                    """
+                )
+                conn.commit()
+            staging = root / ".ai-team/runtime/migration/events.schema30.db"
+
+            stage_schema29_to_schema30(source, staging)
+
+            with closing(sqlite3.connect(staging)) as conn:
+                conn.row_factory = sqlite3.Row
+                event = conn.execute(
+                    "select entity_type, entity_id, actor, command, correlation_id from events where id='E-local'"
+                ).fetchone()
+                issues = validate_audit_events(conn)
+
+        self.assertEqual(event["entity_type"], "requirement")
+        self.assertEqual(event["entity_id"], "R1")
+        self.assertEqual(event["actor"], "schema-migration")
+        self.assertEqual(event["command"], "import legacy local audit event")
+        self.assertTrue(event["correlation_id"])
+        self.assertEqual(issues, [])
+
+    def test_legacy_failed_and_skipped_tasks_map_without_data_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            staging = root / ".ai-team/runtime/migration/schema30-tasks.db"
+            with closing(sqlite3.connect(source)) as conn:
+                add_retired_schema29_fixture_surface(conn)
+                conn.executemany(
+                    """
+                    insert into tasks (id, cycle_id, task, owner, status, updated_at)
+                    values (?, 'CYCLE-current', ?, 'developer', ?, 'now')
+                    """,
+                    [
+                        ("T-failed", "failed task", "failed"),
+                        ("T-skipped", "skipped task", "skipped"),
+                    ],
+                )
+                conn.commit()
+
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                rows = conn.execute("select id, status from tasks order by id").fetchall()
+
+        self.assertEqual(rows, [("T-failed", "blocked"), ("T-skipped", "cancelled")])
+
+    def test_schema29_local_facts_stage_side_by_side_without_external_rows(self) -> None:
+        external_secret = "external-connector-secret-must-stay-in-schema29"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                add_retired_schema29_fixture_surface(conn)
+                conn.execute(
+                    """
+                    insert into requirements
+                    (id, cycle_id, kind, body, priority, status, tool_link, updated_at)
+                    values ('R1', 'CYCLE-current', 'functional', 'local requirement', 'must', 'active', ?, 'now')
+                    """,
+                    (external_secret,),
+                )
+                conn.execute(
+                    """
+                    insert into acceptance
+                    (id, cycle_id, criterion, priority, tool_link, status)
+                    values ('AC1', 'CYCLE-current', 'local acceptance', 'must', ?, 'active')
+                    """,
+                    (external_secret,),
+                )
+                conn.execute(
+                    "insert into requirement_acceptance (cycle_id, requirement_id, acceptance_id) values ('CYCLE-current', 'R1', 'AC1')"
+                )
+                conn.execute(
+                    """
+                    insert into failure_modes
+                    (id, cycle_id, feature, scenario, trigger, expected_behavior, risk, status)
+                    values ('FM1', 'CYCLE-current', 'migration', 'copy', 'upgrade', 'preserve', 'high', 'active')
+                    """
+                )
+                conn.execute(
+                    "insert into failure_mode_acceptance (cycle_id, failure_mode_id, acceptance_id) values ('CYCLE-current', 'FM1', 'AC1')"
+                )
+                conn.execute(
+                    """
+                    insert into agent_sessions
+                    (session_id, agent_id, role, context_id, status, started_at)
+                    values ('S-producer', 'developer', 'developer', 'ctx-producer', 'closed', 'now')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into tasks
+                    (id, cycle_id, task, owner, status, evidence, tool_link, submitted_session_id, accepted_by, updated_at)
+                    values ('T1', 'CYCLE-current', 'local task', 'developer', 'review', 'implemented', ?, 'S-producer', 'qa-reviewer', 'now')
+                    """,
+                    (external_secret,),
+                )
+                conn.execute(
+                    "insert into task_acceptance (cycle_id, task_id, acceptance_id) values ('CYCLE-current', 'T1', 'AC1')"
+                )
+                conn.execute(
+                    "insert into task_failure_modes (cycle_id, task_id, failure_mode_id) values ('CYCLE-current', 'T1', 'FM1')"
+                )
+                conn.execute(
+                    """
+                    insert into test_targets
+                    (id, kind, command_template, description, created_at, updated_at)
+                    values ('UNIT', 'unit', 'python3 -m unittest', 'local target', 'now', 'now')
+                    """
+                )
+                conn.execute(
+                    "insert into task_test_targets (cycle_id, task_id, target_id) values ('CYCLE-current', 'T1', 'UNIT')"
+                )
+                snapshot = json.dumps(
+                    {"requirements": [{"id": "R1", "body": "local requirement", "tool_link": external_secret}]},
+                    sort_keys=True,
+                )
+                conn.execute(
+                    """
+                    insert into baselines
+                    (id, summary, snapshot_json, digest, project_revision, created_by, created_at)
+                    values ('B1', 'local baseline', ?, 'legacy-digest', 1, 'project-manager', 'now')
+                    """,
+                    (snapshot,),
+                )
+                conn.execute(
+                    """
+                    insert into connector_profiles
+                    (id, tool, project_key, status, scope_json, created_at, updated_at)
+                    values ('CP1', 'github', 'local-project', 'active', ?, 'now', 'now')
+                    """,
+                    (json.dumps({"token": external_secret}),),
+                )
+                conn.execute(
+                    """
+                    insert into events
+                    (id, schema_version, type, source, target, payload_json, created_at)
+                    values ('E-external', 29, 'connector_profile_set', 'connector', 'project', ?, 'now')
+                    """,
+                    (json.dumps({"token": external_secret}),),
+                )
+                conn.commit()
+
+            source_digest_before = sha256(source)
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            report = stage_schema29_to_schema30(source, staging)
+            source_digest_after = sha256(source)
+            staging_bytes = staging.read_bytes()
+            with closing(sqlite3.connect(f"file:{staging.as_posix()}?mode=ro", uri=True)) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+                    )
+                }
+                project = conn.execute("select schema_version, runtime_version from project where id=1").fetchone()
+                requirement = conn.execute("select body from requirements where id='R1'").fetchone()[0]
+                requirement_columns = {row[1] for row in conn.execute("pragma table_info(requirements)")}
+                task = conn.execute(
+                    "select status, submitted_context_id from tasks where id='T1'"
+                ).fetchone()
+                task_columns = {row[1] for row in conn.execute("pragma table_info(tasks)")}
+                baseline = json.loads(conn.execute("select snapshot_json from baselines where id='B1'").fetchone()[0])
+                external_event_count = int(
+                    conn.execute("select count(*) from events where event_type='connector_profile_set'").fetchone()[0]
+                )
+                foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+
+        self.assertEqual(source_digest_after, source_digest_before)
+        self.assertEqual(report.source_version, 29)
+        self.assertEqual(report.target_version, 30)
+        self.assertEqual(len(tables), 27)
+        self.assertEqual(project, (30, "5.0.0"))
+        self.assertEqual(requirement, "local requirement")
+        self.assertNotIn("tool_link", requirement_columns)
+        self.assertEqual(task, ("submitted", "ctx-producer"))
+        self.assertFalse({"lease_token", "lease_agent", "fence"} & task_columns)
+        self.assertNotIn("tool_link", baseline["requirements"][0])
+        self.assertNotIn(external_secret.encode("utf-8"), staging_bytes)
+        self.assertNotIn("connector_profiles", tables)
+        self.assertGreaterEqual(report.retired_row_counts["connector_profiles"], 1)
+        self.assertGreaterEqual(report.dropped_event_count, 1)
+        self.assertEqual(external_event_count, 0)
+        self.assertEqual(foreign_key_issues, [])
+
+    def test_schema29_degraded_review_is_not_promoted_by_distinct_session_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                add_retired_schema29_fixture_surface(conn)
+                conn.executemany(
+                    """
+                    insert into agent_sessions
+                    (session_id, agent_id, role, context_id, status, started_at)
+                    values (?, ?, ?, ?, 'closed', 'now')
+                    """,
+                    (
+                        ("S-producer", "developer", "developer", "ctx-producer"),
+                        ("S-reviewer", "qa", "qa", "ctx-reviewer"),
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into tasks
+                    (id, cycle_id, task, owner, status, submitted_session_id, updated_at)
+                    values ('T1', 'CYCLE-current', 'candidate', 'developer', 'review',
+                            'S-producer', 'now')
+                    """
+                )
+                conn.executemany(
+                    """
+                    insert into quality_gates
+                    (id, sequence, cycle_id, candidate_sha, gate_status, gate,
+                     reviewed_commit, reviewer_context, result, project_revision,
+                     reviewer_session_id, created_at)
+                    values (?, ?, 'CYCLE-current', 'candidate', 'active',
+                            'independent_qa', 'candidate', ?, 'pass', 1,
+                            'S-reviewer', 'now')
+                    """,
+                    (
+                        ("G-degraded", 1, "same-context-degraded"),
+                        ("G-fresh", 2, "fresh"),
+                        ("G-spaced-fresh", 3, " fresh "),
+                    ),
+                )
+                conn.commit()
+
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                gates = conn.execute(
+                    """
+                    select id, producer_context_id, reviewer_context_id, review_status
+                    from quality_gates order by sequence
+                    """
+                ).fetchall()
+
+        self.assertEqual(
+            gates,
+            [
+                ("G-degraded", "ctx-producer", "ctx-reviewer", "same-context-degraded"),
+                ("G-fresh", "ctx-producer", "ctx-reviewer", "reviewed-local"),
+                (
+                    "G-spaced-fresh",
+                    "ctx-producer",
+                    "ctx-reviewer",
+                    "same-context-degraded",
+                ),
+            ],
+        )
+
+    def test_empty_session_contexts_never_become_reviewed_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                add_retired_schema29_fixture_surface(conn)
+                conn.executemany(
+                    """
+                    insert into agent_sessions
+                    (session_id, agent_id, role, context_id, status, started_at)
+                    values (?, ?, ?, '', 'closed', 'now')
+                    """,
+                    (
+                        ("S-empty-producer", "developer", "developer"),
+                        ("S-empty-reviewer", "qa", "qa"),
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into tasks
+                    (id, cycle_id, task, owner, status, submitted_session_id, updated_at)
+                    values ('T-empty-context', 'CYCLE-current', 'candidate', 'developer',
+                            'review', 'S-empty-producer', 'now')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into quality_gates
+                    (id, sequence, cycle_id, candidate_sha, gate_status, gate,
+                     reviewed_commit, reviewer_context, result, project_revision,
+                     reviewer_session_id, created_at)
+                    values ('G-empty-context', 1, 'CYCLE-current', 'candidate', 'active',
+                            'independent_qa', 'candidate', 'fresh', 'pass', 1,
+                            'S-empty-reviewer', 'now')
+                    """
+                )
+                conn.commit()
+
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                task_context = conn.execute(
+                    "select submitted_context_id from tasks where id='T-empty-context'"
+                ).fetchone()[0]
+                gate = conn.execute(
+                    """
+                    select producer_context_id, reviewer_context_id, review_status
+                    from quality_gates where id='G-empty-context'
+                    """
+                ).fetchone()
+
+        self.assertEqual(task_context, "")
+        self.assertEqual(gate, ("", "", "same-context-degraded"))
+
+    def test_invalidated_validations_preserve_valid_supersession_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                conn.executemany(
+                    """
+                    insert into validations
+                    (id, cycle_id, candidate_sha, validation_status, superseded_by,
+                     surface, findings, result, residual_risk, created_at)
+                    values (?, 'CYCLE-current', 'candidate', ?, ?, 'unit', '', 'pass', '', ?)
+                    """,
+                    (
+                        ("V-new", "active", "", "2026-07-11T00:00:01Z"),
+                        ("V-old", "superseded", "V-new", "2026-07-11T00:00:00Z"),
+                    ),
+                )
+                conn.commit()
+
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                validations = conn.execute(
+                    "select id, validation_status, superseded_by from validations order by id"
+                ).fetchall()
+
+        self.assertEqual(
+            validations,
+            [
+                ("V-new", "invalidated", None),
+                ("V-old", "invalidated", "V-new"),
+            ],
+        )
+
+    def test_only_controller_artifacts_become_immutable_executions(self) -> None:
+        candidate_sha = "a" * 64
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            artifact = root / ".ai-team/runtime/executions/eligible/stdout.txt"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("Ran 1 test in 0.001s\nOK\n", encoding="utf-8")
+            artifact_sha = sha256(artifact)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                add_retired_schema29_fixture_surface(conn)
+                conn.execute(
+                    "insert into acceptance (id, cycle_id, criterion, status) values ('AC1', 'CYCLE-current', 'verified', 'active')"
+                )
+                conn.execute(
+                    """
+                    insert into failure_modes
+                    (id, cycle_id, feature, scenario, trigger, expected_behavior, risk, status)
+                    values ('FM1', 'CYCLE-current', 'migration', 'evidence', 'upgrade', 'preserve', 'medium', 'active')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into test_targets
+                    (id, kind, command_template, description, gateable, result_format, created_at, updated_at)
+                    values ('UNIT', 'unit', 'python3 -m unittest', 'eligible', 1, 'regex', 'now', 'now')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into evidence
+                    (id, kind, summary, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+                     target_id, executed_count, executed_count_source, result_format, semantic_status,
+                     policy_status, sandbox_profile, sandbox_status, verified_by, trust_anchor, created_at)
+                    values ('EV-controller', 'command', 'controller', 'python3 -m unittest', 0, ?, ?, ?,
+                            'UNIT', 1, 'parsed', 'regex', '', 'allowed', 'none', '', 'controller-local',
+                            'local-only', 'now')
+                    """,
+                    (artifact_sha, artifact.relative_to(root).as_posix(), candidate_sha),
+                )
+                conn.execute(
+                    """
+                    insert into evidence
+                    (id, kind, summary, command, exit_code, stdout_sha256, artifact_path, source_tree_hash,
+                     target_id, executed_count, executed_count_source, result_format, semantic_status,
+                     policy_status, sandbox_profile, sandbox_status, verified_by, trust_anchor, trust_anchor_id, created_at)
+                    values ('EV-manual', 'command', 'forged manual', 'python3 -m unittest', 0, ?, ?, ?,
+                            'UNIT', 1, 'manual', 'regex', 'pass', 'manual', 'none', '', '',
+                            'external-session', 'looks-like-hmac', 'now')
+                    """,
+                    (artifact_sha, artifact.relative_to(root).as_posix(), candidate_sha),
+                )
+                for validation_id in ("V-controller", "V-manual", "V-unbound"):
+                    conn.execute(
+                        """
+                        insert into validations
+                        (id, cycle_id, candidate_sha, validation_status, surface, acceptance_id,
+                         findings, result, residual_risk, source_tree_hash, created_at)
+                        values (?, 'CYCLE-current', ?, 'active', 'migration', 'AC1', 'legacy judgment',
+                                'pass', '', ?, 'now')
+                        """,
+                        (validation_id, candidate_sha, candidate_sha),
+                    )
+                conn.execute(
+                    "insert into validation_evidence (validation_id, evidence_id) values ('V-controller', 'EV-controller')"
+                )
+                conn.execute(
+                    "insert into validation_evidence (validation_id, evidence_id) values ('V-manual', 'EV-manual')"
+                )
+                conn.execute(
+                    """
+                    insert into validation_failure_modes (validation_id, cycle_id, failure_mode_id)
+                    values ('V-controller', 'CYCLE-current', 'FM1')
+                    """
+                )
+                conn.commit()
+
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            report = stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                execution = conn.execute(
+                    "select candidate_sha, target_id, command, exit_code, stdout_sha256, executed_count, semantic_status, runner from executions"
+                ).fetchone()
+                validation_rows = conn.execute(
+                    "select id, validation_status from validations order by id"
+                ).fetchall()
+                links = conn.execute(
+                    "select v.id, ve.execution_id from validations v join validation_executions ve on ve.validation_id=v.id"
+                ).fetchall()
+                failure_links = conn.execute(
+                    "select validation_id, failure_mode_id from validation_failure_modes"
+                ).fetchall()
+                invalidated = {
+                    row[0]
+                    for row in conn.execute(
+                        "select target_id from invalidations where target_type='validation'"
+                    )
+                }
+                tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("update executions set command='false'")
+
+        self.assertEqual(
+            execution,
+            (candidate_sha, "UNIT", "python3 -m unittest", 0, artifact_sha, 1, "pass", "local"),
+        )
+        self.assertEqual(
+            validation_rows,
+            [("V-controller", "active"), ("V-manual", "invalidated"), ("V-unbound", "invalidated")],
+        )
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0][0], "V-controller")
+        self.assertEqual(failure_links, [("V-controller", "FM1")])
+        self.assertEqual(invalidated, {"V-manual", "V-unbound"})
+        self.assertNotIn("evidence", tables)
+        self.assertNotIn("tests", tables)
+        self.assertEqual(report.converted_execution_count, 1)
+        self.assertEqual(report.converted_validation_count, 1)
+        self.assertEqual(report.invalidated_validation_count, 2)
+
+
+class Schema30LegacyStagingTests(unittest.TestCase):
+    def _assert_legacy_fixture_migrates(self, source_version: int) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (_create_schema27_fixture if source_version == 27 else create_schema28_fixture)(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                source_inventory = (
+                    conn.execute("select count(*) from sqlite_master where type='table' and name not like 'sqlite_%'").fetchone()[0],
+                    conn.execute("select count(*) from sqlite_master where type='index'").fetchone()[0],
+                )
+            source_digest_before = sha256(source)
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+
+            report = stage_supported_schema_to_schema30(source, staging)
+
+            source_digest_after = sha256(source)
+            with closing(sqlite3.connect(staging)) as conn:
+                project = conn.execute(
+                    "select schema_version, runtime_version, current_cycle_id from project where id=1"
+                ).fetchone()
+                requirements = conn.execute(
+                    "select cycle_id, id, body from requirements order by cycle_id, id"
+                ).fetchall()
+                tasks = conn.execute(
+                    "select cycle_id, id, status from tasks order by cycle_id, id"
+                ).fetchall()
+                gates = conn.execute(
+                    "select id, sequence, result, review_status from quality_gates order by sequence"
+                ).fetchall()
+                migrations = conn.execute(
+                    "select from_version, to_version, status from migrations order by id"
+                ).fetchall()
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+                    )
+                }
+                foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+
+        self.assertEqual(source_digest_after, source_digest_before)
+        self.assertEqual(report.source_version, source_version)
+        self.assertEqual(report.target_version, 30)
+        self.assertEqual(project, (30, "5.0.0", "CYCLE-current"))
+        self.assertEqual(requirements, [("CYCLE-current", "R1", "Preserve requirement")])
+        expected_tasks = [("CYCLE-current", "T0", "accepted"), ("CYCLE-current", "T1", "submitted")] if source_version == 27 else [("CYCLE-current", "T1", "planned")]
+        expected_gates = [("G1", "pass")] if source_version == 27 else [("z-old-pass", "pass"), ("a-new-fail", "fail")]
+        self.assertEqual(tasks, expected_tasks)
+        self.assertEqual([(row[0], row[2]) for row in gates], expected_gates)
+        self.assertEqual([row[1] for row in gates], list(range(1, len(gates) + 1)))
+        self.assertTrue(all(row[3] in {"reviewed-local", "same-context-degraded"} for row in gates))
+        self.assertEqual(source_inventory, (53, 60) if source_version == 27 else (17, 17))
+        self.assertIn((source_version, 29, "legacy-history"), migrations)
+        self.assertIn((29, 30, "staged"), migrations)
+        self.assertEqual(len(tables), 27)
+        self.assertNotIn("session_attestations", tables)
+        self.assertNotIn("ci_verifications", tables)
+        self.assertNotIn("external_session_verifications", tables)
+        self.assertEqual(foreign_key_issues, [])
+        if source_version == 27:
+            self.assertEqual(
+                (report.converted_execution_count, report.converted_validation_count),
+                (1, 1),
+            )
+            self.assertEqual(report.retired_row_counts["adapter_actions"], 1)
+
+    def test_published_schema27_uses_isolated_legacy_stage(self) -> None:
+        self._assert_legacy_fixture_migrates(27)
+
+    def test_development_schema28_uses_isolated_legacy_stage(self) -> None:
+        self._assert_legacy_fixture_migrates(28)
+
+    def test_legacy_session_ids_do_not_replace_shared_context_identity(self) -> None:
+        for source_version, fixture in (
+            (27, _create_schema27_fixture),
+            (28, create_schema28_fixture),
+        ):
+            with self.subTest(source_version=source_version), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                fixture(root)
+                source = root / ".ai-team/state/harness.db"
+                with closing(sqlite3.connect(source)) as conn:
+                    conn.executemany(
+                        """
+                        insert into agent_sessions
+                        (session_id, agent_id, role, context_id, origin, trust_level,
+                         status, started_at)
+                        values (?, ?, ?, 'ctx-shared', 'manual', 'local-only', 'closed', 'now')
+                        """,
+                        (
+                            ("S-context-producer", "developer", "developer"),
+                            ("S-context-reviewer", "qa", "qa"),
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        insert into tasks
+                        (id, cycle_id, task, owner, status, submitted_session_id, updated_at)
+                        values ('T-context', 'CYCLE-current', 'candidate', 'developer',
+                                'review', 'S-context-producer', 'now')
+                        """
+                    )
+                    conn.execute(
+                        """
+                        insert into quality_gates
+                        (id, cycle_id, candidate_sha, gate, reviewed_commit,
+                         reviewer_context, result, project_revision,
+                         reviewer_session_id, created_at)
+                        values ('G-context', 'CYCLE-current', 'candidate', 'independent_qa',
+                                'candidate', 'fresh', 'pass', 1,
+                                'S-context-reviewer', 'now')
+                        """
+                    )
+                    conn.commit()
+
+                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+                stage_supported_schema_to_schema30(source, staging)
+                with closing(sqlite3.connect(staging)) as conn:
+                    task_context = conn.execute(
+                        "select submitted_context_id from tasks where id='T-context'"
+                    ).fetchone()[0]
+                    gate = conn.execute(
+                        """
+                        select producer_context_id, reviewer_context_id, review_status
+                        from quality_gates where id='G-context'
+                        """
+                    ).fetchone()
+
+                self.assertEqual(task_context, "ctx-shared")
+                self.assertEqual(
+                    gate,
+                    ("ctx-shared", "ctx-shared", "same-context-degraded"),
+                )
+
+
+class ProjectionPathContractTests(unittest.TestCase):
+    def test_projection_and_rollback_path_inventories_are_exact_and_unique(self) -> None:
+        expected = (
+            Path(".ai-team/control/project-state.yaml"),
+            Path(".ai-team/requirements/requirements.md"),
+            Path(".ai-team/requirements/traceability.md"),
+            Path(".ai-team/requirements/acceptance.md"),
+            Path(".ai-team/requirements/failure-modes.md"),
+            Path(".ai-team/planning/task-board.md"),
+            Path(".ai-team/control/test-targets.md"),
+            Path("docs/harness/validation.md"),
+            Path("docs/harness/executions.md"),
+            Path("docs/harness/findings.md"),
+            Path("docs/harness/quality-gates.md"),
+            Path("docs/harness/delivery.md"),
+            Path(".ai-team/control/decision-log.md"),
+        )
+        self.assertEqual(PROJECTION_PATHS, expected)
+        self.assertEqual(len(PROJECTION_PATHS), len(set(PROJECTION_PATHS)))
+        self.assertEqual(
+            PROJECTION_ROLLBACK_PATHS,
+            (*expected, Path("docs/harness/evidence.md")),
+        )
+        self.assertEqual(len(PROJECTION_ROLLBACK_PATHS), len(set(PROJECTION_ROLLBACK_PATHS)))
+
+
+class Schema30ActivationRollbackTests(unittest.TestCase):
+    def _prepare_source(self, root: Path) -> Path:
+        init_schema29_fixture(root)
+        source = root / ".ai-team/state/harness.db"
+        with closing(sqlite3.connect(source)) as conn:
+            conn.execute(
+                "insert into decisions (id, decision, reason, created_at) values ('D-sentinel', 'keep', 'rollback sentinel', 'now')"
+            )
+            conn.commit()
+        return source
+
+    def test_failure_injection_preserves_or_restores_active_database(self) -> None:
+        points = (
+            "before_copy",
+            "during_relation_copy",
+            "during_invariant_validation",
+            "before_atomic_replace",
+            "after_atomic_replace",
+        )
+        for point in points:
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                active = self._prepare_source(root)
+                source_digest = sha256(active)
+
+                with self.assertRaises(InjectedLocalCoreMigrationFailure):
+                    migrate_project_to_schema30(root, fail_at=point)
+
+                with closing(sqlite3.connect(active)) as conn:
+                    version = int(conn.execute("select schema_version from project where id=1").fetchone()[0])
+                    sentinel = conn.execute("select decision from decisions where id='D-sentinel'").fetchone()[0]
+                    integrity = conn.execute("pragma integrity_check").fetchone()[0]
+                    foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+                backup_dirs = sorted((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+                self.assertEqual(len(backup_dirs), 1)
+                manifest_path = backup_dirs[0] / "migration-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                backup_path = Path(manifest["backup"]["backup_path"])
+                backup_digest = manifest["backup"]["sha256"]
+                active_digest = sha256(active)
+                lock_exists = (root / ".ai-team/state/local-core-migration.lock").exists()
+
+                self.assertEqual(version, 29)
+                self.assertEqual(sentinel, "keep")
+                self.assertEqual(integrity, "ok")
+                self.assertEqual(foreign_key_issues, [])
+                self.assertTrue(backup_path.is_file())
+                self.assertEqual(sha256(backup_path), backup_digest)
+                self.assertFalse(lock_exists)
+                if point == "after_atomic_replace":
+                    self.assertEqual(manifest["status"], "rolled-back")
+                    self.assertEqual(active_digest, backup_digest)
+                    failed = Path(manifest["failed_schema30_path"])
+                    self.assertTrue(failed.is_file())
+                    with closing(sqlite3.connect(failed)) as conn:
+                        self.assertEqual(
+                            int(conn.execute("select schema_version from project where id=1").fetchone()[0]),
+                            30,
+                        )
+                else:
+                    self.assertEqual(manifest["status"], "failed-before-activation")
+                    self.assertEqual(active_digest, source_digest)
+
+    def test_post_activation_projection_failure_restores_verified_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            (root / ".gitignore").write_text(
+                "\n".join(harness_db.RUNTIME_GITIGNORE_PATTERNS) + "\n", encoding="utf-8"
+            )
+            with patch.object(
+                harness_db,
+                "render_all",
+                side_effect=(None, harness_db.HarnessError("projection failed")),
+            ):
+                with self.assertRaisesRegex(harness_db.HarnessError, "projection failed"):
+                    harness_db.migrate(root, "29", 30)
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+            self.assertEqual(
+                (version, sha256(active), manifest["status"]),
+                (29, manifest["backup"]["sha256"], "rolled-back"),
+            )
+
+    def test_final_doctor_failure_does_not_publish_schema30_projections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            state = root / ".ai-team/control/project-state.yaml"
+            delivery = root / "docs/harness/delivery.md"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            delivery.parent.mkdir(parents=True, exist_ok=True)
+            state.write_bytes(b"schema: 29\nstate: original\n")
+            delivery.write_bytes(b"# Original schema 29 delivery view\n")
+
+            def render_with_visible_side_effect(render_root: Path) -> None:
+                if render_root.resolve() != root.resolve():
+                    return
+                state.write_bytes(b"schema: 30\nstate: published-too-early\n")
+                delivery.write_bytes(b"# Incorrect schema 30 delivery view\n")
+
+            with (
+                patch.object(harness_db, "render_all", side_effect=render_with_visible_side_effect),
+                patch.object(harness_db, "doctor", return_value=["forced final doctor failure"]),
+            ):
+                with self.assertRaisesRegex(harness_db.HarnessError, "forced final doctor failure"):
+                    harness_db.migrate(root, "29", 30)
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+
+            self.assertEqual(version, 29)
+            self.assertEqual(state.read_bytes(), b"schema: 29\nstate: original\n")
+            self.assertEqual(delivery.read_bytes(), b"# Original schema 29 delivery view\n")
+            self.assertIn("projection_backup", manifest)
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+
+    def test_partial_projection_failure_restores_exact_pre_migration_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original = root / ".ai-team/control/project-state.yaml"
+            created_during_failure = root / "docs/harness/executions.md"
+            retired_evidence = root / "docs/harness/evidence.md"
+            original.parent.mkdir(parents=True, exist_ok=True)
+            retired_evidence.parent.mkdir(parents=True, exist_ok=True)
+            original.write_bytes(b"schema: 29\noriginal: true\n")
+            retired_evidence.write_bytes(b"# Legacy evidence view\n")
+            original.chmod(0o640)
+            retired_evidence.chmod(0o600)
+            original_mode = original.stat().st_mode & 0o7777
+            retired_mode = retired_evidence.stat().st_mode & 0o7777
+            original_digest = sha256(original)
+            retired_digest = sha256(retired_evidence)
+
+            def partially_render(render_root: Path) -> None:
+                if render_root.resolve() != root.resolve():
+                    return
+                original.write_bytes(b"schema: 30\npartial: true\n")
+                created_during_failure.parent.mkdir(parents=True, exist_ok=True)
+                created_during_failure.write_bytes(b"# Partial schema 30 executions\n")
+                retired_evidence.unlink()
+                raise harness_db.HarnessError("partial projection failure")
+
+            with patch.object(harness_db, "render_all", side_effect=partially_render):
+                with self.assertRaisesRegex(harness_db.HarnessError, "partial projection failure"):
+                    harness_db.migrate(root, "29", 30)
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+
+            self.assertEqual(version, 29)
+            self.assertEqual(original.read_bytes(), b"schema: 29\noriginal: true\n")
+            self.assertEqual(original.stat().st_mode & 0o7777, original_mode)
+            self.assertEqual(sha256(original), original_digest)
+            self.assertFalse(created_during_failure.exists())
+            self.assertEqual(retired_evidence.read_bytes(), b"# Legacy evidence view\n")
+            self.assertEqual(retired_evidence.stat().st_mode & 0o7777, retired_mode)
+            self.assertEqual(sha256(retired_evidence), retired_digest)
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            entries = {
+                entry["path"]: entry for entry in manifest["projection_backup"]["entries"]
+            }
+            self.assertEqual(entries[str(PROJECTION_PATHS[0])]["sha256"], original_digest)
+            self.assertEqual(entries[str(PROJECTION_PATHS[0])]["mode"], original_mode)
+            self.assertFalse(entries[str(Path("docs/harness/executions.md"))]["existed"])
+            self.assertEqual(entries[str(Path("docs/harness/evidence.md"))]["sha256"], retired_digest)
+
+    def test_projection_restore_failure_is_never_reported_as_complete_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_text("schema: 29\n", encoding="utf-8")
+
+            with (
+                patch.object(
+                    harness_db,
+                    "render_all",
+                    side_effect=(None, harness_db.HarnessError("projection publish failed")),
+                ),
+                patch.object(
+                    local_core_migration,
+                    "_restore_projection_backup",
+                    side_effect=local_core_migration.LocalCoreMigrationError(
+                        "projection restore failed"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(Exception, "projection restore failed"):
+                    harness_db.migrate(root, "29", 30)
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+            self.assertEqual(version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["projection_restore_status"], "failed")
+            self.assertIn("projection publish failed", manifest["error"])
+            self.assertIn("projection restore failed", manifest["projection_restore_error"])
+
+    def test_failed_schema30_move_uses_verified_copy_before_authority_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_replace = local_core_migration.os.replace
+
+            def reject_failed_database_move(source: Path, destination: Path) -> None:
+                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 move denial")
+                original_replace(source, destination)
+
+            with patch.object(
+                local_core_migration.os,
+                "replace",
+                side_effect=reject_failed_database_move,
+            ):
+                with self.assertRaises(InjectedLocalCoreMigrationFailure):
+                    migrate_project_to_schema30(root, fail_at="after_atomic_replace")
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            failed = Path(manifest["failed_schema30_path"])
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+            with closing(sqlite3.connect(failed)) as conn:
+                failed_version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(failed_version, 30)
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(
+                manifest["failed_schema30_preservation_status"],
+                "copied-after-move-failure",
+            )
+            self.assertIn("move denial", manifest["failed_schema30_preservation_error"])
+
+    def test_failed_schema30_diagnostic_loss_cannot_prevent_authority_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_replace = local_core_migration.os.replace
+            original_copyfile = local_core_migration.shutil.copyfile
+
+            def reject_failed_database_move(source: Path, destination: Path) -> None:
+                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 move denial")
+                original_replace(source, destination)
+
+            def reject_failed_database_copy(source: Path, destination: Path) -> None:
+                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 copy denial")
+                original_copyfile(source, destination)
+
+            with (
+                patch.object(
+                    local_core_migration.os,
+                    "replace",
+                    side_effect=reject_failed_database_move,
+                ),
+                patch.object(
+                    local_core_migration.shutil,
+                    "copyfile",
+                    side_effect=reject_failed_database_copy,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "diagnostic preservation was incomplete",
+                ):
+                    migrate_project_to_schema30(root, fail_at="after_atomic_replace")
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertEqual(manifest["failed_schema30_preservation_status"], "failed")
+            self.assertIn("move denial", manifest["failed_schema30_preservation_error"])
+            self.assertIn("copy denial", manifest["failed_schema30_preservation_error"])
+
+    def test_failed_schema30_hash_denial_cannot_prevent_authority_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_sha256 = local_core_migration._sha256_file
+
+            def reject_failed_active_digest(path: Path) -> str:
+                resolved = Path(path)
+                if resolved.resolve() == active.resolve():
+                    with closing(sqlite3.connect(resolved)) as conn:
+                        version = int(
+                            conn.execute(
+                                "select schema_version from project where id=1"
+                            ).fetchone()[0]
+                        )
+                    if version == 30:
+                        raise PermissionError("injected active-schema30 read denial")
+                return original_sha256(resolved)
+
+            with patch.object(
+                local_core_migration,
+                "_sha256_file",
+                side_effect=reject_failed_active_digest,
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "diagnostic preservation was incomplete",
+                ):
+                    migrate_project_to_schema30(root, fail_at="after_atomic_replace")
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertEqual(manifest["failed_schema30_preservation_status"], "failed")
+            self.assertIn(
+                "active-schema30 read denial",
+                manifest["failed_schema30_preservation_error"],
+            )
+
+    def test_failed_schema30_cleanup_denial_cannot_prevent_authority_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_replace = local_core_migration.os.replace
+            original_copyfile = local_core_migration.shutil.copyfile
+            path_type = type(active)
+            original_unlink = path_type.unlink
+
+            def reject_failed_database_move(source: Path, destination: Path) -> None:
+                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 move denial")
+                original_replace(source, destination)
+
+            def reject_failed_database_copy(source: Path, destination: Path) -> None:
+                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 copy denial")
+                original_copyfile(source, destination)
+
+            def reject_failed_database_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+                if Path(path).name.startswith("harness.schema30.failed-after-activation"):
+                    raise PermissionError("injected failed-schema30 cleanup denial")
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(
+                    local_core_migration.os,
+                    "replace",
+                    side_effect=reject_failed_database_move,
+                ),
+                patch.object(
+                    local_core_migration.shutil,
+                    "copyfile",
+                    side_effect=reject_failed_database_copy,
+                ),
+                patch.object(path_type, "unlink", new=reject_failed_database_cleanup),
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "diagnostic preservation was incomplete",
+                ):
+                    migrate_project_to_schema30(root, fail_at="after_atomic_replace")
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertIn(
+                "cleanup denial",
+                manifest["failed_schema30_preservation_error"],
+            )
+
+    def test_projection_dry_run_failure_preserves_source_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            with patch.object(
+                harness_db, "render_all", side_effect=harness_db.HarnessError("projection dry-run failed")
+            ):
+                with self.assertRaisesRegex(harness_db.HarnessError, "projection dry-run failed"):
+                    harness_db.migrate(root, "29", 30)
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+            self.assertEqual((version, manifest["status"]), (29, "failed-before-activation"))
+
+    def test_successful_activation_keeps_backup_and_valid_schema30(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+
+            result = migrate_project_to_schema30(root)
+
+            manifest = json.loads(Path(result.migration_manifest_path).read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = int(conn.execute("select schema_version from project where id=1").fetchone()[0])
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+                    )
+                }
+                sentinel = conn.execute("select decision from decisions where id='D-sentinel'").fetchone()[0]
+                migration_status = conn.execute(
+                    "select status from migrations where to_version=30 order by id desc limit 1"
+                ).fetchone()[0]
+                foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+            with closing(sqlite3.connect(result.backup.backup_path)) as conn:
+                backup_version = int(conn.execute("select schema_version from project where id=1").fetchone()[0])
+            active_digest = sha256(active)
+
+        self.assertEqual(result.source_version, 29)
+        self.assertEqual(result.target_version, 30)
+        self.assertEqual(result.active_sha256, active_digest)
+        self.assertEqual(manifest["status"], "activated")
+        self.assertEqual(manifest["projection_restore_status"], "not-needed")
+        self.assertEqual(manifest["projection_backup"]["live_projection_count"], 13)
+        self.assertEqual(manifest["projection_backup"]["rollback_path_count"], 14)
+        self.assertEqual(len(manifest["projection_backup"]["entries"]), 14)
+        self.assertEqual(version, 30)
+        self.assertEqual(len(tables), 27)
+        self.assertEqual(sentinel, "keep")
+        self.assertEqual(migration_status, "activated")
+        self.assertEqual(foreign_key_issues, [])
+        self.assertEqual(backup_version, 29)
+
+    def test_successful_runtime_migration_publishes_and_verifies_all_projections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            (root / ".gitignore").write_text(
+                "\n".join(harness_db.RUNTIME_GITIGNORE_PATTERNS) + "\n",
+                encoding="utf-8",
+            )
+            retired_evidence = root / "docs/harness/evidence.md"
+            retired_evidence.parent.mkdir(parents=True)
+            retired_evidence.write_text("# Retired evidence view\n", encoding="utf-8")
+
+            harness_db.migrate(root, "29", 30)
+
+            backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
+            manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                version = conn.execute("select schema_version from project where id=1").fetchone()[0]
+
+            self.assertEqual(version, 30)
+            self.assertEqual(harness_db.doctor(root), [])
+            self.assertTrue(all((root / path).is_file() for path in PROJECTION_PATHS))
+            self.assertFalse(retired_evidence.exists())
+            self.assertEqual(manifest["status"], "activated")
+            self.assertEqual(manifest["projection_restore_status"], "not-needed")
+            evidence_entry = next(
+                entry
+                for entry in manifest["projection_backup"]["entries"]
+                if entry["path"] == "docs/harness/evidence.md"
+            )
+            self.assertTrue(evidence_entry["existed"])
+            self.assertEqual(len(evidence_entry["sha256"]), 64)
+
+
+class Schema30FactPreservationTests(unittest.TestCase):
+    def test_cycle_candidate_gate_risk_finding_invalidation_and_delivery_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            source = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(source)) as conn:
+                conn.execute("pragma foreign_keys = on")
+                conn.execute(
+                    """
+                    update delivery_cycles
+                    set status='delivered', candidate_sha='candidate-old', closed_at='2026-07-10T00:00:00Z'
+                    where id='CYCLE-current'
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into delivery_cycles
+                    (id, name, goal, status, phase, base_ref, candidate_sha, started_at, closed_at, created_at, updated_at)
+                    values ('CYCLE-next', 'Next', 'Current candidate', 'active', 'qa', 'main', 'candidate-new',
+                            '2026-07-11T00:00:00Z', '', '2026-07-11T00:00:00Z', '2026-07-11T00:00:00Z')
+                    """
+                )
+                for cycle_id, body, criterion, task_status in (
+                    ("CYCLE-current", "old requirement", "old acceptance", "accepted"),
+                    ("CYCLE-next", "new requirement", "new acceptance", "planned"),
+                ):
+                    conn.execute(
+                        """
+                        insert into requirements (id, cycle_id, kind, body, status, updated_at)
+                        values ('R1', ?, 'functional', ?, 'active', 'now')
+                        """,
+                        (cycle_id, body),
+                    )
+                    conn.execute(
+                        "insert into acceptance (id, cycle_id, criterion, status) values ('AC1', ?, ?, 'active')",
+                        (cycle_id, criterion),
+                    )
+                    conn.execute(
+                        """
+                        insert into failure_modes
+                        (id, cycle_id, feature, scenario, trigger, expected_behavior, risk, status,
+                         accepted_by, acceptance_reason, acceptance_scope, accepted_revision, expires_at)
+                        values ('FM1', ?, 'delivery', 'risk', 'migration', 'preserve', 'high', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cycle_id,
+                            "resolved" if cycle_id == "CYCLE-current" else "accepted",
+                            "" if cycle_id == "CYCLE-current" else "user",
+                            "" if cycle_id == "CYCLE-current" else "temporary acceptance",
+                            "" if cycle_id == "CYCLE-current" else "candidate",
+                            None if cycle_id == "CYCLE-current" else 9,
+                            None if cycle_id == "CYCLE-current" else "2000-01-01T00:00:00Z",
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        insert into tasks (id, cycle_id, task, owner, status, updated_at)
+                        values ('T1', ?, 'cycle task', 'developer', ?, 'now')
+                        """,
+                        (cycle_id, task_status),
+                    )
+                    conn.execute(
+                        "insert into requirement_acceptance (cycle_id, requirement_id, acceptance_id) values (?, 'R1', 'AC1')",
+                        (cycle_id,),
+                    )
+                    conn.execute(
+                        "insert into failure_mode_acceptance (cycle_id, failure_mode_id, acceptance_id) values (?, 'FM1', 'AC1')",
+                        (cycle_id,),
+                    )
+                    conn.execute(
+                        "insert into task_acceptance (cycle_id, task_id, acceptance_id) values (?, 'T1', 'AC1')",
+                        (cycle_id,),
+                    )
+                    conn.execute(
+                        "insert into task_failure_modes (cycle_id, task_id, failure_mode_id) values (?, 'T1', 'FM1')",
+                        (cycle_id,),
+                    )
+                conn.execute(
+                    """
+                    insert into findings
+                    (id, cycle_id, candidate_sha, surface, severity, status, summary, created_at)
+                    values ('F-old', 'CYCLE-current', 'candidate-old', 'delivery', 'high', 'resolved', 'old resolved', 'now')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into findings
+                    (id, cycle_id, candidate_sha, surface, severity, status, summary, waiver_expires_at, created_at)
+                    values ('F-new', 'CYCLE-next', 'candidate-new', 'delivery', 'critical', 'open', 'current blocker',
+                            '2000-01-01T00:00:00Z', 'now')
+                    """
+                )
+                gate_rows = (
+                    ("G-old", 1, "CYCLE-current", "candidate-old", "active", "", "pass", "F-old"),
+                    ("G-pass", 2, "CYCLE-next", "candidate-new", "superseded", "G-fail", "pass", ""),
+                    ("G-fail", 3, "CYCLE-next", "candidate-new", "active", "", "fail", "F-new"),
+                )
+                for gate_id, sequence, cycle_id, candidate, gate_status, superseded_by, result, finding_id in gate_rows:
+                    conn.execute(
+                        """
+                        insert into quality_gates
+                        (id, sequence, cycle_id, candidate_sha, gate_status, superseded_by, gate,
+                         reviewed_commit, reviewer_context, result, project_revision, created_at)
+                        values (?, ?, ?, ?, ?, ?, 'independent_qa', ?, 'same-context-degraded', ?, 9, 'now')
+                        """,
+                        (gate_id, sequence, cycle_id, candidate, gate_status, superseded_by, candidate, result),
+                    )
+                    if finding_id:
+                        conn.execute(
+                            "insert into quality_gate_findings (gate_id, finding_id) values (?, ?)",
+                            (gate_id, finding_id),
+                        )
+                conn.execute(
+                    """
+                    insert into deliveries
+                    (id, cycle_id, candidate_sha, scope, acceptance, validation, qa, quality_gate, created_at)
+                    values ('D-old', 'CYCLE-current', 'candidate-old', 'historical delivery', 'AC1',
+                            'verified', 'reviewed', 'G-old', '2026-07-10T00:00:00Z')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into delivery_acceptance (delivery_id, cycle_id, acceptance_id)
+                    values ('D-old', 'CYCLE-current', 'AC1')
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into invalidations
+                    (id, cycle_id, source_type, source_id, target_type, target_id, reason, created_at)
+                    values ('I1', 'CYCLE-next', 'acceptance', 'AC1', 'task', 'T1', 'acceptance changed', 'now')
+                    """
+                )
+                conn.execute(
+                    """
+                    update project set current_cycle_id='CYCLE-next', phase='qa', revision=9, updated_at='now'
+                    where id=1
+                    """
+                )
+                conn.commit()
+
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+            stage_schema29_to_schema30(source, staging)
+            with closing(sqlite3.connect(staging)) as conn:
+                current = conn.execute(
+                    "select current_cycle_id, phase, revision from project where id=1"
+                ).fetchone()
+                cycles = conn.execute(
+                    "select id, status, candidate_sha from delivery_cycles order by id"
+                ).fetchall()
+                requirements = conn.execute(
+                    "select cycle_id, id, body from requirements where id='R1' order by cycle_id"
+                ).fetchall()
+                tasks = conn.execute(
+                    "select cycle_id, id, status from tasks where id='T1' order by cycle_id"
+                ).fetchall()
+                risks = conn.execute(
+                    """
+                    select cycle_id, status, accepted_by, acceptance_reason, acceptance_scope,
+                           accepted_revision, expires_at
+                    from failure_modes where id='FM1' order by cycle_id
+                    """
+                ).fetchall()
+                gates = conn.execute(
+                    "select id, sequence, gate_status, superseded_by, result from quality_gates order by sequence"
+                ).fetchall()
+                findings = conn.execute(
+                    "select id, cycle_id, candidate_sha, severity, status, summary from findings order by id"
+                ).fetchall()
+                gate_findings = conn.execute(
+                    "select gate_id, finding_id from quality_gate_findings order by gate_id"
+                ).fetchall()
+                invalidations = conn.execute(
+                    "select id, cycle_id, source_type, source_id, target_type, target_id, reason from invalidations"
+                ).fetchall()
+                deliveries = conn.execute(
+                    "select id, cycle_id, candidate_sha, scope, decision_status from deliveries"
+                ).fetchall()
+                delivery_links = conn.execute(
+                    "select delivery_id, cycle_id, acceptance_id from delivery_acceptance"
+                ).fetchall()
+                foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+
+        self.assertEqual(current, ("CYCLE-next", "qa", 9))
+        self.assertEqual(
+            cycles,
+            [
+                ("CYCLE-current", "delivered", "candidate-old"),
+                ("CYCLE-next", "active", "candidate-new"),
+            ],
+        )
+        self.assertEqual(
+            requirements,
+            [
+                ("CYCLE-current", "R1", "old requirement"),
+                ("CYCLE-next", "R1", "new requirement"),
+            ],
+        )
+        self.assertEqual(
+            tasks,
+            [
+                ("CYCLE-current", "T1", "accepted"),
+                ("CYCLE-next", "T1", "planned"),
+            ],
+        )
+        self.assertEqual(risks[1], (
+            "CYCLE-next",
+            "accepted",
+            "user",
+            "temporary acceptance",
+            "candidate",
+            9,
+            "2000-01-01T00:00:00Z",
+        ))
+        self.assertEqual(
+            gates,
+            [
+                ("G-old", 1, "active", None, "pass"),
+                ("G-pass", 2, "superseded", "G-fail", "pass"),
+                ("G-fail", 3, "active", None, "fail"),
+            ],
+        )
+        self.assertEqual(
+            findings,
+            [
+                ("F-new", "CYCLE-next", "candidate-new", "critical", "open", "current blocker"),
+                ("F-old", "CYCLE-current", "candidate-old", "high", "resolved", "old resolved"),
+            ],
+        )
+        self.assertEqual(gate_findings, [("G-fail", "F-new"), ("G-old", "F-old")])
+        self.assertEqual(
+            invalidations,
+            [("I1", "CYCLE-next", "acceptance", "AC1", "task", "T1", "acceptance changed")],
+        )
+        self.assertEqual(
+            deliveries,
+            [("D-old", "CYCLE-current", "candidate-old", "historical delivery", "historical-migrated")],
+        )
+        self.assertEqual(delivery_links, [("D-old", "CYCLE-current", "AC1")])
+        self.assertEqual(foreign_key_issues, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

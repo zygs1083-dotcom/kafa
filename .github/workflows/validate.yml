@@ -55,13 +55,15 @@ jobs:
           find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec ${{ matrix.python }} -m json.tool {} \; >/dev/null
 
       - name: Compile Python
-        run: ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
+        run: ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-harness/scripts/harness.py tests/test_*.py tests/run_isolated_install_smoke.py
 
       - name: Install kafa package
         run: ${{ matrix.python }} -m pip install -e .
 
       - name: Install pinned Codex CLI for plugin smoke
-        run: npm install --global "@openai/codex@0.143.0"
+        run: |
+          codex_version="$(${{ matrix.python }} -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
+          npm install --global "@openai/codex@$codex_version"
 
       - name: Check kafa package
         run: |
@@ -70,25 +72,24 @@ jobs:
           kafa doctor --repo .
           rm -rf .agents
 
+      - name: Run local core hardening targeted tests
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests.test_local_core_hardening tests.test_local_delivery_policy
+
       - name: Isolated user plugin install smoke
         run: ${{ matrix.python }} tests/run_isolated_install_smoke.py --repo .
 
       - name: Run install release tests
-        run: ${{ matrix.python }} -m unittest tests/test_install_release.py
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests/test_install_release.py
 
       - name: Run control plane architecture tests
-        run: ${{ matrix.python }} -m unittest tests/test_control_plane_architecture.py
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests/test_control_plane_architecture.py
 
       - name: Run runtime tests
-        run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 
       - name: Run runtime smoke
         if: matrix.os == 'ubuntu-latest'
         run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_runtime_smoke.py
-
-      - name: Run forward compatibility wrapper
-        if: matrix.os == 'ubuntu-latest'
-        run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_forward_eval.py
 
       - name: Run skill eval fixture
         if: matrix.os == 'ubuntu-latest'
@@ -101,14 +102,15 @@ jobs:
         if: matrix.e2e == 'stability'
         run: ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 
-      - name: Run kernel diagnostic smoke
+      - name: Run local kernel diagnostic smoke
         if: matrix.os == 'ubuntu-latest'
         run: |
           tmp="$(mktemp -d)"
           ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" init
-          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" kernel doctor
-          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" invariant validate
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" doctor
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" validate
           ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" projection rebuild
+          ${{ matrix.python }} plugins/codex-project-harness/scripts/harness.py --root "$tmp" doctor
 
       - name: Check whitespace
         run: git diff --check

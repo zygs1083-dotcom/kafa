@@ -1,4 +1,4 @@
-# Runtime Smoke And Fresh Eval Prompts
+# Local Kernel Fresh-Session Prompts
 
 Use these prompts to validate whether the harness skills produce the intended behavior in fresh Codex sessions.
 
@@ -14,21 +14,25 @@ The runner writes regression results to:
 docs/runtime/runtime-smoke-results.json
 ```
 
-`run_forward_eval.py` remains as a compatibility wrapper. The prompts below are still useful for fresh-session qualitative evaluation.
+The prompts below exercise the supported local-only journey in a fresh session. External tools,
+hidden providers, and synthetic Host receipts are intentionally out of scope.
 
 ## Full Project
 
 ```text
-Use $project-harness from this repository to build a small task tracker app. Stop at verified code delivery. Decide whether GitHub, Linear, Notion, Figma, or Slack is useful from context.
+Use $project-harness from this repository to build a small task tracker app.
+Use OpenSpec if the requirements or architecture need a durable spec. Keep Kafa
+delivery facts local and stop at verified code handoff without deploying.
 ```
 
 Expected behavior:
 
-- Runs bootstrap before requirement baseline.
-- Initializes local harness files when needed.
-- Confirms or states the requirement baseline.
-- Creates task board rows mapped to acceptance criteria.
-- Records validation evidence before delivery readiness.
+- Reads project instructions and inspects the real workspace before mutation.
+- Initializes local Kernel files only when the delivery workflow needs them.
+- Uses OpenSpec as specification authority for the broad change.
+- Maps root-owned tasks and test targets to acceptance criteria and failure modes.
+- Runs controller-owned verification before any quality-gate or delivery decision.
+- Reports `human-review-required` when high/critical provenance is insufficient.
 - Does not deploy.
 
 ## Clear Feature
@@ -39,10 +43,11 @@ Use $project-harness from this repository to add CSV export to the current app.
 
 Expected behavior:
 
-- Uses lightweight bootstrap if git/tooling context matters.
+- Inspects Git and local tooling context when it matters.
 - Creates or updates focused tasks.
 - Uses test-first delivery when a stable export contract exists.
-- Records validation and delivery evidence.
+- Registers an exact test target and runs `verify run` on the current candidate.
+- Records only truthful validation and delivery facts; skipped checks are not passes.
 
 ## Bug Fix
 
@@ -54,19 +59,21 @@ Expected behavior:
 
 - Routes to `bug-fix-loop`.
 - Reproduces or characterizes the failure.
-- Records task and validation evidence.
-- Runs QA before delivery readiness.
+- Returns implementation results to the root controller for task-state mutation.
+- Runs current-candidate verification and QA before verified handoff.
 
-## Tool-Heavy Project
+## Multi-Module Project
 
 ```text
-Use $project-harness from this repository. Build a settings page from an existing Figma design and track tasks in Linear. Use GitHub PR evidence for QA.
+Use $project-harness from this repository to add a settings page backed by a
+local API and SQLite migration. Keep the change local-only, delegate bounded
+implementation work through Native Codex, and stop at verified code handoff.
 ```
 
 Expected behavior:
 
-- Uses project-bootstrap.
-- Maps design context to Figma.
-- Maps tasks to Linear.
-- Uses GitHub PR/check evidence when available.
-- Records all mappings in local harness files.
+- Routes durable cross-module requirements and migration behavior through OpenSpec.
+- Keeps schema, migration, trust, delivery-gate, and integration decisions with the root controller.
+- Lets Native Codex own subagent, worktree, approval, model, cancel, and handoff lifecycle.
+- Requires rollback coverage and immutable local execution records.
+- Does not create a second provider, dispatch, receipt, or external synchronization lifecycle.

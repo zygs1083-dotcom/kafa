@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import tempfile
@@ -14,52 +15,115 @@ FIXTURE = ROOT / "docs" / "runtime" / "skill-eval-transcript-fixture.txt"
 
 REQUIRED_MARKERS = [
     "harness.py --root . init",
-    "harness.py --root . phase project_bootstrap",
-    "harness.py --root . phase requirement_baseline",
-    "harness.py --root . scope confirm",
     "harness.py --root . baseline freeze",
     "harness.py --root . requirement link",
     "harness.py --root . task add",
+    "harness.py --root . task start",
+    "harness.py --root . task submit",
+    "--context-id producer-context",
     "harness.py --root . test-target add",
-    "harness.py --root . dispatch run",
-    "--target",
-    "--trust-anchor",
-    "harness.py --root . validation record",
-    "harness.py --root . session attest",
+    "harness.py --root . test-target link",
+    "harness.py --root . verify run",
     "harness.py --root . gate record",
+    "--reviewer-context-id reviewer-context",
+    "harness.py --root . task accept",
+    "harness.py --root . validate --delivery",
+    "harness.py --root . delivery record",
+    "Native Codex/ChatGPT owns",
+    "human-review-required",
+]
+
+ORDERED_MARKERS = [
+    "Native Codex/ChatGPT owns",
+    "harness.py --root . init",
+    "harness.py --root . requirement link",
+    "harness.py --root . baseline freeze",
+    "harness.py --root . task add",
+    "harness.py --root . task start",
+    "harness.py --root . task submit",
+    "--context-id producer-context",
+    "harness.py --root . test-target add",
+    "harness.py --root . test-target link",
+    "harness.py --root . verify run",
+    "harness.py --root . gate record",
+    "--reviewer-context-id reviewer-context",
+    "harness.py --root . task accept",
+    "harness.py --root . validate --delivery",
+    "harness.py --root . delivery record",
+    "human-review-required",
+]
+
+FORBIDDEN_MARKERS = [
+    "harness.py --root . phase ",
+    "harness.py --root . scope ",
+    "harness.py --root . session ",
+    "harness.py --root . dispatch ",
+    "harness.py --root . evidence ",
+    "harness.py --root . test record",
     "--reviewer-session-id",
     "--reviewer-attestation-id",
-    "harness.py --root . phase delivery_readiness",
-    "harness.py --root . delivery record",
 ]
 
 
-def transcript_text() -> str:
+def transcript_evidence() -> tuple[str, int, str]:
     command = os.environ.get("CODEX_EVAL_CMD", "").strip()
     if not command:
-        return FIXTURE.read_text(encoding="utf-8")
+        return FIXTURE.read_text(encoding="utf-8"), 0, "fixture"
 
-    with tempfile.TemporaryDirectory() as temp:
-        result = subprocess.run(
-            command,
-            cwd=temp,
-            text=True,
-            shell=True,
-            capture_output=True,
-            check=False,
-            timeout=120,
-        )
-    return result.stdout + "\n" + result.stderr
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run(
+                command,
+                cwd=temp,
+                text=True,
+                shell=True,
+                capture_output=True,
+                check=False,
+                timeout=120,
+            )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return stdout + "\n" + stderr, 124, "host-command"
+    return result.stdout + "\n" + result.stderr, result.returncode, "host-command"
 
 
-def main() -> int:
-    text = transcript_text()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate local-only fresh-session Skill transcript markers"
+    )
+    parser.parse_args(argv)
+
+    text, command_returncode, source = transcript_evidence()
     missing = [marker for marker in REQUIRED_MARKERS if marker not in text]
+    retired = [marker for marker in FORBIDDEN_MARKERS if marker in text]
+    positions = [(marker, text.find(marker)) for marker in ORDERED_MARKERS]
+    ordered_positions = [(marker, position) for marker, position in positions if position >= 0]
+    out_of_order = [
+        marker
+        for index, (marker, position) in enumerate(ordered_positions)
+        if index and position < ordered_positions[index - 1][1]
+    ]
+    if command_returncode != 0:
+        print(
+            "ERROR: host skill eval command failed "
+            f"(source={source}, returncode={command_returncode})"
+        )
     if missing:
         for marker in missing:
             print(f"ERROR: missing skill eval marker: {marker}")
+    if retired:
+        for marker in retired:
+            print(f"ERROR: retired skill eval marker present: {marker}")
+    if out_of_order:
+        for marker in out_of_order:
+            print(f"ERROR: out-of-order skill eval marker: {marker}")
+    if command_returncode != 0 or missing or retired or out_of_order:
         return 1
-    print(f"OK: skill eval transcript passed ({len(REQUIRED_MARKERS)} markers)")
+    print(
+        "OK: local-only skill eval transcript passed "
+        f"({len(REQUIRED_MARKERS)} required markers)"
+    )
     return 0
 
 

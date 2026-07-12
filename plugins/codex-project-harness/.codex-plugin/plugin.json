@@ -1,7 +1,7 @@
 {
   "name": "codex-project-harness",
-  "version": "1.25.0-beta.1",
-  "description": "A universal Codex-native code-delivery harness for requirement baselines, executable local runtime state, implementation, QA gates, collaboration-tool mapping, and verified handoff. It stops at verified code delivery and does not perform deployment.",
+  "version": "2.0.0-beta.1",
+  "description": "A local-only verified delivery kernel for requirements, immutable controller verification, QA gates, and code handoff. Native Codex/ChatGPT owns task and agent lifecycle; Kafa does not perform external tool writes and does not perform deployment.",
   "author": {
     "name": "zygs1083-dotcom",
     "url": "https://github.com/zygs1083-dotcom"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Codex 项目小队操作系统",
     "shortDescription": "从需求基线到已验证代码交付",
-    "longDescription": "通用代码交付 Harness，通过项目启动检查、需求确认、任务编排、实现、测试、独立 QA、Failure Mode 覆盖和交付证据完成可验证代码交付。外部协作工具可选，本地事实源始终可用，不执行生产部署。",
+    "longDescription": "本地代码交付 Kernel，通过需求基线、root controller 单写任务状态、不可变执行与验证、独立 QA、Failure Mode 覆盖和交付门禁完成可验证代码交付。Native Codex/ChatGPT 独占 task、subagent、worktree、approval、model、cancel 和 handoff 生命周期；Kafa 不直连外部业务系统，不执行生产部署。",
     "developerName": "zygs1083-dotcom",
     "category": "Developer Tools",
     "capabilities": [

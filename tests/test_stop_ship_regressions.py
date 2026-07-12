@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -10,27 +8,26 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from tests.test_local_delivery_policy import (
+    create_schema30_delivery_fixture,
+    schema30_issues,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HARNESS = REPO_ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
-DEFAULT_TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
+HARNESS = REPO_ROOT / "plugins/codex-project-harness/scripts/harness.py"
 
 
 def run_harness(
     root: Path,
     *args: str,
     check: bool = True,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
     result = subprocess.run(
         [sys.executable, str(HARNESS), "--root", str(root), *args],
         text=True,
         capture_output=True,
         check=False,
-        env=merged_env,
     )
     if check and result.returncode != 0:
         raise AssertionError(result.stdout + result.stderr)
@@ -38,16 +35,7 @@ def run_harness(
 
 
 def db_path(root: Path) -> Path:
-    return root / ".ai-team" / "state" / "harness.db"
-
-
-def task_revision(root: Path, task_id: str) -> int:
-    with closing(sqlite3.connect(db_path(root))) as conn:
-        return int(conn.execute("select revision from tasks where id = ?", (task_id,)).fetchone()[0])
-
-
-def stdout_field(stdout: str, name: str) -> str:
-    return stdout.split(f"{name}=", 1)[1].split(None, 1)[0].strip()
+    return root / ".ai-team/state/harness.db"
 
 
 def cycle_fact_rows(
@@ -59,184 +47,58 @@ def cycle_fact_rows(
     columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
     identity_column = "local_id" if "local_id" in columns else "id"
     return conn.execute(
-        f"select cycle_id, {value_column} from {table} where {identity_column} = ? order by cycle_id",
+        f"select cycle_id, {value_column} from {table} "
+        f"where {identity_column} = ? order by cycle_id",
         (local_id,),
     ).fetchall()
 
 
-def accept_task(root: Path, task_id: str) -> None:
-    claim = run_harness(
-        root,
-        "task",
-        "claim",
-        task_id,
-        "--agent",
-        "developer",
-        "--expected-revision",
-        str(task_revision(root, task_id)),
-    )
-    producer_token = stdout_field(claim.stdout, "token")
-    run_harness(
-        root,
-        "task",
-        "start",
-        task_id,
-        "--agent",
-        "developer",
-        "--lease-token",
-        producer_token,
-        "--expected-revision",
-        str(task_revision(root, task_id)),
-    )
-    run_harness(
-        root,
-        "task",
-        "submit",
-        task_id,
-        "--agent",
-        "developer",
-        "--lease-token",
-        producer_token,
-        "--expected-revision",
-        str(task_revision(root, task_id)),
-        "--evidence",
-        "implemented",
-    )
-    review = run_harness(
-        root,
-        "task",
-        "review",
-        task_id,
-        "--agent",
-        "qa-reviewer",
-        "--expected-revision",
-        str(task_revision(root, task_id)),
-    )
-    reviewer_token = stdout_field(review.stdout, "token")
-    run_harness(
-        root,
-        "task",
-        "accept",
-        task_id,
-        "--agent",
-        "qa-reviewer",
-        "--lease-token",
-        reviewer_token,
-        "--expected-revision",
-        str(task_revision(root, task_id)),
-        "--evidence",
-        "reviewed",
-    )
-
-
-def prepare_delivery_candidate(root: Path) -> None:
-    run_harness(root, "init")
-    run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Example")
-    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example acceptance")
-    run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
-    run_harness(root, "task", "add", "--id", "T1", "--task", "Example task", "--acceptance", "AC1")
-    accept_task(root, "T1")
-    run_harness(root, "scope", "confirm", "--by", "project-manager", "--summary", "confirmed")
-    run_harness(root, "baseline", "freeze", "--id", "B1", "--summary", "baseline")
-    (root / "test_harness_dummy.py").write_text(
-        "import unittest\n\n"
-        "class HarnessDummyTest(unittest.TestCase):\n"
-        "    def test_dummy(self):\n"
-        "        self.assertTrue(True)\n",
-        encoding="utf-8",
-    )
-    run_harness(
-        root,
-        "test-target",
-        "add",
-        "--id",
-        "UNIT",
-        "--kind",
-        "unit",
-        "--command-template",
-        DEFAULT_TEST_COMMAND,
-    )
-    evidence_id = run_harness(
-        root,
-        "dispatch",
-        "run",
-        "--agent",
-        "developer",
-        "--target",
-        "UNIT",
-        "--command",
-        DEFAULT_TEST_COMMAND,
-        "--code-identity",
-        "content-hash",
-    ).stdout.strip().rsplit(" ", 1)[-1]
-    run_harness(
-        root,
-        "test",
-        "record",
-        "--id",
-        "TEST1",
-        "--surface",
-        "Example",
-        "--command",
-        DEFAULT_TEST_COMMAND,
-        "--result",
-        "pass",
-        "--evidence",
-        evidence_id,
-    )
-    run_harness(
-        root,
-        "validation",
-        "record",
-        "--surface",
-        "Example",
-        "--acceptance",
-        "AC1",
-        "--commands",
-        DEFAULT_TEST_COMMAND,
-        "--findings",
-        "passed",
-        "--result",
-        "pass",
-        "--test",
-        "TEST1",
-        "--evidence",
-        evidence_id,
-        "--target",
-        "UNIT",
-        "--code-identity",
-        "content-hash",
-    )
-
-
-def move_to_delivery_readiness(root: Path) -> subprocess.CompletedProcess[str]:
-    for phase in ["project_bootstrap", "requirement_baseline", "confirmation", "planning", "implementation", "qa"]:
-        run_harness(root, "phase", phase)
-    return run_harness(root, "phase", "delivery_readiness", check=False)
-
-
-def git_init_with_tiny_project(root: Path) -> None:
-    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
-    (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-    (root / "test_calc.py").write_text(
-        "import unittest\n\n"
-        "from calc import add\n\n"
-        "class CalcTest(unittest.TestCase):\n"
-        "    def test_add(self):\n"
-        "        self.assertEqual(add(2, 3), 5)\n",
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "add", "calc.py", "test_calc.py"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+def insert_finding(
+    root: Path,
+    *,
+    finding_id: str,
+    status: str,
+    cycle_id: str = "CYCLE-current",
+    waived_by: str = "",
+    waiver_reason: str = "",
+    waiver_scope: str = "",
+    waived_revision: int | None = None,
+    waiver_expires_at: str = "",
+) -> None:
+    with closing(sqlite3.connect(db_path(root))) as conn:
+        candidate = conn.execute(
+            "select candidate_sha from delivery_cycles where id = ?",
+            (cycle_id,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            insert into findings
+            (id, cycle_id, candidate_sha, surface, severity, status, summary,
+             waived_by, waiver_reason, waiver_scope, waived_revision,
+             waiver_expires_at, created_at)
+            values (?, ?, ?, 'delivery', 'critical', ?, 'stop-ship finding',
+                    ?, ?, ?, ?, ?, '2026-07-11T00:00:00Z')
+            """,
+            (
+                finding_id,
+                cycle_id,
+                candidate,
+                status,
+                waived_by,
+                waiver_reason,
+                waiver_scope,
+                waived_revision,
+                waiver_expires_at,
+            ),
+        )
+        conn.commit()
 
 
 class StopShipRegressionTest(unittest.TestCase):
-    def test_dt_001_open_critical_finding_blocks_delivery(self) -> None:
+    def test_open_critical_finding_links_to_gate_and_blocks_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            prepare_delivery_candidate(root)
+            create_schema30_delivery_fixture(root)
             run_harness(
                 root,
                 "finding",
@@ -250,7 +112,7 @@ class StopShipRegressionTest(unittest.TestCase):
                 "--status",
                 "open",
                 "--summary",
-                "Known release blocker",
+                "Known blocker",
             )
             run_harness(
                 root,
@@ -260,117 +122,149 @@ class StopShipRegressionTest(unittest.TestCase):
                 "same-context-degraded",
                 "--result",
                 "pass",
-                "--commands",
-                DEFAULT_TEST_COMMAND,
-                "--evidence",
-                "reviewed",
                 "--finding",
                 "F-critical",
             )
             with closing(sqlite3.connect(db_path(root))) as conn:
-                linked_finding = conn.execute(
+                linked = conn.execute(
                     """
                     select f.severity, f.status
                     from quality_gate_findings qgf
                     join findings f on f.id = qgf.finding_id
-                    where f.id = 'F-critical'
+                    join quality_gates g on g.id = qgf.gate_id
+                    where f.id = 'F-critical' and g.gate_status = 'active'
                     """
                 ).fetchone()
-            self.assertEqual(linked_finding, ("critical", "open"))
+            issues = schema30_issues(root)
 
-            readiness = move_to_delivery_readiness(root)
+        self.assertEqual(linked, ("critical", "open"))
+        self.assertIn("critical finding blocks delivery: F-critical", " ".join(issues))
 
-        self.assertNotEqual(
-            readiness.returncode,
-            0,
-            "DT-001: a passing gate linked to an open critical finding incorrectly reached delivery_readiness",
-        )
-        self.assertIn("F-critical", readiness.stdout + readiness.stderr)
-
-    def test_dt_002_same_second_newer_fail_gate_wins(self) -> None:
+    def test_same_second_newer_failed_gate_wins_by_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            prepare_delivery_candidate(root)
-            for result in ["pass", "fail"]:
-                run_harness(
-                    root,
-                    "gate",
-                    "record",
-                    "--reviewer-context",
-                    "same-context-degraded",
-                    "--result",
-                    result,
-                    "--commands",
-                    DEFAULT_TEST_COMMAND,
-                    "--evidence",
-                    result,
+            create_schema30_delivery_fixture(root)
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "fail")
+            with closing(sqlite3.connect(db_path(root))) as conn:
+                pass_id = conn.execute(
+                    "select id from quality_gates where sequence = 2"
+                ).fetchone()[0]
+                fail_id = conn.execute(
+                    "select id from quality_gates where sequence = 3"
+                ).fetchone()[0]
+                timestamp = "2026-07-11T10:00:00Z"
+                conn.execute(
+                    "update quality_gates set id = 'a-new-fail', created_at = ? where id = ?",
+                    (timestamp, fail_id),
                 )
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                timestamp = "2026-07-10T10:00:00Z"
-                conn.execute("update quality_gates set id = 'z-old-pass', created_at = ? where result = 'pass'", (timestamp,))
-                conn.execute("update quality_gates set id = 'a-new-fail', created_at = ? where result = 'fail'", (timestamp,))
+                conn.execute(
+                    "update quality_gates set superseded_by = 'a-new-fail' where sequence = 2"
+                )
+                conn.execute(
+                    "update quality_gates set id = 'z-old-pass', created_at = ? where id = ?",
+                    (timestamp, pass_id),
+                )
+                conn.execute(
+                    "update quality_gates set superseded_by = 'z-old-pass', created_at = ? where sequence = 1",
+                    (timestamp,),
+                )
                 conn.commit()
-                insertion_order = [
-                    row[0] for row in conn.execute("select result from quality_gates order by rowid")
-                ]
-            self.assertEqual(insertion_order, ["pass", "fail"])
+                rows = conn.execute(
+                    "select sequence, id, gate_status, superseded_by, result "
+                    "from quality_gates order by sequence"
+                ).fetchall()
+            issues = schema30_issues(root)
 
-            readiness = move_to_delivery_readiness(root)
-
-        output = readiness.stdout + readiness.stderr
-        self.assertNotEqual(
-            readiness.returncode,
-            0,
-            "DT-002: a newer fail gate was hidden by an older pass gate written in the same second",
+        self.assertEqual(
+            rows,
+            [
+                (1, "G1", "superseded", "z-old-pass", "pass"),
+                (2, "z-old-pass", "superseded", "a-new-fail", "pass"),
+                (3, "a-new-fail", "active", None, "fail"),
+            ],
         )
-        self.assertIn("latest quality gate is not pass", output)
+        self.assertIn("latest quality gate is not pass", " ".join(issues))
 
-    def test_dt_001_resolved_finding_does_not_block_delivery(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            prepare_delivery_candidate(root)
-            run_harness(root, "finding", "record", "--id", "F-resolved", "--surface", "delivery", "--severity", "critical", "--status", "resolved", "--summary", "Closed")
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-resolved")
+    def test_resolved_and_complete_current_waiver_are_allowed(self) -> None:
+        cases = (
+            ("resolved", {}, False),
+            (
+                "accepted",
+                {
+                    "waived_by": "user",
+                    "waiver_reason": "explicit candidate waiver",
+                    "waiver_scope": "candidate",
+                    "waived_revision": 1,
+                    "waiver_expires_at": "2026-07-12T00:00:00Z",
+                },
+                False,
+            ),
+            (
+                "accepted",
+                {
+                    "waived_by": "user",
+                    "waiver_reason": "expired waiver",
+                    "waiver_scope": "candidate",
+                    "waived_revision": 1,
+                    "waiver_expires_at": "2000-01-01T00:00:00Z",
+                },
+                True,
+            ),
+            (
+                "accepted",
+                {
+                    "waived_by": "user",
+                    "waiver_reason": "stale waiver",
+                    "waiver_scope": "candidate",
+                    "waived_revision": 2,
+                    "waiver_expires_at": "2026-07-12T00:00:00Z",
+                },
+                True,
+            ),
+        )
+        for index, (status, waiver, should_block) in enumerate(cases, start=1):
+            with self.subTest(status=status, waiver=waiver), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                create_schema30_delivery_fixture(root)
+                finding_id = f"F-{index}"
+                insert_finding(root, finding_id=finding_id, status=status, **waiver)
+                issues = schema30_issues(root)
 
-            readiness = move_to_delivery_readiness(root)
-
-        self.assertEqual(readiness.returncode, 0, readiness.stdout + readiness.stderr)
-
-    def test_dt_001_expired_finding_waiver_blocks_delivery(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            prepare_delivery_candidate(root)
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                revision = conn.execute("select revision from project where id = 1").fetchone()[0]
-            run_harness(
-                root, "finding", "record", "--id", "F-waived", "--surface", "delivery",
-                "--severity", "high", "--status", "accepted", "--summary", "Temporary waiver",
-                "--waived-by", "release-owner", "--waiver-reason", "time-boxed",
-                "--waiver-scope", "candidate", "--waived-revision", str(revision),
-                "--waiver-expires-at", "2000-01-01T00:00:00Z",
+            self.assertEqual(
+                any(finding_id in issue for issue in issues),
+                should_block,
+                issues,
             )
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-waived")
 
-            readiness = move_to_delivery_readiness(root)
-
-        self.assertNotEqual(readiness.returncode, 0)
-        self.assertIn("F-waived", readiness.stdout + readiness.stderr)
-
-    def test_dt_001_old_cycle_finding_does_not_block_current_cycle(self) -> None:
+    def test_open_finding_from_old_cycle_does_not_block_current_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            prepare_delivery_candidate(root)
-            run_harness(root, "finding", "record", "--id", "F-old", "--surface", "delivery", "--severity", "critical", "--status", "open", "--summary", "Old cycle")
+            create_schema30_delivery_fixture(root)
             with closing(sqlite3.connect(db_path(root))) as conn:
-                conn.execute("update findings set cycle_id = 'CYCLE-old' where id = 'F-old'")
+                candidate = conn.execute(
+                    "select candidate_sha from delivery_cycles where id = 'CYCLE-current'"
+                ).fetchone()[0]
+                conn.execute(
+                    """
+                    insert into delivery_cycles
+                    (id, name, goal, status, phase, base_ref, candidate_sha, started_at,
+                     closed_at, created_at, updated_at)
+                    values ('CYCLE-old', 'Old', 'Historical', 'archived',
+                            'delivery_readiness', '', ?, '2026-07-10T00:00:00Z',
+                            '2026-07-10T01:00:00Z', '2026-07-10T00:00:00Z',
+                            '2026-07-10T01:00:00Z')
+                    """,
+                    (candidate,),
+                )
                 conn.commit()
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--finding", "F-old")
+            insert_finding(root, finding_id="F-old", status="open", cycle_id="CYCLE-old")
 
-            readiness = move_to_delivery_readiness(root)
+            issues = schema30_issues(root)
 
-        self.assertEqual(readiness.returncode, 0, readiness.stdout + readiness.stderr)
+        self.assertFalse(any("F-old" in issue for issue in issues), issues)
 
-    def test_cy_001_reusing_local_ids_does_not_move_old_cycle_history(self) -> None:
+    def test_cycle_local_ids_preserve_history_and_project_current_facts_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
@@ -381,29 +275,8 @@ class StopShipRegressionTest(unittest.TestCase):
             run_harness(root, "cycle", "start", "--id", "CYCLE-next", "--name", "Next", "--goal", "Iterate")
             run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Next requirement")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Next acceptance")
-            second_task = run_harness(
-                root,
-                "task",
-                "add",
-                "--id",
-                "T1",
-                "--task",
-                "Next task",
-                "--acceptance",
-                "AC1",
-                check=False,
-            )
-            claimed = run_harness(
-                root,
-                "task",
-                "claim",
-                "T1",
-                "--agent",
-                "developer",
-                "--expected-revision",
-                "1",
-                check=False,
-            )
+            run_harness(root, "task", "add", "--id", "T1", "--task", "Next task", "--acceptance", "AC1")
+            started = run_harness(root, "task", "start", "T1")
             trace = run_harness(root, "trace", "validate", check=False)
             with closing(sqlite3.connect(db_path(root))) as conn:
                 requirements = cycle_fact_rows(conn, "requirements", "body", "R1")
@@ -414,246 +287,27 @@ class StopShipRegressionTest(unittest.TestCase):
                 ).fetchall()
             task_board = (root / ".ai-team/planning/task-board.md").read_text(encoding="utf-8")
 
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.assertEqual(
-            (requirements, acceptance, second_task.returncode, claimed.returncode, tasks, task_states),
-            (
-                [("CYCLE-current", "Original requirement"), ("CYCLE-next", "Next requirement")],
-                [("CYCLE-current", "Original acceptance"), ("CYCLE-next", "Next acceptance")],
-                0,
-                0,
-                [("CYCLE-current", "Original task"), ("CYCLE-next", "Next task")],
-                [("CYCLE-current", "ready", 1), ("CYCLE-next", "claimed", 2)],
-            ),
-            "CY-001: cycle-local IDs must preserve old requirement, acceptance, and task history",
+            requirements,
+            [("CYCLE-current", "Original requirement"), ("CYCLE-next", "Next requirement")],
+        )
+        self.assertEqual(
+            acceptance,
+            [("CYCLE-current", "Original acceptance"), ("CYCLE-next", "Next acceptance")],
+        )
+        self.assertEqual(
+            tasks,
+            [("CYCLE-current", "Original task"), ("CYCLE-next", "Next task")],
+        )
+        self.assertEqual(
+            task_states,
+            [("CYCLE-current", "planned", 1), ("CYCLE-next", "active", 2)],
         )
         self.assertIn("Next task", task_board)
         self.assertNotIn("Original task", task_board)
         self.assertNotEqual(trace.returncode, 0)
         self.assertIn("requirement has no acceptance link: R1", trace.stdout + trace.stderr)
-
-    def test_tr_001_cli_cannot_self_issue_connector_attestation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            run_harness(root, "init")
-
-            result = run_harness(
-                root,
-                "session",
-                "attest",
-                "--session-id",
-                "S-review",
-                "--agent",
-                "qa-reviewer",
-                "--role",
-                "qa-reviewer",
-                "--context-id",
-                "ctx-review",
-                "--origin",
-                "connector",
-                check=False,
-                env={"HARNESS_CONNECTOR_KEY": "test-secret"},
-            )
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                trusted_rows = conn.execute(
-                    "select count(*) from session_attestations where trust_level = 'connector'"
-                ).fetchone()[0]
-
-        self.assertNotEqual(
-            result.returncode,
-            0,
-            "TR-001: the ordinary Kernel CLI self-issued connector trust without an external receipt",
-        )
-        self.assertEqual(trusted_rows, 0)
-
-    def test_qs_001_quickstart_stops_before_independent_qa_and_delivery(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            git_init_with_tiny_project(root)
-
-            result = run_harness(
-                root,
-                "quickstart",
-                "minimal",
-                "--id",
-                "SMOKE",
-                "--goal",
-                "Keep add working",
-                "--acceptance",
-                "add(2, 3) returns 5",
-                "--task",
-                "Verify calculator add",
-                "--test-command",
-                "python3 -B -m unittest discover -s . -p 'test_*.py'",
-                "--execute",
-            )
-            cycle = json.loads(run_harness(root, "cycle", "status", "--json").stdout)
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                delivery_count = conn.execute("select count(*) from deliveries").fetchone()[0]
-                fresh_pass_count = conn.execute(
-                    "select count(*) from quality_gates where reviewer_context = 'fresh' and result = 'pass'"
-                ).fetchone()[0]
-
-        self.assertEqual(
-            (
-                cycle["status"] != "delivered",
-                delivery_count == 0,
-                fresh_pass_count == 0,
-                "NEXT:" in result.stdout,
-            ),
-            (True, True, True, True),
-            "QS-001: quickstart must stop at verified setup and print the independent reviewer next step",
-        )
-
-    def test_qs_001_fresh_gate_requires_bound_reviewer_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            prepare_delivery_candidate(root)
-
-            rejected = run_harness(
-                root,
-                "gate",
-                "record",
-                "--reviewer-context",
-                "fresh",
-                "--result",
-                "pass",
-                "--commands",
-                DEFAULT_TEST_COMMAND,
-                "--evidence",
-                "reviewed",
-                check=False,
-            )
-            attested = run_harness(
-                root,
-                "session",
-                "attest",
-                "--session-id",
-                "S-qa",
-                "--agent",
-                "qa-reviewer",
-                "--role",
-                "qa-reviewer",
-                "--context-id",
-                "ctx-qa",
-                "--origin",
-                "manual",
-            )
-            attestation_id = stdout_field(attested.stdout, "attestation")
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                conn.execute("update tasks set submitted_session_id = 'S-qa'")
-                conn.commit()
-            producer_rejected = run_harness(
-                root,
-                "gate",
-                "record",
-                "--reviewer-context",
-                "fresh",
-                "--result",
-                "pass",
-                "--reviewer-session-id",
-                "S-qa",
-                "--reviewer-attestation-id",
-                attestation_id,
-                check=False,
-            )
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                conn.execute("update tasks set submitted_session_id = ''")
-                conn.commit()
-            accepted = run_harness(
-                root,
-                "gate",
-                "record",
-                "--reviewer-context",
-                "fresh",
-                "--result",
-                "pass",
-                "--commands",
-                DEFAULT_TEST_COMMAND,
-                "--evidence",
-                "reviewed",
-                "--reviewer-session-id",
-                "S-qa",
-                "--reviewer-attestation-id",
-                attestation_id,
-            )
-
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                gates = conn.execute(
-                    "select reviewer_context, reviewer_session_id, reviewer_attestation_id from quality_gates"
-                ).fetchall()
-
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("fresh reviewer context requires", rejected.stdout + rejected.stderr)
-        self.assertNotEqual(producer_rejected.returncode, 0)
-        self.assertIn("fresh reviewer session matches producer session", producer_rejected.stdout + producer_rejected.stderr)
-        self.assertIn("OK: quality gate recorded", accepted.stdout)
-        self.assertEqual(gates, [("fresh", "S-qa", attestation_id)])
-
-    def test_qs_001_delivery_rejects_unbound_fresh_gate_if_storage_is_tampered(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            prepare_delivery_candidate(root)
-            run_harness(
-                root,
-                "gate",
-                "record",
-                "--reviewer-context",
-                "same-context-degraded",
-                "--result",
-                "pass",
-                "--commands",
-                DEFAULT_TEST_COMMAND,
-                "--evidence",
-                "reviewed",
-            )
-            with closing(sqlite3.connect(db_path(root))) as conn:
-                conn.execute(
-                    "update quality_gates set reviewer_context = 'fresh', reviewer_session_id = '', "
-                    "reviewer_attestation_id = '', review_trust_level = 'local-only'"
-                )
-                conn.commit()
-
-            result = move_to_delivery_readiness(root)
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("fresh quality gate requires", result.stdout + result.stderr)
-
-    def test_in_001_user_marketplace_source_resolves_to_copied_plugin(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            home = Path(temp) / "home"
-            home.mkdir()
-            env = os.environ.copy()
-            env["HOME"] = str(home)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "kafa.cli",
-                    "plugin",
-                    "install",
-                    "--repo",
-                    str(REPO_ROOT),
-                    "--scope",
-                    "user",
-                ],
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-                env=env,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            marketplace_path = home / ".agents" / "plugins" / "marketplace.json"
-            marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
-            entry = next(plugin for plugin in marketplace["plugins"] if plugin["name"] == "codex-project-harness")
-            resolved_source = (home / entry["source"]["path"]).resolve()
-            copied_plugin = (home / ".agents" / "plugins" / "codex-project-harness").resolve()
-
-        self.assertEqual(
-            resolved_source,
-            copied_plugin,
-            "IN-001: the user marketplace source path does not resolve to the plugin copied by kafa",
-        )
 
 
 if __name__ == "__main__":

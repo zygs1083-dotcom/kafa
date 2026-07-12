@@ -1,9 +1,8 @@
 """Markdown projection builder for SQLite runtime state."""
-
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
+from typing import Callable, Iterable
 
 from harness_lib import ensure_parent, markdown_row, write_state
 
@@ -15,21 +14,7 @@ def _runtime():
 
 
 def render_all(root: Path) -> None:
-    render_project_state(root)
-    render_requirements(root)
-    render_traceability(root)
-    render_acceptance(root)
-    render_failure_modes(root)
-    render_tasks(root)
-    render_test_targets(root)
-    render_validation(root)
-    render_evidence(root)
-    render_findings(root)
-    render_gates(root)
-    render_deliveries(root)
-    render_decisions(root)
-    render_tooling_map(root)
-    render_advisory_fallbacks(root)
+    render_affected(root, PROJECTION_NAMES)
 
 
 def render_project_state(root: Path) -> None:
@@ -41,7 +26,6 @@ def render_project_state(root: Path) -> None:
         {
             "status": row["status"],
             "phase": row["phase"],
-            "connector_project_key": row["connector_project_key"],
             "scope_status": row["scope_status"],
             "current_owner": row["current_owner"],
             "schema_version": row["schema_version"],
@@ -63,8 +47,8 @@ def render_requirements(root: Path) -> None:
     with runtime.connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from requirements where cycle_id = ? order by id", (cycle_id,)).fetchall()
-    lines = ["# Requirements", "", "| ID | Kind | Body | Priority | Status | Tool Link | Revision |", "| --- | --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["id"], row["kind"], row["body"], row["priority"], row["status"], row["tool_link"], row["revision"]]) for row in rows)
+    lines = ["# Requirements", "", "| ID | Kind | Body | Priority | Status | Revision |", "| --- | --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["id"], row["kind"], row["body"], row["priority"], row["status"], row["revision"]]) for row in rows)
     write_view(root, ".ai-team/requirements/requirements.md", "\n".join(lines))
 
 
@@ -78,8 +62,8 @@ def render_acceptance(root: Path) -> None:
     with runtime.connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from acceptance where cycle_id = ? order by id", (cycle_id,)).fetchall()
-    lines = ["# Acceptance Criteria", "", "| ID | Criterion | Priority | Tool Link | Status |", "| --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["id"], row["criterion"], row["priority"], row["tool_link"], row["status"]]) for row in rows)
+    lines = ["# Acceptance Criteria", "", "| ID | Criterion | Priority | Status |", "| --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["id"], row["criterion"], row["priority"], row["status"]]) for row in rows)
     write_view(root, ".ai-team/requirements/acceptance.md", "\n".join(lines))
 
 
@@ -142,7 +126,7 @@ def render_tasks(root: Path) -> None:
         acceptance = runtime.grouped(conn, "task_acceptance", "task_id", "acceptance_id", cycle_id)
         failure_modes = runtime.grouped(conn, "task_failure_modes", "task_id", "failure_mode_id", cycle_id)
         dependencies = runtime.grouped(conn, "task_dependencies", "task_id", "depends_on", cycle_id)
-    lines = ["# Task Board", "", "| ID | Task | Owner | Status | Acceptance | Failure Modes | Depends On | Tool Link | Evidence | Revision | Lease |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["# Task Board", "", "| ID | Task | Owner | Status | Acceptance | Failure Modes | Depends On | Evidence | Producer Context | Revision |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         lines.append(
             markdown_row(
@@ -154,28 +138,17 @@ def render_tasks(root: Path) -> None:
                     acceptance.get(row["id"], ""),
                     failure_modes.get(row["id"], ""),
                     dependencies.get(row["id"], ""),
-                    row["tool_link"],
                     row["evidence"],
+                    row["submitted_context_id"],
                     row["revision"],
-                    row["lease_agent"] or "",
                 ]
             )
         )
     write_view(root, ".ai-team/planning/task-board.md", "\n".join(lines))
-
-
-def grouped(conn: sqlite3.Connection, table: str, key: str, value: str) -> dict[str, str]:
-    return {
-        row[key]: row["ids"]
-        for row in conn.execute(f"select {key}, group_concat({value}, ', ') as ids from {table} group by {key}")
-    }
-
-
 def render_test_targets(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
         targets = conn.execute("select * from test_targets order by id").fetchall()
-        prefixes = conn.execute("select prefix, reason from executor_allowlist order by prefix").fetchall()
     lines = [
         "# Test Targets",
         "",
@@ -203,8 +176,6 @@ def render_test_targets(root: Path) -> None:
         )
         for row in targets
     )
-    lines.extend(["", "## Executor Allow Prefixes", "", "| Prefix | Reason |", "| --- | --- |"])
-    lines.extend(markdown_row([row["prefix"], row["reason"]]) for row in prefixes)
     write_view(root, ".ai-team/control/test-targets.md", "\n".join(lines))
 
 
@@ -214,80 +185,100 @@ def render_validation(root: Path) -> None:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from validations where cycle_id = ? order by created_at, id", (cycle_id,)).fetchall()
         failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id", cycle_id)
-    lines = ["# Validation", "", "| Surface | Acceptance | Failure Modes | Head | Source Hash | Diff Hash | Project Revision | Tool Context | Commands | Command | Target | Executed Count | Count Source | Exit Code | Stdout SHA256 | Artifact | Policy | Trust Anchor | Sandbox | Findings | Pass/Fail | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-    lines.extend(
-        markdown_row(
-            [
-                row["surface"],
-                row["acceptance_id"],
-                failure_modes.get(row["id"], ""),
-                row["head_commit"],
-                row["source_tree_hash"],
-                row["tracked_diff_hash"],
-                row["project_revision"],
-                "",
-                row["commands"],
-                row["command"] if "command" in row.keys() else "",
-                row["target_id"] if "target_id" in row.keys() else "",
-                row["executed_count"] if "executed_count" in row.keys() else "",
-                row["executed_count_source"] if "executed_count_source" in row.keys() else "",
-                row["exit_code"] if "exit_code" in row.keys() else "",
-                row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
-                row["artifact_path"] if "artifact_path" in row.keys() else "",
-                row["policy_status"] if "policy_status" in row.keys() else "",
-                row["trust_anchor"] if "trust_anchor" in row.keys() else "",
-                row["sandbox_profile"] if "sandbox_profile" in row.keys() else "",
-                row["findings"],
-                row["result"],
-                row["residual_risk"],
-            ]
-        )
-        for row in rows
-    )
+        execution_rows = {
+            row["id"]: conn.execute(
+                """
+                select e.* from validation_executions ve
+                join executions e on e.id = ve.execution_id
+                where ve.validation_id = ? order by e.created_at, e.id
+                """,
+                (row["id"],),
+            ).fetchall()
+            for row in rows
+        }
+    lines = [
+        "# Validation",
+        "",
+        "| ID | Candidate | Surface | Acceptance | Failure Modes | Result | Status | Execution | Target | Command | Count | Format | Semantic | Exit | Stdout SHA256 | Artifact | Runner | Sandbox | No Network | Policy | Findings | Residual Risk |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        linked = execution_rows[row["id"]] or [None]
+        for execution in linked:
+            lines.append(
+                markdown_row(
+                    [
+                        row["id"],
+                        row["candidate_sha"],
+                        row["surface"],
+                        row["acceptance_id"] or "",
+                        failure_modes.get(row["id"], ""),
+                        row["result"],
+                        row["validation_status"],
+                        execution["id"] if execution else "",
+                        execution["target_id"] if execution else "",
+                        execution["command"] if execution else "",
+                        execution["executed_count"] if execution else "",
+                        execution["result_format"] if execution else "",
+                        execution["semantic_status"] if execution else "",
+                        execution["exit_code"] if execution else "",
+                        execution["stdout_sha256"] if execution else "",
+                        execution["artifact_path"] if execution else "",
+                        execution["runner"] if execution else "",
+                        execution["sandbox_status"] if execution else "",
+                        execution["no_network"] if execution else "",
+                        execution["policy_status"] if execution else "",
+                        row["findings"],
+                        row["residual_risk"],
+                    ]
+                )
+            )
     write_view(root, "docs/harness/validation.md", "\n".join(lines))
 
 
-def render_evidence(root: Path) -> None:
+def render_executions(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
-        evidence_rows = conn.execute("select * from evidence order by created_at, id").fetchall()
-        test_rows = conn.execute("select * from tests order by created_at, id").fetchall()
-    lines = ["# Evidence", "", "## Evidence Records", "", "| ID | Kind | Summary | URI | Hash | Command | Target | Executed Count | Count Source | Exit Code | Stdout SHA256 | Artifact | Source Hash | Policy | Trust Anchor | Sandbox | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+        rows = conn.execute("select * from executions order by created_at, id").fetchall()
+    lines = [
+        "# Immutable Executions",
+        "",
+        "| ID | Cycle | Candidate | Target | Command | Exit | Stdout SHA256 | Artifact | Count | Format | Semantic | Runner | Sandbox | No Network | Policy | Created At |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
     lines.extend(
         markdown_row(
             [
                 row["id"],
-                row["kind"],
-                row["summary"],
-                row["uri"],
-                row["hash"],
-                row["command"] if "command" in row.keys() else "",
-                row["target_id"] if "target_id" in row.keys() else "",
-                row["executed_count"] if "executed_count" in row.keys() else "",
-                row["executed_count_source"] if "executed_count_source" in row.keys() else "",
-                row["exit_code"] if "exit_code" in row.keys() else "",
-                row["stdout_sha256"] if "stdout_sha256" in row.keys() else "",
-                row["artifact_path"] if "artifact_path" in row.keys() else "",
-                row["source_tree_hash"] if "source_tree_hash" in row.keys() else "",
-                row["policy_status"] if "policy_status" in row.keys() else "",
-                row["trust_anchor"] if "trust_anchor" in row.keys() else "",
-                row["sandbox_profile"] if "sandbox_profile" in row.keys() else "",
+                row["cycle_id"],
+                row["candidate_sha"],
+                row["target_id"] or "",
+                row["command"],
+                row["exit_code"],
+                row["stdout_sha256"],
+                row["artifact_path"],
+                row["executed_count"],
+                row["result_format"],
+                row["semantic_status"],
+                row["runner"],
+                row["sandbox_status"],
+                row["no_network"],
+                row["policy_status"],
                 row["created_at"],
             ]
         )
-        for row in evidence_rows
+        for row in rows
     )
-    lines.extend(["", "## Test Records", "", "| ID | Surface | Command | Result | Evidence | Created At |", "| --- | --- | --- | --- | --- | --- |"])
-    lines.extend(markdown_row([row["id"], row["surface"], row["command"], row["result"], row["evidence_id"], row["created_at"]]) for row in test_rows)
-    write_view(root, "docs/harness/evidence.md", "\n".join(lines))
+    write_view(root, "docs/harness/executions.md", "\n".join(lines))
+    (root / "docs/harness/evidence.md").unlink(missing_ok=True)
 
 
 def render_findings(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
         rows = conn.execute("select * from findings order by created_at, id").fetchall()
-    lines = ["# Findings", "", "| ID | Surface | Severity | Status | Summary | Evidence | Created At |", "| --- | --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["id"], row["surface"], row["severity"], row["status"], row["summary"], row["evidence_id"], row["created_at"]]) for row in rows)
+    lines = ["# Findings", "", "| ID | Cycle | Candidate | Surface | Severity | Status | Summary | Accepted By | Reason | Scope | Revision | Expires | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["id"], row["cycle_id"], row["candidate_sha"], row["surface"], row["severity"], row["status"], row["summary"], row["waived_by"], row["waiver_reason"], row["waiver_scope"], row["waived_revision"] or "", row["waiver_expires_at"], row["created_at"]]) for row in rows)
     write_view(root, "docs/harness/findings.md", "\n".join(lines))
 
 
@@ -296,8 +287,8 @@ def render_gates(root: Path) -> None:
     with runtime.connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from quality_gates where cycle_id = ? order by sequence", (cycle_id,)).fetchall()
-    lines = ["# Quality Gates", "", "| Gate | Commit | Base | Head | Source Hash | Diff Hash | Project Revision | Reviewer Context | Result | Blocking Findings | Commands | Evidence | Residual Risk |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-    lines.extend(markdown_row([row["gate"], row["reviewed_commit"], row["base_commit"], row["head_commit"], row["diff_hash"], row["tracked_diff_hash"], row["project_revision"], row["reviewer_context"], row["result"], row["blocking_findings"], row["commands"], row["evidence"], row["residual_risk"]]) for row in rows)
+    lines = ["# Quality Gates", "", "| Gate | Candidate | Producer Context | Reviewer Context | Review Status | Result | Blocking Findings | Residual Risk | Revision | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines.extend(markdown_row([row["gate"], row["candidate_sha"], row["producer_context_id"], row["reviewer_context_id"], row["review_status"], row["result"], row["blocking_findings"], row["residual_risk"], row["reviewed_revision"], row["created_at"]]) for row in rows)
     write_view(root, "docs/harness/quality-gates.md", "\n".join(lines))
 
 
@@ -311,6 +302,9 @@ def render_deliveries(root: Path) -> None:
         lines.extend(
             [
                 f"## Delivery Record {row['created_at']}",
+                "",
+                "### Decision Status",
+                row["decision_status"],
                 "",
                 "### Scope",
                 row["scope"],
@@ -326,9 +320,6 @@ def render_deliveries(root: Path) -> None:
                 "",
                 "### Independent QA",
                 row["qa"],
-                "",
-                "### Collaboration Links",
-                row["collaboration_links"],
                 "",
                 "### Failure Mode Coverage",
                 row["failure_mode_coverage"],
@@ -362,66 +353,52 @@ def render_decisions(root: Path) -> None:
     write_view(root, ".ai-team/control/decision-log.md", "\n".join(lines))
 
 
-def render_tooling_map(root: Path) -> None:
-    runtime = _runtime()
-    with runtime.connection(root) as conn:
-        rows = conn.execute("select * from adapters order by tool, artifact").fetchall()
-    lines = ["# Tooling Map", "", "| Artifact | Source Of Truth | External Tool | External ID / Link | Fallback | Mode | Idempotency Key |", "| --- | --- | --- | --- | --- | --- | --- |"]
-    if not rows:
-        defaults = [
-            ("Requirements", "local", "", "", ".ai-team/requirements/requirements.md", "", ""),
-            ("Tasks", "local", "", "", ".ai-team/planning/task-board.md", "", ""),
-            ("Validation", "local", "", "", "docs/harness/validation.md", "", ""),
-            ("Delivery", "local", "", "", "docs/harness/delivery.md", "", ""),
-        ]
-        lines.extend(markdown_row(list(row)) for row in defaults)
-    else:
-        lines.extend(
-            markdown_row(
-                [
-                    row["artifact"],
-                    "local",
-                    row["tool"],
-                    row["external_link"] or row["external_id"],
-                    row["fallback"],
-                    row["mode"],
-                    row["idempotency_key"],
-                ]
-            )
-            for row in rows
-        )
-    write_view(root, ".ai-team/control/tooling-map.md", "\n".join(lines))
+PROJECTION_PATHS: tuple[Path, ...] = (
+    Path(".ai-team/control/project-state.yaml"),
+    Path(".ai-team/requirements/requirements.md"),
+    Path(".ai-team/requirements/traceability.md"),
+    Path(".ai-team/requirements/acceptance.md"),
+    Path(".ai-team/requirements/failure-modes.md"),
+    Path(".ai-team/planning/task-board.md"),
+    Path(".ai-team/control/test-targets.md"),
+    Path("docs/harness/validation.md"),
+    Path("docs/harness/executions.md"),
+    Path("docs/harness/findings.md"),
+    Path("docs/harness/quality-gates.md"),
+    Path("docs/harness/delivery.md"),
+    Path(".ai-team/control/decision-log.md"),
+)
+PROJECTION_ROLLBACK_PATHS: tuple[Path, ...] = (
+    *PROJECTION_PATHS,
+    Path("docs/harness/evidence.md"),
+)
 
 
-def render_advisory_fallbacks(root: Path) -> None:
-    runtime = _runtime()
-    with runtime.connection(root) as conn:
-        exists = conn.execute("select 1 from sqlite_master where type='table' and name='advisory_fallbacks'").fetchone()
-        rows = []
-        if exists:
-            rows = conn.execute("select * from advisory_fallbacks order by generated_at, action_id").fetchall()
-    lines = [
-        "# Advisory Fallbacks",
-        "",
-        "These records are local advisory drafts only. They are not delivery evidence.",
-        "",
-        "| Action | Connector | Operation | Kind | Official Capability | Status | Delivery Eligible | Artifact | Summary |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    lines.extend(
-        markdown_row(
-            [
-                row["action_id"],
-                row["tool"],
-                row["operation"],
-                row["fallback_kind"],
-                row["official_capability"],
-                row["status"],
-                row["delivery_eligible"],
-                row["artifact_path"],
-                row["summary"],
-            ]
-        )
-        for row in rows
-    )
-    write_view(root, ".ai-team/control/advisory-fallbacks.md", "\n".join(lines))
+PROJECTION_RENDERERS: tuple[tuple[str, Callable[[Path], None]], ...] = (
+    ("project-state", render_project_state),
+    ("requirements", render_requirements),
+    ("traceability", render_traceability),
+    ("acceptance", render_acceptance),
+    ("failure-modes", render_failure_modes),
+    ("tasks", render_tasks),
+    ("test-targets", render_test_targets),
+    ("validation", render_validation),
+    ("executions", render_executions),
+    ("findings", render_findings),
+    ("gates", render_gates),
+    ("deliveries", render_deliveries),
+    ("decisions", render_decisions),
+)
+PROJECTION_NAMES = tuple(name for name, _ in PROJECTION_RENDERERS)
+
+
+def render_affected(root: Path, projections: Iterable[str]) -> None:
+    """Rebuild only explicitly affected generated views in stable order."""
+
+    selected = frozenset(projections)
+    unknown = sorted(selected - set(PROJECTION_NAMES))
+    if unknown:
+        raise ValueError(f"unknown projection(s): {', '.join(unknown)}")
+    for name, renderer in PROJECTION_RENDERERS:
+        if name in selected:
+            renderer(root)

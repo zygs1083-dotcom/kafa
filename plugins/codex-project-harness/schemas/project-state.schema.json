@@ -2,8 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Codex Project Harness Project State",
   "type": "object",
-  "required": ["status", "phase", "current_cycle_id", "connector_project_key", "scope_status", "current_owner", "schema_version", "runtime_version", "project_id", "revision"],
+  "required": ["id", "status", "phase", "current_cycle_id", "scope_status", "current_owner", "schema_version", "runtime_version", "project_id", "revision", "updated_at"],
   "properties": {
+    "id": { "type": "integer" },
     "status": { "type": "string" },
     "phase": {
       "type": "string",
@@ -22,15 +23,13 @@
       ]
     },
     "current_cycle_id": { "type": "string" },
-    "connector_project_key": { "type": "string" },
     "scope_status": { "type": "string" },
     "current_owner": { "type": "string" },
     "schema_version": { "type": "integer" },
     "runtime_version": { "type": "string" },
     "project_id": { "type": "string" },
     "revision": { "type": "integer" },
-    "blocked_reason": { "type": ["string", "null"] },
-    "updated_at": { "type": ["string", "null"] }
+    "updated_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

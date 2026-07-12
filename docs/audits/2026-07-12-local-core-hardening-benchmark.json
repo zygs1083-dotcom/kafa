@@ -1,0 +1,164 @@
+{
+  "baseline": {
+    "empty_db_bytes": 552960,
+    "fact_count": 5000,
+    "full_test_count": 370,
+    "full_test_seconds": 406.72,
+    "full_test_status": "passed",
+    "init_seconds": 0.31,
+    "schema_version": 29,
+    "single_mutation_seconds": 0.146113,
+    "targeted_projection_seconds": null,
+    "targeted_projection_status": "not-recorded"
+  },
+  "baseline_source": "docs/audits/2026-07-11-local-core-slimming-baseline.md:58",
+  "benchmark_kind": "comparative-report-only",
+  "comparison": {
+    "current_full_over_targeted_projection": {
+      "baseline": 0.0033,
+      "current": 0.024376,
+      "current_over_baseline": 7.386667,
+      "delta": 0.021076,
+      "status": "measured"
+    },
+    "empty_db_bytes": {
+      "baseline": 552960,
+      "current": 315392,
+      "current_over_baseline": 0.57037,
+      "delta": -237568.0,
+      "status": "measured"
+    },
+    "full_test_seconds": {
+      "baseline": 406.72,
+      "current": 94.78,
+      "current_over_baseline": 0.233035,
+      "delta": -311.94,
+      "status": "measured"
+    },
+    "init_seconds": {
+      "baseline": 0.31,
+      "current": 0.123897,
+      "current_over_baseline": 0.399668,
+      "delta": -0.186103,
+      "status": "measured"
+    },
+    "single_mutation_seconds": {
+      "baseline": 0.146113,
+      "current": 0.004956,
+      "current_over_baseline": 0.033919,
+      "delta": -0.141157,
+      "status": "measured"
+    },
+    "targeted_projection_seconds": {
+      "baseline": null,
+      "current": 0.0033,
+      "current_over_baseline": null,
+      "delta": null,
+      "status": "not-comparable"
+    }
+  },
+  "created_at": "2026-07-12T06:42:54+00:00",
+  "environment": {
+    "head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "machine": "arm64",
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "python": "3.14.5",
+    "working_tree_dirty": true
+  },
+  "notes": [
+    "Wall-clock values are evidence, not CI pass/fail thresholds.",
+    "Baseline targeted projection timing was not recorded and is reported as not-comparable.",
+    "A not-run full test is not a pass; inject task 11.3 wall time after the suite completes."
+  ],
+  "report_version": 1,
+  "schema30": {
+    "empty_db": {
+      "median_bytes": 315392,
+      "sample_count": 5,
+      "samples_bytes": [
+        315392,
+        315392,
+        315392,
+        315392,
+        315392
+      ]
+    },
+    "full_projection": {
+      "median_seconds": 0.024376,
+      "projection_count": 13,
+      "projections": [
+        "project-state",
+        "requirements",
+        "traceability",
+        "acceptance",
+        "failure-modes",
+        "tasks",
+        "test-targets",
+        "validation",
+        "executions",
+        "findings",
+        "gates",
+        "deliveries",
+        "decisions"
+      ],
+      "sample_count": 5,
+      "samples_seconds": [
+        0.024862,
+        0.024124,
+        0.024627,
+        0.024376,
+        0.024364
+      ]
+    },
+    "full_test": {
+      "command": "python3 -W error::ResourceWarning -m unittest discover -s tests -p test_*.py",
+      "seconds": 94.78,
+      "status": "passed",
+      "test_count": 296
+    },
+    "init": {
+      "median_seconds": 0.123897,
+      "sample_count": 5,
+      "samples_seconds": [
+        0.125188,
+        0.12551,
+        0.122845,
+        0.122986,
+        0.123897
+      ]
+    },
+    "runtime_version": "5.0.0",
+    "schema_version": 30,
+    "single_mutation_after_local_facts": {
+      "fact_count": 5000,
+      "median_seconds": 0.004956,
+      "projection_count": 3,
+      "sample_count": 5,
+      "samples_seconds": [
+        0.005512,
+        0.004956,
+        0.005257,
+        0.004318,
+        0.004913
+      ]
+    },
+    "targeted_projection": {
+      "median_seconds": 0.0033,
+      "projection_count": 3,
+      "projections": [
+        "project-state",
+        "requirements",
+        "traceability"
+      ],
+      "sample_count": 5,
+      "samples_seconds": [
+        0.0033,
+        0.003535,
+        0.003135,
+        0.003058,
+        0.003648
+      ]
+    }
+  },
+  "timing_assertions": false
+}

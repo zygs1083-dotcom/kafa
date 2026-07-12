@@ -15,8 +15,9 @@ Check:
 
 - requirement to implementation traceability,
 - failure mode coverage for risky behavior,
-- Linear/GitHub/Notion/Figma mappings against local acceptance criteria when present,
-- GitHub PR diff, checks, and review context when available,
+- the current candidate revision against local or OpenSpec acceptance criteria,
+- the candidate diff, checks, and review context available in the local workspace,
+- immutable local execution and validation evidence for the reviewed revision,
 - tests proving meaningful behavior,
 - API response shape versus frontend types,
 - database fields versus DTOs and validation,
@@ -35,11 +36,14 @@ For broad changes, split QA into short-lived subagents by risk surface. Examples
 - QA-C: data model, migrations, validation, idempotency, failure modes.
 - QA-D: security, permissions, secrets exposure, dependency risk.
 
-Each subagent must return evidence: files inspected, commands run, findings, and residual risk.
-Record material command/test proof with `scripts/harness.py --root . evidence record ...` and `scripts/harness.py --root . test record ...`.
-Record each material QA result with `scripts/harness.py --root . validation record ...`.
-Record unresolved issues with `scripts/harness.py --root . finding record ...`.
-Record the gate decision with `scripts/harness.py --root . gate record ...`, including the reviewed commit or revision.
+Each subagent must return evidence to the root controller: files inspected,
+commands run, findings, and residual risk. Subagents do not mutate Kafa state.
+
+The root controller records material command proof by registering an exact
+`test-target` and running `scripts/harness.py --root . verify run ...` on the
+current candidate. Use `validation record` only for reviewer judgment,
+`finding record` for unresolved issues, and `gate record` for the decision.
+Free-form validation cannot substitute for immutable execution provenance.
 
 Use this output shape for each QA subagent:
 
@@ -64,7 +68,8 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 - Critical or high findings fail the gate.
 - Missing required validation fails or blocks the gate.
 - Medium findings require explicit residual-risk acceptance.
-- Same-context review can pass only with `reviewer_context: same-context-degraded` and clear residual-risk notes.
+- Same-context review can pass only with `reviewer_context: same-context-degraded`, a real context ID, and clear residual-risk notes.
+- High/critical work without verifiable current-candidate provenance and distinct producer/reviewer context returns `human-review-required` unless the user explicitly accepts complete, current, unexpired risk metadata.
 - Code changes after QA require a new gate record for the new commit or revision.
 - Requirement, acceptance, or failure-mode changes invalidate dependent validation and gate records until fresh evidence is recorded.
 
@@ -72,6 +77,6 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 
 Lead with findings ordered by severity. If no issues are found, say that clearly and mention remaining test gaps or residual risk.
 
-Include GitHub/Linear/Notion/Figma/Slack links or local fallback artifacts used during review.
+Include the local execution artifacts and record IDs used during review.
 
 Before passing delivery readiness, run `scripts/harness.py --root . validate --delivery` and report any warnings or errors.

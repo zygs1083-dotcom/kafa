@@ -1,6 +1,0 @@
-interface:
-  display_name: "需求基线"
-  short_description: "把模糊需求转成可确认、可追踪、可验收的交付基线。"
-  default_prompt: "Use $requirement-baseline to clarify the goal, scope, acceptance criteria, risks, non-goals, and traceability before implementation."
-policy:
-  allow_implicit_invocation: true

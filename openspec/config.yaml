@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  Kafa is a Python 3.11+ stdlib-first Codex Plugin and local SQLite delivery
+  runtime. The current development baseline is VERSION 1.25.0-beta.1,
+  Runtime/Kernel 4.18.0, and schema 29. The latest published prerelease is
+  older, so every public CLI or schema removal must be treated as an explicit
+  breaking migration.
+
+  The target product is local-only. Native Codex/ChatGPT owns task, thread,
+  subagent, worktree, approval, model, cancel, steer, and handoff lifecycle.
+  Kafa owns local requirements, acceptance, failure modes, candidate identity,
+  controller-executed verification, findings, QA, and delivery decisions.
+  Kafa must not directly call GitHub, Linear, Notion, Figma, or Slack APIs.
+
+  Preserve local Git, per-project SQLite, structured test parsing, optional
+  no-network container verification, Codex Plugin installation, and truthful
+  fail-closed delivery gates. Do not claim cryptographic or external trust when
+  only model-visible local state exists.
+
+rules:
+  proposal:
+    - Mark removed CLI, schema, connector, and provider behavior as BREAKING.
+    - Keep GitHub Actions and local Git outside runtime-removal scope.
+  design:
+    - Include migration, rollback, performance budgets, and trust-boundary rationale.
+    - Separate immediate deletion from later model normalization.
+  specs:
+    - Use observable SHALL requirements and explicit negative scenarios.
+    - Require fail-closed behavior for unsupported external or legacy paths.
+  tasks:
+    - Keep each task independently verifiable and normally under five files.
+    - Put schema and trust changes before CLI, docs, and cleanup.
+    - Require targeted tests plus a full checkpoint after every implementation wave.

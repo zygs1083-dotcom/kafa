@@ -60,18 +60,8 @@ def require_task_runnable(
     *,
     error_factory: Callable[[str], Exception] = ValueError,
 ) -> None:
-    if row["status"] not in {"ready", "claimed"}:
+    if row["status"] != "planned":
         raise error_factory(f"task status is not runnable: {row['id']} status={row['status']}")
     blockers = dependency_blockers(conn, row["id"], row["cycle_id"])
     if blockers:
         raise error_factory(f"task dependencies are not accepted: {row['id']} blockers={', '.join(blockers)}")
-
-
-def ready_queue(conn: sqlite3.Connection, cycle_id: str = "") -> list[str]:
-    cycle_id = cycle_id or current_cycle_id(conn)
-    rows = conn.execute("select id from tasks where cycle_id = ? and status = 'ready' order by id", (cycle_id,)).fetchall()
-    ready: list[str] = []
-    for row in rows:
-        if not dependency_blockers(conn, row["id"], cycle_id):
-            ready.append(row["id"])
-    return ready

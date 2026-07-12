@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 import hashlib
 import json
 import os
@@ -12,12 +13,18 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import tomllib
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+
+if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
+    import msvcrt
+else:  # pragma: no branch - exactly one platform backend is loaded
+    import fcntl
 
 
 PLUGIN_NAME = "codex-project-harness"
@@ -28,48 +35,148 @@ REPO_VERSION_FILE = Path(__file__).resolve().parents[1] / "VERSION"
 
 REQUIRED_SKILLS = (
     "project-harness",
-    "project-bootstrap",
-    "project-runtime",
-    "requirement-baseline",
-    "team-architecture",
     "minimal-safe-change",
     "test-first-delivery",
     "bug-fix-loop",
     "independent-quality-gate",
-    "delivery-readiness",
     "harness-audit",
     "project-retrospective",
 )
-REQUIRED_REFERENCES = ("collaboration-tools.md", "tool-adapters.md")
 REQUIRED_CORE = (
     "__init__.py", "api.py",
 )
 REQUIRED_SCRIPTS = (
-    "init_project_harness.py", "validate_structure.py", "harness_lib.py", "harness_wrapper.py",
-    "harness_status.py", "update_phase.py", "add_acceptance.py", "add_failure_mode.py", "add_task.py",
-    "update_task.py", "record_decision.py", "record_validation.py", "record_quality_gate.py",
-    "record_delivery.py", "validate_harness_state.py", "harness_db.py", "harness.py",
-    "run_runtime_smoke.py", "run_forward_eval.py", "run_skill_eval.py", "run_agent_e2e_eval.py",
+    "validate_structure.py", "harness_lib.py", "harness_db.py", "harness.py",
+    "run_runtime_smoke.py", "run_skill_eval.py", "run_agent_e2e_eval.py",
 )
 REQUIRED_HOOKS = ("hooks.json", "harness_hook.py")
+REQUIRED_HOOK_EVENTS = ("SessionStart", "SubagentStart", "Stop")
+REQUIRED_AGENT_TEMPLATES = ("architect.toml", "developer.toml", "qa-reviewer.toml")
 REQUIRED_SCHEMAS = (
     "project-state.schema.json", "delivery-cycle.schema.json", "requirement.schema.json",
-    "acceptance.schema.json", "task.schema.json", "task-attempt.schema.json", "task-test-target.schema.json",
+    "acceptance.schema.json", "task.schema.json", "task-test-target.schema.json",
     "event.schema.json", "quality-gate.schema.json", "failure-mode.schema.json", "validation.schema.json",
-    "evidence.schema.json", "test.schema.json", "test-target.schema.json", "finding.schema.json",
-    "invalidation.schema.json", "delivery.schema.json", "adapter.schema.json", "adapter-action.schema.json",
-    "connector-budget.schema.json", "connector-profile.schema.json", "advisory-fallback.schema.json",
-    "ci-verification.schema.json", "command-log.schema.json", "codex-fanout-export.schema.json",
-    "external-session-verification.schema.json", "agent.schema.json", "agent-session.schema.json",
-    "session-attestation.schema.json", "baseline.schema.json", "dispatch-run.schema.json",
-    "dispatch-assignment.schema.json", "dispatch-worktree.schema.json", "task-file-claim.schema.json",
-    "agent-report.schema.json", "agent-provider-session.schema.json", "agent-provider-event.schema.json",
-    "sandbox-execution.schema.json", "integration-attempt.schema.json", "runtime-snapshot.schema.json",
+    "test-target.schema.json", "execution.schema.json", "finding.schema.json",
+    "invalidation.schema.json", "delivery.schema.json",
+    "baseline.schema.json",
 )
+RETIRED_CORE_FILES = ("agent_provider.py", "agent_runner.py", "connector_trust.py")
+FORBIDDEN_RUNTIME_LITERALS = (
+    "gh api",
+    "api.github.com",
+    "api.linear.app",
+    "api.notion.com",
+    "api.figma.com",
+    "slack.com/api",
+    "github_token",
+    "gh_token",
+    "linear_api_key",
+    "notion_token",
+    "figma_token",
+    "slack_bot_token",
+    "harness_connector_key",
+)
+FORBIDDEN_PROVIDER_IMPORTS = {"github", "linear", "notion_client", "figma", "slack_sdk", "openai_codex"}
 
 
 class KafaError(RuntimeError):
     """User-facing CLI error."""
+
+
+def _migration_in_progress_error(sentinel: Path) -> KafaError | None:
+    try:
+        with sentinel.open("r", encoding="utf-8") as handle:
+            raw = handle.read(4096)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return KafaError(
+            f"migration-in-progress: sentinel exists at {sentinel} (metadata unreadable: {exc})"
+        )
+
+    metadata: list[str] = []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        for field in ("pid", "created_at", "target_schema"):
+            value = payload.get(field)
+            if value not in (None, ""):
+                metadata.append(f"{field}={value}")
+    suffix = f" ({', '.join(metadata)})" if metadata else " (metadata invalid or incomplete)"
+    return KafaError(
+        f"migration-in-progress: sentinel exists at {sentinel}{suffix}; inspect the owner and remove it only "
+        "after confirming no migration is active"
+    )
+
+
+def _raise_if_migration_in_progress(sentinel: Path) -> None:
+    error = _migration_in_progress_error(sentinel)
+    if error is not None:
+        raise error
+
+
+def _try_cli_operation_lock(descriptor: int) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_cli_operation_lock(descriptor: int) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _project_doctor_db_operation(root: Path, *, timeout: float = 5.0):
+    state_dir = root / ".ai-team/state"
+    sentinel = state_dir / "local-core-migration.lock"
+    operation_lock = state_dir / "harness.db.operation.lock"
+    _raise_if_migration_in_progress(sentinel)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(operation_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
+    try:
+        os.set_inheritable(descriptor, False)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.chmod(operation_lock, 0o600)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _try_cli_operation_lock(descriptor)
+                locked = True
+                break
+            except OSError as exc:
+                if not isinstance(exc, BlockingIOError) and exc.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EDEADLK,
+                }:
+                    raise KafaError(f"project-db-operation-lock-error: cannot lock {operation_lock}: {exc}") from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise KafaError(
+                        "project-db-operation-timeout: could not acquire exclusive operation lock "
+                        f"{operation_lock} within {timeout:.1f} seconds"
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+        _raise_if_migration_in_progress(sentinel)
+        yield
+    finally:
+        if locked:
+            try:
+                _unlock_cli_operation_lock(descriptor)
+            except OSError:
+                pass
+        os.close(descriptor)
 
 
 def release_version() -> str:
@@ -297,6 +404,15 @@ def validate_plugin_source(repo: Path, source: Path) -> None:
     version_file = repo / "VERSION"
     if version_file.exists() and data.get("version") != version_file.read_text(encoding="utf-8").strip():
         raise KafaError("plugin manifest version must match repo VERSION")
+    structure_ok, structure_details = static_plugin_structure(source)
+    if not structure_ok:
+        raise KafaError(f"plugin source structure is invalid: {structure_details}")
+    contract_ok, contract_details = control_plane_contract(source)
+    if not contract_ok:
+        raise KafaError(f"plugin source control-plane contract is invalid: {contract_details}")
+    local_only_ok, local_only_details = local_only_runtime_boundary(source)
+    if not local_only_ok:
+        raise KafaError(f"plugin source is not local-only: {local_only_details}")
 
 
 def copy_action(source: Path, target: Path, *, force: bool, dry_run: bool, actions: list[str]) -> None:
@@ -380,7 +496,8 @@ def doctor_report(repo: Path, scope: str) -> dict[str, Any]:
     add_check(checks, "plugin structure", structure_ok, structure_details)
     contract_ok, contract_details = control_plane_contract(source)
     add_check(checks, "control plane contract", contract_ok, contract_details)
-    add_check(checks, "connector namespace boundary", True, "installer does not create external workspaces; per-project connector profile lives in harness runtime state")
+    local_only_ok, local_only_details = local_only_runtime_boundary(source)
+    add_check(checks, "local-only runtime boundary", local_only_ok, local_only_details)
     add_install_health_checks(checks, repo, scope, source, source_metadata)
     return {"ok": all(check["ok"] for check in checks), "scope": scope, "repo": str(repo), "checks": checks}
 
@@ -513,6 +630,28 @@ def path_is_link(path: Path) -> bool:
         return True
 
 
+def read_static_python_constants(path: Path) -> dict[str, object]:
+    """Resolve literal and same-module alias constants without importing source."""
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return {}
+    resolved: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        try:
+            value: object = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            value = resolved.get(node.value.id) if isinstance(node.value, ast.Name) else None
+        for target in targets:
+            if isinstance(target, ast.Name):
+                resolved[target.id] = value
+    return resolved
+
+
 def static_plugin_structure(source: Path) -> tuple[bool, str]:
     errors: list[str] = []
     repo_root = source.parent.parent
@@ -525,11 +664,24 @@ def static_plugin_structure(source: Path) -> tuple[bool, str]:
         return False, f"invalid plugin manifest: {exc}"
 
     version_path = repo_root / "VERSION"
-    version = read_text(version_path).strip()
+    version_text = read_text(version_path).strip()
+    release_path = repo_root / "release.json"
+    release_manifest: dict[str, object] = {}
+    if release_path.exists():
+        try:
+            release_value = json.loads(release_path.read_text(encoding="utf-8"))
+            if not isinstance(release_value, dict):
+                raise ValueError("root must be an object")
+            release_manifest = release_value
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"invalid release.json: {exc}")
+    version = str(release_manifest.get("version", "") or version_text)
     if manifest.get("name") != PLUGIN_NAME:
         errors.append(f"plugin name must be {PLUGIN_NAME}")
+    if release_manifest and version_text != version:
+        errors.append("root VERSION must match release.json")
     if version and manifest.get("version") != version:
-        errors.append("plugin version must match root VERSION")
+        errors.append("plugin version must match release.json")
     if "schema_version" in manifest or "display_name" in manifest:
         errors.append("plugin manifest contains legacy fields")
     if not isinstance(manifest.get("author"), dict):
@@ -554,22 +706,40 @@ def static_plugin_structure(source: Path) -> tuple[bool, str]:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         errors.append(f"invalid pyproject.toml: {exc}")
         project = {}
-    expected_package_version = version.replace("-beta.", "b") if "-beta." in version else version
+    expected_package_version = str(
+        release_manifest.get("pep440_version", "")
+        or (version.replace("-beta.", "b") if "-beta." in version else version)
+    )
     if project.get("name") != "kafa":
         errors.append("pyproject project.name must be kafa")
     if version and project.get("version") != expected_package_version:
-        errors.append("pyproject version must match root VERSION")
+        errors.append("pyproject version must match release.json")
     if project.get("requires-python") != ">=3.11":
         errors.append("pyproject requires-python must be >=3.11")
     dependencies = project.get("dependencies", [])
     if not isinstance(dependencies, list) or dependencies:
         errors.append("pyproject base dependencies must remain empty")
     optional_dependencies = project.get("optional-dependencies", {})
-    host_codex = optional_dependencies.get("host-codex", []) if isinstance(optional_dependencies, dict) else []
-    if not isinstance(host_codex, list) or "openai-codex>=0.1.0b3" not in host_codex:
-        errors.append("pyproject optional dependency host-codex must include openai-codex>=0.1.0b3")
+    if isinstance(optional_dependencies, dict):
+        flattened = [str(item).lower() for values in optional_dependencies.values() if isinstance(values, list) for item in values]
+        if "host-codex" in optional_dependencies or any("openai-codex" in item for item in flattened):
+            errors.append("pyproject must not declare the retired Host Codex SDK dependency")
     if not isinstance(project.get("scripts"), dict) or project["scripts"].get("kafa") != "kafa.cli:main":
         errors.append("pyproject must expose kafa = kafa.cli:main")
+
+    if release_manifest:
+        runtime_identity = read_static_python_constants(source / "core" / "__init__.py")
+        for constant, field in [
+            ("RUNTIME_VERSION", "runtime_version"),
+            ("KERNEL_VERSION", "kernel_version"),
+            ("SCHEMA_VERSION", "schema_version_runtime"),
+        ]:
+            if runtime_identity.get(constant) != release_manifest.get(field):
+                errors.append(
+                    f"{constant} must match release.json {field}: "
+                    f"runtime={runtime_identity.get(constant)!r} "
+                    f"manifest={release_manifest.get(field)!r}"
+                )
 
     skills_root = source / "skills"
     for skill in REQUIRED_SKILLS:
@@ -591,25 +761,44 @@ def static_plugin_structure(source: Path) -> tuple[bool, str]:
     if actual_skills != set(REQUIRED_SKILLS):
         errors.append(f"skill inventory mismatch: {sorted(actual_skills ^ set(REQUIRED_SKILLS))}")
 
-    for reference in REQUIRED_REFERENCES:
-        if not (source / "references" / reference).is_file():
-            errors.append(f"missing reference: {reference}")
     check_required_file_inventory(errors, source / "core", REQUIRED_CORE, ".py", "core")
+    for retired in RETIRED_CORE_FILES:
+        if (source / "core" / retired).exists():
+            errors.append(f"retired core file exists: {retired}")
     errors.extend(local_python_import_errors(source))
     check_exact_file_inventory(errors, source / "scripts", REQUIRED_SCRIPTS, ".py", "scripts")
     check_exact_file_inventory(errors, source / "hooks", REQUIRED_HOOKS, "", "hooks")
     check_exact_file_inventory(errors, source / "schemas", REQUIRED_SCHEMAS, ".json", "schemas")
-    if not (source / "skills" / "project-runtime" / "scripts" / "harness.py").is_file():
-        errors.append("missing project-runtime self-contained CLI")
+    check_exact_file_inventory(
+        errors,
+        source / "templates" / "agents",
+        REQUIRED_AGENT_TEMPLATES,
+        ".toml",
+        "agent templates",
+    )
+    proxy = source / "skills" / "project-harness" / "scripts" / "harness.py"
+    if not proxy.is_file() or path_is_link(proxy):
+        errors.append("missing project-harness self-contained CLI")
+    for template_name in REQUIRED_AGENT_TEMPLATES:
+        template = source / "templates" / "agents" / template_name
+        try:
+            payload = tomllib.loads(template.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            errors.append(f"invalid agent template {template_name}: {exc}")
+            continue
+        expected_name = template_name.removesuffix(".toml")
+        if set(payload) != {"name", "description", "developer_instructions"}:
+            errors.append(f"invalid agent template fields: {template_name}")
+        if payload.get("name") != expected_name:
+            errors.append(f"agent template name mismatch: {template_name}")
     for schema in REQUIRED_SCHEMAS:
         try:
             json.loads((source / "schemas" / schema).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"invalid schema {schema}: {exc}")
-    try:
-        json.loads((source / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        errors.append(f"invalid hooks.json: {exc}")
+    hooks_ok, hooks_details = static_hook_definition(source)
+    if not hooks_ok:
+        errors.append(hooks_details)
     if (source / "skills" / "release-readiness" / "SKILL.md").exists() or (source / "templates" / "agents" / "release-engineer.toml").exists():
         errors.append("stale delivery-only replacement exists")
 
@@ -709,7 +898,7 @@ def static_hook_definition(plugin_root: Path) -> tuple[bool, str]:
     except (OSError, json.JSONDecodeError) as exc:
         return False, f"invalid hooks.json: {exc}"
     hooks = payload.get("hooks", {}) if isinstance(payload, dict) else {}
-    expected = {"SessionStart", "SubagentStart", "PreToolUse", "PostToolUse", "Stop"}
+    expected = set(REQUIRED_HOOK_EVENTS)
     if set(hooks) != expected:
         return False, f"hook events={sorted(hooks)} expected={sorted(expected)}"
     for event, groups in hooks.items():
@@ -722,11 +911,15 @@ def static_hook_definition(plugin_root: Path) -> tuple[bool, str]:
             for hook in entries:
                 if not isinstance(hook, dict):
                     return False, f"{event}: invalid hook entry"
+                if hook.get("type") != "command":
+                    return False, f"{event}: hook type must be command"
                 if "${PLUGIN_ROOT}" not in str(hook.get("command", "")):
                     return False, f"{event}: POSIX command does not use PLUGIN_ROOT"
                 if "%PLUGIN_ROOT%" not in str(hook.get("commandWindows", "")):
                     return False, f"{event}: Windows command does not use PLUGIN_ROOT"
-    return True, "five lifecycle events use installed PLUGIN_ROOT commands"
+                if event not in str(hook.get("command", "")) or event not in str(hook.get("commandWindows", "")):
+                    return False, f"{event}: command does not dispatch the matching event"
+    return True, "three warn-only lifecycle events use installed PLUGIN_ROOT commands"
 
 
 def codex_plugin_health(
@@ -801,12 +994,19 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
         add_check(checks, "git project", False, "project root or git missing")
 
     db_path = repo / ".ai-team" / "state" / "harness.db"
-    initialized = harness_project_initialized(db_path)
-    add_check(checks, "harness initialized", initialized, str(db_path) if initialized else f"missing initialized runtime at {db_path}")
-    if not initialized:
+    runtime_blocked = False
+    try:
+        initialized = harness_project_initialized(db_path)
+        initialized_details = str(db_path) if initialized else f"missing initialized runtime at {db_path}"
+    except KafaError as exc:
+        initialized = False
+        runtime_blocked = True
+        initialized_details = str(exc)
+    add_check(checks, "harness initialized", initialized, initialized_details)
+    if not initialized and not runtime_blocked:
         next_commands.append(f"kafa project init --repo {shlex.quote(str(repo))}")
         next_commands.append(f"kafa project quickstart --repo {shlex.quote(str(repo))} status")
-    else:
+    elif initialized:
         next_commands.append(f"kafa project quickstart --repo {shlex.quote(str(repo))} status")
 
     gitignore = repo / ".gitignore"
@@ -822,23 +1022,84 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
         ignored = False
         details = "missing .gitignore runtime rules"
     add_check(checks, "runtime gitignore", ignored, details)
-    add_check(checks, "connector namespace boundary", True, "connector profiles are per project; project doctor does not create external workspaces")
+    add_check(checks, "local-only runtime boundary", True, "project doctor requires no remote profile or credential")
     return {"ok": all(check["ok"] for check in checks), "kind": "project", "repo": str(repo), "checks": checks, "next_commands": next_commands}
 
 
 def harness_project_initialized(db_path: Path) -> bool:
-    if not db_path.exists():
-        return False
-    try:
-        import sqlite3
+    root = db_path.resolve().parents[2]
+    with _project_doctor_db_operation(root):
+        if not db_path.exists():
+            return False
+        try:
+            import sqlite3
 
-        with closing(sqlite3.connect(db_path)) as conn:
-            exists = conn.execute("select 1 from sqlite_master where type='table' and name='project'").fetchone()
-            if not exists:
-                return False
-            return conn.execute("select 1 from project where id = 1").fetchone() is not None
-    except sqlite3.Error:
-        return False
+            with closing(sqlite3.connect(db_path)) as conn:
+                exists = conn.execute("select 1 from sqlite_master where type='table' and name='project'").fetchone()
+                if not exists:
+                    return False
+                return conn.execute("select 1 from project where id = 1").fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+
+def local_only_runtime_boundary(source: Path) -> tuple[bool, str]:
+    failures: list[str] = []
+    for retired in RETIRED_CORE_FILES:
+        if (source / "core" / retired).exists():
+            failures.append(f"retired core file exists: {retired}")
+
+    runtime_paths = [
+        *(source / "core").glob("*.py"),
+        *(source / "scripts").glob("*.py"),
+        *(source / "hooks").glob("*.py"),
+    ]
+    for path in runtime_paths:
+        if path_is_link(path):
+            failures.append(f"runtime path is a link: {path.relative_to(source)}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            failures.append(f"runtime source unreadable: {path.relative_to(source)}: {exc}")
+            continue
+        lowered = text.lower()
+        if path.name != "validate_structure.py":
+            for marker in FORBIDDEN_RUNTIME_LITERALS:
+                if marker in lowered:
+                    failures.append(f"external runtime marker {marker!r} in {path.relative_to(source)}")
+        for node in ast.walk(tree):
+            modules: list[str] = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module]
+            for module in modules:
+                if module.split(".", 1)[0] in FORBIDDEN_PROVIDER_IMPORTS:
+                    failures.append(f"external provider import {module!r} in {path.relative_to(source)}")
+
+    pyproject = source.parent.parent / "pyproject.toml"
+    try:
+        package = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        failures.append(f"pyproject unreadable: {exc}")
+    else:
+        project = package.get("project", {}) if isinstance(package, dict) else {}
+        optional = project.get("optional-dependencies", {}) if isinstance(project, dict) else {}
+        flattened = (
+            [str(item).lower() for values in optional.values() if isinstance(values, list) for item in values]
+            if isinstance(optional, dict)
+            else []
+        )
+        if isinstance(optional, dict) and (
+            "host-codex" in optional or any("openai-codex" in item for item in flattened)
+        ):
+            failures.append("retired Host Codex SDK dependency exists")
+
+    if failures:
+        return False, "; ".join(failures[:6])
+    return True, "local files only; no Connector, provider SDK, token, or network-call runtime"
 
 
 def control_plane_contract(source: Path) -> tuple[bool, str]:
@@ -847,9 +1108,9 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
         "Skill Entry",
         "Plugin Distribution",
         "Hooks Advisory Layer",
-        "Host Bridge/Provider Layer",
+        "Local Runtime Boundary",
         "Kernel Trust Layer",
-        "Connector/Eval Boundary",
+        "Local Eval Boundary",
     ]
 
     manifest = source / ".codex-plugin" / "plugin.json"
@@ -858,8 +1119,12 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
             data = json.loads(manifest.read_text(encoding="utf-8"))
             if data.get("skills") != "./skills/":
                 failures.append("Plugin Distribution: plugin manifest must point skills at ./skills/")
-            description = " ".join(str(data.get(key, "")) for key in ["description"])
+            description = str(data.get("description", ""))
             long_description = str(data.get("interface", {}).get("longDescription", ""))
+            if "local-only verified delivery kernel" not in description:
+                failures.append("Plugin Distribution: manifest must declare the local-only verified delivery kernel")
+            if "does not perform external tool writes" not in description:
+                failures.append("Plugin Distribution: manifest must declare the no-external-write boundary")
             if "does not perform deployment" not in description and "不执行生产部署" not in long_description:
                 failures.append("Plugin Distribution: manifest must declare verified-handoff/deployment boundary")
         except (OSError, json.JSONDecodeError) as exc:
@@ -867,15 +1132,16 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
     else:
         failures.append(f"Plugin Distribution: missing {manifest}")
 
-    expected_hooks = {"SessionStart", "SubagentStart", "PreToolUse", "PostToolUse", "Stop"}
+    expected_hooks = set(REQUIRED_HOOK_EVENTS)
     hooks_json = source / "hooks" / "hooks.json"
     if hooks_json.exists():
         try:
             hook_data = json.loads(hooks_json.read_text(encoding="utf-8"))
             actual_hooks = set(hook_data.get("hooks", {}))
-            missing_hooks = sorted(expected_hooks - actual_hooks)
-            if missing_hooks:
-                failures.append(f"Hooks Advisory Layer: missing hook events {missing_hooks}")
+            if actual_hooks != expected_hooks:
+                failures.append(
+                    f"Hooks Advisory Layer: events={sorted(actual_hooks)} expected={sorted(expected_hooks)}"
+                )
         except (OSError, json.JSONDecodeError) as exc:
             failures.append(f"Hooks Advisory Layer: hooks.json unreadable: {exc}")
     else:
@@ -884,43 +1150,35 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
     required_markers = [
         (
             "Skill Entry",
-            source / "skills" / "project-runtime" / "SKILL.md",
+            source / "skills" / "project-harness" / "SKILL.md",
             [
-                "natural-language Skill Entry",
-                "SQLite-backed harness runtime",
-                "Markdown files are generated views, not the primary fact source",
+                "OpenSpec is the specification authority",
+                "Kafa SQLite is the delivery authority",
+                "Native Codex/ChatGPT owns task",
+                "Only the root controller writes Kafa delivery facts",
+                "human-review-required",
             ],
         ),
         (
             "Hooks Advisory Layer",
             source / "hooks" / "harness_hook.py",
-            ["Hooks are advisory lifecycle guardrails", "never create delivery evidence"],
-        ),
-        (
-            "Host Bridge/Provider Layer",
-            source / "core" / "agent_provider.py",
-            ["class HostCodexProvider", "delivery evidence"],
+            ["Hooks are advisory", "never create delivery facts or evidence", "Stop is warn-only"],
         ),
         (
             "Kernel Trust Layer",
-            source / "scripts" / "harness_db.py",
+            source / "core" / "delivery.py",
             [
-                "insert into agent_reports",
-                "insert into task_attempts",
-                "def dispatch_verify_attempt",
-                "status = 'verified'",
-                "def execute_connector_action",
+                "def evaluate_schema30_delivery_readiness",
+                "human-review-required",
             ],
         ),
         (
-            "Connector/Eval Boundary",
+            "Local Eval Boundary",
             source / "scripts" / "run_agent_e2e_eval.py",
             [
-                "scenario_host_codex_fake_sdk_e2e",
-                "scenario_connector_mock_server_e2e",
-                "scenario_crash_retry_recovery",
                 "scenario_sqlite_contention_stress",
                 "\"stability\": run_stability",
+                "false_pass_count",
             ],
         ),
     ]
@@ -932,6 +1190,10 @@ def control_plane_contract(source: Path) -> tuple[bool, str]:
         for marker in markers:
             if marker not in text:
                 failures.append(f"{layer}: missing marker {marker!r} in {path.name}")
+
+    local_only_ok, local_only_details = local_only_runtime_boundary(source)
+    if not local_only_ok:
+        failures.append(f"Local Runtime Boundary: {local_only_details}")
 
     if failures:
         return False, "; ".join(failures[:6])

@@ -1,162 +1,235 @@
 {
   "agent_runtime_seconds": null,
   "estimated_cost": null,
+  "evaluation_source": {
+    "generated_at": "2026-07-12T00:25:20+00:00",
+    "git_dirty": true,
+    "git_head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "source_scope": [
+      "kafa/",
+      "plugins/",
+      "tests/",
+      "benchmarks/",
+      "VERSION",
+      "docs/runtime/fresh-skill-eval-prompts.md",
+      "docs/runtime/skill-eval-transcript-fixture.txt",
+      "pyproject.toml",
+      "release.json"
+    ],
+    "status_entry_count": 180,
+    "status_sha256": "b3fbe64a646b2ff3fe1e5c0743c50bb358fc7ade9afd776cbe7857a3e58f3046",
+    "workspace_sha256": "b44236242d636c9ed01d5bd9e14dc7e81de54034d34cf28d3d52bd6eb003de70"
+  },
+  "evidence_scope": "deterministic-local-runtime",
   "live_skipped": false,
+  "live_status": "not-applicable",
   "matrix": {
-    "codex_available": false,
-    "connector_mock": true,
-    "container_available": false,
-    "git_version": "git version x.y.z",
+    "codex_available": true,
+    "container_available": true,
+    "git_version": "git version 2.54.0",
     "live_skipped_reasons": [],
-    "platform": "example-platform",
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
     "profile": "stability",
-    "python_version": "3.x",
+    "python_version": "3.14.5",
     "sqlite_stress": true
   },
   "mode": "stability",
+  "native_host": null,
   "scenarios": [
     {
-      "category": "fixture",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "fixture",
-      "name": "parallel_success",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "fixture",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "fixture",
-      "name": "dependency_blocked",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "fixture",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "fixture",
-      "name": "same_file_conflict",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "fixture",
+      "category": "cold-start",
       "details": {
-        "controller_evidence_count": 0
+        "external_credentials_required": false,
+        "retired_views": [],
+        "schema_version": 30,
+        "table_count": 27,
+        "template_names": [
+          "architect.toml",
+          "developer.toml",
+          "qa-reviewer.toml"
+        ]
       },
-      "duration_seconds": 0.0,
-      "mode": "fixture",
-      "name": "forged_evidence_blocked",
+      "duration_seconds": 0.52021,
+      "mode": "local",
+      "name": "fresh_local_install_and_init",
       "pass": true,
       "skip_reason": ""
     },
     {
-      "category": "fixture",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "fixture",
-      "name": "integration_regression_blocked",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "host-codex",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "host_codex_fake_sdk_e2e",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "host-codex",
+      "category": "quickstart",
       "details": {
-        "evidence_count": 0,
-        "selected_model": "gpt-5.3-codex-spark",
-        "spark_eligible": true,
-        "thread_run_model": "gpt-5.3-codex-spark",
-        "thread_start_model": "gpt-5.3-codex-spark"
+        "deliveries": 0,
+        "delivery_validation_returncode": 1,
+        "executions": 1,
+        "false_pass_count": 0,
+        "quality_gates": 0,
+        "task_status": "submitted",
+        "validations": 1
       },
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "host_codex_spark_policy_fake_sdk_e2e",
+      "duration_seconds": 0.691255,
+      "mode": "local",
+      "name": "quickstart_stops_before_independent_review",
       "pass": true,
       "skip_reason": ""
     },
     {
-      "category": "session",
-      "details": {},
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "multi_role_thread_lifecycle",
-      "pass": true,
-      "skip_reason": ""
-    },
-    {
-      "category": "connector",
+      "category": "candidate",
       "details": {
-        "evidence_count": 0
+        "candidate_count": 2,
+        "validation_statuses": [
+          "superseded",
+          "active"
+        ]
       },
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "connector_mock_server_e2e",
+      "duration_seconds": 0.710424,
+      "mode": "local",
+      "name": "current_candidate_supersedes_stale_validation",
       "pass": true,
       "skip_reason": ""
     },
     {
-      "category": "connector",
+      "category": "trust",
       "details": {
-        "evidence_count": 0,
-        "remote_recovery_count": 1,
-        "writes": 0
+        "delivery_count": 0,
+        "delivery_returncode": 1,
+        "execution_count": 0,
+        "false_pass_count": 0,
+        "forged_evidence_block_count": 1
       },
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "connector_exactly_once_recovery",
+      "duration_seconds": 1.367216,
+      "mode": "local",
+      "name": "manual_evidence_cannot_satisfy_delivery",
       "pass": true,
       "skip_reason": ""
     },
     {
-      "category": "recovery",
+      "category": "findings",
       "details": {
-        "attempts": 1,
-        "evidence": 1,
-        "reports": 1
+        "delivery_returncode": 1,
+        "false_pass_count": 0,
+        "finding_block_count": 1
       },
-      "duration_seconds": 0.0,
-      "mode": "stability",
-      "name": "crash_retry_recovery",
+      "duration_seconds": 0.786899,
+      "mode": "local",
+      "name": "open_high_finding_blocks_delivery",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "trust",
+      "details": {
+        "delivery_returncode": 1,
+        "expected_human_review_required_count": 1,
+        "false_pass_count": 0,
+        "human_intervention_count": 0
+      },
+      "duration_seconds": 1.734551,
+      "mode": "local",
+      "name": "high_risk_requires_human_review",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "execution-policy",
+      "details": {
+        "false_pass_count": 0,
+        "local_no_network_blocked": true,
+        "policy_block_count": 2,
+        "structured_zero_blocked": true
+      },
+      "duration_seconds": 0.939602,
+      "mode": "local",
+      "name": "structured_and_no_network_policy_fail_closed",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "cycle",
+      "details": {
+        "current_cycle": "CYCLE-next",
+        "cycle_ids": [
+          "CYCLE-current",
+          "CYCLE-next"
+        ]
+      },
+      "duration_seconds": 0.59765,
+      "mode": "local",
+      "name": "cycle_isolation",
       "pass": true,
       "skip_reason": ""
     },
     {
       "category": "sqlite",
       "details": {
-        "sqlite_lock_error_count": 0
+        "acceptance_count": 6,
+        "doctor_returncode": 0,
+        "failed_returncodes": [],
+        "operation_count": 12,
+        "sqlite_lock_error_count": 0,
+        "thread_leak_count": 0
       },
-      "duration_seconds": 0.0,
-      "mode": "stability",
+      "duration_seconds": 0.449616,
+      "mode": "local",
       "name": "sqlite_contention_stress",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "migration",
+      "details": {
+        "migration_rollback_count": 1,
+        "preserved_local_fact_counts": [
+          1,
+          2,
+          1,
+          1,
+          1
+        ],
+        "retired_active_table_count": 0,
+        "rollback_backup_count": 1,
+        "rollback_observed": true,
+        "schema27_rollback_version": 27,
+        "schema27_source_table_count": 53,
+        "schema27_success_version": 30,
+        "schema27_target_version": 30
+      },
+      "duration_seconds": 0.223764,
+      "mode": "local",
+      "name": "schema27_29_migration_and_rollback",
+      "pass": true,
+      "skip_reason": ""
+    },
+    {
+      "category": "installation",
+      "details": {
+        "discovery_scope": "isolated installed filesystem contract",
+        "hook_count": 3,
+        "retired_paths": [],
+        "runtime_script_count": 7,
+        "schema_count": 16,
+        "skill_count": 7,
+        "template_count": 3
+      },
+      "duration_seconds": 0.465939,
+      "mode": "local",
+      "name": "installed_plugin_surface",
       "pass": true,
       "skip_reason": ""
     }
   ],
   "summary": {
-    "duration_seconds": 0.0,
+    "duration_seconds": 8.517755,
+    "expected_human_review_required_count": 1,
     "failed_count": 0,
     "false_pass_count": 0,
     "forged_evidence_block_count": 1,
     "human_intervention_count": 0,
-    "merge_conflict_count": 0,
-    "passed_count": 12,
-    "retry_count": 0,
-    "scenario_count": 12,
+    "passed_count": 11,
+    "scenario_count": 11,
+    "scenario_pass_rate": 1.0,
     "skipped_count": 0,
-    "sqlite_lock_error_count": 0,
-    "task_once_completion_rate": 1.0
+    "sqlite_lock_error_count": 0
   },
-  "token_count": null
+  "token_count": null,
+  "token_usage": null
 }

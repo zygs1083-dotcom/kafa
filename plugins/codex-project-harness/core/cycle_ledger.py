@@ -69,7 +69,6 @@ def ensure_delivery_cycles(conn: sqlite3.Connection) -> None:
                 "quality_gates",
                 "deliveries",
                 "invalidations",
-                "dispatch_runs",
             ]
         )
         if has_audit_rows:
@@ -91,7 +90,7 @@ def ensure_delivery_cycles(conn: sqlite3.Connection) -> None:
             (DEFAULT_CYCLE_ID, now, now, now),
         )
         legacy_target = LEGACY_CYCLE_ID if has_audit_rows else DEFAULT_CYCLE_ID
-        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations", "dispatch_runs"]:
+        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations"]:
             conn.execute(f"update {table} set cycle_id = ? where cycle_id = ''", (legacy_target,))
     if project:
         current_cycle_id = project["current_cycle_id"] if "current_cycle_id" in project.keys() else ""
@@ -101,7 +100,7 @@ def ensure_delivery_cycles(conn: sqlite3.Connection) -> None:
                 "update project set current_cycle_id = ?, phase = coalesce(nullif(phase, ''), 'intake'), updated_at = ? where id = 1",
                 (DEFAULT_CYCLE_ID, now),
             )
-        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations", "dispatch_runs"]:
+        for table in ["requirements", "acceptance", "tasks", "failure_modes", "validations", "quality_gates", "deliveries", "invalidations"]:
             conn.execute(f"update {table} set cycle_id = ? where cycle_id = ''", (current_cycle_id,))
 
 
@@ -154,24 +153,6 @@ def baseline_issues(conn: sqlite3.Connection) -> list[str]:
     if row["digest"] != current:
         return [f"frozen baseline is stale: {row['id']}"]
     return []
-
-
-def validation_has_test_or_evidence(conn: sqlite3.Connection, validation_id: str) -> bool:
-    return bool(
-        conn.execute(
-            """
-            select 1 from validation_tests vt
-            join tests t on t.id = vt.test_id
-            where vt.validation_id = ? and t.result = 'pass'
-            union
-            select 1 from validation_evidence ve
-            join evidence e on e.id = ve.evidence_id
-            where ve.validation_id = ?
-            limit 1
-            """,
-            (validation_id, validation_id),
-        ).fetchone()
-    )
 
 
 def trace_snapshot(conn: sqlite3.Connection, requirement_id: str) -> dict[str, Any]:
@@ -248,7 +229,7 @@ def traceability_issues(conn: sqlite3.Connection, requirement_id: str | None = N
                 """
                 select 1 from task_acceptance ta
                 join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id
-                where ta.cycle_id = ? and ta.acceptance_id = ? and t.status in ('accepted', 'cancelled', 'skipped')
+                where ta.cycle_id = ? and ta.acceptance_id = ? and t.status in ('accepted', 'cancelled')
                 limit 1
                 """,
                 (cycle_id, acceptance_id),

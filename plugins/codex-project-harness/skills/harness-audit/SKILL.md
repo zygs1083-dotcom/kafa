@@ -14,13 +14,12 @@ Check whether the project operating system still matches reality.
 - `.agents/skills/`
 - `.codex/agents/`
 - `docs/harness/`
-- `.ai-team/control/tooling-map.md`
 - task board and decision log
 - acceptance criteria and traceability
-- GitHub/Linear/Notion/Figma/Slack mappings when present
-- recent code changes and tests
-- `scripts/harness_status.py`
-- `scripts/validate_harness_state.py`
+- current candidate, local runtime records, and evidence
+- recent code changes and local tests
+- `scripts/harness.py status`
+- `scripts/harness.py validate --delivery`
 
 ## Detect
 
@@ -30,7 +29,7 @@ Check whether the project operating system still matches reality.
 - unclear review gates,
 - skills that no longer trigger correctly,
 - task state that disagrees with code reality,
-- external tool state that disagrees with local harness state,
+- runtime records that disagree with the current candidate or evidence,
 - missing escalation points,
 - uncontrolled growth of logs or generated artifacts.
 

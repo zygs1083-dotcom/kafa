@@ -1,84 +1,449 @@
 from __future__ import annotations
 
-import re
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+import run_agent_e2e_eval  # noqa: E402
+
+ACTIVE_GUIDANCE = [
+    "README.md",
+    "INSTALL.md",
+    "QUICKSTART.md",
+    "docs/runtime/OS_RUNTIME.md",
+    "docs/runtime/CONTROL_PLANE.md",
+    "docs/runtime/fresh-skill-eval-prompts.md",
+    "examples/full-project-flow.md",
+    "examples/forward-tests.md",
+    "plugins/codex-project-harness/docs/TRIGGER_MATRIX.md",
+    "plugins/codex-project-harness/skills/project-harness/SKILL.md",
+    "plugins/codex-project-harness/skills/minimal-safe-change/SKILL.md",
+    "plugins/codex-project-harness/skills/bug-fix-loop/SKILL.md",
+    "plugins/codex-project-harness/skills/test-first-delivery/SKILL.md",
+    "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md",
+    "plugins/codex-project-harness/skills/harness-audit/SKILL.md",
+    "plugins/codex-project-harness/skills/project-retrospective/SKILL.md",
+]
+
+RETAINED_SKILLS = {
+    "project-harness",
+    "minimal-safe-change",
+    "bug-fix-loop",
+    "test-first-delivery",
+    "independent-quality-gate",
+    "harness-audit",
+    "project-retrospective",
+}
+
+RETIRED_COMMAND_FRAGMENTS = [
+    " connector profile",
+    " adapter plan",
+    " adapter record",
+    " provider start",
+    " dispatch plan",
+    " dispatch run",
+    " dispatch native-",
+    " phase project_",
+    " scope confirm",
+    " session attest",
+    " evidence record",
+    " test record",
+    " checkpoint create",
+    " checkpoint export",
+    " event export",
+    " executor allow-prefix",
+    " invariant validate",
+    " kernel doctor",
+    " task claim",
+    " task heartbeat",
+    " task recover-stale",
+    " task release",
+    " task review",
+    " task next",
+    " task update",
+    " task complete",
+    "--reviewer-session-id",
+    "--reviewer-attestation-id",
+    "--trust-anchor",
+    "--lease-token",
+    "--fence",
+]
 
 
 class DocumentationContractTest(unittest.TestCase):
     def read(self, relative: str) -> str:
         return (REPO_ROOT / relative).read_text(encoding="utf-8")
 
-    def test_current_guidance_is_not_a_version_chronology(self) -> None:
+    def active_guidance(self) -> str:
+        return "\n".join(self.read(relative) for relative in ACTIVE_GUIDANCE)
+
+    def documented_commands(self) -> str:
+        normalized = self.active_guidance().replace("\\\n", " ")
+        return "\n".join(
+            line.strip().lower()
+            for line in normalized.splitlines()
+            if "harness.py" in line.lower()
+            or line.strip().lower().startswith(("harness ", "$ harness"))
+        )
+
+    def test_primary_docs_define_one_local_only_delivery_journey(self) -> None:
         for relative in [
             "README.md",
+            "QUICKSTART.md",
+            "docs/runtime/OS_RUNTIME.md",
             "docs/runtime/CONTROL_PLANE.md",
-            "plugins/codex-project-harness/skills/project-runtime/SKILL.md",
+            "examples/full-project-flow.md",
         ]:
             text = self.read(relative)
-            self.assertIsNone(re.search(r"(?:从|From) v\d", text), relative)
+            self.assertIn("local-only", text, relative)
+            self.assertIn("Native Codex/ChatGPT", text, relative)
+            self.assertIn("root controller", text.lower(), relative)
 
-        runtime = self.read("docs/runtime/OS_RUNTIME.md")
-        self.assertNotIn("v1.11 intentionally", runtime)
-        self.assertNotIn("v1.25 keeps", runtime)
-
-    def test_docs_report_current_runtime_and_schema(self) -> None:
         readme = self.read("README.md")
-        runtime = self.read("docs/runtime/OS_RUNTIME.md")
+        self.assertIn("OpenSpec", readme)
+        self.assertIn("verified code handoff", readme)
+        self.assertIn("human-review-required", readme)
+        self.assertIn("schema 30", readme)
 
-        self.assertNotIn("v1.20 beta / Kernel v4.13", readme)
-        self.assertIn("Kernel v4.18.0", readme)
-        self.assertIn("schema 29", readme)
-        self.assertIn("database schema version is `29`", runtime)
-        self.assertNotIn("database schema version is `28`", runtime)
+    def test_v1_operating_system_plan_is_explicitly_superseded(self) -> None:
+        plan = self.read("docs/superpowers/plans/2026-06-22-harness-operating-system.md")
+        self.assertIn("Status: Historical / Superseded", plan)
+        self.assertIn("do not execute", plan)
 
-    def test_quickstart_uses_current_native_route_advice(self) -> None:
-        quickstart = self.read("QUICKSTART.md")
+    def test_active_guidance_has_no_retired_cli_or_skill_entrypoints(self) -> None:
+        guidance = self.active_guidance().lower()
+        commands = self.documented_commands()
+        for fragment in RETIRED_COMMAND_FRAGMENTS:
+            self.assertNotIn(fragment, commands, fragment)
+        for retired_skill in [
+            "`project-bootstrap`",
+            "`project-runtime`",
+            "`requirement-baseline`",
+            "`team-architecture`",
+            "`delivery-readiness`",
+        ]:
+            self.assertNotIn(retired_skill, guidance, retired_skill)
 
-        self.assertIn("native-host-small-verified", quickstart)
-        self.assertNotIn("host-codex-spark", quickstart)
-        self.assertIn("dispatch native-export", quickstart)
-        self.assertIn("same-context-degraded", quickstart)
-        self.assertIn("resolved installed Plugin", quickstart)
+    def test_current_guidance_uses_immutable_controller_verification(self) -> None:
+        for relative in [
+            "README.md",
+            "QUICKSTART.md",
+            "docs/runtime/OS_RUNTIME.md",
+            "examples/full-project-flow.md",
+            "plugins/codex-project-harness/skills/project-harness/SKILL.md",
+            "plugins/codex-project-harness/skills/test-first-delivery/SKILL.md",
+        ]:
+            text = self.read(relative)
+            self.assertIn("verify run", text, relative)
+            self.assertIn("immutable", text.lower(), relative)
 
-    def test_install_docs_distinguish_discovery_from_live_hook_execution(self) -> None:
+        quality = self.read(
+            "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md"
+        )
+        self.assertIn("test-target", quality)
+        self.assertIn("verify run", quality)
+        self.assertIn("human-review-required", quality)
+
+    def test_project_harness_defines_a_bounded_host_delegation_matrix(self) -> None:
+        skill = self.read("plugins/codex-project-harness/skills/project-harness/SKILL.md")
+        reference_path = "plugins/codex-project-harness/references/delegation-matrix.md"
+        reference = self.read(reference_path)
+
+        for marker in [
+            "Delegation Matrix",
+            "| Task |",
+            "Acceptance",
+            "Depends On",
+            "Exclusive Files",
+            "Shared Files",
+            "Targeted Test",
+            "Integration Test",
+            "Capability Hint",
+            "Context Budget",
+            "Output Budget",
+            "Latency Budget",
+            "Escalation",
+        ]:
+            self.assertIn(marker, reference, marker)
+        self.assertIn("references/delegation-matrix.md", skill)
+        self.assertIn("Native Host maps capability hints to actual models", reference)
+        self.assertIn("Parallelism is a wall-clock optimization, not a token optimization", reference)
+        self.assertIn("batch them into one producer", reference)
+        self.assertLessEqual(len(skill.encode("utf-8")), 12_800)
+        self.assertLessEqual(
+            len(skill.encode("utf-8")) + len(reference.encode("utf-8")),
+            16_000,
+        )
+        for routing_contract in [
+            "Default one producer",
+            "Use two or three only",
+            "waves capped at three",
+            "UTF-8 bytes",
+            "<=4,000 UTF-8 bytes",
+            "required saving",
+            "no latency SLA means no fan-out",
+            "never split work only to satisfy this target",
+            "model identity is unavailable",
+        ]:
+            self.assertIn(routing_contract, reference, routing_contract)
+
+    def test_plugin_inventory_is_exact_and_documented(self) -> None:
+        skills = {
+            path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()
+        }
+        hooks = json.loads(
+            (PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8")
+        )["hooks"]
+        templates = {
+            path.name
+            for path in (PLUGIN_ROOT / "templates" / "agents").glob("*.toml")
+        }
+
+        self.assertEqual(skills, RETAINED_SKILLS)
+        self.assertEqual(set(hooks), {"SessionStart", "SubagentStart", "Stop"})
+        self.assertEqual(
+            templates, {"architect.toml", "developer.toml", "qa-reviewer.toml"}
+        )
+
         install = self.read("INSTALL.md")
+        self.assertIn("seven Skills", install)
+        self.assertIn("three Hooks", install)
+        self.assertIn("three agent templates", install)
 
-        self.assertIn("isolated install smoke proves discovery", install)
-        self.assertIn("`live-codex` profile proves host Hook execution", install)
-        self.assertNotIn("Real hook execution is reserved for the isolated CI smoke", install)
+    def test_skill_eval_fixture_enforces_the_local_contract(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PLUGIN_ROOT / "scripts" / "run_skill_eval.py"),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("local-only skill eval transcript passed", result.stdout)
+
+    def test_skill_eval_help_does_not_execute_the_fixture(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PLUGIN_ROOT / "scripts" / "run_skill_eval.py"),
+                "--help",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("usage:", result.stdout.lower())
+        self.assertNotIn("transcript passed", result.stdout.lower())
+
+    def test_skill_eval_rejects_failed_host_command_even_with_all_markers(self) -> None:
+        fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
+        with tempfile.TemporaryDirectory() as temp:
+            producer = Path(temp) / "producer.py"
+            producer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "print(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+                "raise SystemExit(int(sys.argv[2]))\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["CODEX_EVAL_CMD"] = shlex.join(
+                [sys.executable, str(producer), str(fixture), "7"]
+            )
+            result = subprocess.run(
+                [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("host skill eval command failed", result.stdout.lower())
+
+    def test_skill_eval_rejects_reversed_workflow_markers(self) -> None:
+        fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
+        with tempfile.TemporaryDirectory() as temp:
+            reversed_transcript = Path(temp) / "reversed.txt"
+            reversed_transcript.write_text(
+                "\n".join(reversed(fixture.read_text(encoding="utf-8").splitlines())) + "\n",
+                encoding="utf-8",
+            )
+            producer = Path(temp) / "producer.py"
+            producer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "print(Path(sys.argv[1]).read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["CODEX_EVAL_CMD"] = shlex.join(
+                [sys.executable, str(producer), str(reversed_transcript)]
+            )
+            result = subprocess.run(
+                [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("out-of-order skill eval marker", result.stdout.lower())
+
+    def test_e2e_example_reports_only_current_local_scenarios(self) -> None:
+        report = json.loads(
+            self.read("docs/runtime/agent-e2e-eval-example.json")
+        )
+        names = {scenario["name"] for scenario in report["scenarios"]}
+        categories = {scenario["category"] for scenario in report["scenarios"]}
+
+        self.assertEqual(report["mode"], "stability")
+        self.assertEqual(report["evidence_scope"], "deterministic-local-runtime")
+        self.assertEqual(report["summary"]["scenario_count"], 11)
+        self.assertEqual(report["summary"]["failed_count"], 0)
+        self.assertEqual(report["summary"]["skipped_count"], 0)
+        self.assertEqual(report["summary"]["false_pass_count"], 0)
+        self.assertNotIn("task_once_completion_rate", report["summary"])
+        self.assertNotIn("retry_count", report["summary"])
+        self.assertEqual(len(report["evaluation_source"]["workspace_sha256"]), 64)
+        self.assertIn("high_risk_requires_human_review", names)
+        self.assertIn("schema27_29_migration_and_rollback", names)
+        self.assertFalse(categories & {"connector", "provider", "host-codex"})
+
+    def test_persistent_native_host_evidence_is_compact_and_truthful(self) -> None:
+        live = json.loads(self.read("docs/runtime/native-codex-live-eval.json"))
+        parallel = json.loads(self.read("docs/runtime/native-codex-parallel-eval.json"))
+
+        for name, report in [("live", live), ("parallel", parallel)]:
+            self.assertEqual(report["live_status"], "passed", name)
+            self.assertFalse(report["live_skipped"], name)
+            self.assertGreater(report["token_count"], 0, name)
+            self.assertEqual(
+                report["token_count"],
+                report["token_usage"]["input_tokens"]
+                + report["token_usage"]["output_tokens"],
+                name,
+            )
+            self.assertGreater(report["agent_runtime_seconds"], 0, name)
+            self.assertIsNone(report["estimated_cost"], name)
+            self.assertEqual(len(report["evaluation_source"]["workspace_sha256"]), 64, name)
+            self.assertIn("plugins/", report["evaluation_source"]["source_scope"], name)
+            self.assertEqual(
+                run_agent_e2e_eval.report_consistency_errors(
+                    report,
+                    require_current_git_state=False,
+                ),
+                [],
+                name,
+            )
+            self.assertEqual(
+                report["native_host"]["trust"],
+                "local-capability-only-not-delivery-provenance",
+                name,
+            )
+            self.assertNotEqual(report["native_host"]["sha256"], "0" * 64, name)
+            serialized = json.dumps(report, ensure_ascii=False)
+            for verbose in [
+                "native_stdout_tail",
+                "native_stderr_tail",
+                "controller_verify_output",
+                "stdout_tail",
+                "stderr_tail",
+            ]:
+                self.assertNotIn(verbose, serialized, f"{name}: {verbose}")
+
+        details = parallel["scenarios"][0]["details"]
+        current_source = run_agent_e2e_eval.evaluation_source_identity()
+        for field in ["workspace_sha256", "source_scope"]:
+            self.assertEqual(live["evaluation_source"][field], current_source[field], field)
+            self.assertEqual(parallel["evaluation_source"][field], current_source[field], field)
+        for field in [
+            "git_head",
+            "git_dirty",
+            "status_sha256",
+            "status_entry_count",
+        ]:
+            self.assertEqual(
+                live["evaluation_source"][field],
+                parallel["evaluation_source"][field],
+                field,
+            )
+        self.assertEqual(
+            live["evaluation_source"]["workspace_sha256"],
+            parallel["evaluation_source"]["workspace_sha256"],
+        )
+        self.assertEqual(
+            live["evaluation_source"]["status_sha256"],
+            parallel["evaluation_source"]["status_sha256"],
+        )
+        self.assertEqual(details["producer_count"], 2)
+        self.assertEqual(live["scenarios"][0]["details"]["workload_units"], 1)
+        self.assertEqual(details["workload_units"], 2)
+        self.assertEqual(
+            live["scenarios"][0]["details"]["workload_unit_sha256"],
+            details["workload_unit_sha256"],
+        )
+        self.assertEqual(details["native_token_scope"], "native-producers-only")
+        self.assertGreater(details["producer_overlap_seconds"], 0)
+        self.assertEqual(details["changed_files"], ["alpha.py", "beta.py"])
+        self.assertEqual(details["scope_conflicts"], {})
+        self.assertEqual(details["combined_verify_returncode"], 0)
+        self.assertTrue(details["producer_attribution_valid"])
+        self.assertTrue(details["controller_state_unchanged_during_native"])
+        self.assertEqual(details["overlap_policy"], "block-parallel-on-declared-overlap")
+        self.assertEqual(
+            details["scope_enforcement"],
+            "isolated-producer-workspaces-plus-exact-diff-integration",
+        )
+
+    def test_superseded_runtime_records_cannot_be_mistaken_for_current_guidance(self) -> None:
+        for relative in [
+            "docs/runtime/APPS_MCP_RECEIPT_ADR.md",
+            "docs/runtime/NATIVE_CODEX_RUNTIME_ADR.md",
+        ]:
+            text = self.read(relative)
+            self.assertIn("Status: Superseded", text, relative)
+            self.assertIn("local-core-slimming", text, relative)
+            self.assertLess(len(text.splitlines()), 50, relative)
+            self.assertNotIn('"receipt_version"', text, relative)
+            self.assertNotIn("legacy-direct", text, relative)
+
+        schema29 = self.read("docs/runtime/SCHEMA_29_MIGRATION.md")
+        self.assertIn("Historical migration record", schema29)
+        self.assertIn("schema 30", schema29)
 
     def test_architecture_docs_name_the_deep_kernel_contracts(self) -> None:
-        control_plane = self.read("docs/runtime/CONTROL_PLANE.md")
-        runtime = self.read("docs/runtime/OS_RUNTIME.md")
-
-        for marker in ["explicit public API", "Cycle Ledger", "Schema Lifecycle", "Delivery Decision"]:
-            self.assertIn(marker, control_plane)
-            self.assertIn(marker, runtime)
-
-    def test_changelog_records_stop_ship_compatibility_and_architecture_work(self) -> None:
-        changelog = self.read("CHANGELOG.md")
-
-        self.assertIn("real-host compatibility", changelog)
-        self.assertIn("Apps/MCP receipt", changelog)
-        self.assertIn("explicit public API", changelog)
-        self.assertIn("Cycle Ledger", changelog)
-        self.assertIn("Schema Lifecycle", changelog)
-
-    def test_fresh_quality_gate_guidance_requires_reviewer_identity(self) -> None:
-        readme = self.read("README.md")
-        runtime = self.read("docs/runtime/OS_RUNTIME.md")
-        skill = self.read("plugins/codex-project-harness/skills/project-runtime/SKILL.md")
-        fixture = self.read("docs/runtime/skill-eval-transcript-fixture.txt")
-
-        self.assertIn("`fresh` 不能只靠字符串声明", readme)
-        for text in [runtime, skill, fixture]:
-            self.assertIn("--reviewer-context fresh", text)
-            self.assertIn("--reviewer-session-id", text)
-            self.assertIn("--reviewer-attestation-id", text)
+        for relative in [
+            "docs/runtime/CONTROL_PLANE.md",
+            "docs/runtime/OS_RUNTIME.md",
+        ]:
+            text = self.read(relative)
+            for marker in [
+                "explicit public API",
+                "Cycle Ledger",
+                "Schema Lifecycle",
+                "Delivery Decision",
+            ]:
+                self.assertIn(marker, text, f"{relative}: {marker}")
 
 
 if __name__ == "__main__":

@@ -1,38 +1,42 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Codex Project Harness Quality Gate",
+  "title": "Kafa Local Quality Gate",
   "type": "object",
-  "required": ["id", "sequence", "cycle_id", "candidate_sha", "gate_status", "superseded_by", "gate", "reviewed_commit", "reviewer_context", "result"],
+  "required": [
+    "id",
+    "sequence",
+    "cycle_id",
+    "candidate_sha",
+    "gate_status",
+    "gate",
+    "producer_context_id",
+    "reviewer_context_id",
+    "review_status",
+    "result",
+    "blocking_findings",
+    "residual_risk",
+    "reviewed_revision",
+    "created_at"
+  ],
   "properties": {
     "id": { "type": "string" },
     "sequence": { "type": "integer" },
     "cycle_id": { "type": "string" },
     "candidate_sha": { "type": "string" },
     "gate_status": { "type": "string", "enum": ["active", "superseded", "legacy-ambiguous"] },
-    "superseded_by": { "type": "string" },
+    "superseded_by": { "type": ["string", "null"] },
     "gate": { "type": "string" },
-    "reviewed_commit": { "type": "string" },
-    "evidence_commit": { "type": "string" },
-    "diff_hash": { "type": "string" },
-    "base_commit": { "type": "string" },
-    "head_commit": { "type": "string" },
-    "tracked_diff_hash": { "type": "string" },
-    "project_revision": { "type": "integer" },
-    "reviewer_context": {
+    "producer_context_id": { "type": "string" },
+    "reviewer_context_id": { "type": "string" },
+    "review_status": {
       "type": "string",
-      "enum": ["fresh", "same-context-degraded", "external"]
+      "enum": ["reviewed-local", "same-context-degraded"]
     },
-    "result": {
-      "type": "string",
-      "enum": ["pass", "fail", "conditional", "blocked"]
-    },
+    "result": { "type": "string", "enum": ["pass", "fail", "conditional", "blocked"] },
     "blocking_findings": { "type": "string" },
-    "commands": { "type": "string" },
-    "evidence": { "type": "string" },
     "residual_risk": { "type": "string" },
-    "reviewer_session_id": { "type": "string" },
-    "reviewer_attestation_id": { "type": "string" },
-    "review_trust_level": { "type": "string", "enum": ["local-only", "human-confirmed", "connector", "legacy-untrusted"] }
+    "reviewed_revision": { "type": "integer" },
+    "created_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

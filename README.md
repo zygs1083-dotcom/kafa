@@ -1,629 +1,253 @@
 # Codex Project Harness
 
-Codex Project Harness 是一套面向 Codex 的通用代码交付方法论与本地运行时插件。它把一次“我要开发一个需求”的对话，组织成可追踪、可验证、可交付的工程流程：先澄清需求，再建立验收标准和失败模式，随后拆分任务、实现代码、执行测试、独立 QA，最后产出代码交付证据。
+Codex Project Harness（Kafa）是一个面向 Codex 的 **local-only verified delivery kernel**。它把需求、验收、任务、验证、审查和代码交付事实保存在项目本地，用可复验的执行证据回答一个核心问题：当前本地 candidate 是否已经具备可信的代码交付条件。
 
-这个项目不是某个业务系统的模板，也不是只适用于某个技术栈的脚手架。它是一个通用能力层，可以用于前端、后端、全栈、数据、自动化、插件、CLI、文档型工程等不同项目。外部协作工具可用时会被纳入流程，不可用时仍然能依赖本地 `.ai-team/` 和 `docs/harness/` 文件完成交付。
+Kafa 不替代 Codex/ChatGPT，也不实现第二套协作生命周期。Native Codex/ChatGPT 是 task、subagent、worktree、approval、model、cancel 和 handoff 的唯一 owner；Kafa 只在根工作区维护交付事实、验证当前 candidate，并给出诚实的 delivery decision。
 
-当前源码候选版本是 **v1.25.0-beta.1**，`release.json` 将其明确标记为 `development`，因此它不是已发布版本。最新正式 tag/release 以 GitHub 和 `git tag` 为准。当前架构代际定位为 **Codex Harness Kernel v4.18.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
+当前源码候选版本是 **v2.0.0-beta.1**，`release.json` 将其明确标记为 `development`，因此它不是已发布版本。最新正式 tag/release 以 GitHub 和 `git tag` 为准。当前架构代际定位为 **Codex Harness Kernel v5.0.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
-## 版本与发布
+## 三个权威边界
 
-本项目从 `v0.4.0-beta.1` 开始使用正式 Git tag 标记版本。普通 commit 和 `release_state=development` 只表示开发源码；只有 `release.json`、版本文件、Changelog、tag 和 GitHub prerelease 全部一致时，版本才是可回看、可安装、可对比的发布点。
+一次完整交付只有三个清晰的 owner：
 
-```bash
-cat VERSION
-cat release.json
-python3 -m kafa.release --json
-git tag --list
-git show v0.4.0-beta.1
-git log <old-tag>..<new-tag> --oneline
-```
+| 层 | 权威内容 | 不负责 |
+| --- | --- | --- |
+| OpenSpec | 在需求不清晰、中大型功能、架构或跨模块变更中，维护 proposal、design、tasks 和归档后的产品行为 | 不保存 Kafa 的运行时事实 |
+| Kafa | 本地 SQLite 中的需求、验收、任务、不可变执行、验证判断、finding、质量门和交付结论 | 不创建或管理 Native Codex/ChatGPT 的协作生命周期 |
+| Native Codex/ChatGPT | task、subagent、worktree、approval、model、cancel、steer 和 handoff | 不直接写 Kafa SQLite，也不把自报文本升级为验证证据 |
 
-版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。Tag workflow 会先执行 `python -m kafa.release --require-tag`、完整回归和真实隔离安装 smoke，再构建 wheel 与完整 source archive 并创建 GitHub prerelease；开发状态下即使误推 tag 也会 fail-closed。
+OpenSpec 是需要规格化时的 spec authority；Kafa 是 verified delivery authority。Kafa 可以引用 OpenSpec 的路径和结论，但不会复制一套 OpenSpec 文档作为自己的事实源。
 
-## 这个项目解决什么问题
-
-很多 AI 编程协作会停留在“直接写代码”的层面，容易出现几个问题：
-
-- 需求没有确认清楚，代码写完才发现范围错了。
-- 任务拆分和执行记录只存在聊天上下文里，换会话后丢失。
-- 测试和 QA 是事后补充，缺少验收标准和失败场景映射。
-- 多 agent 协作只有角色名称，没有明确的状态、证据和边界。
-- GitHub、Linear、Notion、Figma、Slack 等工具没有统一进入工程流。
-- 最终交付只给一段总结，缺少可审计的变更、测试、风险和质量门记录。
-
-Codex Project Harness 的目标是把这些隐性流程显式化、结构化、可执行化。
-
-## 工作方法约束
-
-Harness 的默认工作方式不是“直接动手写代码”，而是先把问题压回到可验证的工程单元：
-
-- 动手前先回到根本问题：本任务到底要解决什么问题，避免照搬惯例或默认流程。
-- 把问题拆到最小、能验证的单元，逐个实现和复验。
-- 每个关键决定都要说得出“为什么”，而不只是“怎么做”。
-- 交付前切换成最挑剔的审查者，从逻辑漏洞、事实错误、更简单方案、可验证证据四个角度攻击自己的方案。
-- 不能只说“看起来没问题”；必须给出验证证据，或者明确写出剩余风险和未验证范围。
-
-这些约束不替代 Kernel 的 delivery gate，也不让主观判断变成可信 evidence。它们是 Skill、Agent 模板和人工协作共同遵守的工作纪律。
-
-## 核心能力
-
-| 能力 | 说明 |
-| --- | --- |
-| 需求基线 | 将模糊想法转成目标、用户场景、功能范围、非目标、约束和验收标准 |
-| 追踪链 | 结构化维护需求 → 验收 → 任务 → 验证 → 交付的链路 |
-| 项目启动检查 | 检查工作区、Git、分支、远端、项目说明和本地 harness 文件 |
-| 运行时状态 | 用脚本维护阶段、任务、决策、验证、质量门和交付记录 |
-| Agent 小队方法 | 用项目经理、产品、架构、开发、QA、交付等角色组织协作 |
-| 子 agent 执行 | 将明确的独立任务拆给短生命周期子 agent，并要求返回证据 |
-| Failure Mode Engineering | 为风险场景建立失败模式矩阵，推动测试覆盖和恢复策略 |
-| Test-first Delivery | 鼓励先定义可执行验证，再实现最小安全改动 |
-| Independent Quality Gate | 在交付前记录独立 QA 结论、reviewer context、阻塞问题和剩余风险 |
-| 协作工具适配 | Git/GitHub、Linear、Notion、Figma、Slack 可按上下文进入流程 |
-| Connector 韧性兜底 | 外部 connector 限流/失败会记录 budget、blocked finding 和本地事实源 fallback，不重复外部写入 |
-| Connector 命名空间隔离 | 每个项目绑定已有外部目标，写入前强校验 project profile，并用 project-key + idempotency-key 双 marker 防止跨项目污染 |
-| AgentRunner 与并行隔离 | dispatch 可显式使用本地子进程 runner，并通过 git worktree 与文件 claim 隔离并行编辑 |
-| 原生 Codex 子 agent | 安装 `.codex/agents/*.toml`，为 `spawn_agents_on_csv` 导出/导入原生 CSV 与 schema，并由控制器重新验证 worker 报告 |
-| AgentProvider 生命周期 | 可审计管理 host/manual/fixture provider session 的 start、collect、cancel、reconcile；Host Codex start 只登记并启动后台 worker，不等待完整 turn；provider report 仍只是 raw report |
-| 原生任务路由建议 | `dispatch route-advice` 只输出风险与可复验能力提示；具体模型、推理、沙箱、审批和任务生命周期由 ChatGPT/Codex 宿主决定 |
-| Session Attestation | 用 `agent_sessions` 与 HMAC `session_attestations` 证明独立 QA 来自不同会话/上下文，高风险 QA 不能只靠角色字符串 |
-| 真实沙箱复验与集成硬化 | `dispatch verify-attempt --runner container` 通过 Docker/Podman no-network 容器复验；`dispatch integrate` 只合并已验证、未漂移且文件 claim 覆盖的分支 |
-| Agent E2E 评测 | `run_agent_e2e_eval.py` 提供 fixture、stability、live-codex 三层评测，验证调度、provider raw report、controller verify、file claim、integration 阻断和稳定性矩阵 |
-| 安装和发行 | `kafa` console script 生成 Codex marketplace 安装入口，并提供 install/upgrade/uninstall/doctor |
-| Codex Hooks 护栏 | 插件自带 `SessionStart`、`SubagentStart`、`PreToolUse`、`PostToolUse`、`Stop` hooks，用于状态注入、边界提醒和 readiness 检查 |
-| 架构控制面 | Skill 是自然语言入口，Plugin 负责分发，Hooks/Host/Connector/Eval 都不能绕过 Kernel 事实源与门禁 |
-| 持续迭代 Cycle | `cycle start/status/close` 将长期项目拆成当前 delivery cycle；旧记录保留审计价值但不永久阻断新 candidate |
-| 代码交付边界 | 明确停止在 verified code handoff，不自动进入部署或生产操作 |
-
-## 架构概览
-
-Codex Project Harness 使用三层执行模型。
+## 一条本地交付路径
 
 ```text
-Layer 0: Project Manager
-  - 当前会话的总控
-  - 维护需求、状态、决策和交付边界
-  - 判断是否需要工具、角色和子任务
-
-Layer 1: Domain Sessions
-  - Product / Architecture / Development / QA / Security / Delivery
-  - 按领域保留上下文
-  - 输出结构化任务、判断和证据
-
-Layer 2: Subagents
-  - 短生命周期任务执行单元
-  - 可用于实现、测试、审查、风险排查
-  - 不一定拥有独立用户会话，但必须返回可验证产物
+User intent
+  -> OpenSpec proposal/design/tasks（需要时）
+  -> Kafa init + local requirement baseline
+  -> root controller 建立 task 与 test target
+  -> Native Codex/ChatGPT 完成可见的本地代码工作
+  -> root controller 接收结果并推进 task
+  -> Kafa verify run 独立执行当前 candidate
+  -> validation + finding + independent quality gate
+  -> delivery decision / verified code handoff
 ```
 
-一个典型请求会沿着下面的路径流动：
-
-```text
-User Request
-  -> Project Bootstrap
-  -> Requirement Baseline
-  -> Confirmation Gate
-  -> Team Architecture
-  -> Planning
-  -> Implementation
-  -> Test / Validation
-  -> Independent Quality Gate
-  -> Delivery Readiness
-  -> Retrospective
-```
-
-## 工作流程
-
-当用户对 Codex 说：
-
-```text
-我要开发一个微信小程序，用于管理亲友关系、生日提醒和关系图谱。
-```
-
-Harness 应该按以下方式工作：
-
-1. 读取当前项目和仓库状态。
-2. 初始化或修复 `.ai-team/` 和 `docs/harness/` 本地控制面。
-3. 检查 Git/GitHub/Linear/Notion/Figma/Slack 是否有用。
-4. 形成需求基线：目标、用户、场景、功能、非目标、约束。
-5. 建立验收标准，例如 `AC1`、`AC2`、`AC3`。
-6. 为风险行为建立失败模式，例如 `FM1`、`FM2`。
-7. 让用户确认范围，或在低风险清晰任务中记录假设后继续。
-8. 选择最小有效 agent 小队。
-9. 将需求拆成任务，例如 `T1`、`T2`、`T3`。
-10. 让 producer 负责实现，让 reviewer 或 QA 做独立检查。
-11. 执行测试、lint、build、手工检查或其它项目适配验证。
-12. 记录质量门：reviewed commit、base/head commit、source tree hash、tracked diff hash、reviewer context、result、blocking findings。
-13. 产出交付说明：变更内容、验收映射、测试证据、遗留风险和外部链接。
-
-完整示例见 [examples/full-project-flow.md](examples/full-project-flow.md)。
-
-## 本地运行时控制面
-
-Harness 会在目标项目中维护一个结构化事实源，并生成两类 Markdown 视图。
-
-结构化事实源：
-
-```text
-.ai-team/state/harness.db
-```
-
-这是 SQLite 数据库，保存 project、requirements、acceptance、failure modes、tasks、validations、evidence、tests、findings、invalidations、quality gates、deliveries、adapter mappings、agents、migrations 和 events。SQLite 使用事务、WAL、外键、唯一约束和 task revision/lease/heartbeat 来支持多会话和多 agent 协作。
-
-当前运行时是 **Kernel v4.18.0 / schema 29**。它按稳定契约分层：
-
-- `core.api` 是显式 public API，不会自动暴露内部函数。
-- **Schema Lifecycle** 拥有事务化建表、兼容列与迁移前置条件。
-- **Cycle Ledger** 拥有当前 cycle、baseline identity 与 traceability read model。
-- **Delivery Decision** 只读取 Kernel facts，执行 fail-closed 交付判定。
-- Store、schema guard、event bus、executor、invariant checker 和 projections 分别负责持久化、写前约束、审计、执行证据、不变量和派生视图。
-
-Delivery gate 只接受当前 cycle、当前 candidate 的有效事实。可信 command evidence 必须绑定 gateable target、真实退出码、正数执行计数、stdout artifact digest、当前代码身份和适用的 trust anchor；manual 文本、raw provider report、Hook 输出、Connector 结果、advisory fallback 和 eval 结果均不能冒充交付证据。High/critical 风险继续要求外部 CI/session receipt 或 connector(HMAC) reviewer attestation。
-
-原生 ChatGPT/Codex 负责 task、thread、subagent、worktree、approval、model、cancel、steer 与 handoff。Kafa 通过 `dispatch route-advice` 输出风险/能力提示，通过 `dispatch native-export` 输出不可变任务包，并把 host receipt 作为 audit-only raw attempt 导入；只有 controller `dispatch verify-attempt` 可以生成 evidence。旧 `host-codex` SDK bridge 是显式、可选、fail-closed 的兼容入口，不是原生生命周期。
-
-Connector 写入使用项目 profile、transactional outbox、execution fence、双 marker 和 unknown recovery。Apps/MCP 是长期授权与外部动作边界，但 Codex 0.143.0 尚未公开 result-bound host-verifiable receipt，因此当前五个直连 adapter 明确标记为 `legacy-direct`，结果只用于 workflow sync。
-
-仓库评测分三层：fixture/stability 是确定性 Kernel 矩阵；isolated install smoke 证明真实 Codex 的插件、Skill 与 Hook discovery；显式启用的 `live-codex` profile 才证明真实宿主 Hook execution、thread/turn、worktree、receipt、verify 与 integrate。`not-run`、`blocked` 或 skipped 不能算能力通过。
-
-真实 Connector 写入前，先把当前项目绑定到允许写入的已有外部目标：
-
-```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile set \
-  --project-key my-project \
-  --github-repo owner/repo \
-  --linear-team TEAM \
-  --notion-parent PAGE_ID \
-  --slack-channel C123456 \
-  --figma-file FILE_KEY
-python3 plugins/codex-project-harness/scripts/harness.py --root . connector profile status --json
-```
-
-原生 ChatGPT/Codex 路径不由 Kafa 选择模型。`dispatch route-advice` 只输出任务风险和 `small_verified_candidate` 能力提示，宿主拥有具体模型、推理、沙箱、审批以及 task/thread/worktree 生命周期。旧 Host Codex Provider 仍保留显式兼容策略：`HARNESS_CODEX_MODEL` 是最高优先级硬覆盖；没有该覆盖时，`HARNESS_CODEX_MODEL_POLICY=spark-deterministic` 必须同时显式设置 `HARNESS_CODEX_SPARK_MODEL=<model>`，且只有满足低风险可复验规则的任务才会选该模型。Kafa 不内置 preview 模型名，模型选择也不是可信 evidence。
-
-长期 Connector 边界已在 [Apps/MCP Connector Receipt ADR](docs/runtime/APPS_MCP_RECEIPT_ADR.md) 中锁定：ChatGPT Apps/MCP 负责授权、workspace policy、tool approval 和外部动作，Kafa 只治理 project scope、immutable intent、outbox fence、receipt validation 与 fallback。当前 `gh`/HTTP 路径明确属于 `legacy-direct` 兼容模式；ADR 不代表 receipt runtime 已实现，也不会把 Apps/MCP 工具输出升级为 delivery evidence。
-
-原生 Agent 生命周期边界见 [Native Codex Runtime ADR](docs/runtime/NATIVE_CODEX_RUNTIME_ADR.md)：Codex/ChatGPT 宿主管理 task、thread、subagent、worktree、approval、model、steer、cancel 与 handoff；Kafa 根控制器只导出不可变 task package、导入真实 host receipt，并继续负责 controller verification 和 delivery gate。当前 SQLite 主事实源保持 root-workspace single-writer，managed worktree 不复制或修改数据库；hosted transport 未实现前不冒充兼容。
-
-信任等级按强度分为三档：
-
-- `local-only`：本地模型会话执行证据，可覆盖 low/medium 风险。
-- `human-confirmed`：人工确认记录，可覆盖 low/medium 风险，但不能冒充外部执行。
-- `connector(HMAC)`：宿主/connector 用模型会话拿不到的 key 生成或验证 HMAC，可覆盖 high/critical 风险。
-
-Markdown 文件是面向人的派生视图。
-
-`.ai-team/` 用于项目控制、需求和计划：
-
-```text
-.ai-team/
-  control/
-    capability-report.md
-    project-charter.md
-    project-state.yaml
-    agent-registry.md
-    tooling-map.md
-    risk-register.md
-    decision-log.md
-  requirements/
-    requirements.md
-    acceptance.md
-    failure-modes.md
-    traceability.md
-  planning/
-    roadmap.md
-    task-board.md
-```
-
-`docs/harness/` 用于交付证据和过程文档：
-
-```text
-docs/harness/
-  bootstrap.md
-  team-architecture.md
-  workflow.md
-  runtime.md
-  design-context.md
-  validation.md
-  quality-gates.md
-  delivery.md
-  evolution-log.md
-```
-
-运行时状态和事件的事实源是：
-
-```text
-.ai-team/state/harness.db
-```
-
-其中 `events` 表保存可审计事件流；`.ai-team/` 和 `docs/harness/` 下的 Markdown 文件由运行时渲染生成，适合阅读和交付，但不作为唯一事实源。
-
-## 插件目录结构
-
-仓库的主要内容在 `plugins/codex-project-harness/`。
-
-```text
-plugins/codex-project-harness/
-  .codex-plugin/
-    plugin.json
-  skills/
-    project-harness/
-    project-bootstrap/
-    project-runtime/
-    requirement-baseline/
-    team-architecture/
-    minimal-safe-change/
-    test-first-delivery/
-    bug-fix-loop/
-    independent-quality-gate/
-    delivery-readiness/
-    harness-audit/
-    project-retrospective/
-    project-runtime/scripts/harness.py
-  scripts/
-    harness.py
-    harness_db.py
-    harness_wrapper.py
-    init_project_harness.py
-    validate_structure.py
-    harness_status.py
-    update_phase.py
-    add_acceptance.py
-    add_failure_mode.py
-    add_task.py
-    update_task.py
-    record_decision.py
-    record_validation.py
-    record_quality_gate.py
-    record_delivery.py
-    validate_harness_state.py
-  hooks/
-    hooks.json
-    harness_hook.py
-  references/
-    collaboration-tools.md
-    tool-adapters.md
-  schemas/
-    project-state.schema.json
-    requirement.schema.json
-    acceptance.schema.json
-    task.schema.json
-    event.schema.json
-    failure-mode.schema.json
-    quality-gate.schema.json
-    validation.schema.json
-    evidence.schema.json
-    test.schema.json
-    finding.schema.json
-    invalidation.schema.json
-    delivery.schema.json
-    adapter.schema.json
-    agent.schema.json
-  templates/
-    agents/
-    project/
-```
-
-## Skills
-
-| Skill | 使用场景 |
-| --- | --- |
-| `project-harness` | 完整项目或功能的总控入口，从需求到代码交付 |
-| `project-bootstrap` | 检查工作区、Git、分支、本地控制面和协作工具映射 |
-| `project-runtime` | 更新阶段、任务、验收、失败模式、验证、质量门和交付记录 |
-| `requirement-baseline` | 澄清需求并形成可确认、可验收的范围 |
-| `team-architecture` | 为任务选择最小有效 agent 小队和协作模式 |
-| `minimal-safe-change` | 小范围、安全、低风险改动 |
-| `test-first-delivery` | 测试优先、契约敏感或需要回归覆盖的实现 |
-| `bug-fix-loop` | 复现、定位、修复和验证 bug |
-| `independent-quality-gate` | 交付前独立 QA、代码审查和集成一致性检查 |
-| `delivery-readiness` | 汇总代码交付证据和遗留风险 |
-| `harness-audit` | 审计 harness 文件、状态和流程漂移 |
-| `project-retrospective` | 复盘项目过程并沉淀方法论改进 |
-
-## 运行时脚本
-
-这些脚本让方法论不只停留在 Markdown 文档里。
-
-推荐使用统一 CLI：
-
-```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . init
-python3 plugins/codex-project-harness/scripts/harness.py --root . doctor
-python3 plugins/codex-project-harness/scripts/harness.py --root . task next
-```
-
-如果插件安装在目标项目之外，使用 `project-runtime` skill 内的代理 CLI：
-
-```bash
-python3 <project-runtime-skill-dir>/scripts/harness.py --root . status
-python3 <project-runtime-skill-dir>/scripts/harness.py --root . validate
-python3 <project-runtime-skill-dir>/scripts/harness.py --root . task add --id T1 --task "Example" --acceptance AC1
-```
-
-这个入口会从 skill 目录定位插件脚本，并以 `--root` 指定的目标项目作为工作目录执行。下面的 legacy 直接脚本路径适用于插件源码被 vendored 到目标项目中的情况。
-
-统一 CLI 支持：
-
-```bash
-harness.py --root . init
-harness.py --root . doctor
-harness.py --root . validate --delivery
-harness.py --root . repair
-harness.py --root . repair --dry-run
-harness.py --root . migrate --from-version 6 --to-version 22
-harness.py --root . migrate --from-version markdown-v1 --to-version 22 --dry-run
-harness.py --root . invariant validate
-harness.py --root . projection rebuild
-harness.py --root . kernel doctor
-harness.py --root . phase project_bootstrap
-harness.py --root . scope confirm --by project-manager --summary "Scope confirmed"
-harness.py --root . baseline freeze --id B1 --summary "Confirmed baseline"
-harness.py --root . baseline diff --from B1
-harness.py --root . baseline validate
-harness.py --root . requirement add --id R1 --kind functional --body "Example requirement"
-harness.py --root . acceptance add --id AC1 --criterion "Example acceptance"
-harness.py --root . requirement link --requirement R1 --acceptance AC1
-harness.py --root . trace show --requirement R1
-harness.py --root . trace validate
-harness.py --root . failure-mode add --id FM1 --feature "Example" --scenario "Risk" --trigger "Bad input" --expected "Safe handling" --acceptance AC1
-harness.py --root . task add --id T1 --task "Implement example" --acceptance AC1 --failure-mode FM1
-harness.py --root . task next
-harness.py --root . task claim T1 --agent developer --expected-revision 1
-harness.py --root . task start T1 --agent developer --lease-token <token> --expected-revision 2 --fence <fence>
-harness.py --root . task heartbeat T1 --agent developer --lease-token <token> --expected-revision 3 --fence <fence>
-harness.py --root . task recover-stale
-harness.py --root . task submit T1 --agent developer --lease-token <token> --expected-revision 4 --fence <fence> --evidence "tests passed"
-harness.py --root . task review T1 --agent qa-reviewer --expected-revision 5
-harness.py --root . task accept T1 --agent qa-reviewer --lease-token <review-token> --expected-revision 6 --fence <review-fence> --evidence "review passed"
-harness.py --root . decision record --decision "Selected local runtime" --reason "SQLite is the source of truth"
-harness.py --root . test-target add --id UNIT --kind unit --command-template "pytest"
-harness.py --root . test-target link --task T1 --target UNIT
-harness.py --root . dispatch run --agent developer --target UNIT --command "pytest"
-harness.py --root . test record --id TEST1 --surface "Example" --command "pytest" --result pass --evidence <executor-evidence-id>
-harness.py --root . finding record --id F1 --surface "Example" --severity medium --status open --summary "Follow-up needed"
-harness.py --root . validation record --surface "Example" --acceptance AC1 --failure-mode FM1 --findings "passed" --result pass --test TEST1 --evidence <executor-evidence-id> --target UNIT --trust-anchor external-session --trust-anchor-id <session-id>
-harness.py --root . gate record --reviewer-context same-context-degraded --result pass --commands "test command" --finding F1
-harness.py --root . checkpoint create --label before-delivery
-harness.py --root . checkpoint export --out checkpoint.json
-harness.py --root . event validate
-harness.py --root . dispatch plan --scope "Example scope"
-harness.py --root . dispatch route-advice --run-id <run-id> --json
-harness.py --root . agents install
-harness.py --root . dispatch native-export <run-id>
-# Codex/ChatGPT host creates the visible task/thread/subagent/worktree and returns receipt.json.
-harness.py --root . dispatch native-import <run-id> --receipt receipt.json
-harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
-harness.py --root . dispatch export-csv <run-id>
-# Host/user runs Codex spawn_agents_on_csv with generated spawn_config.json.
-harness.py --root . dispatch import-csv <run-id> --result .ai-team/runtime/codex-fanout/<run-id>/output.csv
-harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1
-harness.py --root . dispatch verify-attempt --run-id <run-id> --task T1 --runner container --container-image python:3.12-slim
-harness.py --root . dispatch integrate --run-id <run-id>
-harness.py --root . dispatch integrate --run-id <run-id>
-harness.py --root . executor allow-prefix add --prefix "pytest" --reason "local test runner"
-harness.py --root . dispatch run --agent developer --target UNIT --command "pytest" --sandbox-profile none
-harness.py --root . dispatch run --agent developer --runner local-process --claim-file src/app.py --command "python3 -m unittest" --allow-unlisted --reason "local agent task"
-harness.py --root . dispatch integrate --run-id <run-id>
-harness.py --root . adapter ci-verify --provider github --run-id <run-id> --conclusion success --commit-sha <sha>
-harness.py --root . adapter plan --tool github --mode write-confirm --artifact Tasks --action "create issue" \
-  --payload-json '{"execute":true,"operation":"github.issue.create","params":{"repo":"owner/repo","title":"T1","body":"Task body"}}'
-harness.py --root . adapter confirm --id <action-id>
-harness.py --root . risk sweep-expired
-harness.py --root . delivery record --scope "Example delivery" --validation "tests passed" --quality-gate "independent_qa pass"
-harness.py --root . adapter record --tool github --mode read-only --artifact Tasks --external-id issue-1 --idempotency-key codex-project-harness:project:task:T1
-```
-
-兼容脚本仍然保留给旧流程和已有文档使用，例如 `init_project_harness.py`、`add_task.py`、`record_validation.py`、`validate_harness_state.py`。它们现在只是统一 CLI 的薄包装，不再直接写 Markdown/JSONL 事实文件。SQLite 是唯一运行时事实源，Markdown 文件是渲染视图。
-
-旧脚本到统一 CLI 的对应关系：
-
-| Legacy script | Canonical CLI |
-| --- | --- |
-| `harness_status.py` | `harness.py --root . status` |
-| `update_phase.py` | `harness.py --root . phase ...` |
-| `add_acceptance.py` | `harness.py --root . acceptance add ...` |
-| `add_failure_mode.py` | `harness.py --root . failure-mode add ...` |
-| `add_task.py` | `harness.py --root . task add ...` |
-| `update_task.py` | `harness.py --root . task update/start/complete/block ...` |
-| `record_decision.py` | `harness.py --root . decision record ...` |
-| `record_validation.py` | `harness.py --root . validation record ...` |
-| `record_quality_gate.py` | `harness.py --root . gate record ...` |
-| `record_delivery.py` | `harness.py --root . delivery record ...` |
-| `validate_harness_state.py` | `harness.py --root . validate --delivery` |
-
-校验本插件结构：
-
-```bash
-python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
-```
-
-## Failure Mode Engineering
-
-失败模式是这个项目的重要增强点。它要求 Codex 在实现之前或规划期间思考：
-
-- 正常路径是什么。
-- 用户输入无效时系统应该怎么做。
-- 外部 API、文件、数据库或网络失败时如何恢复。
-- 重复提交、并发、重试、幂等问题如何处理。
-- 数据写入失败时是否能保持安全状态。
-- 哪些风险需要测试覆盖，哪些风险只能记录为残余风险。
-
-失败模式会进入 `.ai-team/requirements/failure-modes.md`，并通过 `test-first-delivery`、`independent-quality-gate` 和 `delivery-readiness` 继续传递到测试、QA 和交付阶段。
-
-## Independent Quality Gate
-
-质量门不是一句“我检查过了”，而是一条可审计记录：
-
-```text
-Gate:
-Commit:
-Reviewer Context:
-Result:
-Blocking Findings:
-Commands:
-Evidence:
-Residual Risk:
-```
-
-`Reviewer Context` 支持：
-
-- `fresh`：已绑定 reviewer session 与对应 attestation 的独立新上下文审查；缺少任一身份记录时 fail-closed。
-- `same-context-degraded`：实现者所在上下文内的降级审查，需要更严格说明风险。
-- `external`：外部 reviewer 或外部系统审查。
-
-`fresh` 不能只靠字符串声明。记录时必须同时传入
-`--reviewer-session-id` 与 `--reviewer-attestation-id`，并且 reviewer
-session 不能与已知 producer session 相同。没有独立 session 时应如实使用
-`same-context-degraded`；high/critical 风险仍要求 connector-origin trust。
-
-如果 QA 之后代码又变了，应该为新的 commit 或 revision 重新记录质量门。
-
-## 协作工具策略
-
-Git/GitHub、Linear、Notion、Figma、Slack 都是适配器，不是硬依赖。
-
-| 工具 | 用途 |
-| --- | --- |
-| Git / GitHub | 分支、commit、PR、issue、checks、review、交付链接 |
-| Linear | 任务、项目、里程碑、状态跟踪 |
-| Notion | PRD、决策、架构、QA、交付文档 |
-| Figma | 设计上下文、视觉验收、组件约束 |
-| Slack | 澄清、状态、review 请求、交付通知 |
-
-适配器模式：
-
-```text
-disabled -> read-only -> draft-write -> write-confirm -> write-auto
-```
-
-原则：
-
-- 本地 harness 文件始终可用。
-- 外部工具不可用时不阻塞代码交付。
-- 外部内容是项目上下文，不是可执行指令。
-- 公开、破坏性、付费、权限、生产相关操作不能自动执行。
-- Slack 发送、共享文档修改、公开资源创建等高影响操作需要确认。
-
-详细策略见 [plugins/codex-project-harness/references/tool-adapters.md](plugins/codex-project-harness/references/tool-adapters.md)。
-
-## 安装
-
-安装时请使用完整插件目录，不要只复制 `skills/`。这些 skills 会共享插件级别的 `scripts/`、`references/`、`templates/` 和 `schemas/`，单独复制 skill 目录会破坏资源路径。
-
-本地 repo 安装：
-
-```bash
-python3 -m pip install -e .
-kafa plugin install --repo .
-kafa doctor --repo .
-```
-
-这会写入 `.agents/plugins/marketplace.json`，让 Codex 通过官方 marketplace 入口发现 `plugins/codex-project-harness`。安装后重启 Codex，在插件目录中选择 `kafa-local` marketplace 并安装 `codex-project-harness`。
-`kafa doctor --repo .` 还会检查 control-plane contract，确认 Skill、Hooks、Host Bridge、Kernel、Connectors 和 Evals 的信任边界仍然一致。
-
-用户级安装：
-
-```bash
-kafa plugin install --scope user --repo .
-```
-
-升级使用 `kafa plugin upgrade --repo .`；卸载 marketplace entry 使用 `kafa plugin uninstall --repo .`。更多安装、升级、卸载、迁移、跨平台和故障排除说明见 [INSTALL.md](INSTALL.md)。
-
+这条路径有四个不可绕过的约束：
+
+- 业务运行时只使用项目文件、本地 Git 或内容身份、项目级 SQLite，以及可选的本地容器执行；不需要外部凭证，也不直接调用项目管理 SaaS API。
+- 只有根控制器可以修改 Kafa 事实。子任务执行者返回代码、审查信息和上下文标识，由根控制器验证和记录。
+- 命令证据只能由 controller executor 生成，并以 immutable execution 保存。人工文字只能是判断或审计说明。
+- High/critical 风险没有可验证 provenance 时返回 `human-review-required`；它不是通过状态。
 
 ## 快速开始
 
-完整项目：
+从 Kafa 源码仓库安装 repo-scoped plugin：
 
-```text
-用项目小队流程完成这个功能并交付可验证代码：我要开发一个亲友生日提醒小程序。
+```bash
+python3 -m pip install -e .
+kafa plugin install --repo .
+kafa doctor --repo .
 ```
 
-明确触发某个 skill：
+重启 Codex 后，从 `kafa-local` marketplace 安装 `codex-project-harness`。在普通业务项目中初始化：
 
-```text
-$requirement-baseline
-帮我把这个需求问清楚，形成可验收的需求基线，并列出关键失败模式。
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root . init
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root . status
 ```
 
-```text
-$independent-quality-gate
-独立验收当前实现，重点检查 API 返回、前端类型和数据库字段是否一致。
+如果目标已经清晰并且有真实测试命令，可以运行最小闭环：
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root . quickstart minimal \
+  --id SMOKE \
+  --goal "Keep the current behavior working" \
+  --acceptance "The existing test command passes" \
+  --task "Verify the current behavior" \
+  --test-command "python3 -B -m unittest discover -s . -p 'test_*.py'" \
+  --execute
 ```
 
-```text
-$delivery-readiness
-整理本次代码交付证据，包括验收映射、失败模式覆盖、变更文件、测试结果、质量门结论和遗留风险。
+`--execute` 会通过 controller executor 运行已登记的 target。退出码为零但没有有效结构化结果、通过数为零、结果文件缺失或结果语义失败，都不能生成 passing validation。
+
+更完整的操作顺序见 [QUICKSTART.md](QUICKSTART.md)，安装、升级和 schema 迁移见 [INSTALL.md](INSTALL.md)。
+
+## OpenSpec 与 Kafa 的分工
+
+当需求不清晰、变更跨模块、影响长期行为或需要架构决策时，先在 OpenSpec 中锁定提案、设计与任务：
+
+```bash
+openspec status --change <change-name>
+openspec validate <change-name>
 ```
 
-更多例子见 [QUICKSTART.md](QUICKSTART.md)。
+实施时以该 change 的 `tasks.md` 为清单，并在完成后更新 checkbox。Kafa 记录与交付相关的最小本地事实：需求和验收链接、task 状态、当前 candidate 的执行、验证判断、finding、质量门和最终交付。小型且验收明确的安全改动可以直接使用对应的 Kafa Skill，不强制创建 OpenSpec change。
+
+## 根控制器单写
+
+Kafa 的 task 状态机是：
+
+```text
+planned -> active -> submitted -> accepted
+                    |            -> blocked
+                    -> blocked
+
+planned / active / submitted -> cancelled
+```
+
+公开 task 操作只有：
+
+```text
+task add
+task list
+task start
+task submit
+task accept
+task block
+task cancel
+```
+
+状态转换必须按顺序发生；例如 planned 或 active task 不能直接 accept。`revision` 只作为审计序号。Native Codex/ChatGPT 完成本地工作后，根控制器检查实际 diff 和 candidate，再执行 `task submit`、验证和 `task accept`。任何子任务执行者都不应调用 Kafa mutation 命令。
+
+## 不可变执行与验证判断
+
+Runtime 使用 schema 30 的 27 张 local-core tables。主事实源是：
+
+```text
+.ai-team/state/harness.db
+```
+
+其中：
+
+- `executions` 保存当前 candidate、target、命令、真实退出码、输出 digest、artifact、执行计数、结构化结果和 sandbox policy；记录后不可覆盖。
+- `validations` 保存对验收面和风险面的判断，并通过关系表引用 execution；它不能复制或修改命令事实。
+- `events` 是 compact append-only audit log，只记录受影响实体和有界摘要，不是数据库恢复或 replay 来源。
+- `.ai-team/` 与 `docs/harness/` 下的 Markdown 是按影响范围更新的阅读视图，不是第二事实源。
+
+登记和执行本地 target 的典型命令：
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . test-target add \
+  --id UNIT \
+  --kind unit \
+  --command-template "python3 -B -m unittest discover -s tests -p 'test_*.py'"
+
+python3 plugins/codex-project-harness/scripts/harness.py --root . test-target link \
+  --task T1 \
+  --target UNIT
+
+python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
+  --target UNIT \
+  --acceptance AC1
+```
+
+需要本地隔离执行时，使用 `verify run --runner container --container-image <image>`。如果 target 声明必须 sandbox 或 no-network，实际执行 metadata 不满足时会 fail closed。
+
+`validation record` 只记录判断。没有 controller execution 支撑的自由文本，不会变成 delivery gate 可接受的命令证据。
+
+## Delivery trust
+
+本地信任状态分为：
+
+- `controller-verified`：根控制器针对当前 candidate 执行的 target。
+- `reviewed-local`：不同 producer/reviewer context 的本地审查元数据。
+- `same-context-degraded`：同一 context 的降级审查，只适用于 low/medium 风险。
+- `human-review-required`：high/critical 默认结果，表示不能自主交付。
+
+High/critical failure mode 至少需要当前 candidate 的 structured execution 和不同 producer/reviewer context。即使满足这两项，没有独立可验证 provenance 时仍必须返回 `human-review-required`。只有用户明确接受或豁免全部剩余高风险，并完整记录 actor、reason、范围、revision 和 expiry，才可以沿 accepted-risk 路径继续；该记录是程序性审计，不是密码学证明。
+
+`skipped`、`blocked`、`not-run`、fixture-only 和零测试数都不能描述为通过。代码在 execution 或 quality gate 之后发生变化时，旧事实仍可审计，但不再满足当前 candidate。
+
+## Public CLI
+
+统一 CLI 只公开以下顶层领域：
+
+```text
+init  status  doctor  quickstart
+cycle  requirement  acceptance  failure-mode  baseline  trace
+task  test-target  verify  validation
+finding  gate  delivery  decision
+validate  repair  migrate  projection
+```
+
+先用 `--help` 确认具体参数：
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --help
+python3 plugins/codex-project-harness/scripts/harness.py task --help
+python3 plugins/codex-project-harness/scripts/harness.py verify run --help
+```
+
+`projection rebuild` 是本地视图恢复命令。正常 mutation 只重建受影响的视图。`repair` 在修改前创建并验证 SQLite backup。
+
+## Plugin surface
+
+Plugin 保留七个 delivery-focused Skills：
+
+| Skill | 用途 |
+| --- | --- |
+| `project-harness` | 从工作区检查、OpenSpec 路由和需求基线到 verified handoff 的总入口 |
+| `minimal-safe-change` | 验收明确的小型安全改动 |
+| `bug-fix-loop` | 复现、定位、修复和回归 bug |
+| `test-first-delivery` | 契约敏感或回归敏感的测试优先交付 |
+| `independent-quality-gate` | 独立 QA、finding 和 current-candidate 审查 |
+| `harness-audit` | 审计运行时、边界和交付证据 |
+| `project-retrospective` | 交付后复盘和方法改进 |
+
+Plugin 只定义三个 Hooks：
+
+- `SessionStart`：只读注入本地状态。
+- `SubagentStart`：注入根控制器单写和角色边界。
+- `Stop`：仅给出警告，不阻止 Native Codex/ChatGPT 停止。
+
+未初始化项目中的 Hook 会简洁跳过，不创建 `.ai-team`。项目初始化只安装三个静态 Native Codex agent templates：`developer.toml`、`architect.toml` 和 `qa-reviewer.toml`；模板提供角色说明，但 Kafa 不拥有其生命周期。
+
+## Schema 30 migration and recovery
+
+支持的 v1 schema 迁移通过 side-by-side conversion 完成：先创建带 digest 和完整性结果的 SQLite backup，再把有效本地事实复制到 staging schema 30，验证 foreign keys、invariants 和 projection dry-run，最后原子替换 active DB。
+
+被移除的远程协作、执行者生命周期和历史恢复子系统数据只保留在 pre-migration backup，不会进入 active schema 30。激活后 doctor 失败时，运行时使用已验证 backup 自动恢复；schema 30 写入新事实后不承诺自动 downgrade。
+
+具体 dry-run、backup 路径和恢复边界见 [INSTALL.md](INSTALL.md)。
 
 ## 交付边界
 
-这个 harness 会做：
+Kafa 会：
 
-- 需求澄清和范围确认。
-- 任务拆解和 agent 小队编排。
-- 代码实现和本地验证。
-- 测试、审查、质量门记录。
-- Git commit、PR 草稿或交付说明，取决于上下文和用户授权。
-- 最终代码交付证据整理。
+- 形成本地需求、验收、failure mode 和 task traceability。
+- 保存当前 candidate 的 immutable execution 和 validation judgment。
+- 记录 finding、quality gate、remaining risk 和 delivery decision。
+- 输出 verified code handoff 所需的证据和明确的未验证范围。
 
-这个 harness 不做：
+Kafa 不会：
 
-- 生产部署。
-- 正式上线发布。
-- 云资源或付费资源创建。
-- 生产数据库迁移。
-- 密钥、凭证、权限变更。
-- 生产监控和事故响应。
+- 代替 Native Codex/ChatGPT 管理 task、subagent、worktree、approval、model、cancel 或 handoff。
+- 直接操作业务项目的远程协作系统。
+- 把自报上下文标识、人工文字或 Hook 输出伪装成可信执行证据。
+- 自动 commit、push、merge、tag、release、deploy 或执行生产变更。
 
-如果用户需要部署或上线，应在代码交付后切换到单独的部署流程。
+## 维护本仓库
 
-## 验证
-
-维护本仓库时建议至少运行：
+结构和本地回归入口：
 
 ```bash
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
-python3 -m json.tool plugins/codex-project-harness/.codex-plugin/plugin.json >/dev/null
-find plugins/codex-project-harness/schemas -maxdepth 1 -name '*.json' -print -exec python3 -m json.tool {} \; >/dev/null
-python3 -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py
-python3 -m unittest tests/test_control_plane_architecture.py
-python3 -m unittest tests/test_kernel_module_architecture.py tests/test_documentation_contract.py
+python3 -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py \
+  plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py
 python3 -m unittest discover -s tests -p 'test_*.py'
-python3 -m pip install -e .
-kafa --version
-kafa plugin install --repo .
-kafa doctor --repo .
 python3 tests/run_isolated_install_smoke.py --repo .
 python3 plugins/codex-project-harness/scripts/run_runtime_smoke.py
-python3 plugins/codex-project-harness/scripts/run_forward_eval.py
-python3 plugins/codex-project-harness/scripts/run_skill_eval.py
 python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
 python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
 git diff --check
 ```
 
-发布候选还必须在受保护、已认证的真实宿主上显式运行 `HARNESS_E2E_ENABLE_LIVE_CODEX=1 ... --mode live-codex`。未启用、缺少认证、能力 blocked 或 scenario failed 都会阻止 tag publish。
+真实 Native Codex compatibility profile 是显式 opt-in 的独立验证面。没有运行、能力不可用、认证缺失或场景被阻塞时，必须如实报告，不能用本地 fixture 结果替代。
 
-如果修改了 skill，建议对每个 skill 运行 Codex skill 校验工具。当前仓库的脚本、schema 和运行时单测均保持无第三方运行依赖，方便在普通 Python 环境中验证。
-
-仓库还提供 GitHub Actions workflow：
-
-```text
-.github/workflows/validate.yml
-```
-
-它会在 push 和 pull request 上运行结构校验、JSON 校验、Python 编译、packaging install、`kafa` doctor、运行时回归测试和 Agent E2E fixture。Ubuntu 额外运行 runtime smoke、forward wrapper、本地 skill eval fixture、Agent E2E stability matrix 和 Kernel 诊断烟测；macOS/Windows 跑可移植子集。
-
-## 当前状态
-
-- 源码候选：`v1.25.0-beta.1`，`release_state=development`。
-- Kernel：`v4.18.0`；数据库：`schema 29`。
-- 插件包含 12 个 Skills 和 5 个 Codex lifecycle Hooks。
-- 发布仍处于 stop-ship；只有 deterministic matrix 与真实宿主 compatibility profile 同时通过后，tag workflow 才允许进入 publish。
-- 项目目标固定为 verified code delivery，不包含 deployment。
+版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## License
 

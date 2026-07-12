@@ -1,65 +1,134 @@
-# Architecture Control Plane
+# Local Delivery Control Plane
 
-Codex Project Harness is an architecture control plane for verified code delivery. It keeps Skill, Plugin, Hooks, Host Bridge, Kernel, Connectors, and Evals in separate trust layers so conversational convenience cannot bypass delivery gates.
+Codex Project Harness separates specification, host lifecycle, and delivery
+trust so conversational convenience cannot bypass verified handoff. The
+business-project runtime is local-only and uses schema 30.
 
-## Layers
+## Authority and Layers
 
-| Layer | Responsibility | Boundary |
+| Layer | Responsibility | Non-bypass boundary |
 | --- | --- | --- |
-| Skill Entry | Natural-language entrypoints that guide project work and point agents to runtime commands. | Skills are instructions, not facts. They do not create trusted evidence or change delivery status by themselves. |
-| Plugin Distribution | Plugin manifest, packaged skills, hooks, templates, schemas, and local marketplace installation through `kafa`. | Plugin metadata distributes the control plane; it does not execute gates or mutate runtime state. |
-| Hooks Advisory Layer | Codex lifecycle reminders for status, role boundaries, write warnings, change summaries, and Stop-time validation hints. | Hooks are advisory/warn-only by default and never write delivery-eligible evidence. |
-| Host Bridge / Provider Layer | Native host receipt import and the optional legacy Host Codex bridge collect external agent reports. | Provider and host receipts are raw reports until controller `dispatch verify-attempt` creates trusted evidence. |
-| Kernel Trust Layer | SQLite fact source, scheduler, leases, idempotency, controller verification, HMAC/session attestation, integration, and delivery gates. | This is the only layer allowed to decide delivery readiness. Markdown projections are generated views. |
-| Connector / Eval Boundary | GitHub/Linear/Notion/Figma/Slack adapters synchronize workflow records; evals measure the control plane. | Connectors may write only to the current project's bound profile scopes. Connector outputs and eval results are audit or release signals, not delivery evidence for a project task. |
+| OpenSpec | Own proposal, design, behavioral specs, implementation tasks, and archive for substantial changes. | Kafa may reference OpenSpec paths and IDs, but it does not copy the spec into a competing source of truth. |
+| Skill entry | Route work, explain responsibilities, and guide the root controller. | Instructions are not runtime facts and cannot create trusted evidence. |
+| Plugin distribution | Package the approved Skills, Hooks, role templates, schemas, local runtime, and installer metadata. | Distribution metadata does not decide delivery readiness. |
+| Native Codex/ChatGPT host | Own visible tasks, threads, subagents, worktrees, approval, model, cancellation, steering, and handoff. | Kafa does not implement a second lifecycle or treat self-reported host identifiers as trust anchors. |
+| Hooks advisory layer | Read local status, inject role boundaries, and warn at Stop. | Hooks are warn-only, skip uninitialized projects, and never write delivery-eligible facts. |
+| Local delivery runtime | Store current-cycle facts in SQLite, run controller verification, record review findings, and make the delivery decision. | This is the only layer that can determine Kafa handoff readiness. Generated Markdown is read-only projection output. |
+| Release evaluation | Test the Kafa distribution, migrations, negative gates, and real native-host compatibility. | A Kafa release evaluation does not prove that an arbitrary project candidate passed its own acceptance criteria. |
+
+## Responsibility Split
+
+```text
+OpenSpec change
+  proposal + design + specs + tasks
+                  |
+                  v
+Native Codex/ChatGPT host
+  visible work + approvals + local candidate
+                  |
+                  v
+Kafa root controller
+  task intent -> exact target -> immutable execution
+              -> validation link -> independent review
+              -> candidate-scoped delivery decision
+                  |
+                  v
+Local Git/content identity + SQLite + optional no-network container
+```
+
+The root controller is the sole writer of Kafa SQLite facts. Subagents and
+reviewers return code, commands, findings, and context through the native host.
+They do not claim database leases or advance their own task state.
 
 ## Non-Bypass Rules
 
-- Skill, Hooks, Host Bridge, Connectors, and Evals must not produce delivery-eligible evidence directly.
-- Trusted evidence must bind to Kernel-controlled verification: parsed execution evidence, current code identity, target mapping, HMAC/session attestation where required, and integration/delivery gate checks.
-- Delivery Cycles, Connector outbox recovery state, and Connector namespace profiles are Kernel facts. Skills and hooks may prompt `cycle start/status/close` or `connector profile status/set/unset`, but only Kernel schema 29 state determines which cycle-local fact, candidate, connector claim, bound external scope, or recovered external marker is delivery-relevant.
-- Target sandbox policy, stack profile, and structured test semantic status are Kernel facts. Local runner output cannot satisfy targets that require sandbox or no-network, and regex output cannot impersonate structured result evidence.
-- Host Codex and native fan-out worker output always enters as `agent_reports` plus `task_attempts(status=reported)` before controller verification.
-- Native host model policy is authoritative. The legacy bridge may use an explicitly configured `spark-deterministic` compatibility model for low-risk, testable developer assignments, but selected model metadata never creates delivery evidence or relaxes Kernel verification.
-- Connector writes are external workflow synchronization records governed by project profile scope checks plus transactional outbox claim/recovery. Harness never creates external workspaces, projects, channels, files, or repos; it only binds the project to existing targets. Connector links cannot satisfy high/critical delivery gates without existing connector(HMAC) trust anchors.
-- Apps/MCP is the target authorization and external-action boundary. The Kernel accepts only receipts bound to the exact action, fence, payload hash, project key, and external scope; model-visible tool output is audit-only unless a non-forgeable host attestation is available. Current direct HTTP/`gh` adapters are `legacy-direct` compatibility paths. See [Apps/MCP Connector Receipt Boundary](APPS_MCP_RECEIPT_ADR.md).
-- Native Codex/ChatGPT owns task, thread, subagent, worktree, approval, model, steer, cancel, handoff, and archive lifecycle. Kafa exports immutable constraints and imports host receipts with real IDs; it does not manufacture a parallel native lifecycle. Mutable SQLite facts remain single-writer in the root workspace. See [Native Codex Runtime Ownership](NATIVE_CODEX_RUNTIME_ADR.md).
-- Evals are release gates for the harness itself. They do not prove an arbitrary project task is ready to deliver.
+- OpenSpec is the specification authority whenever the change is routed there;
+  Kafa records only the delivery facts needed to verify the candidate.
+- Skills, templates, and Hooks may guide behavior but cannot create immutable
+  executions, passing validations, quality gates, or delivery records by
+  themselves.
+- The native host owns task/thread/subagent/worktree/approval/model/cancel and
+  handoff lifecycle. Kafa neither spawns a hidden worker nor manufactures host
+  provenance.
+- Only root-controller `verify run` can create a delivery-eligible execution.
+  Free-form validation text remains audit-only.
+- Every passing execution must bind to the current cycle, current candidate,
+  exact registered target, artifact digest, positive test count, semantic
+  result, and actual sandbox/no-network policy status.
+- A candidate change invalidates old execution and review credit for delivery.
+  Historical rows remain auditable.
+- A passing review gate cannot be recorded with a dirty Git worktree.
+- High/critical work without verifiable provenance remains
+  `human-review-required`. Distinct local context strings document procedural
+  separation but are not cryptographic proof.
+- A user-directed high-risk acceptance is valid only when actor, reason, scope,
+  current revision, and unexpired expiry are recorded. It remains procedural.
+- `skipped`, `blocked`, `not-run`, unavailable, and fixture-only outcomes are
+  never reported as passes.
 
-## Control Flow
+## Local Runtime Boundary
 
-```text
-User intent
-  -> Skill Entry
-  -> Plugin-distributed runtime CLI
-  -> Kernel task/requirement/scheduler state
-  -> Current Delivery Cycle and candidate identity
-  -> Host Bridge or local runner produces raw attempt
-  -> Kernel controller verification produces trusted evidence
-  -> Integration gate verifies branch identity and file claims
-  -> Delivery gate checks evidence, QA, risk, and trust anchors
-  -> Evals/doctor validate the harness release itself
-```
+The supported runtime uses the project filesystem, local Git or content
+identity, per-project SQLite, local commands, and an optional local no-network
+container. It does not call remote project-management APIs, request integration
+tokens, invoke `gh api`, or synchronize project state to an external service.
 
-`kafa doctor --repo .` includes a `control plane contract` check that verifies the packaged components still declare these boundaries.
+External apps remain a user/host capability. Their outputs do not enter Kafa's
+active schema or satisfy delivery trust.
+
+## Fact and Trust Flow
+
+1. Read applicable project instructions and the authoritative OpenSpec change.
+2. Confirm the real workspace, current branch/revision, and dirty state.
+3. Initialize the local runtime and record acceptance-linked task intent.
+4. Let the native host perform implementation in its visible task or worktree.
+5. Return to the root workspace and establish the current candidate.
+6. Run an exact registered target with root-controller `verify run`.
+7. Store one immutable execution and link validation judgment to it.
+8. Obtain an independent review through a distinct native-host context.
+9. Resolve findings and apply the honest high-risk policy.
+10. Record delivery only when the current-candidate decision has no blockers.
+
+The database stores the execution once. Validation, review, and delivery logic
+read that normalized fact instead of copying command output or accepting a
+manual claim.
+
+## Recovery Boundary
+
+Compact append-only audit events explain local mutations, but they do not
+contain whole-database snapshots and are not replay or recovery input.
+
+Schema migration and administrator repair use verified SQLite backups with
+integrity checks and digests. Schema 27/28/29 upgrades are built side by side;
+schema 30 becomes active only after schema, foreign-key, invariant, and
+projection checks. Removed remote and host-lifecycle history stays in the
+pre-migration backup rather than entering the active database.
 
 ## Kernel Module Contracts
 
-- `core.api` is the **explicit public API** consumed by the runtime CLI. It lists supported symbols and does not dynamically re-export implementation details.
-- **Schema Lifecycle** (`core/schema_lifecycle.py`) owns transactional DDL, compatibility columns, and schema initialization.
-- **Cycle Ledger** (`core/cycle_ledger.py`) owns current-cycle identity, baseline validity, and traceability read models.
-- **Delivery Decision** (`core/gate_engine.py`) consumes Cycle Ledger facts and trust-policy inputs without importing the monolithic compatibility module.
+- `core.api` is the **explicit public API** consumed by the runtime CLI.
+- **Schema Lifecycle** in `core/schema_lifecycle.py` owns initialization,
+  side-by-side migration, verified backup, and rollback behavior.
+- **Cycle Ledger** in `core/cycle_ledger.py` owns current-cycle identity,
+  baseline validity, and traceability reads.
+- `core/execution.py` owns local/container execution, target policy, result
+  parsing, artifacts, and immutable execution metadata.
+- **Delivery Decision** in `core/delivery.py` evaluates only current-cycle and
+  current-candidate facts under the local trust policy.
+- `core/projections.py` rebuilds only affected generated views during normal
+  mutation; an administrator can request a full local rebuild.
 
-The feature freeze protects CLI, migration, trust, plugin, Hook/Skill, runtime-script, and release contracts. Internal core files may be split or renamed when those contracts and their regression evidence remain intact.
+The public CLI is restricted to initialization/status, cycle and requirement
+facts, root-owned task state, test targets and verification, local judgments,
+delivery decisions, migration/repair, and projection rebuild. Removed v1
+families are not kept as empty compatibility layers.
 
-Native ChatGPT/Codex owns concrete model, reasoning, sandbox, approval, and task lifecycle selection. The legacy Host Codex Provider retains environment-variable compatibility only: `HARNESS_CODEX_MODEL` is the highest-priority hard override; without it, `spark-deterministic` requires an explicit `HARNESS_CODEX_SPARK_MODEL`. Kafa does not embed a preview model slug or treat model selection as evidence.
+## Packaged Surface
 
-The base `kafa` installer and Kernel are stdlib-only. The legacy Host Codex SDK bridge is an explicit optional capability installed with `kafa[host-codex]`; missing SDK support fails closed at provider execution and does not affect plugin installation, doctor, project launchers, or non-Host delivery governance.
+The Plugin exposes seven delivery-focused Skills, three role templates
+(`developer`, `architect`, `qa-reviewer`), and exactly three Hooks
+(`SessionStart`, `SubagentStart`, `Stop`).
 
-The legacy bridge cannot inherit a native parent task's permission and approval policy. It is disabled by default and runs only when the operator explicitly sets `HARNESS_CODEX_LEGACY_HOST_POLICY=isolated-deny-all`, accepting the fixed worktree sandbox and deny-all approval mode. Native tasks remain authoritative and need no such compatibility opt-in.
-
-When explicitly enabled, the legacy bridge remains fail-closed: a separate watchdog enforces its deadline, dead workers cannot receive heartbeat lease extensions, and DB/file CAS prevents late reports from creating evidence. It kills the known process tree, but cannot prove that an already reparented helper is gone; therefore cancel/timeout never auto-replans a legacy assignment and remains `verification_failed`. These controls do not make the bridge native.
-
-Cold-start guidance is explicit. Use `kafa project doctor --repo <project>` for ordinary projects, and use `quickstart status` or `quickstart minimal --execute` inside the harness runtime when a new user needs a guided first loop. These commands call the Kernel runtime and existing dispatch evidence paths; they do not create delivery evidence outside controller execution, and they do not weaken delivery readiness.
-
-`dispatch route-advice` gives the controlling model a read-only capability and risk report before native execution. It can identify small controller-verifiable candidates, but it cannot choose a model, spawn subagents, create evidence, or bypass the Kernel trust layer. With a run id it points to immutable `dispatch native-export` packages.
+`kafa project doctor --repo <project>` checks an ordinary project. `kafa doctor
+--repo <kafa-source>` checks Kafa or Plugin source layout. Neither command
+changes the ownership boundaries above.

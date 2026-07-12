@@ -15,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
 SCRIPTS = PLUGIN_ROOT / "scripts"
+RELEASE = json.loads((REPO_ROOT / "release.json").read_text(encoding="utf-8"))
 
 for path in [PLUGIN_ROOT, SCRIPTS]:
     if str(path) not in sys.path:
@@ -22,102 +23,53 @@ for path in [PLUGIN_ROOT, SCRIPTS]:
 
 import harness  # noqa: E402
 import harness_db  # noqa: E402
-from core import KERNEL_VERSION  # noqa: E402
-from validate_structure import REQUIRED_CORE, REQUIRED_HOOKS, REQUIRED_SCHEMAS, REQUIRED_SCRIPTS, REQUIRED_SKILLS  # noqa: E402
+from core import KERNEL_VERSION, RUNTIME_VERSION, SCHEMA_VERSION  # noqa: E402
+from validate_structure import (  # noqa: E402
+    REQUIRED_CORE,
+    REQUIRED_HOOKS,
+    REQUIRED_SCHEMAS,
+    REQUIRED_SCRIPTS,
+    REQUIRED_SKILLS,
+)
 
-
-EXPECTED_PLUGIN_VERSION = "1.25.0-beta.1"
-EXPECTED_RUNTIME_VERSION = "4.18.0"
-EXPECTED_SCHEMA_VERSION = 29
 
 EXPECTED_TABLES = {
+    "project",
+    "delivery_cycles",
+    "requirements",
     "acceptance",
-    "adapter_actions",
-    "adapters",
-    "advisory_fallbacks",
-    "agent_capabilities",
-    "agent_provider_events",
-    "agent_provider_sessions",
-    "agent_reports",
-    "agent_sessions",
-    "agents",
+    "requirement_acceptance",
+    "failure_modes",
+    "failure_mode_acceptance",
     "baselines",
-    "ci_verifications",
-    "codex_fanout_exports",
-    "command_log",
-    "connector_budgets",
-    "connector_profiles",
-    "decisions",
+    "tasks",
+    "task_acceptance",
+    "task_failure_modes",
+    "task_dependencies",
+    "test_targets",
+    "task_test_targets",
+    "executions",
+    "validations",
+    "validation_executions",
+    "validation_failure_modes",
+    "findings",
+    "quality_gates",
+    "quality_gate_findings",
     "deliveries",
     "delivery_acceptance",
-    "delivery_cycles",
-    "dispatch_assignments",
-    "dispatch_runs",
-    "dispatch_worktrees",
-    "events",
-    "evidence",
-    "executor_allowlist",
-    "external_session_verifications",
-    "failure_mode_acceptance",
-    "failure_modes",
-    "findings",
-    "integration_attempts",
+    "decisions",
     "invalidations",
     "migrations",
-    "project",
-    "quality_gate_findings",
-    "quality_gates",
-    "requirement_acceptance",
-    "requirements",
-    "runtime_snapshots",
-    "sandbox_executions",
-    "session_attestations",
-    "task_acceptance",
-    "task_attempts",
-    "task_dependencies",
-    "task_failure_modes",
-    "task_file_claims",
-    "task_test_targets",
-    "tasks",
-    "test_targets",
-    "tests",
-    "validation_evidence",
-    "validation_failure_modes",
-    "validation_tests",
-    "validations",
+    "events",
 }
 
 EXPECTED_CLI_SURFACE = {
     "acceptance",
     "acceptance.add",
-    "adapter",
-    "adapter.ci-verify",
-    "adapter.complete",
-    "adapter.confirm",
-    "adapter.draft",
-    "adapter.external-session-verify",
-    "adapter.plan",
-    "adapter.reconcile",
-    "adapter.record",
-    "agent",
-    "agent.capability",
-    "agent.capability.add",
-    "agents",
-    "agents.install",
     "baseline",
     "baseline.diff",
     "baseline.freeze",
     "baseline.validate",
-    "checkpoint",
-    "checkpoint.create",
-    "checkpoint.export",
-    "checkpoint.import",
-    "checkpoint.list",
-    "connector",
-    "connector.profile",
-    "connector.profile.set",
-    "connector.profile.status",
-    "connector.profile.unset",
     "cycle",
     "cycle.close",
     "cycle.start",
@@ -126,39 +78,7 @@ EXPECTED_CLI_SURFACE = {
     "decision.record",
     "delivery",
     "delivery.record",
-    "dispatch",
-    "dispatch.claim-next",
-    "dispatch.export-csv",
-    "dispatch.file-claim",
-    "dispatch.file-claim.add",
-    "dispatch.file-claim.list",
-    "dispatch.file-claim.release",
-    "dispatch.import-csv",
-    "dispatch.integrate",
-    "dispatch.native-export",
-    "dispatch.native-import",
-    "dispatch.plan",
-    "dispatch.provider",
-    "dispatch.provider.cancel",
-    "dispatch.provider.collect",
-    "dispatch.provider.reconcile",
-    "dispatch.provider.start",
-    "dispatch.provider.status",
-    "dispatch.recover-stale",
-    "dispatch.route-advice",
-    "dispatch.run",
-    "dispatch.status",
-    "dispatch.verify-attempt",
     "doctor",
-    "event",
-    "event.export",
-    "event.validate",
-    "evidence",
-    "evidence.record",
-    "executor",
-    "executor.allow-prefix",
-    "executor.allow-prefix.add",
-    "executor.allow-prefix.list",
     "failure-mode",
     "failure-mode.add",
     "finding",
@@ -166,12 +86,7 @@ EXPECTED_CLI_SURFACE = {
     "gate",
     "gate.record",
     "init",
-    "invariant",
-    "invariant.validate",
-    "kernel",
-    "kernel.doctor",
     "migrate",
-    "phase",
     "projection",
     "projection.rebuild",
     "quickstart",
@@ -181,32 +96,15 @@ EXPECTED_CLI_SURFACE = {
     "requirement",
     "requirement.add",
     "requirement.link",
-    "risk",
-    "risk.sweep-expired",
-    "scope",
-    "scope.confirm",
-    "session",
-    "session.attest",
-    "session.close",
-    "session.status",
     "status",
     "task",
     "task.accept",
-    "task.accept-ready",
     "task.add",
     "task.block",
-    "task.claim",
-    "task.complete",
-    "task.heartbeat",
-    "task.next",
-    "task.recover-stale",
-    "task.release",
-    "task.review",
+    "task.cancel",
+    "task.list",
     "task.start",
     "task.submit",
-    "task.update",
-    "test",
-    "test.record",
     "test-target",
     "test-target.add",
     "test-target.link",
@@ -217,23 +115,38 @@ EXPECTED_CLI_SURFACE = {
     "validate",
     "validation",
     "validation.record",
+    "verify",
+    "verify.run",
 }
 
 
+def copy_source_layout(target: Path) -> Path:
+    plugin_copy = target / "plugins" / "codex-project-harness"
+    plugin_copy.parent.mkdir(parents=True)
+    shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
+    for name in ["VERSION", "release.json", "pyproject.toml"]:
+        shutil.copyfile(REPO_ROOT / name, target / name)
+    return plugin_copy
+
+
 class FeatureFreezeTest(unittest.TestCase):
-    def test_versions_are_consistent_for_v1200(self) -> None:
-        plugin = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    def test_release_manifest_is_the_single_expected_version_source(self) -> None:
+        plugin = json.loads(
+            (PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
 
-        self.assertEqual((REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(), EXPECTED_PLUGIN_VERSION)
-        self.assertEqual(plugin["version"], EXPECTED_PLUGIN_VERSION)
-        self.assertEqual(harness_db.RUNTIME_VERSION, EXPECTED_RUNTIME_VERSION)
-        self.assertEqual(KERNEL_VERSION, EXPECTED_RUNTIME_VERSION)
+        self.assertEqual((REPO_ROOT / "VERSION").read_text().strip(), RELEASE["version"])
+        self.assertEqual(plugin["version"], RELEASE["version"])
+        self.assertEqual(RUNTIME_VERSION, RELEASE["runtime_version"])
+        self.assertEqual(KERNEL_VERSION, RELEASE["kernel_version"])
+        self.assertEqual(SCHEMA_VERSION, RELEASE["schema_version_runtime"])
+        self.assertEqual(harness_db.RUNTIME_VERSION, RUNTIME_VERSION)
+        self.assertEqual(harness_db.SCHEMA_VERSION, SCHEMA_VERSION)
 
-    def test_schema_version_is_29(self) -> None:
-        self.assertEqual(harness_db.SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION)
+    def test_schema_version_and_repair_message_use_the_canonical_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repair_plan = harness_db.repair(Path(temp), dry_run=True)
-        self.assertIn("repair action: migrate schema to 29", repair_plan)
+        self.assertIn(f"repair action: migrate schema to {SCHEMA_VERSION}", repair_plan)
 
     def test_feature_freeze_rejects_schema_growth(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -243,20 +156,23 @@ class FeatureFreezeTest(unittest.TestCase):
                 tables = {
                     row[0]
                     for row in conn.execute(
-                        "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'"
+                        "select name from sqlite_master "
+                        "where type='table' and name not like 'sqlite_%'"
                     )
                 }
 
+        self.assertEqual(len(EXPECTED_TABLES), 27)
         self.assertEqual(tables, EXPECTED_TABLES)
 
     def test_feature_freeze_rejects_cli_surface_growth(self) -> None:
+        self.assertEqual(len(EXPECTED_CLI_SURFACE), 53)
         self.assertEqual(_cli_surface(harness.build_parser()), EXPECTED_CLI_SURFACE)
 
-    def test_feature_freeze_protects_public_files_and_required_kernel_contracts(self) -> None:
+    def test_feature_freeze_protects_public_files(self) -> None:
         skill_dirs = {path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()}
-        schema_files = {path.name for path in (PLUGIN_ROOT / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
-        core_files = {path.name for path in (PLUGIN_ROOT / "core").iterdir() if path.is_file() and path.suffix == ".py"}
-        script_files = {path.name for path in (PLUGIN_ROOT / "scripts").iterdir() if path.is_file() and path.suffix == ".py"}
+        schema_files = {path.name for path in (PLUGIN_ROOT / "schemas").glob("*.json")}
+        core_files = {path.name for path in (PLUGIN_ROOT / "core").glob("*.py")}
+        script_files = {path.name for path in (PLUGIN_ROOT / "scripts").glob("*.py")}
         hook_files = {path.name for path in (PLUGIN_ROOT / "hooks").iterdir() if path.is_file()}
 
         self.assertEqual(skill_dirs, set(REQUIRED_SKILLS))
@@ -268,61 +184,29 @@ class FeatureFreezeTest(unittest.TestCase):
 
     def test_validate_structure_rejects_extra_schema_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            temp_root = Path(temp)
-            plugin_copy = temp_root / "plugins" / "codex-project-harness"
-            plugin_copy.parent.mkdir(parents=True)
-            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
-            (temp_root / "VERSION").write_text(EXPECTED_PLUGIN_VERSION + "\n", encoding="utf-8")
-            (plugin_copy / "schemas" / "unexpected.schema.json").write_text("{}", encoding="utf-8")
-
-            result = subprocess.run(
-                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            plugin_copy = copy_source_layout(Path(temp))
+            (plugin_copy / "schemas" / "unexpected.schema.json").write_text("{}")
+            result = self.run_structure(plugin_copy)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected schema file", result.stdout)
 
     def test_validate_structure_rejects_extra_hook_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            temp_root = Path(temp)
-            plugin_copy = temp_root / "plugins" / "codex-project-harness"
-            plugin_copy.parent.mkdir(parents=True)
-            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
-            (temp_root / "VERSION").write_text(EXPECTED_PLUGIN_VERSION + "\n", encoding="utf-8")
-            (plugin_copy / "hooks" / "unexpected.py").write_text("print('unexpected')\n", encoding="utf-8")
-
-            result = subprocess.run(
-                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            plugin_copy = copy_source_layout(Path(temp))
+            (plugin_copy / "hooks" / "unexpected.py").write_text("print('unexpected')\n")
+            result = self.run_structure(plugin_copy)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected hook file", result.stdout)
 
     def test_internal_core_modules_are_not_frozen_by_filename(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            temp_root = Path(temp)
-            plugin_copy = temp_root / "plugins" / "codex-project-harness"
-            plugin_copy.parent.mkdir(parents=True)
-            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
-            shutil.copyfile(REPO_ROOT / "VERSION", temp_root / "VERSION")
-            shutil.copyfile(REPO_ROOT / "pyproject.toml", temp_root / "pyproject.toml")
+            plugin_copy = copy_source_layout(Path(temp))
             (plugin_copy / "core" / "internal_delivery_module.py").write_text(
-                '"""Private Kernel implementation module."""\n',
-                encoding="utf-8",
+                '\"\"\"Private Kernel implementation module.\"\"\"\n'
             )
-
-            result = subprocess.run(
-                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result = self.run_structure(plugin_copy)
             from kafa.cli import static_plugin_structure
 
             structure_ok, structure_details = static_plugin_structure(plugin_copy)
@@ -332,23 +216,21 @@ class FeatureFreezeTest(unittest.TestCase):
 
     def test_validate_structure_rejects_a_missing_imported_core_module(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            temp_root = Path(temp)
-            plugin_copy = temp_root / "plugins" / "codex-project-harness"
-            plugin_copy.parent.mkdir(parents=True)
-            shutil.copytree(PLUGIN_ROOT, plugin_copy, ignore=shutil.ignore_patterns("__pycache__"))
-            shutil.copyfile(REPO_ROOT / "VERSION", temp_root / "VERSION")
-            shutil.copyfile(REPO_ROOT / "pyproject.toml", temp_root / "pyproject.toml")
+            plugin_copy = copy_source_layout(Path(temp))
             (plugin_copy / "core" / "store.py").unlink()
-
-            result = subprocess.run(
-                [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result = self.run_structure(plugin_copy)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing local Python import: core.store", result.stdout)
+
+    @staticmethod
+    def run_structure(plugin_copy: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(plugin_copy / "scripts" / "validate_structure.py"), str(plugin_copy)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def _cli_surface(parser: argparse.ArgumentParser) -> set[str]:

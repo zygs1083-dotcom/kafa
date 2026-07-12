@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-12
+goal: Harden schema-30 migration exclusion, projection rollback coherence, and
+  high-risk review-status enforcement without expanding the local-only kernel

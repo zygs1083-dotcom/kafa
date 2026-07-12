@@ -1,0 +1,121 @@
+{
+  "agent_runtime_seconds": 34.378938,
+  "estimated_cost": null,
+  "evaluation_source": {
+    "generated_at": "2026-07-12T06:38:49+00:00",
+    "git_dirty": true,
+    "git_head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "source_scope": [
+      "kafa/",
+      "plugins/",
+      "tests/",
+      "benchmarks/",
+      "VERSION",
+      "docs/runtime/fresh-skill-eval-prompts.md",
+      "docs/runtime/skill-eval-transcript-fixture.txt",
+      "pyproject.toml",
+      "release.json"
+    ],
+    "status_entry_count": 181,
+    "status_sha256": "8666fc5b827d80cb35b10469fc936021a61bceb925ef0113dd7f683850ca0811",
+    "workspace_sha256": "625faadd5af8e0247a8d053b088652c5d10d4dfe5a44488d3f9caf6c58b88c60"
+  },
+  "evidence_scope": "live-codex",
+  "live_skipped": false,
+  "live_status": "passed",
+  "matrix": {
+    "codex_available": true,
+    "container_available": true,
+    "git_version": "git version 2.54.0",
+    "live_skipped_reasons": [],
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "profile": "live-codex",
+    "python_version": "3.14.5",
+    "sqlite_stress": false
+  },
+  "mode": "live-codex",
+  "native_host": {
+    "resolved_path": "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js",
+    "sha256": "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406",
+    "source": "path-discovery",
+    "trust": "local-capability-only-not-delivery-provenance"
+  },
+  "scenarios": [
+    {
+      "category": "live-codex",
+      "details": {
+        "capability_status": "passed",
+        "changed_files": [
+          "candidate.py"
+        ],
+        "codex_version": "codex-cli 0.143.0",
+        "controller_state_unchanged_during_native": true,
+        "controller_test_unchanged": true,
+        "controller_verify_returncode": 0,
+        "controller_verify_status": "passed",
+        "exclusive_files": [
+          "candidate.py"
+        ],
+        "execution_count": 1,
+        "false_pass_count": 0,
+        "human_intervention_count": 0,
+        "integrated_files": [
+          "candidate.py"
+        ],
+        "last_message_recorded": true,
+        "native_returncode": 0,
+        "native_runtime_seconds": 34.378938,
+        "native_runtime_source": "controller-wall-clock",
+        "native_token_count": 49936,
+        "native_token_scope": "native-producers-only",
+        "native_token_source": "codex-json-turn.completed",
+        "native_usage": {
+          "cached_input_tokens": 38400,
+          "input_tokens": 49331,
+          "output_tokens": 605,
+          "reasoning_output_tokens": 0,
+          "token_count": 49936
+        },
+        "producer_changed_files": [
+          "candidate.py"
+        ],
+        "producer_scope_valid": true,
+        "producer_workspace_isolated": true,
+        "provider_surface_absent": true,
+        "retired_host_tables": [],
+        "task_status": "submitted",
+        "test_file_unchanged": true,
+        "validation_count": 1,
+        "workload_family": "isolated-one-file-value-flip-v1",
+        "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
+        "workload_units": 1
+      },
+      "duration_seconds": 35.771951,
+      "mode": "live-codex",
+      "name": "native_codex_edit_and_controller_verify",
+      "pass": true,
+      "skip_reason": ""
+    }
+  ],
+  "summary": {
+    "duration_seconds": 35.77198,
+    "expected_human_review_required_count": 0,
+    "failed_count": 0,
+    "false_pass_count": 0,
+    "forged_evidence_block_count": 0,
+    "human_intervention_count": 0,
+    "passed_count": 1,
+    "scenario_count": 1,
+    "scenario_pass_rate": 1.0,
+    "skipped_count": 0,
+    "sqlite_lock_error_count": 0
+  },
+  "token_count": 49936,
+  "token_usage": {
+    "cached_input_tokens": 38400,
+    "input_tokens": 49331,
+    "output_tokens": 605,
+    "reasoning_output_tokens": 0,
+    "token_count": 49936
+  }
+}

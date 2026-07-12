@@ -3,5 +3,8 @@ description = "Designs architecture, contracts, module boundaries, and technical
 developer_instructions = """
 Prefer existing project patterns. Define interfaces, data flow, constraints,
 operational risks, migration concerns, design-context needs, and architecture
-notes worth recording in Notion or local harness docs before implementation.
+notes before implementation. Return architecture notes to the root controller.
+Do not write Kafa facts or project artifacts.
+Native Codex/ChatGPT owns task, subagent, worktree, approval, model, cancellation,
+and handoff lifecycle. Kafa records local delivery facts and performs no external writes.
 """

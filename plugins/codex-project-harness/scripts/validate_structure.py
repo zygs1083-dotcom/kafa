@@ -12,22 +12,12 @@ from pathlib import Path
 
 REQUIRED_SKILLS = [
     "project-harness",
-    "project-bootstrap",
-    "project-runtime",
-    "requirement-baseline",
-    "team-architecture",
     "minimal-safe-change",
     "test-first-delivery",
     "bug-fix-loop",
     "independent-quality-gate",
-    "delivery-readiness",
     "harness-audit",
     "project-retrospective",
-]
-
-REQUIRED_REFERENCES = [
-    "collaboration-tools.md",
-    "tool-adapters.md",
 ]
 
 REQUIRED_CORE = [
@@ -36,25 +26,11 @@ REQUIRED_CORE = [
 ]
 
 REQUIRED_SCRIPTS = [
-    "init_project_harness.py",
     "validate_structure.py",
     "harness_lib.py",
-    "harness_wrapper.py",
-    "harness_status.py",
-    "update_phase.py",
-    "add_acceptance.py",
-    "add_failure_mode.py",
-    "add_task.py",
-    "update_task.py",
-    "record_decision.py",
-    "record_validation.py",
-    "record_quality_gate.py",
-    "record_delivery.py",
-    "validate_harness_state.py",
     "harness_db.py",
     "harness.py",
     "run_runtime_smoke.py",
-    "run_forward_eval.py",
     "run_skill_eval.py",
     "run_agent_e2e_eval.py",
 ]
@@ -63,6 +39,25 @@ REQUIRED_HOOKS = [
     "hooks.json",
     "harness_hook.py",
 ]
+REQUIRED_HOOK_EVENTS = ["SessionStart", "SubagentStart", "Stop"]
+REQUIRED_AGENT_TEMPLATES = ["architect.toml", "developer.toml", "qa-reviewer.toml"]
+RETIRED_CORE_FILES = ["agent_provider.py", "agent_runner.py", "connector_trust.py"]
+FORBIDDEN_RUNTIME_LITERALS = [
+    "gh api",
+    "api.github.com",
+    "api.linear.app",
+    "api.notion.com",
+    "api.figma.com",
+    "slack.com/api",
+    "github_token",
+    "gh_token",
+    "linear_api_key",
+    "notion_token",
+    "figma_token",
+    "slack_bot_token",
+    "harness_connector_key",
+]
+FORBIDDEN_PROVIDER_IMPORTS = {"github", "linear", "notion_client", "figma", "slack_sdk", "openai_codex"}
 
 REQUIRED_SCHEMAS = [
     "project-state.schema.json",
@@ -70,41 +65,17 @@ REQUIRED_SCHEMAS = [
     "requirement.schema.json",
     "acceptance.schema.json",
     "task.schema.json",
-    "task-attempt.schema.json",
     "task-test-target.schema.json",
     "event.schema.json",
     "quality-gate.schema.json",
     "failure-mode.schema.json",
     "validation.schema.json",
-    "evidence.schema.json",
-    "test.schema.json",
     "test-target.schema.json",
+    "execution.schema.json",
     "finding.schema.json",
     "invalidation.schema.json",
     "delivery.schema.json",
-    "adapter.schema.json",
-    "adapter-action.schema.json",
-    "connector-budget.schema.json",
-    "connector-profile.schema.json",
-    "advisory-fallback.schema.json",
-    "ci-verification.schema.json",
-    "command-log.schema.json",
-    "codex-fanout-export.schema.json",
-    "external-session-verification.schema.json",
-    "agent.schema.json",
-    "agent-session.schema.json",
-    "session-attestation.schema.json",
     "baseline.schema.json",
-    "dispatch-run.schema.json",
-    "dispatch-assignment.schema.json",
-    "dispatch-worktree.schema.json",
-    "task-file-claim.schema.json",
-    "agent-report.schema.json",
-    "agent-provider-session.schema.json",
-    "agent-provider-event.schema.json",
-    "sandbox-execution.schema.json",
-    "integration-attempt.schema.json",
-    "runtime-snapshot.schema.json",
 ]
 
 
@@ -114,6 +85,28 @@ def pep440_version(release_version: str) -> str:
         base, beta = release_version.split(marker, 1)
         return f"{base}b{beta}"
     return release_version
+
+
+def python_constants(path: Path) -> dict[str, object]:
+    """Read literal and same-module alias constants without importing code."""
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return {}
+    resolved: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        try:
+            value: object = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            value = resolved.get(node.value.id) if isinstance(node.value, ast.Name) else None
+        for target in targets:
+            if isinstance(target, ast.Name):
+                resolved[target.id] = value
+    return resolved
 
 
 def main() -> int:
@@ -134,8 +127,22 @@ def main() -> int:
     if data.get("name") != "codex-project-harness":
         errors.append("plugin name must be codex-project-harness")
     version_file = repo_root / "VERSION"
-    if version_file.exists() and data.get("version") != version_file.read_text(encoding="utf-8").strip():
-        errors.append("plugin version must match root VERSION")
+    release_manifest_path = repo_root / "release.json"
+    release_manifest: dict[str, object] = {}
+    if release_manifest_path.exists():
+        try:
+            parsed_release = json.loads(release_manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(parsed_release, dict):
+                raise ValueError("root must be an object")
+            release_manifest = parsed_release
+        except Exception as exc:
+            errors.append(f"invalid release.json: {exc}")
+    version_text = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else ""
+    release_version = str(release_manifest.get("version", "") or version_text)
+    if release_manifest and version_text != release_version:
+        errors.append("root VERSION must match release.json")
+    if release_version and data.get("version") != release_version:
+        errors.append("plugin version must match release.json")
     if "schema_version" in data:
         errors.append("plugin.json must not use legacy schema_version")
     if "display_name" in data:
@@ -146,7 +153,6 @@ def main() -> int:
         errors.append('plugin skills must be the relative string "./skills/"')
 
     pyproject = repo_root / "pyproject.toml"
-    release_version = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else ""
     if not pyproject.exists():
         errors.append("missing pyproject.toml")
     else:
@@ -159,19 +165,37 @@ def main() -> int:
         scripts = project.get("scripts", {}) if isinstance(project, dict) else {}
         if project.get("name") != "kafa":
             errors.append("pyproject project.name must be kafa")
-        if release_version and project.get("version") != pep440_version(release_version):
-            errors.append("pyproject version must match root VERSION")
+        expected_package_version = str(
+            release_manifest.get("pep440_version", "") or pep440_version(release_version)
+        )
+        if expected_package_version and project.get("version") != expected_package_version:
+            errors.append("pyproject version must match release.json")
         if project.get("requires-python") != ">=3.11":
             errors.append("pyproject requires-python must be >=3.11")
         dependencies = project.get("dependencies", [])
         if not isinstance(dependencies, list) or dependencies:
             errors.append("pyproject base dependencies must remain empty")
         optional_dependencies = project.get("optional-dependencies", {})
-        host_codex = optional_dependencies.get("host-codex", []) if isinstance(optional_dependencies, dict) else []
-        if not isinstance(host_codex, list) or "openai-codex>=0.1.0b3" not in host_codex:
-            errors.append("pyproject optional dependency host-codex must include openai-codex>=0.1.0b3")
+        if isinstance(optional_dependencies, dict):
+            flattened = [str(item).lower() for values in optional_dependencies.values() if isinstance(values, list) for item in values]
+            if "host-codex" in optional_dependencies or any("openai-codex" in item for item in flattened):
+                errors.append("pyproject must not declare the retired Host Codex SDK dependency")
         if scripts.get("kafa") != "kafa.cli:main":
             errors.append("pyproject must expose kafa = kafa.cli:main")
+
+    if release_manifest:
+        runtime_identity = python_constants(root / "core" / "__init__.py")
+        for constant, field in [
+            ("RUNTIME_VERSION", "runtime_version"),
+            ("KERNEL_VERSION", "kernel_version"),
+            ("SCHEMA_VERSION", "schema_version_runtime"),
+        ]:
+            if runtime_identity.get(constant) != release_manifest.get(field):
+                errors.append(
+                    f"{constant} must match release.json {field}: "
+                    f"runtime={runtime_identity.get(constant)!r} "
+                    f"manifest={release_manifest.get(field)!r}"
+                )
 
     interface = data.get("interface")
     if not isinstance(interface, dict):
@@ -220,16 +244,16 @@ def main() -> int:
     for skill in extra_skills:
         errors.append(f"unexpected skill directory: {root / 'skills' / skill}")
 
-    for ref in REQUIRED_REFERENCES:
-        ref_path = root / "references" / ref
-        if not ref_path.exists():
-            errors.append(f"missing reference file: {ref_path}")
-
     for core_file in REQUIRED_CORE:
         core_path = root / "core" / core_file
         if not core_path.exists():
             errors.append(f"missing kernel core file: {core_path}")
+    for retired in RETIRED_CORE_FILES:
+        retired_path = root / "core" / retired
+        if retired_path.exists():
+            errors.append(f"retired core file exists: {retired_path}")
     errors.extend(local_python_import_errors(root))
+    errors.extend(local_only_runtime_errors(root))
 
     for script in REQUIRED_SCRIPTS:
         script_path = root / "scripts" / script
@@ -247,9 +271,16 @@ def main() -> int:
             continue
         if hook_path.suffix == ".json":
             try:
-                json.loads(hook_path.read_text(encoding="utf-8"))
+                hook_payload = json.loads(hook_path.read_text(encoding="utf-8"))
             except Exception as exc:
                 errors.append(f"invalid hook json {hook_path}: {exc}")
+            else:
+                actual_events = set(hook_payload.get("hooks", {})) if isinstance(hook_payload, dict) else set()
+                if actual_events != set(REQUIRED_HOOK_EVENTS):
+                    errors.append(
+                        f"hook event inventory mismatch: actual={sorted(actual_events)} "
+                        f"expected={sorted(REQUIRED_HOOK_EVENTS)}"
+                    )
     if hooks_dir.exists():
         hook_files = {path.name for path in hooks_dir.iterdir() if path.is_file()}
         for hook in sorted(hook_files - set(REQUIRED_HOOKS)):
@@ -257,9 +288,30 @@ def main() -> int:
     else:
         errors.append(f"missing hooks directory: {hooks_dir}")
 
-    runtime_cli = root / "skills" / "project-runtime" / "scripts" / "harness.py"
+    runtime_cli = root / "skills" / "project-harness" / "scripts" / "harness.py"
     if not runtime_cli.exists():
-        errors.append(f"missing project-runtime self-contained CLI: {runtime_cli}")
+        errors.append(f"missing project-harness self-contained CLI: {runtime_cli}")
+
+    templates_dir = root / "templates" / "agents"
+    template_files = {
+        path.name for path in templates_dir.iterdir() if path.is_file() and path.suffix == ".toml"
+    } if templates_dir.exists() else set()
+    if template_files != set(REQUIRED_AGENT_TEMPLATES):
+        errors.append(
+            f"agent template inventory mismatch: actual={sorted(template_files)} "
+            f"expected={sorted(REQUIRED_AGENT_TEMPLATES)}"
+        )
+    for template_name in REQUIRED_AGENT_TEMPLATES:
+        template_path = templates_dir / template_name
+        try:
+            payload = tomllib.loads(template_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append(f"invalid agent template {template_path}: {exc}")
+            continue
+        if set(payload) != {"name", "description", "developer_instructions"}:
+            errors.append(f"invalid agent template fields: {template_path}")
+        if payload.get("name") != template_name.removesuffix(".toml"):
+            errors.append(f"agent template name mismatch: {template_path}")
 
     for schema in REQUIRED_SCHEMAS:
         schema_path = root / "schemas" / schema
@@ -328,6 +380,37 @@ def local_python_import_errors(root: Path) -> list[str]:
                 continue
             if module and module not in available_core:
                 errors.add(f"missing local Python import: core.{module} referenced by {path.relative_to(root)}")
+    return sorted(errors)
+
+
+def local_only_runtime_errors(root: Path) -> list[str]:
+    source_paths = [
+        *(root / "core").glob("*.py"),
+        *(root / "scripts").glob("*.py"),
+        *(root / "hooks").glob("*.py"),
+    ]
+    errors: set[str] = set()
+    for path in source_paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            errors.add(f"invalid local-only runtime source: {path.relative_to(root)}: {exc}")
+            continue
+        lowered = text.lower()
+        if path.name != "validate_structure.py":
+            for marker in FORBIDDEN_RUNTIME_LITERALS:
+                if marker in lowered:
+                    errors.add(f"external runtime marker {marker!r} in {path.relative_to(root)}")
+        for node in ast.walk(tree):
+            modules: list[str] = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module]
+            for module in modules:
+                if module.split(".", 1)[0] in FORBIDDEN_PROVIDER_IMPORTS:
+                    errors.add(f"external provider import {module!r} in {path.relative_to(root)}")
     return sorted(errors)
 
 

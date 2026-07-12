@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Project Harness Immutable Execution",
+  "description": "Insert-only controller execution fact. Stored properties are immutable after creation.",
+  "type": "object",
+  "readOnly": true,
+  "required": [
+    "id",
+    "cycle_id",
+    "candidate_sha",
+    "command",
+    "exit_code",
+    "stdout_sha256",
+    "artifact_path",
+    "executed_count",
+    "result_format",
+    "semantic_status",
+    "runner",
+    "sandbox_status",
+    "no_network",
+    "policy_status",
+    "created_at"
+  ],
+  "properties": {
+    "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
+    "candidate_sha": { "type": "string" },
+    "target_id": { "type": ["string", "null"] },
+    "command": { "type": "string" },
+    "exit_code": { "type": "integer" },
+    "stdout_sha256": { "type": "string" },
+    "artifact_path": { "type": "string" },
+    "executed_count": { "type": "integer", "minimum": 0 },
+    "result_format": { "type": "string" },
+    "semantic_status": { "type": "string" },
+    "runner": { "type": "string", "enum": ["local", "container"] },
+    "sandbox_status": { "type": "string" },
+    "no_network": { "type": "integer", "enum": [0, 1] },
+    "policy_status": { "type": "string" },
+    "created_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

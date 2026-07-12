@@ -18,11 +18,6 @@ import harness_db
 from core.store import InMemoryStore, SqliteStore
 
 
-def task_revision(root: Path, task_id: str) -> int:
-    with harness_db.connection(root) as conn:
-        return int(conn.execute("select revision from tasks where id = ?", (task_id,)).fetchone()[0])
-
-
 class StoreSeamTest(unittest.TestCase):
     def use_in_memory_store(self, root: Path) -> InMemoryStore:
         store = InMemoryStore(root)
@@ -39,18 +34,19 @@ class StoreSeamTest(unittest.TestCase):
             harness_db.init_runtime(root)
             harness_db.add_acceptance(root, "AC1", "Example acceptance")
             harness_db.add_task(root, "T1", "Example task", owner="developer", acceptance="AC1")
-            producer_token, _ = harness_db.claim_task(root, "T1", "developer", task_revision(root, "T1"))
-            harness_db.start_task(root, "T1", "developer", lease_token=producer_token, expected_revision=task_revision(root, "T1"))
-            harness_db.submit_task(root, "T1", "implemented", agent="developer", lease_token=producer_token, expected_revision=task_revision(root, "T1"))
-            reviewer_token, _ = harness_db.review_task(root, "T1", "qa-reviewer", task_revision(root, "T1"))
-            harness_db.accept_task(root, "T1", "accepted", agent="qa-reviewer", lease_token=reviewer_token, expected_revision=task_revision(root, "T1"))
+            harness_db.start_task(root, "T1")
+            harness_db.submit_task(root, "T1", "implemented", context_id="producer-context")
+            harness_db.accept_task(root, "T1", "accepted")
 
             with harness_db.connection(root) as conn:
                 status = conn.execute("select status from tasks where id = 'T1'").fetchone()[0]
 
             self.assertEqual(status, "accepted")
+            self.assertFalse(
+                (root / ".ai-team/state/harness.db.operation.lock").exists()
+            )
 
-    def test_store_transaction_before_commit_rolls_back_invariant_failure(self) -> None:
+    def test_store_transaction_before_commit_rolls_back_missing_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.use_in_memory_store(root)
@@ -62,16 +58,17 @@ class StoreSeamTest(unittest.TestCase):
                 with harness_db.transaction(root, touched=[("task", "T1")]) as conn:
                     conn.execute(
                         """
-                        update tasks
-                        set status = 'accepted', evidence = 'manual', accepted_by = 'developer'
+                        update tasks set status = 'accepted', accepted_by = 'root-controller'
                         where id = 'T1'
                         """
                     )
 
             with harness_db.connection(root) as conn:
-                status, accepted_by = conn.execute("select status, accepted_by from tasks where id = 'T1'").fetchone()
+                status, evidence, accepted_by = conn.execute(
+                    "select status, evidence, accepted_by from tasks where id = 'T1'"
+                ).fetchone()
 
-            self.assertEqual((status, accepted_by), ("ready", ""))
+            self.assertEqual((status, evidence, accepted_by), ("planned", "", ""))
 
     def test_store_seam_static_boundaries(self) -> None:
         store_text = (PLUGIN_ROOT / "core/store.py").read_text(encoding="utf-8")

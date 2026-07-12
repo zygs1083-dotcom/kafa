@@ -15,10 +15,18 @@
     "failure_mode_coverage": { "type": "string" },
     "quality_gate": { "type": "string" },
     "data_config_notes": { "type": "string" },
-    "collaboration_links": { "type": "string" },
     "known_gaps": { "type": "string" },
     "handoff": { "type": "string" },
+    "decision_status": {
+      "type": "string",
+      "enum": [
+        "delivered",
+        "accepted-risk",
+        "same-context-degraded",
+        "historical-migrated"
+      ]
+    },
     "created_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }
