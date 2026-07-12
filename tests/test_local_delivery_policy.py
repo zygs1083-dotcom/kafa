@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import os
 import sqlite3
 import subprocess
 import sys
@@ -22,8 +23,10 @@ for path in (PLUGIN_ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 from core.cycle_ledger import current_candidate_sha  # noqa: E402
+from core.projections import PROJECTION_ROLLBACK_PATHS  # noqa: E402
 from core.schema_lifecycle import create_schema30  # noqa: E402
 import harness_db  # noqa: E402
+import harness_lib  # noqa: E402
 
 
 def run_harness(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -37,11 +40,14 @@ def run_harness(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def prepare_cli_validation(root: Path) -> None:
+    harness_db.render_all(root)
+
+
+def prepare_cli_candidate_config(root: Path) -> None:
     (root / ".gitignore").write_text(
         "\n".join(harness_db.RUNTIME_GITIGNORE_PATTERNS) + "\n",
         encoding="utf-8",
     )
-    harness_db.render_all(root)
 
 
 def delivery_module():
@@ -568,6 +574,18 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
 
 
 class Schema30DeliveryDecisionTests(unittest.TestCase):
+    def test_candidate_identity_excludes_only_exact_generated_non_state_paths(self) -> None:
+        expected = {
+            path.as_posix()
+            for path in PROJECTION_ROLLBACK_PATHS
+            if path.as_posix().startswith("docs/harness/")
+        } | {
+            ".codex/agents/architect.toml",
+            ".codex/agents/developer.toml",
+            ".codex/agents/qa-reviewer.toml",
+        }
+        self.assertEqual(harness_lib.HARNESS_EXACT_SOURCE_PATHS, expected)
+
     def test_schema30_degraded_gate_cannot_pass_high_risk_with_accepted_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -593,6 +611,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             degraded_root = Path(temp) / "degraded"
             degraded_root.mkdir()
+            prepare_cli_candidate_config(degraded_root)
             degraded_db = create_schema30_delivery_fixture(
                 degraded_root,
                 failure_mode_status="accepted",
@@ -613,6 +632,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
 
             reviewed_root = Path(temp) / "reviewed"
             reviewed_root.mkdir()
+            prepare_cli_candidate_config(reviewed_root)
             create_schema30_delivery_fixture(
                 reviewed_root,
                 failure_mode_status="accepted",
@@ -987,11 +1007,671 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
                 capture_output=True,
             )
             create_schema30_delivery_fixture(root)
+            reviewed_candidate = current_candidate_sha(root)
             (root / "dirty.txt").write_text("not reviewed\n", encoding="utf-8")
 
+            changed_candidate = current_candidate_sha(root)
             issues = schema30_issues(root)
 
-        self.assertIn("git worktree is dirty after quality gate", " ".join(issues))
+        self.assertNotEqual(reviewed_candidate, changed_candidate)
+        self.assertIn("current candidate", " ".join(issues))
+
+    def test_ignored_runtime_source_change_invalidates_schema30_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            (root / ".gitignore").write_text(
+                "\n".join(
+                    [
+                        *harness_db.RUNTIME_GITIGNORE_PATTERNS,
+                        "runtime_extension.py",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "loader.py").write_text(
+                "import runtime_extension\n",
+                encoding="utf-8",
+            )
+            extension = root / "runtime_extension.py"
+            extension.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", ".gitignore", "candidate.py", "loader.py"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "candidate with ignored runtime module"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            create_schema30_delivery_fixture(root)
+            reviewed_candidate = current_candidate_sha(root)
+            self.assertEqual(schema30_issues(root), [])
+
+            extension.write_text(
+                "raise RuntimeError('ignored runtime drift')\n",
+                encoding="utf-8",
+            )
+            changed_candidate = current_candidate_sha(root)
+            issues = schema30_issues(root)
+
+        self.assertNotEqual(reviewed_candidate, changed_candidate)
+        self.assertIn("current candidate", " ".join(issues))
+
+    def test_candidate_identity_excludes_top_level_dependency_environment_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            (root / ".gitignore").write_text(
+                ".venv/\n.ruff_cache/\nruntime_extension.py\n",
+                encoding="utf-8",
+            )
+            (root / "loader.py").write_text(
+                "import runtime_extension\n",
+                encoding="utf-8",
+            )
+            extension = root / "runtime_extension.py"
+            extension.write_text("VALUE = 1\n", encoding="utf-8")
+            lockfile = root / "requirements.lock"
+            lockfile.write_text("example==1\n", encoding="utf-8")
+            environment_python = root / ".venv/bin/python"
+            environment_python.parent.mkdir(parents=True)
+            environment_python.write_bytes(b"generated environment executable")
+            tool_cache = root / ".ruff_cache/state"
+            tool_cache.parent.mkdir(parents=True)
+            tool_cache.write_text("cache v1\n", encoding="utf-8")
+            adjacent_python = root / ".venvish/bin/python"
+            adjacent_python.parent.mkdir(parents=True)
+            adjacent_python.write_bytes(b"ordinary ignored source")
+            subprocess.run(
+                ["git", "add", ".gitignore", "loader.py", "requirements.lock"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "candidate with local dependency environment"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            original_is_symlink = Path.is_symlink
+
+            def report_environment_symlink(path: Path) -> bool:
+                if path.resolve() == environment_python.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", new=report_environment_symlink):
+                original = current_candidate_sha(root)
+                tool_cache.write_text("cache v2\n", encoding="utf-8")
+                cache_changed = current_candidate_sha(root)
+                extension.write_text("VALUE = 2\n", encoding="utf-8")
+                ignored_source_changed = current_candidate_sha(root)
+                lockfile.write_text("example==2\n", encoding="utf-8")
+                lockfile_changed = current_candidate_sha(root)
+
+            self.assertEqual(original, cache_changed)
+            self.assertNotEqual(original, ignored_source_changed)
+            self.assertNotEqual(ignored_source_changed, lockfile_changed)
+
+            def report_adjacent_symlink(path: Path) -> bool:
+                if path.resolve() == adjacent_python.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", new=report_adjacent_symlink):
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    current_candidate_sha(root)
+
+    def test_content_candidate_identity_excludes_top_level_dependency_environment_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            environment_python = root / ".venv/bin/python"
+            environment_python.parent.mkdir(parents=True)
+            environment_python.write_bytes(b"generated environment executable")
+            tool_cache = root / ".ruff_cache/state"
+            tool_cache.parent.mkdir(parents=True)
+            tool_cache.write_text("cache v1\n", encoding="utf-8")
+            adjacent_python = root / ".venvish/bin/python"
+            adjacent_python.parent.mkdir(parents=True)
+            adjacent_python.write_bytes(b"ordinary source")
+            original_is_symlink = Path.is_symlink
+
+            def report_environment_symlink(path: Path) -> bool:
+                if path.resolve() == environment_python.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", new=report_environment_symlink):
+                original = current_candidate_sha(root)
+                tool_cache.write_text("cache v2\n", encoding="utf-8")
+                cache_changed = current_candidate_sha(root)
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                changed = current_candidate_sha(root)
+            self.assertEqual(original, cache_changed)
+            self.assertNotEqual(original, changed)
+
+            def report_adjacent_symlink(path: Path) -> bool:
+                if path.resolve() == adjacent_python.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", new=report_adjacent_symlink):
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    current_candidate_sha(root)
+
+    def test_versioned_dependency_named_root_remains_candidate_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            (root / ".gitignore").write_text(".venv/*\n", encoding="utf-8")
+            tracked = root / ".venv/project_source.py"
+            tracked.parent.mkdir(parents=True)
+            tracked.write_text("VALUE = 1\n", encoding="utf-8")
+            ignored = root / ".venv/runtime_extension.py"
+            ignored.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", ".gitignore"], cwd=root, check=True
+            )
+            subprocess.run(
+                ["git", "add", "-f", ".venv/project_source.py"], cwd=root, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "versioned dependency-named source root"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            original = current_candidate_sha(root)
+            ignored.write_text("VALUE = 2\n", encoding="utf-8")
+            changed = current_candidate_sha(root)
+
+        self.assertNotEqual(original, changed)
+
+    def test_candidate_identity_binds_gitignore_and_non_generated_reserved_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            gitignore = root / ".gitignore"
+            gitignore.write_text("generated/\n", encoding="utf-8")
+            loader = root / "loader.py"
+            loader.write_text(
+                "from pathlib import Path\n"
+                "CONFIG = Path('.gitignore').read_text()\n"
+                "EXTENSION = Path('docs/harness/runtime_extension.py').read_text()\n",
+                encoding="utf-8",
+            )
+            harness_extension = root / "docs/harness/runtime_extension.py"
+            harness_extension.parent.mkdir(parents=True)
+            harness_extension.write_text("VALUE = 1\n", encoding="utf-8")
+            agent_extension = root / ".codex/agents/runtime_extension.py"
+            agent_extension.parent.mkdir(parents=True)
+            agent_extension.write_text("VALUE = 1\n", encoding="utf-8")
+            generated_projection = root / "docs/harness/delivery.md"
+            generated_projection.write_text("generated v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate source and generated view"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            original = current_candidate_sha(root)
+
+            generated_projection.write_text("generated v2\n", encoding="utf-8")
+            generated_only = current_candidate_sha(root)
+            self.assertEqual(original, generated_only)
+
+            gitignore.write_text("different-generated/\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "change runtime-readable gitignore"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            gitignore_changed = current_candidate_sha(root)
+
+            harness_extension.write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "docs/harness/runtime_extension.py"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "change non-generated harness sibling"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            harness_extension_changed = current_candidate_sha(root)
+
+            agent_extension.write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", ".codex/agents/runtime_extension.py"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "change non-generated agent sibling"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            agent_extension_changed = current_candidate_sha(root)
+
+        self.assertNotEqual(original, gitignore_changed)
+        self.assertNotEqual(gitignore_changed, harness_extension_changed)
+        self.assertNotEqual(harness_extension_changed, agent_extension_changed)
+
+    def test_no_git_candidate_identity_fails_closed_on_non_regular_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            non_regular = root / "runtime.pipe"
+            non_regular.write_bytes(b"placeholder")
+            original_is_file = Path.is_file
+            original_is_dir = Path.is_dir
+
+            def report_non_regular_file(path: Path) -> bool:
+                if path.resolve() == non_regular.resolve():
+                    return False
+                return original_is_file(path)
+
+            def report_non_regular_directory(path: Path) -> bool:
+                if path.resolve() == non_regular.resolve():
+                    return False
+                return original_is_dir(path)
+
+            with (
+                patch.object(Path, "is_file", new=report_non_regular_file),
+                patch.object(Path, "is_dir", new=report_non_regular_directory),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "non-regular"):
+                    current_candidate_sha(root)
+
+    def test_candidate_identity_binds_executable_mode_and_file_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "non-executable candidate"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            non_executable = current_candidate_sha(root)
+            source.chmod(0o755)
+            subprocess.run(
+                ["git", "update-index", "--chmod=+x", "candidate.py"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "executable candidate"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            executable = current_candidate_sha(root)
+
+            first = root / "tests/a"
+            second = root / "tests/b"
+            first.parent.mkdir()
+            first.write_bytes(b"X\0tests/b\0" + b"100644" + b"\0Y")
+            subprocess.run(["git", "add", "tests/a"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "one framed file"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            one_file = current_candidate_sha(root)
+            first.write_bytes(b"X")
+            second.write_bytes(b"Y")
+            subprocess.run(["git", "add", "tests/a", "tests/b"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "two framed files"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            two_files = current_candidate_sha(root)
+
+        self.assertNotEqual(non_executable, executable)
+        self.assertNotEqual(one_file, two_files)
+
+    def test_candidate_identity_rejects_symlink_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            original_is_symlink = Path.is_symlink
+
+            def report_candidate_as_symlink(path: Path) -> bool:
+                if path.resolve() == source.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", new=report_candidate_as_symlink):
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    current_candidate_sha(root)
+
+    def test_candidate_identity_rejects_head_only_gitlink_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Kafa Test"], cwd=root, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tests/source.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{commit},tests/submodule",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "record gitlink"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "rm", "--cached", "tests/submodule"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "non-regular.*tests/submodule"):
+                current_candidate_sha(root)
+
+    def test_candidate_identity_ignores_commit_replace_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Kafa Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tests/source.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "clean baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            clean_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{clean_commit},tests/submodule",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "head contains gitlink"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            replaced_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "rm", "--cached", "tests/submodule"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "replace", replaced_head, clean_commit],
+                cwd=root,
+                check=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "non-regular.*tests/submodule"):
+                current_candidate_sha(root)
+
+    def test_candidate_identity_rejects_missing_blob_hidden_by_replace_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Kafa Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            object_id = subprocess.run(
+                ["git", "rev-parse", "HEAD:candidate.py"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            replacement = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=root,
+                input="replacement bytes\n",
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "replace", object_id, replacement],
+                cwd=root,
+                check=True,
+            )
+            loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
+            self.assertTrue(loose_object.is_file())
+            loose_object.unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "Git object"):
+                current_candidate_sha(root)
+
+    def test_candidate_identity_ignores_ambient_git_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            ambient = Path(temp) / "ambient"
+            root.mkdir()
+            ambient.mkdir()
+            for repository in (root, ambient):
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                )
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            expected = current_candidate_sha(root)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(ambient / ".git"),
+                    "GIT_WORK_TREE": str(ambient),
+                },
+                clear=False,
+            ):
+                isolated = current_candidate_sha(root)
+
+        self.assertEqual(isolated, expected)
+
+    def test_candidate_identity_pins_root_against_local_core_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            redirected = Path(temp) / "redirected-worktree"
+            root.mkdir()
+            redirected.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "core.worktree", str(redirected)],
+                cwd=root,
+                check=True,
+            )
+
+            before = harness_lib.git_source_tree_hash(root)
+            hidden = root / "plugins/evil.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text("raise RuntimeError('must be bound')\n", encoding="utf-8")
+            after = harness_lib.git_source_tree_hash(root)
+            dirty = harness_lib.git_dirty(root)
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertNotEqual(after, before)
+        self.assertIs(dirty, True)
+
+    def test_candidate_identity_fails_closed_on_missing_tracked_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "kafa@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "candidate.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            object_id = subprocess.run(
+                ["git", "rev-parse", "HEAD:candidate.py"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
+            self.assertTrue(loose_object.is_file())
+            loose_object.unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "Git object"):
+                current_candidate_sha(root)
 
     def test_delivery_record_rejects_candidate_change_during_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -19,6 +19,16 @@ SPEC.loader.exec_module(run_runtime_smoke)
 
 
 class RuntimeSmokeContractTest(unittest.TestCase):
+    def test_local_delivery_scenario_commits_initialized_candidate_state(self) -> None:
+        result = run_runtime_smoke.scenario_local_delivery()
+
+        self.assertTrue(result["pass"], result)
+        self.assertEqual(result["commands"], [0] * 15)
+        self.assertEqual(
+            result["facts"],
+            {"executions": 1, "validations": 1, "deliveries": 1},
+        )
+
     def test_benchmark_ratio_preserves_raw_decision_value_and_threshold(self) -> None:
         below = run_runtime_smoke.directed_invariant_benchmark_result(
             initialized_returncode=0,

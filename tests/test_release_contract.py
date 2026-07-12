@@ -274,7 +274,10 @@ class ReleaseContractTest(unittest.TestCase):
 
         for runner in ["ubuntu-latest", "macos-latest", "windows-latest"]:
             self.assertIn(f"os: {runner}", workflow)
-        self.assertIn("run_isolated_install_smoke.py --repo .", workflow)
+        self.assertIn("-m pip install build", workflow)
+        self.assertIn("-m build --outdir dist", workflow)
+        self.assertIn("--wheel dist/*.whl", workflow)
+        self.assertIn("--source-archive dist/*.tar.gz", workflow)
         self.assertIn("run_agent_e2e_eval.py --mode fixture", workflow)
         self.assertIn("run_agent_e2e_eval.py --mode stability", workflow)
         self.assertIn("run_skill_eval.py", workflow)

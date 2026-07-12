@@ -92,7 +92,10 @@ class StructuredResultGateTest(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
             (root / "emit.py").write_text(
-                "from pathlib import Path\nPath('pytest.json').write_text('{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}')\n",
+                "from pathlib import Path\n"
+                "result = Path('.ai-team/runtime/pytest.json')\n"
+                "result.parent.mkdir(parents=True, exist_ok=True)\n"
+                "result.write_text('{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}')\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", "emit.py"], cwd=root, check=True)
@@ -112,7 +115,7 @@ class StructuredResultGateTest(unittest.TestCase):
                 "--result-format",
                 "pytest-json",
                 "--result-path",
-                "pytest.json",
+                ".ai-team/runtime/pytest.json",
             )
             run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
 

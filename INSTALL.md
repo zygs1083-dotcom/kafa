@@ -160,7 +160,44 @@ The migration is side-by-side and recoverable:
 5. Atomically activate the staging database.
 6. Run final doctor; if it fails after activation, restore the verified backup and preserve the failed database for diagnosis.
 
+Before atomic replacement, migration atomically persists and fsyncs a
+`recovery-required` sentinel with the manifest path. The sentinel is removed
+only after successful migration or a verified complete rollback of both the DB
+and every generated projection. A `rollback-incomplete`, hard process exit, or
+interrupted recovery keeps the sentinel fail-closed; operators must not remove
+it until the manifest has been used to recover and verify database/projection
+authority. A core caller without the mandatory projection activation validator
+is rejected and cannot report schema 30 activated.
+
+The validator proves content, not only path presence: it renders all 13 views
+from an independent temporary database snapshot and compares the live bytes.
+All production projection publication holds the project operation lock from its
+first database read through its final file write. `project-state.yaml` derives
+its timestamp from SQLite `project.updated_at`, not the render-time clock, and
+rebuild uses replace rather than merge semantics so unchanged facts are
+byte-stable and stale ad-hoc keys are removed. The exact keys include database
+`id` and `current_cycle_id` and exclude generic `blocked_reason`. During rollback, failed
+schema-30 WAL/SHM files are quarantined with the failed main database before the
+source backup is restored and opened through ordinary read-only SQLite
+semantics. A handle or sidecar that cannot be neutralized leaves
+`rollback-incomplete`; it is never masked by an immutable SQLite open.
+Core repeats independent projection content verification after the publication
+callback; callback self-report cannot activate migration. Operation-lock open
+and unlock cleanup is `BaseException`-safe and preserves the cancellation after
+releasing local and OS resources.
+Core also fingerprints the stabilized active DB before and after the callback;
+any callback database write rolls back even when its value and regenerated
+views would otherwise pass doctor.
+
 Migration artifacts are stored under `.ai-team/backups/`. Removed remote-collaboration and execution-lifecycle rows remain only in that backup and never enter the active schema 30 database.
+
+Git source inspection pins the requested root with controlled `GIT_WORK_TREE`.
+Schema 30 permits exactly 27 active tables plus SQLite's `sqlite_sequence`;
+other reserved-prefix tables are corruption, not hidden internals. Real Native
+controller verification runs from a start-verified private Git-backed snapshot
+and compares the original source again at completion. Snapshot initialization,
+hashing, and index construction ignore ambient `GIT_DIR`/global config and use
+an explicit empty template.
 
 After migration:
 
@@ -192,6 +229,21 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
 ```
 
 Do not manually replace `harness.db` unless a diagnosed failure requires operator recovery and the selected backup digest and integrity results have been independently checked.
+
+If Store or `kafa project doctor` reports `recovery-required` or
+`rollback-incomplete`, preserve the sentinel, active DB, manifest, failed DB,
+and projection backup together. Complete and verify recovery first. Only an
+ordinary pre-activation stale sentinel may be considered for removal after the
+owner is confirmed inactive and database/projection authority has been checked;
+operators must not remove a recovery-required sentinel as stale.
+
+The project `status`, `doctor`, `validate`, and `quickstart status` paths check
+this sentinel before deciding that a missing `harness.db` means uninitialized.
+They report the manifest and do-not-remove guidance and do not recommend `init`
+as a recovery action. A handled pre-activation failure clears its diagnostic
+sentinel only after the source database is verified unchanged and the bounded
+projection backup has been restored and verified; an unverified backup failure
+keeps the diagnostic sentinel.
 
 ## Isolated installation verification
 
@@ -236,6 +288,24 @@ If Codex previously pointed at this plugin manually:
 - Quote paths that contain spaces when passing `--repo`, `--plugin-path`, or `--root`.
 - Repo-scope installation writes inside the Kafa checkout. User scope writes under the current user's home directory.
 - Business-project runtime state and backups must remain ignored by Git unless the project has an explicit, reviewed policy to do otherwise.
+
+在项目根创建文档建议的 `.venv/` 不会使 candidate identity 因解释器符号链接失效。
+Kafa 仅排除精确、未版本化的 top-level dependency/tool environment：`.venv/`、
+`venv/`、`.tox/`、`.nox/` 和 `node_modules/`，以及生成工具缓存；普通 ignored
+runtime source 仍会被哈希，`.venvish/` 不会被模糊排除，项目 lockfile 与依赖
+manifest 仍会改变 candidate identity。
+
+除 reserved `.ai-team/` 状态外，Kafa 只排除 exact generated projection、retired
+projection 和三个静态 agent template。`.gitignore` 以及额外的
+`.codex/agents/`、`docs/harness/` runtime 文件仍会改变 candidate；no-Git 项目中的
+FIFO、socket、device 或其他非普通路径会 fail closed。Git index 和 HEAD 都会独立
+检查非普通 mode；HEAD-only gitlink 即使删除已暂存也会使 identity fail closed。
+Identity commands also disable Git replace-object lookup, so `refs/replace`
+cannot substitute a clean commit/tree/blob for the original local authority.
+
+Structured result 文件若由 verification command 生成，应使用 `.ai-team/runtime/`
+下的项目相对路径或 stdout。普通项目路径中的新结果文件属于 candidate source，生成后
+会触发 stale-candidate 保护，而不会被动态加入排除清单。
 
 ## Troubleshooting
 

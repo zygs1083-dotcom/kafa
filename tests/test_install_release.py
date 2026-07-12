@@ -382,6 +382,52 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertEqual(metadata.get_all("Provides-Extra"), None)
         self.assertEqual(sdk_requirements, [], requirements)
 
+    def test_source_distribution_manifest_contains_installable_release_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            release = Path(temp) / "release"
+            release.mkdir()
+            for name in ["VERSION", "README.md", "pyproject.toml", "release.json"]:
+                shutil.copyfile(REPO_ROOT / name, release / name)
+            manifest = REPO_ROOT / "MANIFEST.in"
+            if manifest.is_file():
+                shutil.copyfile(manifest, release / manifest.name)
+            shutil.copytree(
+                REPO_ROOT / "kafa",
+                release / "kafa",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            shutil.copytree(
+                PLUGIN_ROOT,
+                release / "plugins/codex-project-harness",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    ".",
+                    "--wheel-dir",
+                    str(Path(temp) / "dist"),
+                ],
+                cwd=release,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            sources = set(
+                (release / "kafa.egg-info/SOURCES.txt").read_text(encoding="utf-8").splitlines()
+            )
+
+        self.assertIn("release.json", sources)
+        self.assertIn("VERSION", sources)
+        self.assertIn("plugins/codex-project-harness/.codex-plugin/plugin.json", sources)
+        self.assertIn("plugins/codex-project-harness/scripts/harness.py", sources)
+        self.assertFalse(any("__pycache__" in name or name.endswith(".pyc") for name in sources))
+
     def test_user_doctor_validates_installed_copy_and_hook_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
@@ -576,9 +622,43 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertIn(str(sentinel.resolve()), initialized["details"])
         self.assertIn("pid=999999", initialized["details"])
         self.assertIn(
-            "inspect the owner and remove it only after confirming no migration is active",
+            "confirm no migration is active, and verify database/projection authority before considering sentinel removal",
             initialized["details"],
         )
+        self.assertEqual(report["next_commands"], [])
+
+    def test_project_doctor_reports_recovery_required_manifest_without_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            manifest = root / ".ai-team/backups/schema-29/migration-manifest.json"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "created_at": "2026-07-12T00:00:00Z",
+                        "target_schema": 30,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(manifest.resolve()),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("sqlite3.connect", side_effect=AssertionError("SQLite must stay closed")):
+                report = kafa_cli.project_doctor_report(root)
+
+        initialized = next(
+            check for check in report["checks"] if check["name"] == "harness initialized"
+        )
+        self.assertFalse(report["ok"])
+        self.assertFalse(initialized["ok"])
+        self.assertIn("rollback-incomplete", initialized["details"])
+        self.assertIn(str(manifest.resolve()), initialized["details"])
+        self.assertIn("recover and verify", initialized["details"])
+        self.assertIn("do not remove", initialized["details"])
         self.assertEqual(report["next_commands"], [])
 
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:

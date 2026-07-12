@@ -44,6 +44,10 @@ RETAINED_SKILLS = {
     "project-retrospective",
 }
 
+
+def shell_command(argv: list[str]) -> str:
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
 RETIRED_COMMAND_FRAGMENTS = [
     " connector profile",
     " adapter plan",
@@ -266,7 +270,7 @@ class DocumentationContractTest(unittest.TestCase):
     def test_skill_eval_rejects_failed_host_command_even_with_all_markers(self) -> None:
         fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
         with tempfile.TemporaryDirectory() as temp:
-            producer = Path(temp) / "producer.py"
+            producer = Path(temp) / "marker producer.py"
             producer.write_text(
                 "from pathlib import Path\n"
                 "import sys\n"
@@ -275,7 +279,7 @@ class DocumentationContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             env = os.environ.copy()
-            env["CODEX_EVAL_CMD"] = shlex.join(
+            env["CODEX_EVAL_CMD"] = shell_command(
                 [sys.executable, str(producer), str(fixture), "7"]
             )
             result = subprocess.run(
@@ -289,16 +293,18 @@ class DocumentationContractTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("host skill eval command failed", result.stdout.lower())
+        self.assertIn("returncode=7", result.stdout.lower())
+        self.assertNotIn("missing skill eval marker", result.stdout.lower())
 
     def test_skill_eval_rejects_reversed_workflow_markers(self) -> None:
         fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
         with tempfile.TemporaryDirectory() as temp:
-            reversed_transcript = Path(temp) / "reversed.txt"
+            reversed_transcript = Path(temp) / "reversed transcript.txt"
             reversed_transcript.write_text(
                 "\n".join(reversed(fixture.read_text(encoding="utf-8").splitlines())) + "\n",
                 encoding="utf-8",
             )
-            producer = Path(temp) / "producer.py"
+            producer = Path(temp) / "marker producer.py"
             producer.write_text(
                 "from pathlib import Path\n"
                 "import sys\n"
@@ -306,9 +312,12 @@ class DocumentationContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             env = os.environ.copy()
-            env["CODEX_EVAL_CMD"] = shlex.join(
-                [sys.executable, str(producer), str(reversed_transcript)]
-            )
+            producer_command = [
+                sys.executable,
+                str(producer),
+                str(reversed_transcript),
+            ]
+            env["CODEX_EVAL_CMD"] = shell_command(producer_command)
             result = subprocess.run(
                 [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
                 cwd=REPO_ROOT,
@@ -320,6 +329,8 @@ class DocumentationContractTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("out-of-order skill eval marker", result.stdout.lower())
+        self.assertNotIn("host skill eval command failed", result.stdout.lower())
+        self.assertNotIn("missing skill eval marker", result.stdout.lower())
 
     def test_e2e_example_reports_only_current_local_scenarios(self) -> None:
         report = json.loads(
@@ -329,6 +340,7 @@ class DocumentationContractTest(unittest.TestCase):
         categories = {scenario["category"] for scenario in report["scenarios"]}
 
         self.assertEqual(report["mode"], "stability")
+        self.assertEqual(report["report_version"], 1)
         self.assertEqual(report["evidence_scope"], "deterministic-local-runtime")
         self.assertEqual(report["summary"]["scenario_count"], 11)
         self.assertEqual(report["summary"]["failed_count"], 0)
@@ -340,6 +352,113 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("high_risk_requires_human_review", names)
         self.assertIn("schema27_29_migration_and_rollback", names)
         self.assertFalse(categories & {"connector", "provider", "host-codex"})
+
+    def test_migration_recovery_guidance_distinguishes_safe_and_incomplete_cleanup(
+        self,
+    ) -> None:
+        spec = self.read(
+            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
+        )
+        public_guidance = "\n".join(
+            [
+                self.read("README.md"),
+                self.read("INSTALL.md"),
+            ]
+        )
+
+        for text in (spec, public_guidance):
+            self.assertIn("recovery-required", text)
+            self.assertIn("rollback-incomplete", text)
+            self.assertIn("verified complete rollback", text)
+        self.assertIn("hard process exit", spec)
+        self.assertIn("must not remove", public_guidance)
+        self.assertNotIn(
+            "the diagnostic sentinel is removed for a handled failure, and later normal operations can proceed",
+            spec,
+        )
+
+    def test_project_state_projection_is_database_deterministic(self) -> None:
+        design = self.read("openspec/changes/local-core-hardening/design.md")
+        spec = self.read(
+            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
+        )
+        public_guidance = "\n".join(
+            [
+                self.read("README.md"),
+                self.read("INSTALL.md"),
+            ]
+        )
+
+        for text in (design, spec, public_guidance):
+            self.assertIn("project.updated_at", text)
+            self.assertIn("replace rather than merge", text)
+
+    def test_final_hardening_followups_are_explicitly_fail_closed(self) -> None:
+        contract = "\n".join(
+            [
+                self.read("openspec/changes/local-core-hardening/design.md"),
+                self.read(
+                    "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
+                ),
+                self.read("README.md"),
+                self.read("INSTALL.md"),
+            ]
+        )
+        for marker in (
+            "callback self-report",
+            "BaseException",
+            "GIT_WORK_TREE",
+            "sqlite_sequence",
+            "private Git-backed snapshot",
+        ):
+            self.assertIn(marker, contract)
+
+    def test_candidate_identity_distinguishes_source_from_dependency_environments(
+        self,
+    ) -> None:
+        design = self.read("openspec/changes/local-core-hardening/design.md")
+        spec = self.read(
+            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
+        )
+        public_guidance = "\n".join(
+            [
+                self.read("README.md"),
+                self.read("INSTALL.md"),
+            ]
+        )
+
+        for text in (design, spec, public_guidance):
+            self.assertIn("top-level dependency/tool environment", text)
+            self.assertIn(".venv", text)
+            self.assertIn("node_modules", text)
+            self.assertIn("lockfile", text)
+            self.assertIn("exact generated projection", text)
+            self.assertIn(".gitignore", text)
+        self.assertIn("ignored runtime source", spec)
+
+    def test_native_report_contract_binds_profile_telemetry_and_producer_mapping(
+        self,
+    ) -> None:
+        contract = "\n".join(
+            [
+                self.read("openspec/changes/local-core-hardening/design.md"),
+                self.read(
+                    "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
+                ),
+            ]
+        )
+        for marker in (
+            "evidence_scope",
+            "matrix.profile",
+            "positive finite",
+            "current Native Codex binary",
+            "task-to-scope",
+            "Connector/Host",
+            "report_version=1",
+            "path-discovery",
+            "unmerged",
+        ):
+            self.assertIn(marker, contract)
 
     def test_persistent_native_host_evidence_is_compact_and_truthful(self) -> None:
         live = json.loads(self.read("docs/runtime/native-codex-live-eval.json"))
@@ -360,11 +479,7 @@ class DocumentationContractTest(unittest.TestCase):
             self.assertEqual(len(report["evaluation_source"]["workspace_sha256"]), 64, name)
             self.assertIn("plugins/", report["evaluation_source"]["source_scope"], name)
             self.assertEqual(
-                run_agent_e2e_eval.report_consistency_errors(
-                    report,
-                    require_current_binary=False,
-                    require_current_git_state=False,
-                ),
+                run_agent_e2e_eval.persistent_report_consistency_errors(report),
                 [],
                 name,
             )

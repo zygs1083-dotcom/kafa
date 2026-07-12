@@ -8,6 +8,7 @@ import base64
 import gzip
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -18,9 +19,10 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 
@@ -32,14 +34,27 @@ for path in [ROOT, PLUGIN_ROOT, SCRIPTS_ROOT]:
         sys.path.insert(0, str(path))
 
 HARNESS = SCRIPTS_ROOT / "harness.py"
+_CONTROLLER_HARNESS: ContextVar[Path] = ContextVar(
+    "kafa_controller_harness",
+    default=HARNESS,
+)
 
 import harness_db  # noqa: E402
-from harness_lib import git_dirty, git_head_sha, now_iso  # noqa: E402
+from harness_lib import (  # noqa: E402
+    framed_source_digest,
+    git_blob_objects_available,
+    isolated_git_environment,
+    now_iso,
+)
 from core.local_core_migration import (  # noqa: E402
     InjectedLocalCoreMigrationFailure,
     migrate_project_to_schema30,
 )
-from core.schema_lifecycle import SCHEMA30_TABLES, SCHEMA30_VERSION  # noqa: E402
+from core.schema_lifecycle import (  # noqa: E402
+    SCHEMA30_CATALOG_TABLES,
+    SCHEMA30_TABLES,
+    SCHEMA30_VERSION,
+)
 from kafa.codex_app_server import (  # noqa: E402
     APPROVED_AGENT_TEMPLATES,
     APPROVED_RUNTIME_SCRIPTS,
@@ -60,7 +75,13 @@ def run_harness(
     if env:
         command_env.update(env)
     result = subprocess.run(
-        [sys.executable, str(HARNESS), "--root", str(root), *args],
+        [
+            sys.executable,
+            str(_CONTROLLER_HARNESS.get()),
+            "--root",
+            str(root),
+            *args,
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -76,6 +97,20 @@ def db_rows(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sql
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(query, params).fetchall()
+
+
+def active_table_contract(root: Path) -> tuple[list[str], bool]:
+    """Return unexpected tables and exact schema-30 inventory status."""
+
+    tables = {
+        str(row[0])
+        for row in db_rows(
+            root,
+            "select name from sqlite_master where type='table'",
+        )
+    }
+    expected = set(SCHEMA30_CATALOG_TABLES)
+    return sorted(tables - expected), tables == expected
 
 
 def scenario_result(
@@ -110,6 +145,57 @@ LIVE_WORKLOAD_UNIT_SHA256 = hashlib.sha256(
     b"one exclusive Python module: VALUE before-to-after; immutable one-file unittest"
 ).hexdigest()
 NATIVE_TOKEN_SCOPE = "native-producers-only"
+REPORT_VERSION = 1
+REPORT_MODES = frozenset(
+    {"fixture", "stability", "live-codex", "live-codex-parallel"}
+)
+LOCAL_SCENARIO_CONTRACT: dict[str, tuple[str, str]] = {
+    "fresh_local_install_and_init": ("cold-start", "local"),
+    "quickstart_stops_before_independent_review": ("quickstart", "local"),
+    "current_candidate_supersedes_stale_validation": ("candidate", "local"),
+    "manual_evidence_cannot_satisfy_delivery": ("trust", "local"),
+    "open_high_finding_blocks_delivery": ("findings", "local"),
+    "high_risk_requires_human_review": ("trust", "local"),
+    "structured_and_no_network_policy_fail_closed": ("execution-policy", "local"),
+    "cycle_isolation": ("cycle", "local"),
+    "sqlite_contention_stress": ("sqlite", "local"),
+    "schema27_29_migration_and_rollback": ("migration", "local"),
+    "installed_plugin_surface": ("installation", "local"),
+}
+EXPECTED_CODEX_CLI_VERSION = (
+    "codex-cli "
+    + str(json.loads((ROOT / "release.json").read_text(encoding="utf-8"))["codex_cli_smoke_version"])
+)
+PARALLEL_PRODUCER_CONTRACT: dict[str, dict[str, object]] = {
+    "LIVE-P1": {
+        "exclusive_files": ["alpha.py"],
+        "changed_files": ["alpha.py"],
+        "scope_valid": True,
+        "test_file_unchanged": True,
+        "capability_hint": "fast",
+        "context_id": "native-alpha-producer",
+        "target": "LIVE-ALPHA",
+        "acceptance": "LIVE-AC-A",
+        "returncode": 0,
+        "token_source": "codex-json-turn.completed",
+        "last_message_recorded": True,
+        "error": "",
+    },
+    "LIVE-P2": {
+        "exclusive_files": ["beta.py"],
+        "changed_files": ["beta.py"],
+        "scope_valid": True,
+        "test_file_unchanged": True,
+        "capability_hint": "fast",
+        "context_id": "native-beta-producer",
+        "target": "LIVE-BETA",
+        "acceptance": "LIVE-AC-B",
+        "returncode": 0,
+        "token_source": "codex-json-turn.completed",
+        "last_message_recorded": True,
+        "error": "",
+    },
+}
 
 
 def parse_native_usage_jsonl(output: str) -> dict[str, int] | None:
@@ -183,6 +269,177 @@ VERBOSE_NATIVE_OUTPUT_KEYS = {
     "stdout_tail",
     "stderr_tail",
 }
+REPORT_KEYS = frozenset(
+    {
+        "report_version",
+        "mode",
+        "evaluation_source",
+        "live_skipped",
+        "live_status",
+        "matrix",
+        "native_host",
+        "evidence_scope",
+        "token_count",
+        "token_usage",
+        "estimated_cost",
+        "agent_runtime_seconds",
+        "summary",
+        "scenarios",
+    }
+)
+SUMMARY_KEYS = frozenset(
+    {
+        "scenario_count",
+        "passed_count",
+        "failed_count",
+        "skipped_count",
+        "scenario_pass_rate",
+        "false_pass_count",
+        "forged_evidence_block_count",
+        "expected_human_review_required_count",
+        "sqlite_lock_error_count",
+        "human_intervention_count",
+        "duration_seconds",
+    }
+)
+SUMMARY_INTEGER_FIELDS = frozenset(
+    {
+        "scenario_count",
+        "passed_count",
+        "failed_count",
+        "skipped_count",
+        "false_pass_count",
+        "forged_evidence_block_count",
+        "expected_human_review_required_count",
+        "sqlite_lock_error_count",
+        "human_intervention_count",
+    }
+)
+EVALUATION_SOURCE_KEYS = frozenset(
+    {
+        "generated_at",
+        "git_head",
+        "git_dirty",
+        "workspace_sha256",
+        "status_sha256",
+        "status_entry_count",
+        "source_scope",
+    }
+)
+MATRIX_KEYS = frozenset(
+    {
+        "profile",
+        "platform",
+        "python_version",
+        "git_version",
+        "codex_available",
+        "container_available",
+        "sqlite_stress",
+        "live_skipped_reasons",
+    }
+)
+NATIVE_HOST_KEYS = frozenset({"resolved_path", "sha256", "source", "trust"})
+SCENARIO_KEYS = frozenset(
+    {"name", "category", "mode", "pass", "duration_seconds", "skip_reason", "details"}
+)
+USAGE_KEYS = frozenset({*NATIVE_USAGE_FIELDS, "token_count"})
+COMMON_PASSING_LIVE_DETAIL_KEYS = frozenset(
+    {
+        "capability_status",
+        "codex_version",
+        "pre_edit_returncode",
+        "native_runtime_seconds",
+        "native_runtime_source",
+        "native_usage",
+        "native_token_count",
+        "native_token_source",
+        "native_token_scope",
+        "workload_family",
+        "workload_unit_sha256",
+        "workload_units",
+        "changed_files",
+        "integrated_files",
+        "controller_state_unchanged_during_native",
+        "execution_count",
+        "validation_count",
+        "retired_host_tables",
+        "provider_surface_absent",
+        "human_intervention_count",
+        "false_pass_count",
+    }
+)
+SINGLE_PASSING_DETAIL_KEYS = COMMON_PASSING_LIVE_DETAIL_KEYS | frozenset(
+    {
+        "native_returncode",
+        "exclusive_files",
+        "producer_changed_files",
+        "producer_scope_valid",
+        "producer_workspace_isolated",
+        "test_file_unchanged",
+        "controller_test_unchanged",
+        "controller_verify_returncode",
+        "controller_verify_status",
+        "controller_verify_output",
+        "task_submit_returncode",
+        "task_status",
+        "last_message_recorded",
+        "native_stdout_tail",
+        "native_stderr_tail",
+    }
+)
+PARALLEL_PASSING_DETAIL_KEYS = COMMON_PASSING_LIVE_DETAIL_KEYS | frozenset(
+    {
+        "producer_count",
+        "producers",
+        "producer_overlap_seconds",
+        "producer_attribution_valid",
+        "scope_enforcement",
+        "test_files_unchanged",
+        "targeted_verify_returncodes",
+        "producer_state_returncodes",
+        "integration_start_returncode",
+        "combined_verify_returncode",
+        "combined_verify_status",
+        "integration_submit_returncode",
+        "integration_dependency_blocked_before_producers",
+        "task_statuses",
+        "scope_conflicts",
+        "overlap_policy",
+    }
+)
+PARALLEL_PRODUCER_KEYS = frozenset(
+    {
+        "task",
+        "exclusive_files",
+        "changed_files",
+        "scope_valid",
+        "test_file_unchanged",
+        "capability_hint",
+        "context_id",
+        "target",
+        "acceptance",
+        "returncode",
+        "runtime_seconds",
+        "native_usage",
+        "token_count",
+        "token_source",
+        "stdout_tail",
+        "stderr_tail",
+        "last_message_recorded",
+        "error",
+        "started_offset_seconds",
+        "finished_offset_seconds",
+    }
+)
+
+
+def _unexpected_key_errors(
+    prefix: str,
+    value: dict[str, Any],
+    allowed: frozenset[str],
+) -> list[str]:
+    unexpected = sorted(set(value) - allowed)
+    return [f"{prefix} contains unsupported fields: {','.join(unexpected)}"] if unexpected else []
 
 
 def compact_evidence_report(value: Any) -> Any:
@@ -228,6 +485,7 @@ def command_version(command: list[str], *, env: dict[str, str] | None = None) ->
 
 EVALUATION_SOURCE_PREFIXES = ("kafa/", "plugins/", "tests/", "benchmarks/")
 EVALUATION_SOURCE_FILES = {
+    ".gitattributes",
     "VERSION",
     "release.json",
     "pyproject.toml",
@@ -245,63 +503,505 @@ def _is_evaluation_cache_path(relative: str) -> bool:
     return "__pycache__" in parts or ".pytest_cache" in parts
 
 
-def evaluation_source_identity() -> dict[str, Any]:
-    """Bind a report to executable eval sources without hashing its generated output."""
+def _git_blob_oid(content: bytes, object_format: str) -> str:
+    digest = hashlib.new(object_format)
+    digest.update(f"blob {len(content)}\0".encode("ascii"))
+    digest.update(content)
+    return digest.hexdigest()
 
+
+def _absolute_path_flavor(value: str) -> str | None:
+    if not value or "\0" in value:
+        return None
+    windows_path = PureWindowsPath(value)
+    if windows_path.is_absolute() and windows_path.name:
+        return "windows"
+    posix_path = PurePosixPath(value)
+    if posix_path.is_absolute() and posix_path.name:
+        return "posix"
+    return None
+
+
+def _is_cross_platform_absolute_path(value: str) -> bool:
+    return _absolute_path_flavor(value) is not None
+
+
+def _source_identity_git_environment(root: Path = ROOT) -> dict[str, str]:
+    """Return a Git environment isolated from ambient repository overrides."""
+
+    return isolated_git_environment(work_tree=root)
+
+
+def _invalid_evaluation_source_identity() -> dict[str, Any]:
+    return {
+        "generated_at": now_iso(),
+        "git_head": "",
+        "git_dirty": None,
+        "workspace_sha256": "",
+        "status_sha256": "",
+        "status_entry_count": 0,
+        "source_scope": [],
+    }
+
+
+def evaluation_source_identity(root: Path = ROOT) -> dict[str, Any]:
+    """Bind a report to actual executable bytes without running Git content filters."""
+
+    root = root.resolve()
+    git_environment = _source_identity_git_environment(root)
     try:
+        head = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "rev-parse", "--verify", "HEAD"],
+            cwd=root,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout.strip()
         listed = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            cwd=ROOT,
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "ls-files",
+                "--cached",
+                "--others",
+                "-z",
+            ],
+            cwd=root,
+            env=git_environment,
             capture_output=True,
             check=True,
         ).stdout.split(b"\0")
-        raw_status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=ROOT,
+        staged = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+            cwd=root,
+            env=git_environment,
+            capture_output=True,
+            check=True,
+        ).stdout.split(b"\0")
+        object_format = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "rev-parse", "--show-object-format"],
+            cwd=root,
+            env=git_environment,
             text=True,
             capture_output=True,
             check=True,
-        ).stdout
+        ).stdout.strip()
+        head_tree = (
+            subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "ls-tree", "-r", "-z", "HEAD"],
+                cwd=root,
+                env=git_environment,
+                capture_output=True,
+                check=True,
+            ).stdout.split(b"\0")
+            if head
+            else []
+        )
     except (OSError, subprocess.CalledProcessError):
-        return {
-            "generated_at": now_iso(),
-            "git_head": "",
-            "git_dirty": None,
-            "workspace_sha256": "",
-            "status_sha256": "",
-            "status_entry_count": 0,
-        }
-    digest = hashlib.sha256()
+        return _invalid_evaluation_source_identity()
+    if object_format not in {"sha1", "sha256"}:
+        return _invalid_evaluation_source_identity()
+    tracked_entries: dict[bytes, tuple[bytes, str]] = {}
+    unmerged_paths: set[bytes] = set()
+    for raw_entry in (entry for entry in staged if entry):
+        try:
+            metadata, raw_relative = raw_entry.split(b"\t", 1)
+            mode, object_id, stage = metadata.split(b" ", 2)
+        except ValueError:
+            return _invalid_evaluation_source_identity()
+        if stage == b"0":
+            tracked_entries[raw_relative] = (mode, object_id.decode("ascii"))
+        else:
+            unmerged_paths.add(raw_relative)
+
+    head_entries: dict[bytes, tuple[bytes, str]] = {}
+    for raw_entry in (entry for entry in head_tree if entry):
+        try:
+            metadata, raw_relative = raw_entry.split(b"\t", 1)
+            mode, _object_type, object_id = metadata.split(b" ", 2)
+        except ValueError:
+            return _invalid_evaluation_source_identity()
+        head_entries[raw_relative] = (mode, object_id.decode("ascii"))
+
+    scoped_unmerged = {
+        raw_relative
+        for raw_relative in unmerged_paths
+        if _in_evaluation_source_scope(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+        and not _is_evaluation_cache_path(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+    }
+    if scoped_unmerged:
+        return _invalid_evaluation_source_identity()
+
+    for entries in (tracked_entries, head_entries):
+        for raw_relative, (mode, _object_id) in entries.items():
+            relative = raw_relative.decode("utf-8", errors="surrogateescape")
+            if (
+                _in_evaluation_source_scope(relative)
+                and not _is_evaluation_cache_path(relative)
+                and mode not in {b"100644", b"100755"}
+            ):
+                return _invalid_evaluation_source_identity()
+
+    required_objects = {
+        object_id
+        for entries in (tracked_entries, head_entries)
+        for raw_relative, (mode, object_id) in entries.items()
+        if mode in {b"100644", b"100755"}
+        and _in_evaluation_source_scope(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+        and not _is_evaluation_cache_path(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+    }
+    if not git_blob_objects_available(
+        root,
+        required_objects,
+        environment=git_environment,
+    ):
+        return _invalid_evaluation_source_identity()
+
+    source_entries: list[tuple[bytes, bytes, bytes, str, str]] = []
     for raw_relative in sorted(relative for relative in listed if relative):
         relative = raw_relative.decode("utf-8", errors="surrogateescape")
         if not _in_evaluation_source_scope(relative):
             continue
         if _is_evaluation_cache_path(relative):
             continue
-        path = ROOT / relative
+        path = root / relative
+        tracked = tracked_entries.get(raw_relative)
+        if (
+            path.is_symlink()
+            or (tracked is not None and tracked[0] not in {b"100644", b"100755"})
+            or (path.exists() and not path.is_file())
+        ):
+            return _invalid_evaluation_source_identity()
         if not path.is_file():
             continue
-        digest.update(raw_relative)
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    status_lines = [
-        line
-        for line in raw_status.splitlines()
-        if len(line) > 3
-        and _in_evaluation_source_scope(line[3:])
-        and not _is_evaluation_cache_path(line[3:])
-    ]
+        content = path.read_bytes()
+        actual_mode = b"100755" if path.stat().st_mode & 0o111 else b"100644"
+        workspace_mode = (
+            tracked[0] if os.name == "nt" and tracked is not None else actual_mode
+        )
+        source_entries.append(
+            (
+                raw_relative,
+                workspace_mode,
+                actual_mode,
+                hashlib.sha256(content).hexdigest(),
+                _git_blob_oid(content, object_format),
+            )
+        )
+    actual_entries: dict[bytes, tuple[bytes, str]] = {}
+    for (
+        raw_relative,
+        workspace_mode,
+        actual_mode,
+        runtime_sha256,
+        actual_object_id,
+    ) in source_entries:
+        actual_entries[raw_relative] = (actual_mode, actual_object_id)
+    workspace_sha256 = framed_source_digest(
+        (raw_relative, workspace_mode, runtime_sha256)
+        for raw_relative, workspace_mode, _actual_mode, runtime_sha256, _actual_object_id
+        in source_entries
+    )
+
+    status_lines: list[str] = []
+    all_paths = set(head_entries) | set(tracked_entries) | set(actual_entries) | unmerged_paths
+    for raw_relative in sorted(all_paths):
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        if not _in_evaluation_source_scope(relative) or _is_evaluation_cache_path(relative):
+            continue
+        if raw_relative in unmerged_paths:
+            status_lines.append(f"UU {relative}")
+            continue
+        head_entry = head_entries.get(raw_relative)
+        index_entry = tracked_entries.get(raw_relative)
+        actual_entry = actual_entries.get(raw_relative)
+        if head_entry is None and index_entry is None and actual_entry is not None:
+            status_lines.append(f"?? {relative}")
+            continue
+        if head_entry is None and index_entry is not None:
+            index_status = "A"
+        elif head_entry is not None and index_entry is None:
+            index_status = "D"
+        elif head_entry != index_entry:
+            index_status = "M"
+        else:
+            index_status = " "
+        if index_entry is None:
+            worktree_status = "?" if actual_entry is not None else " "
+        elif actual_entry is None:
+            worktree_status = "D"
+        else:
+            actual_mode, actual_object_id = actual_entry
+            mode_changed = (
+                os.name != "nt"
+                and index_entry[0] in {b"100644", b"100755"}
+                and actual_mode != index_entry[0]
+            )
+            worktree_status = (
+                "M" if actual_object_id != index_entry[1] or mode_changed else " "
+            )
+        if index_status != " " or worktree_status != " ":
+            status_lines.append(f"{index_status}{worktree_status} {relative}")
     status = "\n".join(status_lines) + ("\n" if status_lines else "")
     return {
         "generated_at": now_iso(),
-        "git_head": git_head_sha(ROOT) or "",
-        "git_dirty": git_dirty(ROOT),
-        "workspace_sha256": digest.hexdigest(),
+        "git_head": head,
+        "git_dirty": bool(status_lines),
+        "workspace_sha256": workspace_sha256,
         "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
         "status_entry_count": len(status_lines),
         "source_scope": [*EVALUATION_SOURCE_PREFIXES, *sorted(EVALUATION_SOURCE_FILES)],
     }
+
+
+def _copy_evaluation_source_scope(source_root: Path, snapshot_root: Path) -> None:
+    def ignore_generated(_directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name in {"__pycache__", ".pytest_cache"}
+        }
+
+    for prefix in EVALUATION_SOURCE_PREFIXES:
+        source = source_root / prefix.rstrip("/")
+        if not source.exists():
+            continue
+        shutil.copytree(
+            source,
+            snapshot_root / prefix.rstrip("/"),
+            copy_function=shutil.copy2,
+            symlinks=True,
+            ignore=ignore_generated,
+        )
+    for relative in EVALUATION_SOURCE_FILES:
+        source = source_root / relative
+        if not source.is_file() or source.is_symlink():
+            continue
+        destination = snapshot_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _tracked_evaluation_modes(root: Path) -> dict[str, bytes]:
+    environment = _source_identity_git_environment(root)
+    try:
+        entries = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        ).stdout.split(b"\0")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot capture evaluation source index modes") from exc
+    modes: dict[str, bytes] = {}
+    for entry in (value for value in entries if value):
+        try:
+            metadata, raw_relative = entry.split(b"\t", 1)
+            mode, _object_id, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise RuntimeError("malformed evaluation source index entry") from exc
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        if stage == b"0" and _in_evaluation_source_scope(relative):
+            modes[relative] = mode
+    return modes
+
+
+@contextmanager
+def pinned_evaluation_source(
+    root: Path,
+    expected_identity: dict[str, Any],
+) -> Any:
+    """Run controller subprocesses from a start-identity-verified private snapshot."""
+
+    root = root.resolve()
+    expected_workspace = expected_identity.get("workspace_sha256")
+    if not isinstance(expected_workspace, str) or len(expected_workspace) != 64:
+        raise RuntimeError("live evaluation source identity is unavailable at profile start")
+    tracked_modes = _tracked_evaluation_modes(root)
+    with tempfile.TemporaryDirectory(prefix="kafa-controller-source-") as temp:
+        snapshot_root = Path(temp) / "source"
+        snapshot_root.mkdir()
+        _copy_evaluation_source_scope(root, snapshot_root)
+        init_environment = isolated_git_environment()
+        init_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        )
+        empty_template = Path(temp) / "empty-git-template"
+        empty_template.mkdir()
+        subprocess.run(
+            ["git", "init", f"--template={empty_template}"],
+            cwd=snapshot_root,
+            env=init_environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        snapshot_environment = isolated_git_environment(work_tree=snapshot_root)
+        snapshot_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        )
+        for snapshot_path in sorted(snapshot_root.rglob("*")):
+            relative = snapshot_path.relative_to(snapshot_root).as_posix()
+            if relative == ".git" or relative.startswith(".git/"):
+                continue
+            if not _in_evaluation_source_scope(relative) or _is_evaluation_cache_path(
+                relative
+            ):
+                continue
+            if snapshot_path.is_symlink() or (
+                snapshot_path.exists() and not snapshot_path.is_file()
+            ):
+                if snapshot_path.is_dir() and not snapshot_path.is_symlink():
+                    continue
+                raise RuntimeError(
+                    f"private controller snapshot contains unsafe source: {relative}"
+                )
+            if not snapshot_path.is_file():
+                continue
+            mode = tracked_modes.get(relative)
+            if mode is None:
+                mode = (
+                    b"100755"
+                    if snapshot_path.stat().st_mode & 0o111
+                    else b"100644"
+                )
+            if mode not in {b"100644", b"100755"}:
+                raise RuntimeError(
+                    f"unsupported tracked evaluation source mode: {relative} {mode!r}"
+                )
+            object_id = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=snapshot_root,
+                env=snapshot_environment,
+                input=snapshot_path.read_bytes(),
+                capture_output=True,
+                check=True,
+            ).stdout.decode("ascii").strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"{mode.decode('ascii')},{object_id},{relative}",
+                ],
+                cwd=snapshot_root,
+                env=snapshot_environment,
+                check=True,
+                capture_output=True,
+            )
+        snapshot_identity = evaluation_source_identity(snapshot_root)
+        if snapshot_identity.get("workspace_sha256") != expected_workspace:
+            raise RuntimeError(
+                "live evaluation source changed while the controller snapshot was captured"
+            )
+        pinned_harness = (
+            snapshot_root
+            / "plugins/codex-project-harness/scripts/harness.py"
+        )
+        if not pinned_harness.is_file() or pinned_harness.is_symlink():
+            raise RuntimeError("private controller snapshot is missing a safe harness.py")
+        token = _CONTROLLER_HARNESS.set(pinned_harness)
+        try:
+            yield pinned_harness
+        finally:
+            _CONTROLLER_HARNESS.reset(token)
+
+
+def _evaluation_identity_matches(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+) -> bool:
+    return all(
+        expected.get(field) == actual.get(field)
+        for field in (
+            "git_head",
+            "git_dirty",
+            "workspace_sha256",
+            "status_sha256",
+            "status_entry_count",
+            "source_scope",
+        )
+    )
+
+
+def _source_failure_report(
+    mode: str,
+    scenario_name: str,
+    started: float,
+    identity: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    report = summarize(
+        mode,
+        [
+            scenario_result(
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "failed", "reason": reason},
+                category=mode,
+                mode=mode,
+            )
+        ],
+        started,
+        live_status="failed",
+    )
+    report["evaluation_source"] = identity
+    return report
+
+
+def _run_pinned_live_profile(
+    *,
+    mode: str,
+    scenario_name: str,
+    enable_env: str,
+    runner: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    if os.environ.get(enable_env) != "1":
+        return runner()
+    started = time.perf_counter()
+    start_identity = evaluation_source_identity()
+    try:
+        with pinned_evaluation_source(ROOT, start_identity):
+            report = runner()
+    except Exception as exc:
+        return _source_failure_report(
+            mode,
+            scenario_name,
+            started,
+            start_identity,
+            str(exc),
+        )
+    end_identity = evaluation_source_identity()
+    report["evaluation_source"] = start_identity
+    if not _evaluation_identity_matches(start_identity, end_identity):
+        return _source_failure_report(
+            mode,
+            scenario_name,
+            started,
+            start_identity,
+            "evaluation source changed before profile completion",
+        )
+    return report
 
 
 def matrix_info(profile: str, *, live_skipped_reasons: list[str] | None = None) -> dict[str, Any]:
@@ -877,13 +1577,26 @@ def _create_schema27_fixture(root: Path) -> Path:
     return db
 
 
+def _migration_projection_validator(root: Path) -> Callable[[Path], None]:
+    def validate(_active_path: Path) -> None:
+        harness_db.render_all(root)
+        issues = harness_db.doctor(root, require_project_files=False)
+        if issues:
+            raise AssertionError("migration projection validation failed: " + "; ".join(issues))
+
+    return validate
+
+
 def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         base = Path(temp)
         success_root = base / "schema27-success"
         _create_schema27_fixture(success_root)
-        success = migrate_project_to_schema30(success_root)
+        success = migrate_project_to_schema30(
+            success_root,
+            active_validator=_migration_projection_validator(success_root),
+        )
         success_version = int(_scalar(success_root, "select schema_version from project where id=1"))
         preserved = tuple(_scalar(success_root, f"select count(*) from {table}") for table in ("requirements", "tasks", "executions", "validations", "decisions"))
         retired_tables = int(_scalar(success_root, "select count(*) from sqlite_master where type='table' and name in ('adapter_actions','agent_provider_sessions','runtime_snapshots','command_log')"))
@@ -892,7 +1605,11 @@ def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
         rollback_source = _create_schema27_fixture(rollback_root)
         rolled_back = False
         try:
-            migrate_project_to_schema30(rollback_root, fail_at="after_atomic_replace")
+            migrate_project_to_schema30(
+                rollback_root,
+                fail_at="after_atomic_replace",
+                active_validator=_migration_projection_validator(rollback_root),
+            )
         except InjectedLocalCoreMigrationFailure:
             rolled_back = True
         rollback_version = int(_scalar(rollback_root, "select schema_version from project where id=1"))
@@ -1080,6 +1797,7 @@ def summarize(
         else None
     )
     return {
+        "report_version": REPORT_VERSION,
         "mode": mode,
         "evaluation_source": evaluation_source_identity(),
         "live_skipped": live_skipped,
@@ -1107,14 +1825,16 @@ def run_fixture() -> dict[str, Any]:
         try:
             scenarios.append(scenario())
         except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
+            name = scenario.__name__.replace("scenario_", "")
+            category, scenario_mode = LOCAL_SCENARIO_CONTRACT[name]
             scenarios.append(
                 scenario_result(
-                    scenario.__name__.replace("scenario_", ""),
+                    name,
                     started,
                     False,
                     {"error": str(exc)},
-                    category="fixture",
-                    mode="fixture",
+                    category=category,
+                    mode=scenario_mode,
                 )
             )
     return summarize("fixture", scenarios, started)
@@ -1128,7 +1848,17 @@ def run_stability() -> dict[str, Any]:
             scenarios.append(scenario())
         except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
             name = scenario.__name__.replace("scenario_", "")
-            scenarios.append(scenario_result(name, started, False, {"error": str(exc)}, category="stability", mode="stability"))
+            category, scenario_mode = LOCAL_SCENARIO_CONTRACT[name]
+            scenarios.append(
+                scenario_result(
+                    name,
+                    started,
+                    False,
+                    {"error": str(exc)},
+                    category=category,
+                    mode=scenario_mode,
+                )
+            )
     return summarize("stability", scenarios, started)
 
 
@@ -1225,9 +1955,10 @@ def run_live_preflight(codex: str, env: dict[str, str]) -> str:
     if login.returncode != 0:
         raise LiveCapabilityBlocked(f"Codex login status failed (exit {login.returncode})")
     version = command_version(codex_cli_command(codex, "--version"), env=env)
-    expected = f"codex-cli {json.loads((ROOT / 'release.json').read_text(encoding='utf-8'))['codex_cli_smoke_version']}"
-    if version != expected:
-        raise LiveCapabilityBlocked(f"Codex CLI version mismatch; expected {expected}")
+    if version != EXPECTED_CODEX_CLI_VERSION:
+        raise LiveCapabilityBlocked(
+            f"Codex CLI version mismatch; expected {EXPECTED_CODEX_CLI_VERSION}"
+        )
     return version
 
 
@@ -1316,7 +2047,7 @@ def prepare_live_profile(
     return codex, version, native_host, None
 
 
-def run_live_codex() -> dict[str, Any]:
+def _run_live_codex_unpinned() -> dict[str, Any]:
     started = time.perf_counter()
     mode = "live-codex"
     scenario_name = "native_codex_edit_and_controller_verify"
@@ -1488,25 +2219,7 @@ def run_live_codex() -> dict[str, Any]:
         execution_count = int(_scalar(root, "select count(*) from executions"))
         validation_count = int(_scalar(root, "select count(*) from validations"))
         task_status = str(_scalar(root, "select status from tasks where id='LIVE-T1'"))
-        tables = {
-            str(row[0])
-            for row in db_rows(
-                root,
-                "select name from sqlite_master where type='table' and name not like 'sqlite_%'",
-            )
-        }
-        retired_host_tables = sorted(
-            tables
-            & {
-                "agent_provider_sessions",
-                "agent_provider_events",
-                "agent_sessions",
-                "dispatch_runs",
-                "dispatch_assignments",
-                "agent_reports",
-            }
-        )
-        provider_surface_absent = not retired_host_tables
+        retired_host_tables, provider_surface_absent = active_table_contract(root)
         passed = (
             pre_edit.returncode != 0
             and producer_result["returncode"] == 0
@@ -1531,6 +2244,7 @@ def run_live_codex() -> dict[str, Any]:
             {
                 "capability_status": "passed" if passed else "failed",
                 "codex_version": codex_version,
+                "pre_edit_returncode": pre_edit.returncode,
                 "native_returncode": producer_result["returncode"],
                 "native_runtime_seconds": producer_result["runtime_seconds"],
                 "native_runtime_source": "controller-wall-clock",
@@ -1555,6 +2269,7 @@ def run_live_codex() -> dict[str, Any]:
                 "controller_verify_returncode": controller.returncode,
                 "controller_verify_status": controller_verify_status,
                 "controller_verify_output": (controller.stdout + controller.stderr)[-2000:],
+                "task_submit_returncode": submit.returncode,
                 "execution_count": execution_count,
                 "validation_count": validation_count,
                 "task_status": task_status,
@@ -1677,6 +2392,8 @@ def _run_native_eval_producer(
         "test_file_unchanged": test_file_unchanged,
         "capability_hint": str(producer["capability_hint"]),
         "context_id": str(producer["context_id"]),
+        "target": str(producer.get("target") or ""),
+        "acceptance": str(producer.get("acceptance") or ""),
         "returncode": result.returncode,
         "started_at": launched,
         "finished_at": finished,
@@ -1691,7 +2408,7 @@ def _run_native_eval_producer(
     }
 
 
-def run_live_codex_parallel() -> dict[str, Any]:
+def _run_live_codex_parallel_unpinned() -> dict[str, Any]:
     """Run two disjoint Native Host producers and root-owned integration verification."""
 
     started = time.perf_counter()
@@ -2079,24 +2796,7 @@ def run_live_codex_parallel() -> dict[str, Any]:
         }
         execution_count = int(_scalar(root, "select count(*) from executions"))
         validation_count = int(_scalar(root, "select count(*) from validations"))
-        tables = {
-            str(row[0])
-            for row in db_rows(
-                root,
-                "select name from sqlite_master where type='table' and name not like 'sqlite_%'",
-            )
-        }
-        retired_host_tables = sorted(
-            tables
-            & {
-                "agent_provider_sessions",
-                "agent_provider_events",
-                "agent_sessions",
-                "dispatch_runs",
-                "dispatch_assignments",
-                "agent_reports",
-            }
-        )
+        retired_host_tables, provider_surface_absent = active_table_contract(root)
         targeted_returncodes = {
             target: result.returncode for target, result in targeted_results.items()
         }
@@ -2156,7 +2856,7 @@ def run_live_codex_parallel() -> dict[str, Any]:
             == {"LIVE-INTEGRATE": "submitted", "LIVE-P1": "accepted", "LIVE-P2": "accepted"}
             and execution_count == 3
             and validation_count == 3
-            and not retired_host_tables
+            and provider_surface_absent
             and native_usage is not None
             and all(result["last_message_recorded"] for result in producer_results)
         )
@@ -2167,6 +2867,7 @@ def run_live_codex_parallel() -> dict[str, Any]:
             {
                 "capability_status": "passed" if passed else "failed",
                 "codex_version": codex_version,
+                "pre_edit_returncode": pre_edit.returncode,
                 "producer_count": len(producer_results),
                 "producers": producer_summaries,
                 "producer_overlap_seconds": producer_overlap_seconds,
@@ -2186,8 +2887,13 @@ def run_live_codex_parallel() -> dict[str, Any]:
                 "scope_enforcement": "isolated-producer-workspaces-plus-exact-diff-integration",
                 "test_files_unchanged": test_files_unchanged,
                 "targeted_verify_returncodes": targeted_returncodes,
+                "producer_state_returncodes": [
+                    result.returncode for result in producer_state_results
+                ],
+                "integration_start_returncode": integration_started.returncode,
                 "combined_verify_returncode": combined.returncode,
                 "combined_verify_status": combined_verify_status,
+                "integration_submit_returncode": integration_submitted.returncode,
                 "integration_dependency_blocked_before_producers": integration_blocked.returncode != 0,
                 "task_statuses": task_statuses,
                 "execution_count": execution_count,
@@ -2195,6 +2901,7 @@ def run_live_codex_parallel() -> dict[str, Any]:
                 "scope_conflicts": scope_conflicts,
                 "overlap_policy": "block-parallel-on-declared-overlap",
                 "retired_host_tables": retired_host_tables,
+                "provider_surface_absent": provider_surface_absent,
                 "human_intervention_count": 0,
                 "false_pass_count": int(
                     all(result["returncode"] == 0 for result in producer_results)
@@ -2211,6 +2918,24 @@ def run_live_codex_parallel() -> dict[str, Any]:
             live_status="passed" if passed else "failed",
             native_host=native_host,
         )
+
+
+def run_live_codex() -> dict[str, Any]:
+    return _run_pinned_live_profile(
+        mode="live-codex",
+        scenario_name="native_codex_edit_and_controller_verify",
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX",
+        runner=_run_live_codex_unpinned,
+    )
+
+
+def run_live_codex_parallel() -> dict[str, Any]:
+    return _run_pinned_live_profile(
+        mode="live-codex-parallel",
+        scenario_name="native_codex_parallel_overlap_and_controller_verify",
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL",
+        runner=_run_live_codex_parallel_unpinned,
+    )
 
 
 def _valid_nonzero_sha256(value: object) -> bool:
@@ -2233,10 +2958,28 @@ def _valid_aware_iso8601(value: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
+def _matches_exact_json_contract(actual: object, expected: object) -> bool:
+    """Compare closed-report values without Python bool/int or int/float coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _matches_exact_json_contract(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _matches_exact_json_contract(item, contract)
+            for item, contract in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
 def _usage_errors(prefix: str, usage: object) -> list[str]:
     if not isinstance(usage, dict):
         return [f"{prefix} usage is not an object"]
-    errors: list[str] = []
+    errors = _unexpected_key_errors(f"{prefix} usage", usage, USAGE_KEYS)
     for field in (*NATIVE_USAGE_FIELDS, "token_count"):
         value = usage.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -2249,6 +2992,8 @@ def _usage_errors(prefix: str, usage: object) -> list[str]:
         errors.append(f"{prefix} reasoning_output_tokens exceeds output_tokens")
     if usage["token_count"] != usage["input_tokens"] + usage["output_tokens"]:
         errors.append(f"{prefix} token_count does not equal input_tokens + output_tokens")
+    if usage["token_count"] <= 0:
+        errors.append(f"{prefix} token_count is not positive")
     return errors
 
 
@@ -2261,11 +3006,184 @@ def _aggregate_usages(usages: list[dict[str, Any]]) -> dict[str, int] | None:
     }
 
 
+def _passing_live_scenario_errors(
+    mode: str,
+    scenario: dict[str, Any],
+) -> list[str]:
+    """Validate every persisted fact required by a passing Native profile."""
+
+    name = str(scenario.get("name", "<unknown>"))
+    details = scenario.get("details")
+    if not isinstance(details, dict):
+        return [f"scenario {name} details is not an object"]
+    expected_detail_keys = (
+        SINGLE_PASSING_DETAIL_KEYS
+        if mode == "live-codex"
+        else PARALLEL_PASSING_DETAIL_KEYS
+        if mode == "live-codex-parallel"
+        else frozenset()
+    )
+    errors = _unexpected_key_errors(
+        f"scenario {name} details",
+        details,
+        expected_detail_keys,
+    )
+
+    def require(field: str, expected: object) -> None:
+        if not _matches_exact_json_contract(details.get(field), expected):
+            errors.append(f"scenario {name} {field} is inconsistent with passing contract")
+
+    if scenario.get("category") != mode:
+        errors.append(f"scenario {name} category is inconsistent with live profile")
+    if scenario.get("mode") != mode:
+        errors.append(f"scenario {name} mode is inconsistent with live profile")
+    require("capability_status", "passed")
+    pre_edit_returncode = details.get("pre_edit_returncode")
+    if (
+        not isinstance(pre_edit_returncode, int)
+        or isinstance(pre_edit_returncode, bool)
+        or pre_edit_returncode == 0
+    ):
+        errors.append(f"scenario {name} pre_edit_returncode did not prove the red state")
+    if not isinstance(details.get("native_usage"), dict):
+        errors.append(f"scenario {name} native_usage is required for a passing live profile")
+    token_count = details.get("native_token_count")
+    if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count <= 0:
+        errors.append(f"scenario {name} native_token_count is required")
+    runtime = details.get("native_runtime_seconds")
+    if (
+        not isinstance(runtime, (int, float))
+        or isinstance(runtime, bool)
+        or not math.isfinite(float(runtime))
+        or runtime <= 0
+    ):
+        errors.append(f"scenario {name} native_runtime_seconds is required")
+    duration = scenario.get("duration_seconds")
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(float(duration))
+        or duration <= 0
+    ):
+        errors.append(f"scenario {name} duration_seconds is not positive and finite")
+    elif isinstance(runtime, (int, float)) and math.isfinite(float(runtime)) and duration < runtime:
+        errors.append(f"scenario {name} duration_seconds is shorter than Native runtime")
+    require("native_token_scope", NATIVE_TOKEN_SCOPE)
+    require("codex_version", EXPECTED_CODEX_CLI_VERSION)
+    require("human_intervention_count", 0)
+    require("false_pass_count", 0)
+
+    if mode == "live-codex":
+        if name != "native_codex_edit_and_controller_verify":
+            errors.append("passing single Native profile has an unexpected scenario")
+            return errors
+        exact = {
+            "native_returncode": 0,
+            "native_runtime_source": "controller-wall-clock",
+            "exclusive_files": ["candidate.py"],
+            "changed_files": ["candidate.py"],
+            "producer_changed_files": ["candidate.py"],
+            "integrated_files": ["candidate.py"],
+            "producer_scope_valid": True,
+            "producer_workspace_isolated": True,
+            "test_file_unchanged": True,
+            "controller_test_unchanged": True,
+            "controller_state_unchanged_during_native": True,
+            "controller_verify_returncode": 0,
+            "controller_verify_status": "passed",
+            "task_submit_returncode": 0,
+            "execution_count": 1,
+            "validation_count": 1,
+            "workload_units": 1,
+            "task_status": "submitted",
+            "provider_surface_absent": True,
+            "retired_host_tables": [],
+            "last_message_recorded": True,
+        }
+        for field, expected in exact.items():
+            require(field, expected)
+        return errors
+
+    if mode == "live-codex-parallel":
+        if name != "native_codex_two_producer_integration":
+            errors.append("passing parallel Native profile has an unexpected scenario")
+            return errors
+        exact = {
+            "producer_count": 2,
+            "native_runtime_source": "controller-parallel-wall-clock",
+            "changed_files": ["alpha.py", "beta.py"],
+            "integrated_files": ["alpha.py", "beta.py"],
+            "producer_attribution_valid": True,
+            "controller_state_unchanged_during_native": True,
+            "scope_enforcement": "isolated-producer-workspaces-plus-exact-diff-integration",
+            "test_files_unchanged": True,
+            "targeted_verify_returncodes": {"LIVE-ALPHA": 0, "LIVE-BETA": 0},
+            "producer_state_returncodes": [0, 0, 0, 0],
+            "integration_start_returncode": 0,
+            "combined_verify_returncode": 0,
+            "combined_verify_status": "passed",
+            "integration_submit_returncode": 0,
+            "integration_dependency_blocked_before_producers": True,
+            "task_statuses": {
+                "LIVE-INTEGRATE": "submitted",
+                "LIVE-P1": "accepted",
+                "LIVE-P2": "accepted",
+            },
+            "execution_count": 3,
+            "validation_count": 3,
+            "workload_units": 2,
+            "scope_conflicts": {},
+            "overlap_policy": "block-parallel-on-declared-overlap",
+            "retired_host_tables": [],
+            "provider_surface_absent": True,
+        }
+        for field, expected in exact.items():
+            require(field, expected)
+        overlap = details.get("producer_overlap_seconds")
+        if not isinstance(overlap, (int, float)) or isinstance(overlap, bool) or overlap <= 0:
+            errors.append(f"scenario {name} producer_overlap_seconds is not positive")
+        producers = details.get("producers")
+        if not isinstance(producers, list) or len(producers) != len(
+            PARALLEL_PRODUCER_CONTRACT
+        ):
+            errors.append(f"scenario {name} producer task set is inconsistent")
+        else:
+            by_task = {
+                str(producer.get("task")): producer
+                for producer in producers
+                if isinstance(producer, dict)
+            }
+            if set(by_task) != set(PARALLEL_PRODUCER_CONTRACT):
+                errors.append(f"scenario {name} producer task set is inconsistent")
+            else:
+                for task, contract in PARALLEL_PRODUCER_CONTRACT.items():
+                    producer = by_task[task]
+                    errors.extend(
+                        _unexpected_key_errors(
+                            f"scenario {name} producer {task}",
+                            producer,
+                            PARALLEL_PRODUCER_KEYS,
+                        )
+                    )
+                    for field, expected in contract.items():
+                        if not _matches_exact_json_contract(
+                            producer.get(field),
+                            expected,
+                        ):
+                            errors.append(
+                                f"scenario {name} producer {task} {field} is inconsistent"
+                            )
+        return errors
+
+    return [f"scenario {name} uses unsupported passing live mode: {mode}"]
+
+
 def report_consistency_errors(
     report: dict[str, Any],
     *,
     require_current_binary: bool = True,
     require_current_git_state: bool = True,
+    require_current_matrix: bool = True,
 ) -> list[str]:
     """Recompute evidence facts instead of trusting report summary fields.
 
@@ -2276,33 +3194,99 @@ def report_consistency_errors(
     to match the current checkout.
     """
 
-    errors: list[str] = []
+    errors = _unexpected_key_errors("report", report, REPORT_KEYS)
     scenarios = report.get("scenarios")
     if not isinstance(scenarios, list):
         return ["scenarios is not a list"]
     if any(not isinstance(scenario, dict) for scenario in scenarios):
         return ["scenario entry is not an object"]
+    for scenario in scenarios:
+        errors.extend(_unexpected_key_errors("scenario", scenario, SCENARIO_KEYS))
 
     summary = report.get("summary")
     if not isinstance(summary, dict):
         return ["summary is not an object"]
+    errors.extend(_unexpected_key_errors("summary", summary, SUMMARY_KEYS))
+    mode = report.get("mode")
+    if (
+        type(report.get("report_version")) is not int
+        or report.get("report_version") != REPORT_VERSION
+    ):
+        errors.append("report_version is unsupported")
+    if mode not in REPORT_MODES:
+        errors.append(f"report mode is unsupported: {mode!r}")
+    expected_evidence_scope = (
+        "deterministic-local-runtime"
+        if mode in {"fixture", "stability"}
+        else mode
+    )
+    if report.get("evidence_scope") != expected_evidence_scope:
+        errors.append("evidence_scope is inconsistent with report mode")
+    if not isinstance(report.get("live_skipped"), bool):
+        errors.append("live_skipped is not a boolean")
+    matrix = report.get("matrix")
+    if not isinstance(matrix, dict):
+        errors.append("matrix is not an object")
+    else:
+        errors.extend(_unexpected_key_errors("matrix", matrix, MATRIX_KEYS))
+        if matrix.get("profile") != mode:
+            errors.append("matrix profile is inconsistent with report mode")
+        for field in ("platform", "python_version", "git_version"):
+            value = matrix.get(field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"matrix {field} is not a non-empty string")
+        for field in ("codex_available", "container_available", "sqlite_stress"):
+            if not isinstance(matrix.get(field), bool):
+                errors.append(f"matrix {field} is not a boolean")
+        if matrix.get("sqlite_stress") is not (mode == "stability"):
+            errors.append("matrix sqlite_stress is inconsistent with report mode")
+        skipped_reasons = matrix.get("live_skipped_reasons")
+        if not isinstance(skipped_reasons, list):
+            errors.append("matrix live_skipped_reasons is not a list")
+        elif any(not isinstance(reason, str) or not reason.strip() for reason in skipped_reasons):
+            errors.append("matrix live_skipped_reasons contains an invalid reason")
+        if require_current_matrix:
+            current_matrix = {
+                "platform": platform.platform(),
+                "python_version": platform.python_version(),
+                "git_version": command_version(["git", "--version"]),
+                "container_available": shutil.which("docker") is not None
+                or shutil.which("podman") is not None,
+            }
+            for field, expected in current_matrix.items():
+                if matrix.get(field) != expected:
+                    errors.append(f"matrix {field} does not match current generation environment")
+
     summary_duration = summary.get("duration_seconds")
     if (
         not isinstance(summary_duration, (int, float))
         or isinstance(summary_duration, bool)
+        or not math.isfinite(float(summary_duration))
         or summary_duration < 0
     ):
-        errors.append("summary duration_seconds is not non-negative")
+        errors.append("summary duration_seconds is not non-negative and finite")
+    scenario_durations: list[float] = []
     for scenario in scenarios:
         duration = scenario.get("duration_seconds")
         if (
             not isinstance(duration, (int, float))
             or isinstance(duration, bool)
+            or not math.isfinite(float(duration))
             or duration < 0
         ):
             errors.append(
-                f"scenario {scenario.get('name', '<unknown>')} duration_seconds is not non-negative"
+                f"scenario {scenario.get('name', '<unknown>')} duration_seconds is not non-negative and finite"
             )
+        else:
+            scenario_durations.append(float(duration))
+    if (
+        isinstance(summary_duration, (int, float))
+        and not isinstance(summary_duration, bool)
+        and math.isfinite(float(summary_duration))
+        and scenario_durations
+        and float(summary_duration) < max(scenario_durations)
+    ):
+        errors.append("summary duration_seconds is shorter than a scenario duration")
     skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
     passed = sum(
         1
@@ -2333,17 +3317,28 @@ def report_consistency_errors(
         for scenario in scenarios:
             details = scenario.get("details")
             value = details.get(detail_field, 0) if isinstance(details, dict) else 0
-            if not isinstance(value, int) or isinstance(value, bool):
-                errors.append(f"scenario {scenario.get('name', '<unknown>')} {detail_field} is not an integer")
+            if type(value) is not int or value < 0:
+                errors.append(
+                    f"scenario {scenario.get('name', '<unknown>')} {detail_field} "
+                    "is not a non-negative integer"
+                )
                 value = 0
             values.append(value)
         expected_summary[summary_field] = sum(values)
     for field, expected in expected_summary.items():
-        if summary.get(field) != expected:
+        actual = summary.get(field)
+        if field in SUMMARY_INTEGER_FIELDS and type(actual) is not int:
+            errors.append(f"summary {field} is not an exact integer")
+        elif field == "scenario_pass_rate" and (
+            not isinstance(actual, (int, float))
+            or isinstance(actual, bool)
+            or not math.isfinite(float(actual))
+        ):
+            errors.append("summary scenario_pass_rate is not numeric and finite")
+        if actual != expected:
             errors.append(f"summary {field} is inconsistent")
 
-    mode = report.get("mode")
-    if isinstance(mode, str) and mode.startswith("live-codex"):
+    if mode in {"live-codex", "live-codex-parallel"}:
         if report.get("live_skipped") is True:
             expected_live_status = "not-run"
         elif failed and all(
@@ -2363,11 +3358,59 @@ def report_consistency_errors(
         expected_live_status = "not-applicable"
     if report.get("live_status") != expected_live_status:
         errors.append("live_status is inconsistent with scenarios")
+    expected_scenario_inventory = {
+        "fixture": [
+            scenario.__name__.removeprefix("scenario_")
+            for scenario in FIXTURE_SCENARIOS
+        ],
+        "stability": [
+            scenario.__name__.removeprefix("scenario_")
+            for scenario in (*FIXTURE_SCENARIOS, *STABILITY_SCENARIOS)
+        ],
+        "live-codex": ["native_codex_edit_and_controller_verify"],
+        "live-codex-parallel": ["native_codex_two_producer_integration"],
+    }
+    if mode in expected_scenario_inventory and [
+        scenario.get("name") for scenario in scenarios
+    ] != expected_scenario_inventory[mode]:
+        errors.append("profile scenario inventory is inconsistent")
+    if mode in {"fixture", "stability"}:
+        for scenario in scenarios:
+            name = str(scenario.get("name", ""))
+            expected_local_contract = LOCAL_SCENARIO_CONTRACT.get(name)
+            if expected_local_contract is None:
+                continue
+            expected_category, expected_mode = expected_local_contract
+            if scenario.get("category") != expected_category:
+                errors.append(
+                    f"scenario {name} category is inconsistent with local profile"
+                )
+            if scenario.get("mode") != expected_mode:
+                errors.append(
+                    f"scenario {name} mode is inconsistent with local profile"
+                )
+    if expected_live_status == "passed":
+        if not isinstance(summary_duration, (int, float)) or isinstance(
+            summary_duration, bool
+        ) or not math.isfinite(float(summary_duration)) or summary_duration <= 0:
+            errors.append("passing live summary duration_seconds is not positive and finite")
+        if isinstance(matrix, dict):
+            if matrix.get("codex_available") is not True:
+                errors.append("passing live matrix does not report Codex available")
+            if matrix.get("live_skipped_reasons") != []:
+                errors.append("passing live matrix contains skip reasons")
 
     identity = report.get("evaluation_source")
     if not isinstance(identity, dict):
         errors.append("evaluation_source is not an object")
     else:
+        errors.extend(
+            _unexpected_key_errors(
+                "evaluation_source",
+                identity,
+                EVALUATION_SOURCE_KEYS,
+            )
+        )
         if not _valid_aware_iso8601(identity.get("generated_at")):
             errors.append("evaluation_source generated_at is not timezone-aware ISO-8601")
         for field in ("workspace_sha256", "status_sha256"):
@@ -2390,6 +3433,23 @@ def report_consistency_errors(
             or status_entry_count < 0
         ):
             errors.append("evaluation_source status_entry_count is not non-negative")
+        git_dirty = identity.get("git_dirty")
+        empty_status_sha256 = hashlib.sha256(b"").hexdigest()
+        if isinstance(git_dirty, bool) and isinstance(status_entry_count, int) and not isinstance(
+            status_entry_count, bool
+        ) and status_entry_count >= 0:
+            if git_dirty != (status_entry_count > 0):
+                errors.append(
+                    "evaluation_source git_dirty is inconsistent with status_entry_count"
+                )
+            if status_entry_count == 0 and identity.get("status_sha256") != empty_status_sha256:
+                errors.append(
+                    "evaluation_source clean status_sha256 is inconsistent"
+                )
+            if status_entry_count > 0 and identity.get("status_sha256") == empty_status_sha256:
+                errors.append(
+                    "evaluation_source dirty status_sha256 is inconsistent"
+                )
         source_scope = identity.get("source_scope")
         if (
             not isinstance(source_scope, list)
@@ -2419,8 +3479,16 @@ def report_consistency_errors(
     if expected_live_status == "passed" and not isinstance(native_host, dict):
         errors.append("passing live report has no Native Host binary metadata")
     if isinstance(native_host, dict):
+        errors.extend(
+            _unexpected_key_errors("Native Host", native_host, NATIVE_HOST_KEYS)
+        )
         resolved_path = native_host.get("resolved_path")
-        if not isinstance(resolved_path, str) or not Path(resolved_path).is_absolute():
+        path_flavor = (
+            _absolute_path_flavor(resolved_path)
+            if isinstance(resolved_path, str)
+            else None
+        )
+        if path_flavor is None:
             errors.append("Native Host resolved_path is not absolute")
         if not _valid_nonzero_sha256(native_host.get("sha256")):
             errors.append("Native Host sha256 is not a nonzero SHA-256")
@@ -2428,16 +3496,42 @@ def report_consistency_errors(
             errors.append("Native Host source is invalid")
         if native_host.get("trust") != "local-capability-only-not-delivery-provenance":
             errors.append("Native Host trust label is invalid")
-        if isinstance(resolved_path, str):
-            binary_path = Path(resolved_path)
-            if (
-                require_current_binary
-                and expected_live_status == "passed"
-                and not binary_path.is_file()
-            ):
+        if (
+            require_current_binary
+            and expected_live_status == "passed"
+            and isinstance(resolved_path, str)
+            and path_flavor is not None
+        ):
+            current_flavor = "windows" if os.name == "nt" else "posix"
+            if path_flavor != current_flavor:
+                errors.append("Native Host resolved_path is for a different operating system")
+                binary_path = None
+            else:
+                binary_path = Path(resolved_path)
+            if binary_path is None:
+                pass
+            elif not binary_path.is_file():
                 errors.append("Native Host resolved binary is unavailable")
-            elif binary_path.is_file() and native_host.get("sha256") != _sha256(binary_path):
+            elif native_host.get("sha256") != _sha256(binary_path):
                 errors.append("Native Host sha256 does not match resolved binary")
+            expected_binary = live_codex_binary()
+            if not expected_binary:
+                errors.append("current Native Codex binary is unavailable")
+            elif binary_path is not None and binary_path.is_file():
+                expected_path = Path(expected_binary).expanduser().resolve()
+                if binary_path.expanduser().resolve() != expected_path:
+                    errors.append(
+                        "Native Host resolved binary does not match current Native Codex binary"
+                    )
+                expected_source = (
+                    "explicit-test-override"
+                    if os.environ.get("HARNESS_E2E_CODEX_BIN", "").strip()
+                    else "path-discovery"
+                )
+                if native_host.get("source") != expected_source:
+                    errors.append(
+                        "Native Host source does not match current binary discovery"
+                    )
 
     scenario_usages: list[dict[str, Any]] = []
     scenario_token_counts: list[int] = []
@@ -2462,18 +3556,23 @@ def report_consistency_errors(
             scenario_token_counts.append(token_count)
         runtime = details.get("native_runtime_seconds")
         if isinstance(runtime, (int, float)) and not isinstance(runtime, bool):
-            if runtime < 0:
-                errors.append(f"scenario {name} native_runtime_seconds is negative")
+            if not math.isfinite(float(runtime)) or runtime < 0:
+                errors.append(
+                    f"scenario {name} native_runtime_seconds is not non-negative and finite"
+                )
             else:
                 scenario_runtimes.append(float(runtime))
+        elif runtime is not None:
+            errors.append(f"scenario {name} native_runtime_seconds is not numeric")
 
-        if isinstance(mode, str) and mode.startswith("live-codex") and scenario.get("pass") is True:
+        if mode in {"live-codex", "live-codex-parallel"} and scenario.get("pass") is True:
             if details.get("native_token_scope") != NATIVE_TOKEN_SCOPE:
                 errors.append(f"scenario {name} native_token_scope is invalid")
             if details.get("workload_family") != LIVE_WORKLOAD_FAMILY:
                 errors.append(f"scenario {name} workload_family is invalid")
             if details.get("workload_unit_sha256") != LIVE_WORKLOAD_UNIT_SHA256:
                 errors.append(f"scenario {name} workload_unit_sha256 is invalid")
+            errors.extend(_passing_live_scenario_errors(mode, scenario))
 
         producers = details.get("producers")
         if not isinstance(producers, list):
@@ -2498,7 +3597,9 @@ def report_consistency_errors(
                 if scenario.get("pass") is True:
                     if not exclusive:
                         errors.append(f"scenario {name} exclusive_files is empty")
-                    if details.get("native_returncode") != 0:
+                    if type(details.get("native_returncode")) is not int or details.get(
+                        "native_returncode"
+                    ) != 0:
                         errors.append(f"scenario {name} native_returncode is inconsistent")
                     if details.get("integrated_files") != exclusive:
                         errors.append(f"scenario {name} integrated_files is inconsistent with scope")
@@ -2506,11 +3607,16 @@ def report_consistency_errors(
                 isinstance(mode, str)
                 and mode.startswith("live-codex")
                 and scenario.get("pass") is True
-                and details.get("workload_units") != 1
+                and (
+                    type(details.get("workload_units")) is not int
+                    or details.get("workload_units") != 1
+                )
             ):
                 errors.append(f"scenario {name} workload_units is inconsistent")
             continue
-        if details.get("producer_count") != len(producers):
+        if type(details.get("producer_count")) is not int or details.get(
+            "producer_count"
+        ) != len(producers):
             errors.append(f"scenario {name} producer_count is inconsistent")
         try:
             expected_conflicts = live_eval_scope_conflicts(producers)
@@ -2539,7 +3645,8 @@ def report_consistency_errors(
                 continue
             producer_changed_files.update(changed)
             if (
-                producer.get("returncode") != 0
+                type(producer.get("returncode")) is not int
+                or producer.get("returncode") != 0
                 or producer.get("scope_valid") is not True
                 or producer.get("test_file_unchanged") is not True
                 or changed != exclusive
@@ -2553,7 +3660,10 @@ def report_consistency_errors(
             errors.extend(producer_usage_errors)
             if not producer_usage_errors:
                 producer_usages.append(producer_usage)
-                if producer.get("token_count") != producer_usage["token_count"]:
+                if (
+                    type(producer.get("token_count")) is not int
+                    or producer.get("token_count") != producer_usage["token_count"]
+                ):
                     errors.append(
                         f"scenario {name} producer {producer.get('task', '<unknown>')} token_count is inconsistent"
                     )
@@ -2566,24 +3676,39 @@ def report_consistency_errors(
             if (
                 isinstance(producer_start, (int, float))
                 and not isinstance(producer_start, bool)
+                and math.isfinite(float(producer_start))
                 and isinstance(producer_finish, (int, float))
                 and not isinstance(producer_finish, bool)
-                and producer_finish >= producer_start
+                and math.isfinite(float(producer_finish))
+                and producer_finish > producer_start
             ):
                 expected_producer_runtime = round(
                     float(producer_finish) - float(producer_start),
                     6,
                 )
-                if producer.get("runtime_seconds") != expected_producer_runtime:
+                producer_runtime = producer.get("runtime_seconds")
+                if (
+                    not isinstance(producer_runtime, (int, float))
+                    or isinstance(producer_runtime, bool)
+                    or not math.isfinite(float(producer_runtime))
+                    or producer_runtime <= 0
+                    or producer_runtime != expected_producer_runtime
+                ):
                     errors.append(
                         f"scenario {name} producer {producer.get('task', '<unknown>')} runtime_seconds is inconsistent"
                     )
+            else:
+                errors.append(
+                    f"scenario {name} producer {producer.get('task', '<unknown>')} timing is not positive and finite"
+                )
         if details.get("producer_attribution_valid") is not expected_attribution:
             errors.append(f"scenario {name} producer_attribution_valid is inconsistent")
         if producer_usages and details.get("native_usage") != _aggregate_usages(producer_usages):
             errors.append(f"scenario {name} producer usage aggregate is inconsistent")
         if scenario.get("pass") is True:
-            if details.get("workload_units") != len(producers):
+            if type(details.get("workload_units")) is not int or details.get(
+                "workload_units"
+            ) != len(producers):
                 errors.append(f"scenario {name} workload_units is inconsistent")
             expected_files = sorted(producer_changed_files)
             if details.get("changed_files") != expected_files:
@@ -2595,7 +3720,12 @@ def report_consistency_errors(
         if (
             len(starts) == len(producers)
             and len(finishes) == len(producers)
-            and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in starts + finishes)
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in starts + finishes
+            )
         ):
             expected_overlap = round(
                 max(0.0, min(float(value) for value in finishes) - max(float(value) for value in starts)),
@@ -2613,25 +3743,83 @@ def report_consistency_errors(
             errors.append(f"scenario {name} producer timing window is incomplete")
 
     expected_usage = _aggregate_usages(scenario_usages)
-    if report.get("token_usage") != expected_usage:
+    if expected_usage is not None:
+        errors.extend(_usage_errors("top-level", report.get("token_usage")))
+    if not _matches_exact_json_contract(report.get("token_usage"), expected_usage):
         errors.append("top-level token_usage is inconsistent")
     expected_token_count = sum(scenario_token_counts) if scenario_token_counts else None
-    if report.get("token_count") != expected_token_count:
+    if not _matches_exact_json_contract(report.get("token_count"), expected_token_count):
         errors.append("top-level token_count is inconsistent")
     if expected_usage is not None and expected_token_count != expected_usage["token_count"]:
         errors.append("scenario token totals disagree with structured usage")
     expected_runtime = round(sum(scenario_runtimes), 6) if scenario_runtimes else None
-    if report.get("agent_runtime_seconds") != expected_runtime:
+    actual_runtime = report.get("agent_runtime_seconds")
+    if expected_runtime is None:
+        runtime_matches = actual_runtime is None
+    else:
+        runtime_matches = (
+            isinstance(actual_runtime, (int, float))
+            and not isinstance(actual_runtime, bool)
+            and math.isfinite(float(actual_runtime))
+            and actual_runtime == expected_runtime
+        )
+    if not runtime_matches:
         errors.append("top-level agent_runtime_seconds is inconsistent")
+    if expected_live_status == "passed" and (
+        expected_runtime is None or not math.isfinite(expected_runtime) or expected_runtime <= 0
+    ):
+        errors.append("passing live agent_runtime_seconds is not positive and finite")
+    if report.get("estimated_cost") is not None:
+        errors.append("estimated_cost must remain null because cost is not exposed")
+    return errors
+
+
+def persistent_report_consistency_errors(
+    report: dict[str, Any],
+    *,
+    require_current_binary: bool = False,
+    require_current_git_state: bool = False,
+    require_current_matrix: bool = False,
+) -> list[str]:
+    """Validate persisted evidence while rejecting explicit test binaries."""
+
+    errors = report_consistency_errors(
+        report,
+        require_current_binary=require_current_binary,
+        require_current_git_state=require_current_git_state,
+        require_current_matrix=require_current_matrix,
+    )
+    native_host = report.get("native_host")
+    if (
+        report.get("mode") in {"live-codex", "live-codex-parallel"}
+        and report.get("live_status") == "passed"
+        and (
+            not isinstance(native_host, dict)
+            or native_host.get("source") != "path-discovery"
+        )
+    ):
+        errors.append(
+            "persisted passing Native evidence requires a path-discovered binary"
+        )
     return errors
 
 
 def should_fail(report: dict[str, Any]) -> bool:
     if report_consistency_errors(report):
         return True
-    if report["mode"].startswith("live-codex") and report["live_skipped"]:
-        return True
     summary = report["summary"]
+    if report["mode"].startswith("live-codex"):
+        if report["live_skipped"] or report.get("live_status") != "passed":
+            return True
+        if (
+            summary.get("scenario_count") != 1
+            or summary.get("passed_count") != 1
+            or summary.get("failed_count") != 0
+            or summary.get("skipped_count") != 0
+            or summary.get("false_pass_count") != 0
+            or summary.get("human_intervention_count") != 0
+        ):
+            return True
     if summary["failed_count"] != 0:
         return True
     if report["mode"] == "fixture" and summary["scenario_count"] != len(FIXTURE_SCENARIOS):
@@ -2682,22 +3870,38 @@ def main() -> int:
     }
     report = runners[args.mode]()
     evidence_report = compact_evidence_report(report)
+    persistent_errors = (
+        persistent_report_consistency_errors(
+            evidence_report,
+            require_current_binary=True,
+            require_current_git_state=True,
+            require_current_matrix=True,
+        )
+        if args.evidence_out
+        else []
+    )
     text = json.dumps(evidence_report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     if args.evidence_out:
-        evidence_out = Path(args.evidence_out)
-        evidence_out.parent.mkdir(parents=True, exist_ok=True)
-        evidence_out.write_text(text, encoding="utf-8")
+        if persistent_errors:
+            print(
+                "ERROR: refusing persistent evidence: " + "; ".join(persistent_errors),
+                file=sys.stderr,
+            )
+        else:
+            evidence_out = Path(args.evidence_out)
+            evidence_out.parent.mkdir(parents=True, exist_ok=True)
+            evidence_out.write_text(text, encoding="utf-8")
     if args.debug_out:
         debug_out = Path(args.debug_out)
         debug_out.parent.mkdir(parents=True, exist_ok=True)
         debug_text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         debug_out.write_text(debug_text, encoding="utf-8")
     print(text, end="")
-    return 1 if should_fail(report) else 0
+    return 1 if should_fail(report) or persistent_errors else 0
 
 
 if __name__ == "__main__":

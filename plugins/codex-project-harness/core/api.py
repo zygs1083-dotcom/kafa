@@ -36,6 +36,7 @@ from harness_db import (
     record_finding,
     record_gate,
     record_validation,
+    render_all as _render_all,
     repair,
     runtime_initialized,
     set_store_factory,
@@ -102,6 +103,4 @@ __all__ = (
 
 
 def projection_rebuild(root):
-    from core.projections import render_all
-
-    render_all(root)
+    _render_all(root)

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import ast
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -40,12 +44,14 @@ def make_fake_codex(
     *,
     tamper_state: bool = False,
     tamper_attribution: bool = False,
+    inject_retired_table: bool = False,
 ) -> Path:
     script = root / "fake_codex.py"
     script.write_text(
         "import json, os, pathlib, sys, time\n"
         f"TAMPER_STATE = {tamper_state!r}\n"
         f"TAMPER_ATTRIBUTION = {tamper_attribution!r}\n"
+        f"INJECT_RETIRED_TABLE = {inject_retired_table!r}\n"
         "args = sys.argv[1:]\n"
         "if os.environ.get('N8N_MCP_ACCESS_TOKEN'):\n"
         "    print('ambient secret leaked to configured Codex binary', file=sys.stderr)\n"
@@ -70,7 +76,15 @@ def make_fake_codex(
         "        (work / 'beta.py').write_text('VALUE = \\\"after\\\"\\n', encoding='utf-8')\n"
         "        token_count = 700\n"
         "    else:\n"
-        "        (work / 'candidate.py').write_text('VALUE = \\\"after\\\"\\n', encoding='utf-8')\n"
+        "        candidate_source = 'VALUE = \\\"after\\\"\\n'\n"
+        "        if INJECT_RETIRED_TABLE:\n"
+        "            candidate_source = (\n"
+        "                'import sqlite3\\n'\n"
+        "                \"with sqlite3.connect('.ai-team/state/harness.db') as conn:\\n\"\n"
+        "                \"    conn.execute('create table if not exists adapter_actions (id text primary key)')\\n\"\n"
+        "                'VALUE = \\\"after\\\"\\n'\n"
+        "            )\n"
+        "        (work / 'candidate.py').write_text(candidate_source, encoding='utf-8')\n"
         "        token_count = 1234\n"
         "    if TAMPER_STATE:\n"
         "        state = work / '.ai-team/state/harness.db'\n"
@@ -114,6 +128,947 @@ class AgentE2EEvalTest(unittest.TestCase):
             run_agent_e2e_eval._is_evaluation_cache_path("tests/test_agent_e2e_eval.py")
         )
 
+    def test_pinned_controller_source_ignores_transient_original_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            harness = root / "plugins/codex-project-harness/scripts/harness.py"
+            harness.parent.mkdir(parents=True)
+            original = b"print('trusted-controller')\n"
+            harness.write_bytes(original)
+            subprocess.run(
+                ["git", "add", "plugins/codex-project-harness/scripts/harness.py"],
+                cwd=root,
+                check=True,
+            )
+            start_identity = run_agent_e2e_eval.evaluation_source_identity(root)
+            worker_ready = threading.Event()
+            read_pinned = threading.Event()
+            observed: dict[str, bytes] = {}
+
+            with run_agent_e2e_eval.pinned_evaluation_source(
+                root,
+                start_identity,
+            ) as pinned_harness:
+                def read_controller() -> None:
+                    worker_ready.set()
+                    observed["bytes"] = pinned_harness.read_bytes()
+                    read_pinned.set()
+
+                harness.write_bytes(b"print('transient-untrusted-controller')\n")
+                worker = threading.Thread(target=read_controller)
+                worker.start()
+                self.assertTrue(worker_ready.wait(5))
+                self.assertTrue(read_pinned.wait(5))
+                harness.write_bytes(original)
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+
+            end_identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(observed["bytes"], original)
+        self.assertEqual(
+            start_identity["workspace_sha256"],
+            end_identity["workspace_sha256"],
+        )
+
+    def test_pinned_controller_snapshot_ignores_ambient_git_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            ambient_git_dir = Path(temp) / "ambient.git"
+            root.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            harness = root / "plugins/codex-project-harness/scripts/harness.py"
+            harness.parent.mkdir(parents=True)
+            harness.write_text("print('trusted-controller')\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "plugins/codex-project-harness/scripts/harness.py"],
+                cwd=root,
+                check=True,
+            )
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_DIR": str(ambient_git_dir)},
+                clear=False,
+            ):
+                with run_agent_e2e_eval.pinned_evaluation_source(
+                    root,
+                    identity,
+                ) as pinned_harness:
+                    pinned_bytes = pinned_harness.read_bytes()
+
+        self.assertEqual(pinned_bytes, b"print('trusted-controller')\n")
+        self.assertFalse(ambient_git_dir.exists())
+
+    def test_evaluation_source_identity_hashes_runtime_bytes_and_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "core.autocrlf", "true"],
+                cwd=root,
+                check=True,
+            )
+            attributes = root / ".gitattributes"
+            attributes.write_text("* text=auto eol=lf\n", encoding="utf-8")
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"first\nsecond\n")
+            subprocess.run(
+                ["git", "add", "--", str(attributes), str(source)],
+                cwd=root,
+                check=True,
+            )
+            lf_digest = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            source.write_bytes(b"first\r\nsecond\r\n")
+            runtime_crlf_digest = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            source.write_bytes(b"first\r\nchanged\r\n")
+            changed_digest = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+
+            binary = root / "tests/payload.bin"
+            binary.write_bytes(b"\0first\r\nsecond\r\n")
+            binary_digest = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            binary.write_bytes(b"\0first\nsecond\n")
+            changed_binary_digest = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+
+            binary.unlink()
+            before_add = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            added = root / "tests/added.py"
+            added.write_text("value = 1\n", encoding="utf-8")
+            after_add = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            added.unlink()
+            after_delete = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            mode_before = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+            if os.name == "nt":
+                subprocess.run(
+                    ["git", "update-index", "--chmod=+x", "tests/source.py"],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                source.chmod(source.stat().st_mode | 0o111)
+            mode_after = run_agent_e2e_eval.evaluation_source_identity(root)[
+                "workspace_sha256"
+            ]
+
+        self.assertNotEqual(lf_digest, runtime_crlf_digest)
+        self.assertNotEqual(runtime_crlf_digest, changed_digest)
+        self.assertNotEqual(binary_digest, changed_binary_digest)
+        self.assertNotEqual(before_add, after_add)
+        self.assertEqual(before_add, after_delete)
+        self.assertNotEqual(mode_before, mode_after)
+
+    def test_evaluation_source_identity_frames_fixed_file_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            source = root / "tests/payload.bin"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"runtime-bytes\0with-binary")
+            source.chmod(0o644)
+
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+            file_sha256 = hashlib.sha256(source.read_bytes()).hexdigest().encode("ascii")
+            expected = hashlib.sha256(
+                b"tests/payload.bin\0" + b"100644\0" + file_sha256 + b"\0"
+            ).hexdigest()
+
+        self.assertEqual(identity["workspace_sha256"], expected)
+
+    def test_evaluation_source_identity_survives_commit_of_same_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            attributes = root / ".gitattributes"
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            attributes.write_text("* text=auto eol=lf\n", encoding="utf-8")
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+
+            before_commit = run_agent_e2e_eval.evaluation_source_identity(root)
+            subprocess.run(
+                ["git", "add", "--", str(attributes), str(source)],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "publish runtime"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            after_commit = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(
+            before_commit["workspace_sha256"],
+            after_commit["workspace_sha256"],
+        )
+        self.assertTrue(before_commit["git_dirty"])
+        self.assertFalse(after_commit["git_dirty"])
+        self.assertNotEqual(before_commit["status_sha256"], after_commit["status_sha256"])
+
+    def test_evaluation_source_identity_rejects_source_symlink_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            regular = run_agent_e2e_eval.evaluation_source_identity(root)
+            original_is_symlink = Path.is_symlink
+
+            def report_source_as_symlink(path: Path) -> bool:
+                if path.resolve() == source.resolve():
+                    return True
+                return original_is_symlink(path)
+
+            with mock.patch.object(
+                Path,
+                "is_symlink",
+                new=report_source_as_symlink,
+            ):
+                symlink = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(regular["workspace_sha256"], "")
+        self.assertEqual(symlink["workspace_sha256"], "")
+
+    def test_evaluation_source_identity_rejects_gitlink_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            baseline = run_agent_e2e_eval.evaluation_source_identity(root)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            gitlink = root / "tests/submodule"
+            gitlink.mkdir()
+            (gitlink / "runtime.py").write_text(
+                "raise RuntimeError('submodule runtime')\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{head},tests/submodule",
+                ],
+                cwd=root,
+                check=True,
+            )
+            with_gitlink = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(baseline["workspace_sha256"], "")
+        self.assertEqual(with_gitlink["workspace_sha256"], "")
+
+    def test_evaluation_source_identity_rejects_head_only_gitlink_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"], cwd=root, check=True
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tests/source.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{commit},tests/submodule",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "record gitlink"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "rm", "--cached", "tests/submodule"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(identity["workspace_sha256"], "")
+
+    def test_evaluation_source_identity_ignores_commit_replace_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tests/source.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "clean baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            clean_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{clean_commit},tests/submodule",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "head contains gitlink"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            replaced_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "rm", "--cached", "tests/submodule"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "replace", replaced_head, clean_commit],
+                cwd=root,
+                check=True,
+            )
+
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(identity["workspace_sha256"], "")
+        self.assertEqual(identity["source_scope"], [])
+
+    def test_evaluation_source_identity_rejects_unmerged_source_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 'base'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            primary = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(["git", "checkout", "-b", "other"], cwd=root, check=True, capture_output=True)
+            source.write_text("VALUE = 'other'\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "other change"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", primary], cwd=root, check=True, capture_output=True)
+            source.write_text("VALUE = 'primary'\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "primary change"], cwd=root, check=True, capture_output=True)
+            merge = subprocess.run(
+                ["git", "merge", "other"],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(merge.returncode, 0)
+        self.assertEqual(identity["workspace_sha256"], "")
+        self.assertEqual(identity["source_scope"], [])
+
+    def test_evaluation_source_identity_ignores_ambient_git_work_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            ambient_work_tree = Path(temp) / "ambient-work-tree"
+            root.mkdir()
+            ambient_work_tree.mkdir()
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            visible = root / "tests/visible.py"
+            hidden = root / "tests/hidden.py"
+            visible.parent.mkdir(parents=True)
+            visible.write_text("VISIBLE = True\n", encoding="utf-8")
+            hidden.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(visible)], cwd=root, check=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_WORK_TREE": str(ambient_work_tree)},
+                clear=False,
+            ):
+                original = run_agent_e2e_eval.evaluation_source_identity(root)
+                hidden.write_text(
+                    "raise RuntimeError('ambient worktree drift')\n",
+                    encoding="utf-8",
+                )
+                changed = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(
+            original["workspace_sha256"],
+            changed["workspace_sha256"],
+        )
+
+    def test_evaluation_source_identity_pins_root_against_local_core_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            redirected = Path(temp) / "redirected-worktree"
+            root.mkdir()
+            redirected.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            visible = root / "tests/visible.py"
+            visible.parent.mkdir(parents=True)
+            visible.write_text("VISIBLE = True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tests/visible.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "core.worktree", str(redirected)],
+                cwd=root,
+                check=True,
+            )
+
+            original = run_agent_e2e_eval.evaluation_source_identity(root)
+            hidden = root / "plugins/evil.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text("raise RuntimeError('must be bound')\n", encoding="utf-8")
+            changed = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(original["workspace_sha256"], "")
+        self.assertNotEqual(changed["workspace_sha256"], "")
+        self.assertNotEqual(
+            original["workspace_sha256"],
+            changed["workspace_sha256"],
+        )
+        self.assertIs(changed["git_dirty"], True)
+
+    def test_evaluation_source_identity_disables_lazy_git_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            original_run = subprocess.run
+            git_environments: list[dict[str, str] | None] = []
+            git_commands: list[list[str]] = []
+
+            def record_git_environment(
+                command: list[str],
+                *args: object,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[object]:
+                if command and command[0] == "git":
+                    environment = kwargs.get("env")
+                    git_commands.append(command)
+                    git_environments.append(
+                        environment if isinstance(environment, dict) else None
+                    )
+                return original_run(command, *args, **kwargs)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "GIT_DIR": str(root / "ambient-git-dir"),
+                        "GIT_WORK_TREE": str(root / "ambient-work-tree"),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    run_agent_e2e_eval.subprocess,
+                    "run",
+                    side_effect=record_git_environment,
+                ),
+            ):
+                identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(identity["workspace_sha256"], "")
+        self.assertTrue(any("ls-tree" in command for command in git_commands))
+        self.assertTrue(git_environments)
+        for environment in git_environments:
+            with self.subTest(environment=environment):
+                self.assertIsNotNone(environment)
+                assert environment is not None
+                self.assertEqual(environment.get("GIT_NO_LAZY_FETCH"), "1")
+                self.assertEqual(environment.get("GIT_NO_REPLACE_OBJECTS"), "1")
+                self.assertEqual(environment.get("GIT_OPTIONAL_LOCKS"), "0")
+                self.assertEqual(environment.get("GIT_TERMINAL_PROMPT"), "0")
+                self.assertEqual(environment.get("GIT_WORK_TREE"), str(root.resolve()))
+                self.assertEqual(
+                    {
+                        key.upper()
+                        for key in environment
+                        if key.upper().startswith("GIT_")
+                    },
+                    {
+                        "GIT_NO_LAZY_FETCH",
+                        "GIT_NO_REPLACE_OBJECTS",
+                        "GIT_OPTIONAL_LOCKS",
+                        "GIT_TERMINAL_PROMPT",
+                        "GIT_WORK_TREE",
+                    },
+                )
+
+    def test_evaluation_source_identity_fails_closed_on_missing_git_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            original_run = subprocess.run
+
+            def fail_local_object_read(
+                command: list[str],
+                *args: object,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[object]:
+                if "ls-tree" in command:
+                    environment = kwargs.get("env")
+                    self.assertIsInstance(environment, dict)
+                    assert isinstance(environment, dict)
+                    self.assertEqual(environment.get("GIT_NO_LAZY_FETCH"), "1")
+                    self.assertEqual(environment.get("GIT_NO_REPLACE_OBJECTS"), "1")
+                    raise subprocess.CalledProcessError(128, command)
+                return original_run(command, *args, **kwargs)
+
+            with mock.patch.object(
+                run_agent_e2e_eval.subprocess,
+                "run",
+                side_effect=fail_local_object_read,
+            ):
+                identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(identity["workspace_sha256"], "")
+        self.assertEqual(identity["git_head"], "")
+        self.assertIsNone(identity["git_dirty"])
+
+    def test_evaluation_source_identity_fails_closed_on_missing_git_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            object_id = subprocess.run(
+                ["git", "rev-parse", "HEAD:tests/source.py"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
+            self.assertTrue(loose_object.is_file())
+            loose_object.unlink()
+
+            identity = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertEqual(identity["workspace_sha256"], "")
+        self.assertEqual(identity["git_head"], "")
+        self.assertIsNone(identity["git_dirty"])
+
+    def test_evaluation_source_checkout_contract_forces_lf(self) -> None:
+        self.assertEqual(
+            (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8"),
+            "* text=auto eol=lf\n",
+        )
+        self.assertIn(".gitattributes", run_agent_e2e_eval.EVALUATION_SOURCE_FILES)
+
+    def test_evaluation_source_identity_does_not_execute_git_clean_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            source = root / "tests/source.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("ORIGINAL = True\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "config", "user.email", "eval@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Eval Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "core.trustctime", "false"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "core.checkStat", "minimal"],
+                cwd=root,
+                check=True,
+            )
+            source.write_text("A" * 100, encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(source)], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            marker = root / "clean-filter-executed.txt"
+            filter_script = root / "constant-clean-filter.py"
+            filter_script.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(sys.argv[1]).write_text('executed', encoding='utf-8')\n"
+                "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+                encoding="utf-8",
+            )
+            filter_command = " ".join(
+                f'"{Path(argument).as_posix()}"'
+                for argument in (sys.executable, filter_script, marker)
+            )
+            subprocess.run(
+                ["git", "config", "filter.constant.clean", filter_command],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "filter.constant.required", "true"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "core.fsmonitor", filter_command],
+                cwd=root,
+                check=True,
+            )
+            attributes = root / ".git/info/attributes"
+            attributes.parent.mkdir(parents=True, exist_ok=True)
+            attributes.write_text("tests/source.py filter=constant\n", encoding="utf-8")
+
+            source_stat = source.stat()
+            marker.unlink(missing_ok=True)
+            source.write_text("B" * 100, encoding="utf-8")
+            os.utime(
+                source,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+            first = run_agent_e2e_eval.evaluation_source_identity(root)
+            filter_executed = marker.exists()
+            marker.unlink(missing_ok=True)
+            source.write_text("C" * 100, encoding="utf-8")
+            os.utime(
+                source,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+            changed = run_agent_e2e_eval.evaluation_source_identity(root)
+            filter_executed = filter_executed or marker.exists()
+
+        self.assertFalse(filter_executed, "source identity must not execute Git clean filters")
+        self.assertNotEqual(first["workspace_sha256"], changed["workspace_sha256"])
+        self.assertEqual(first["status_sha256"], changed["status_sha256"])
+
+    def test_evaluation_source_identity_includes_ignored_runtime_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            tests_dir = root / "tests"
+            tests_dir.mkdir(parents=True)
+            loader = tests_dir / "loader.py"
+            extension = tests_dir / "runtime_extension.py"
+            loader.write_text("from . import runtime_extension\n", encoding="utf-8")
+            extension.write_text("VALUE = 1\n", encoding="utf-8")
+            (root / ".gitignore").write_text(
+                "tests/runtime_extension.py\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "--", str(loader)], cwd=root, check=True)
+
+            original = run_agent_e2e_eval.evaluation_source_identity(root)
+            extension.write_text(
+                "raise RuntimeError('ignored semantic drift')\n",
+                encoding="utf-8",
+            )
+            changed = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(
+            original["workspace_sha256"],
+            changed["workspace_sha256"],
+        )
+
+    def test_evaluation_source_identity_has_unambiguous_file_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(
+                ["git", "init"], cwd=root, check=True, capture_output=True, text=True
+            )
+            first_path = root / "tests/a"
+            second_path = root / "tests/b"
+            first_path.parent.mkdir(parents=True)
+
+            first_path.write_bytes(b"X\0tests/b\0" + b"100644" + b"\0Y")
+            one_file = run_agent_e2e_eval.evaluation_source_identity(root)
+
+            first_path.write_bytes(b"X")
+            second_path.write_bytes(b"Y")
+            two_files = run_agent_e2e_eval.evaluation_source_identity(root)
+
+        self.assertNotEqual(
+            one_file["workspace_sha256"],
+            two_files["workspace_sha256"],
+        )
+
+    def test_native_host_absolute_path_shape_is_cross_platform(self) -> None:
+        self.assertTrue(
+            run_agent_e2e_eval._is_cross_platform_absolute_path(
+                "/Applications/Codex.app/Contents/Resources/codex"
+            )
+        )
+        self.assertTrue(
+            run_agent_e2e_eval._is_cross_platform_absolute_path(
+                r"C:\Program Files\Codex\codex.exe"
+            )
+        )
+        self.assertTrue(
+            run_agent_e2e_eval._is_cross_platform_absolute_path(
+                r"\\server\share\Codex\codex.exe"
+            )
+        )
+        self.assertFalse(
+            run_agent_e2e_eval._is_cross_platform_absolute_path("relative/codex")
+        )
+        for invalid in ("", "/", "C:relative\\codex.exe", "C:\\", "/abs/with\0nul"):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(
+                    run_agent_e2e_eval._is_cross_platform_absolute_path(invalid)
+                )
+
     def test_persisted_report_keeps_historical_git_state_but_requires_current_source(self) -> None:
         report = json.loads(
             (REPO_ROOT / "docs/runtime/native-codex-live-eval.json").read_text(
@@ -135,15 +1090,54 @@ class AgentE2EEvalTest(unittest.TestCase):
             strict_errors = run_agent_e2e_eval.report_consistency_errors(
                 report,
                 require_current_binary=False,
+                require_current_matrix=False,
             )
             persisted_errors = run_agent_e2e_eval.report_consistency_errors(
                 report,
                 require_current_binary=False,
                 require_current_git_state=False,
+                require_current_matrix=False,
             )
 
         self.assertTrue(any("current checkout" in error for error in strict_errors))
         self.assertEqual(persisted_errors, [])
+
+        existing_but_historical = json.loads(json.dumps(report))
+        existing_but_historical["native_host"]["resolved_path"] = str(EVAL.resolve())
+        existing_but_historical["native_host"]["sha256"] = "f" * 64
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "evaluation_source_identity",
+            return_value=existing_but_historical["evaluation_source"],
+        ):
+            historical_binary_errors = run_agent_e2e_eval.report_consistency_errors(
+                existing_but_historical,
+                require_current_binary=False,
+                require_current_git_state=False,
+                require_current_matrix=False,
+            )
+        self.assertEqual(historical_binary_errors, [])
+
+        foreign_binary = json.loads(json.dumps(report))
+        foreign_binary["native_host"]["resolved_path"] = (
+            "/Applications/Codex.app/Contents/Resources/codex"
+            if os.name == "nt"
+            else r"C:\Program Files\Codex\codex.exe"
+        )
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "evaluation_source_identity",
+            return_value=foreign_binary["evaluation_source"],
+        ):
+            foreign_binary_errors = run_agent_e2e_eval.report_consistency_errors(
+                foreign_binary,
+                require_current_binary=True,
+                require_current_git_state=False,
+                require_current_matrix=False,
+            )
+        self.assertTrue(
+            any("different operating system" in error for error in foreign_binary_errors)
+        )
 
         changed_source = {
             **historical_checkout,
@@ -158,6 +1152,7 @@ class AgentE2EEvalTest(unittest.TestCase):
                 report,
                 require_current_binary=False,
                 require_current_git_state=False,
+                require_current_matrix=False,
             )
         self.assertTrue(
             any("workspace_sha256" in error for error in changed_source_errors)
@@ -169,6 +1164,7 @@ class AgentE2EEvalTest(unittest.TestCase):
             zero_head,
             require_current_binary=False,
             require_current_git_state=False,
+            require_current_matrix=False,
         )
         self.assertTrue(any("git_head" in error for error in zero_head_errors))
 
@@ -180,6 +1176,7 @@ class AgentE2EEvalTest(unittest.TestCase):
                     invalid_time,
                     require_current_binary=False,
                     require_current_git_state=False,
+                    require_current_matrix=False,
                 )
                 self.assertTrue(
                     any("generated_at" in error for error in invalid_time_errors)
@@ -348,6 +1345,142 @@ class AgentE2EEvalTest(unittest.TestCase):
             self.assertIsNone(env.get("HARNESS_CODEX_MODEL_POLICY"))
             self.assertIsNone(env.get("N8N_MCP_ACCESS_TOKEN"))
 
+    def test_report_validator_rejects_unknown_mode_and_forged_fixture_inventory(self) -> None:
+        started = time.perf_counter()
+        unknown = run_agent_e2e_eval.summarize(
+            "connector",
+            [
+                run_agent_e2e_eval.scenario_result(
+                    "forged_connector_report",
+                    started,
+                    True,
+                    {
+                        "controller_verify_returncode": 99,
+                        "retired_host_tables": ["agent_sessions"],
+                    },
+                    category="connector",
+                    mode="connector",
+                )
+            ],
+            started,
+        )
+        self.assertTrue(run_agent_e2e_eval.report_consistency_errors(unknown))
+        self.assertTrue(run_agent_e2e_eval.should_fail(unknown))
+
+        forged_scenarios = []
+        for index in range(len(run_agent_e2e_eval.FIXTURE_SCENARIOS)):
+            details = {
+                "false_pass_count": 0,
+                "human_intervention_count": 0,
+            }
+            if index == 0:
+                details["forged_evidence_block_count"] = 1
+            if index == 1:
+                details["expected_human_review_required_count"] = 1
+            forged_scenarios.append(
+                run_agent_e2e_eval.scenario_result(
+                    f"forged_fixture_{index}",
+                    started,
+                    True,
+                    details,
+                    category="local",
+                    mode="local",
+                )
+            )
+        forged_fixture = run_agent_e2e_eval.summarize(
+            "fixture",
+            forged_scenarios,
+            started,
+        )
+        self.assertTrue(run_agent_e2e_eval.report_consistency_errors(forged_fixture))
+        self.assertTrue(run_agent_e2e_eval.should_fail(forged_fixture))
+
+    def test_report_validator_binds_generation_matrix_facts(self) -> None:
+        report = run_eval("--mode", "fixture")
+        self.assertEqual(run_agent_e2e_eval.report_consistency_errors(report), [])
+
+        mutations = {
+            "platform": "ConnectorOS",
+            "python_version": "",
+            "git_version": "forged",
+            "container_available": "yes",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                tampered = json.loads(json.dumps(report))
+                tampered["matrix"][field] = value
+                errors = run_agent_e2e_eval.report_consistency_errors(tampered)
+                self.assertTrue(
+                    any(f"matrix {field}" in error for error in errors),
+                    errors,
+                )
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        historical = json.loads(json.dumps(report))
+        historical["matrix"].update(
+            {
+                "platform": "HistoricalOS-1",
+                "python_version": "3.11.9",
+                "git_version": "git version 2.45.1",
+                "container_available": not report["matrix"]["container_available"],
+            }
+        )
+        self.assertEqual(
+            run_agent_e2e_eval.persistent_report_consistency_errors(historical),
+            [],
+        )
+
+    def test_report_validator_rejects_boolean_version_and_summary_numbers(self) -> None:
+        report = run_eval("--mode", "fixture")
+        self.assertEqual(run_agent_e2e_eval.report_consistency_errors(report), [])
+
+        mutations = (
+            ("report_version", None, True),
+            ("summary", "failed_count", False),
+            ("summary", "skipped_count", False),
+            ("summary", "false_pass_count", False),
+            ("summary", "forged_evidence_block_count", True),
+            ("summary", "expected_human_review_required_count", True),
+            ("summary", "sqlite_lock_error_count", False),
+            ("summary", "human_intervention_count", False),
+            ("summary", "scenario_pass_rate", True),
+        )
+        for surface, field, value in mutations:
+            with self.subTest(surface=surface, field=field):
+                tampered = json.loads(json.dumps(report))
+                if surface == "report_version":
+                    tampered["report_version"] = value
+                    label = "report_version"
+                else:
+                    tampered["summary"][field] = value
+                    label = f"summary {field}"
+                errors = run_agent_e2e_eval.report_consistency_errors(tampered)
+                self.assertTrue(
+                    any(label in error for error in errors),
+                    errors,
+                )
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+    def test_report_validator_rejects_negative_detail_counter_cancellation(self) -> None:
+        report = run_eval("--mode", "fixture")
+        self.assertEqual(run_agent_e2e_eval.report_consistency_errors(report), [])
+
+        for field in (
+            "false_pass_count",
+            "human_intervention_count",
+            "sqlite_lock_error_count",
+        ):
+            with self.subTest(field=field):
+                tampered = json.loads(json.dumps(report))
+                tampered["scenarios"][0]["details"][field] = 1
+                tampered["scenarios"][1]["details"][field] = -1
+                errors = run_agent_e2e_eval.report_consistency_errors(tampered)
+                self.assertTrue(
+                    any(field in error and "non-negative" in error for error in errors),
+                    errors,
+                )
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
     def test_live_codex_profile_wiring_edits_then_controller_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -406,6 +1539,204 @@ class AgentE2EEvalTest(unittest.TestCase):
             ),
             [],
         )
+        self.assertTrue(
+            run_agent_e2e_eval.persistent_report_consistency_errors(report)
+        )
+
+        passing_contract_mutations = {
+            "controller_verify_returncode": 99,
+            "controller_verify_status": "failed",
+            "execution_count": 0,
+            "validation_count": 0,
+            "task_status": "active",
+            "provider_surface_absent": False,
+            "retired_host_tables": ["agent_sessions"],
+            "controller_state_unchanged_during_native": False,
+            "controller_test_unchanged": False,
+            "last_message_recorded": False,
+        }
+        for field, invalid_value in passing_contract_mutations.items():
+            with self.subTest(passing_contract_field=field):
+                tampered = json.loads(json.dumps(report))
+                tampered["scenarios"][0]["details"][field] = invalid_value
+                tampered["native_host"]["resolved_path"] = sys.executable
+                tampered["native_host"]["sha256"] = hashlib.sha256(
+                    Path(sys.executable).read_bytes()
+                ).hexdigest()
+                errors = run_agent_e2e_eval.report_consistency_errors(tampered)
+                self.assertTrue(errors, f"passing single report trusted {field}")
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        exact_integer_mutations = {
+            "native_returncode": (False, 0.0),
+            "controller_verify_returncode": (False, 0.0),
+            "task_submit_returncode": (False, 0.0),
+            "execution_count": (True, 1.0),
+            "validation_count": (True, 1.0),
+            "workload_units": (True, 1.0),
+        }
+        for field, invalid_values in exact_integer_mutations.items():
+            for invalid_value in invalid_values:
+                with self.subTest(exact_integer_field=field, invalid_value=invalid_value):
+                    tampered = json.loads(json.dumps(report))
+                    tampered["scenarios"][0]["details"][field] = invalid_value
+                    errors = run_agent_e2e_eval.report_consistency_errors(
+                        tampered,
+                        require_current_binary=False,
+                    )
+                    self.assertTrue(
+                        any(field in error for error in errors),
+                        errors,
+                    )
+                    self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        for field in ("token_count", "token_usage.input_tokens"):
+            with self.subTest(exact_top_level_integer_field=field):
+                tampered = json.loads(json.dumps(report))
+                if field == "token_count":
+                    tampered[field] = float(report[field])
+                    error_label = "top-level token_count"
+                else:
+                    tampered["token_usage"]["input_tokens"] = float(
+                        report["token_usage"]["input_tokens"]
+                    )
+                    error_label = "top-level input_tokens"
+                errors = run_agent_e2e_eval.report_consistency_errors(
+                    tampered,
+                    require_current_binary=False,
+                )
+                self.assertTrue(
+                    any(error_label in error for error in errors),
+                    errors,
+                )
+
+        missing_usage = json.loads(json.dumps(report))
+        missing_usage_details = missing_usage["scenarios"][0]["details"]
+        for field in (
+            "native_usage",
+            "native_token_count",
+            "native_runtime_seconds",
+        ):
+            missing_usage_details[field] = None
+        missing_usage["token_usage"] = None
+        missing_usage["token_count"] = None
+        missing_usage["agent_runtime_seconds"] = None
+        missing_usage_errors = run_agent_e2e_eval.report_consistency_errors(
+            missing_usage,
+            require_current_binary=False,
+        )
+        self.assertTrue(missing_usage_errors)
+
+        forged_scope = json.loads(json.dumps(report))
+        forged_scope["evidence_scope"] = "external-connector"
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                forged_scope,
+                require_current_binary=False,
+            )
+        )
+
+        connector_detail = json.loads(json.dumps(report))
+        connector_detail["scenarios"][0]["details"]["connector_receipt"] = {
+            "status": "passed"
+        }
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                connector_detail,
+                require_current_binary=False,
+            )
+        )
+
+        unavailable_matrix = json.loads(json.dumps(report))
+        unavailable_matrix["matrix"]["codex_available"] = False
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                unavailable_matrix,
+                require_current_binary=False,
+            )
+        )
+
+        skipped_matrix = json.loads(json.dumps(report))
+        skipped_matrix["matrix"]["live_skipped_reasons"] = ["codex unavailable"]
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                skipped_matrix,
+                require_current_binary=False,
+            )
+        )
+
+        contradictory_git_state = json.loads(json.dumps(report))
+        contradictory_git_state["evaluation_source"]["git_dirty"] = False
+        contradictory_git_state["evaluation_source"]["status_entry_count"] = 4
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                contradictory_git_state,
+                require_current_binary=False,
+                require_current_git_state=False,
+            )
+        )
+
+        forged_cost = json.loads(json.dumps(report))
+        forged_cost["estimated_cost"] = 999
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                forged_cost,
+                require_current_binary=False,
+            )
+        )
+
+        zero_telemetry = json.loads(json.dumps(report))
+        zero_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "token_count": 0,
+        }
+        zero_details = zero_telemetry["scenarios"][0]["details"]
+        zero_details["native_usage"] = zero_usage
+        zero_details["native_token_count"] = 0
+        zero_telemetry["token_usage"] = zero_usage
+        zero_telemetry["token_count"] = 0
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                zero_telemetry,
+                require_current_binary=False,
+            )
+        )
+
+        nonfinite_runtime = json.loads(json.dumps(report))
+        nonfinite_runtime["scenarios"][0]["details"][
+            "native_runtime_seconds"
+        ] = float("inf")
+        nonfinite_runtime["agent_runtime_seconds"] = float("inf")
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                nonfinite_runtime,
+                require_current_binary=False,
+            )
+        )
+
+        zero_durations = json.loads(json.dumps(report))
+        zero_durations["summary"]["duration_seconds"] = 0
+        zero_durations["scenarios"][0]["duration_seconds"] = 0
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                zero_durations,
+                require_current_binary=False,
+            )
+        )
+
+        substituted_binary = json.loads(json.dumps(report))
+        substituted_binary["native_host"]["resolved_path"] = sys.executable
+        substituted_binary["native_host"]["sha256"] = hashlib.sha256(
+            Path(sys.executable).read_bytes()
+        ).hexdigest()
+        substituted_binary["native_host"]["source"] = "path-discovery"
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(substituted_binary)
+        )
+        self.assertTrue(run_agent_e2e_eval.should_fail(substituted_binary))
 
         inconsistent = json.loads(json.dumps(report))
         inconsistent["summary"]["scenario_count"] = 99
@@ -446,6 +1777,73 @@ class AgentE2EEvalTest(unittest.TestCase):
         for key in run_agent_e2e_eval.VERBOSE_NATIVE_OUTPUT_KEYS:
             self.assertNotIn(key, serialized)
 
+    def test_live_codex_rejects_unexpected_runtime_table_created_by_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_codex = make_fake_codex(root, inject_retired_table=True)
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                '{"fixture": true}\n',
+                encoding="utf-8",
+            )
+            result = run_eval_process(
+                "--mode",
+                "live-codex",
+                env={
+                    "HARNESS_E2E_ENABLE_LIVE_CODEX": "1",
+                    "HARNESS_E2E_CODEX_BIN": str(fake_codex),
+                    "HARNESS_E2E_LIVE_TIMEOUT": "30",
+                    "CODEX_HOME": str(codex_home),
+                },
+            )
+            report = json.loads(result.stdout)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(report["live_status"], "failed")
+        details = report["scenarios"][0]["details"]
+        self.assertFalse(details["provider_surface_absent"])
+        self.assertEqual(details["retired_host_tables"], ["adapter_actions"])
+        self.assertTrue(run_agent_e2e_eval.should_fail(report))
+
+    def test_active_table_contract_rejects_unexpected_sqlite_prefixed_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_agent_e2e_eval.harness_db.init_runtime(root)
+            database = root / ".ai-team/state/harness.db"
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("create table adapter_actions(id text)")
+                conn.execute("pragma writable_schema=on")
+                conn.execute(
+                    """
+                    update sqlite_master
+                    set name='sqlite_adapter_actions',
+                        tbl_name='sqlite_adapter_actions',
+                        sql='CREATE TABLE sqlite_adapter_actions(id text)'
+                    where name='adapter_actions'
+                    """
+                )
+                conn.commit()
+            with closing(sqlite3.connect(database)) as conn:
+                hidden_table_count = int(
+                    conn.execute(
+                        "select count(*) from sqlite_adapter_actions"
+                    ).fetchone()[0]
+                )
+            unexpected, exact = run_agent_e2e_eval.active_table_contract(root)
+            doctor_issues = run_agent_e2e_eval.harness_db.doctor(
+                root,
+                require_project_files=False,
+            )
+
+        self.assertEqual(hidden_table_count, 0)
+        self.assertIn("sqlite_adapter_actions", unexpected)
+        self.assertFalse(exact)
+        self.assertTrue(
+            any("sqlite_adapter_actions" in issue for issue in doctor_issues),
+            doctor_issues,
+        )
+
     def test_native_usage_parser_accepts_only_structured_turn_completion(self) -> None:
         output = "\n".join(
             [
@@ -484,6 +1882,34 @@ class AgentE2EEvalTest(unittest.TestCase):
             }
         )
         self.assertIsNone(run_agent_e2e_eval.parse_native_usage_jsonl(invalid_reasoning))
+
+    def test_explicit_binary_override_cannot_write_persistent_live_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_codex = make_fake_codex(root)
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                '{"fixture": true}\n', encoding="utf-8"
+            )
+            evidence = root / "persistent-live.json"
+            result = run_eval_process(
+                "--mode",
+                "live-codex",
+                "--evidence-out",
+                str(evidence),
+                env={
+                    "HARNESS_E2E_ENABLE_LIVE_CODEX": "1",
+                    "HARNESS_E2E_CODEX_BIN": str(fake_codex),
+                    "HARNESS_E2E_LIVE_TIMEOUT": "30",
+                    "CODEX_HOME": str(codex_home),
+                },
+            )
+            evidence_exists = evidence.exists()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing persistent evidence", result.stderr)
+        self.assertFalse(evidence_exists)
 
     def test_compact_evidence_report_removes_only_verbose_native_output(self) -> None:
         report = {
@@ -614,6 +2040,153 @@ class AgentE2EEvalTest(unittest.TestCase):
             [],
         )
 
+        parallel_contract_mutations = {
+            "controller_state_unchanged_during_native": False,
+            "test_files_unchanged": False,
+            "targeted_verify_returncodes": {"LIVE-ALPHA": 99, "LIVE-BETA": 0},
+            "combined_verify_returncode": 99,
+            "combined_verify_status": "failed",
+            "integration_dependency_blocked_before_producers": False,
+            "task_statuses": {
+                "LIVE-INTEGRATE": "active",
+                "LIVE-P1": "submitted",
+                "LIVE-P2": "submitted",
+            },
+            "execution_count": 0,
+            "validation_count": 0,
+            "retired_host_tables": ["agent_sessions"],
+            "scope_enforcement": "unverified",
+            "overlap_policy": "allow-overlap",
+        }
+        for field, invalid_value in parallel_contract_mutations.items():
+            with self.subTest(parallel_contract_field=field):
+                tampered = json.loads(json.dumps(report))
+                tampered["scenarios"][0]["details"][field] = invalid_value
+                tampered["native_host"]["resolved_path"] = sys.executable
+                tampered["native_host"]["sha256"] = hashlib.sha256(
+                    Path(sys.executable).read_bytes()
+                ).hexdigest()
+                errors = run_agent_e2e_eval.report_consistency_errors(tampered)
+                self.assertTrue(errors, f"passing parallel report trusted {field}")
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        parallel_exact_integer_mutations = {
+            "producer_count": (2.0,),
+            "workload_units": (2.0,),
+            "integration_start_returncode": (False, 0.0),
+            "combined_verify_returncode": (False, 0.0),
+            "integration_submit_returncode": (False, 0.0),
+            "execution_count": (3.0,),
+            "validation_count": (3.0,),
+        }
+        for field, invalid_values in parallel_exact_integer_mutations.items():
+            for invalid_value in invalid_values:
+                with self.subTest(exact_parallel_field=field, invalid_value=invalid_value):
+                    tampered = json.loads(json.dumps(report))
+                    tampered["scenarios"][0]["details"][field] = invalid_value
+                    errors = run_agent_e2e_eval.report_consistency_errors(
+                        tampered,
+                        require_current_binary=False,
+                    )
+                    self.assertTrue(
+                        any(field in error for error in errors),
+                        errors,
+                    )
+                    self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        for field, invalid_value in (
+            ("targeted_verify_returncodes", 0.0),
+            ("producer_state_returncodes", 0.0),
+            ("producer_returncode", False),
+            ("producer_returncode", 0.0),
+            ("producer_token_count", 600.0),
+        ):
+            with self.subTest(exact_nested_integer_field=field, invalid_value=invalid_value):
+                tampered = json.loads(json.dumps(report))
+                tampered_details = tampered["scenarios"][0]["details"]
+                if field == "targeted_verify_returncodes":
+                    tampered_details[field]["LIVE-ALPHA"] = invalid_value
+                elif field == "producer_state_returncodes":
+                    tampered_details[field][0] = invalid_value
+                elif field == "producer_returncode":
+                    tampered_details["producers"][0]["returncode"] = invalid_value
+                else:
+                    tampered_details["producers"][0]["token_count"] = invalid_value
+                errors = run_agent_e2e_eval.report_consistency_errors(
+                    tampered,
+                    require_current_binary=False,
+                )
+                self.assertTrue(
+                    any(
+                        field in error
+                        or (field.startswith("producer_") and "producer" in error)
+                        for error in errors
+                    ),
+                    errors,
+                )
+                self.assertTrue(run_agent_e2e_eval.should_fail(tampered))
+
+        missing_message = json.loads(json.dumps(report))
+        missing_message["scenarios"][0]["details"]["producers"][0][
+            "last_message_recorded"
+        ] = False
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                missing_message,
+                require_current_binary=False,
+            )
+        )
+
+        swapped_tasks = json.loads(json.dumps(report))
+        swapped_producers = swapped_tasks["scenarios"][0]["details"]["producers"]
+        swapped_producers[0]["task"], swapped_producers[1]["task"] = (
+            swapped_producers[1]["task"],
+            swapped_producers[0]["task"],
+        )
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                swapped_tasks,
+                require_current_binary=False,
+            )
+        )
+
+        unbalanced_scopes = json.loads(json.dumps(report))
+        unbalanced_producers = unbalanced_scopes["scenarios"][0]["details"][
+            "producers"
+        ]
+        unbalanced_producers[0]["exclusive_files"] = ["alpha.py", "beta.py"]
+        unbalanced_producers[0]["changed_files"] = ["alpha.py", "beta.py"]
+        unbalanced_producers[1]["exclusive_files"] = []
+        unbalanced_producers[1]["changed_files"] = []
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                unbalanced_scopes,
+                require_current_binary=False,
+            )
+        )
+
+        contradictory_error = json.loads(json.dumps(report))
+        contradictory_error["scenarios"][0]["details"]["producers"][0][
+            "error"
+        ] = "Native subprocess timed out"
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                contradictory_error,
+                require_current_binary=False,
+            )
+        )
+
+        host_worker_detail = json.loads(json.dumps(report))
+        host_worker_detail["scenarios"][0]["details"]["producers"][0][
+            "host_sdk_worker"
+        ] = "present"
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(
+                host_worker_detail,
+                require_current_binary=False,
+            )
+        )
+
         inconsistent = json.loads(json.dumps(report))
         inconsistent_details = inconsistent["scenarios"][0]["details"]
         producers = inconsistent_details["producers"]
@@ -691,9 +2264,19 @@ class AgentE2EEvalTest(unittest.TestCase):
         scenario_count = len(run_agent_e2e_eval.FIXTURE_SCENARIOS) + len(
             run_agent_e2e_eval.STABILITY_SCENARIOS
         )
+        scenario_functions = [
+            *run_agent_e2e_eval.FIXTURE_SCENARIOS,
+            *run_agent_e2e_eval.STABILITY_SCENARIOS,
+        ]
         scenarios = [
             {
-                "name": f"scenario-{index}",
+                "name": scenario.__name__.removeprefix("scenario_"),
+                "category": run_agent_e2e_eval.LOCAL_SCENARIO_CONTRACT[
+                    scenario.__name__.removeprefix("scenario_")
+                ][0],
+                "mode": run_agent_e2e_eval.LOCAL_SCENARIO_CONTRACT[
+                    scenario.__name__.removeprefix("scenario_")
+                ][1],
                 "pass": True,
                 "skip_reason": "",
                 "duration_seconds": 0.0,
@@ -706,11 +2289,19 @@ class AgentE2EEvalTest(unittest.TestCase):
                     else {}
                 ),
             }
-            for index in range(scenario_count)
+            for index, scenario in enumerate(scenario_functions)
         ]
         base = run_agent_e2e_eval.summarize("stability", scenarios, time.perf_counter())
         self.assertEqual(run_agent_e2e_eval.report_consistency_errors(base), [])
         self.assertFalse(run_agent_e2e_eval.should_fail(base))
+        connector_scenarios = json.loads(json.dumps(base))
+        for scenario in connector_scenarios["scenarios"]:
+            scenario["category"] = "connector"
+            scenario["mode"] = "connector"
+        self.assertTrue(
+            run_agent_e2e_eval.report_consistency_errors(connector_scenarios)
+        )
+        self.assertTrue(run_agent_e2e_eval.should_fail(connector_scenarios))
         locked = json.loads(json.dumps(base))
         locked["summary"]["sqlite_lock_error_count"] = 1
         self.assertTrue(run_agent_e2e_eval.should_fail(locked))

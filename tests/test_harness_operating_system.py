@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -71,6 +72,43 @@ def submit_and_accept(root: Path, task_id: str) -> None:
 
 
 class HarnessOperatingSystemTest(unittest.TestCase):
+    def test_missing_database_recovery_sentinel_precedes_init_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / ".ai-team/backups/recovery/migration-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"status":"rollback-incomplete"}\n', encoding="utf-8")
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(manifest),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            for args in (
+                ("status",),
+                ("doctor",),
+                ("validate",),
+                ("quickstart", "status"),
+            ):
+                with self.subTest(args=args):
+                    result = run_harness(root, *args, check=False)
+                    output = (result.stdout + result.stderr).lower()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("rollback-incomplete", output)
+                    self.assertIn(str(manifest).lower(), output)
+                    self.assertIn("do not remove", output)
+                    self.assertNotIn("next:", output)
+                    self.assertNotIn(" init", output)
+                    self.assertFalse(db_path(root).exists())
+
     def test_task_dependencies_block_start_until_dependency_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

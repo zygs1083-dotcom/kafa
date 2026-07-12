@@ -58,7 +58,12 @@ jobs:
         run: ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-harness/scripts/harness.py tests/test_*.py tests/run_isolated_install_smoke.py
 
       - name: Install kafa package
-        run: ${{ matrix.python }} -m pip install -e .
+        run: |
+          ${{ matrix.python }} -m pip install -e .
+          ${{ matrix.python }} -m pip install build==1.5.1
+
+      - name: Build release artifacts
+        run: ${{ matrix.python }} -m build --outdir dist
 
       - name: Install pinned Codex CLI for plugin smoke
         run: |
@@ -75,8 +80,12 @@ jobs:
       - name: Run local core hardening targeted tests
         run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests.test_local_core_hardening tests.test_local_delivery_policy
 
-      - name: Isolated user plugin install smoke
-        run: ${{ matrix.python }} tests/run_isolated_install_smoke.py --repo .
+      - name: Isolated artifact install smoke
+        run: |
+          ${{ matrix.python }} tests/run_isolated_install_smoke.py \
+            --repo . \
+            --wheel dist/*.whl \
+            --source-archive dist/*.tar.gz
 
       - name: Run install release tests
         run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests/test_install_release.py

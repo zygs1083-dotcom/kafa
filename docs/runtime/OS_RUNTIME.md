@@ -126,6 +126,36 @@ worktree state, or with local content identity when Git is unavailable. A
 passing review gate cannot be recorded against a dirty Git worktree. Kafa never
 creates, switches, merges, or removes host-owned worktrees.
 
+Candidate hashing uses actual runtime bytes, executable mode, fixed per-file
+SHA-256 framing, and ignored local runtime files; `.gitignore` is not a trust
+boundary. Git probes clear ambient `GIT_*`, disable fsmonitor and lazy fetch,
+disable replace-object lookup, and fail closed on missing local objects,
+symlinks, gitlinks, unmerged entries,
+or non-regular paths in either the index or HEAD. Kafa-owned state, generated harness views/templates, Git
+internals, and generated Python caches remain outside the candidate so
+recording evidence does not invalidate itself.
+
+Every production projection publication holds the project operation lock across
+database reads and filesystem writes. Doctor verifies view content against an
+independent snapshot rendering. Migration rollback quarantines failed-schema
+WAL/SHM before restoring and ordinarily opening the source backup; otherwise it
+retains rollback-incomplete recovery state.
+
+The generated `project-state.yaml` timestamp is the authoritative
+`project.updated_at`, not a render-time clock. Rebuild uses replace rather than
+merge semantics so unchanged facts are byte-stable and stale ad-hoc keys are
+removed. The projection contains exact DB schema keys (`id` and
+`current_cycle_id` included) and no generic `blocked_reason`.
+
+Core independently verifies projection content after the publication callback;
+callback self-report is not trusted. Operation-lock descriptor cleanup is
+`BaseException`-safe. Git identity pins the explicit root with `GIT_WORK_TREE`,
+and catalog validation allows only the 27 schema-30 tables plus
+`sqlite_sequence`. Real Native controller subprocesses execute from a
+start-verified private Git-backed snapshot and require completion identity to
+match. Callback-era DB fingerprints must remain equal, and snapshot Git init
+uses an ambient-free environment plus an empty template.
+
 ## Root-Controller Task Lifecycle
 
 Task state is intentionally small and single-writer:
@@ -176,6 +206,11 @@ result artifact is missing, malformed, failing, or reports zero executed tests.
 Targets that require a sandbox or no-network execution fail closed when that
 policy was not actually satisfied. An unavailable requested container is
 reported as unavailable, not silently replaced by local execution.
+
+Generated structured-result paths should remain under `.ai-team/runtime/` or be
+emitted on stdout. Writing them to ordinary project paths changes the candidate,
+so the post-execution identity check discards the completed result rather than
+granting verification credit to a different source tree.
 
 `validation record` stores audit judgment only. Free-form text, a claimed exit
 code, a pasted digest, or a model-generated report cannot create a

@@ -21,6 +21,7 @@ from .errors import HarnessError
 from .projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS
 from .schema_lifecycle import (
     SCHEMA30_RUNTIME_VERSION,
+    SCHEMA30_CATALOG_TABLES,
     SCHEMA30_TABLES,
     SCHEMA30_VERSION,
     SQLiteBackupManifest,
@@ -38,15 +39,48 @@ class InjectedLocalCoreMigrationFailure(LocalCoreMigrationError):
     """Deterministic failure used to prove migration rollback boundaries."""
 
 
+@dataclass
+class _MigrationGuard:
+    lock_path: Path
+    recovery_required: bool = False
+    manifest_path: Path | None = None
+    clear_allowed: bool = False
+
+    def record_manifest(self, manifest_path: Path) -> None:
+        self.manifest_path = manifest_path
+
+    def require_recovery(self, manifest_path: Path) -> None:
+        payload: dict[str, object] = {
+            "pid": os.getpid(),
+            "created_at": _timestamp(),
+            "target_schema": SCHEMA30_VERSION,
+            "status": "recovery-required",
+            "manifest_path": str(manifest_path),
+        }
+        _write_json_atomic(self.lock_path, payload)
+        self.recovery_required = True
+        self.manifest_path = manifest_path
+        self.clear_allowed = False
+
+    def mark_safe(self) -> None:
+        self.recovery_required = False
+        self.clear_allowed = True
+
+
 def _sqlite_integer(value: object) -> int | None:
     return value if type(value) is int else None
 
 
-def _positive_sqlite_integer(value: object, *, field: str) -> int:
+def _positive_sqlite_integer(
+    value: object,
+    *,
+    field: str,
+    source_schema: int = 29,
+) -> int:
     integer = _sqlite_integer(value)
     if integer is None or integer <= 0:
         raise LocalCoreMigrationError(
-            f"schema 29 {field} must be a positive SQLite integer: {value!r}"
+            f"schema {source_schema} {field} must be a positive SQLite integer: {value!r}"
         )
     return integer
 
@@ -104,6 +138,10 @@ def _inject_failure(fail_at: str | None, point: str) -> None:
         raise InjectedLocalCoreMigrationFailure(f"injected local-core migration failure at {point}")
 
 
+def _exception_text(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
+
+
 TASK_STATUS_MAP = {
     "ready": "planned",
     "planned": "planned",
@@ -159,6 +197,13 @@ LOCAL_ENTITY_TYPES = {
     "decision",
     "invalidation",
 }
+LOCAL_INVALIDATION_SOURCE_TYPES = {"requirement", "acceptance", "failure_mode"}
+LOCAL_INVALIDATION_TARGET_TYPES = {
+    "acceptance",
+    "task",
+    "validation",
+    "quality_gate",
+}
 
 RETIRED_METADATA_KEYS = {
     "tool_link",
@@ -198,6 +243,15 @@ def _table_names(conn: sqlite3.Connection) -> tuple[str, ...]:
         str(row[0])
         for row in conn.execute(
             "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name"
+        )
+    )
+
+
+def _catalog_table_names(conn: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' order by name"
         )
     )
 
@@ -651,7 +705,7 @@ def _copy_execution_validation_facts(
                 execution_bindings[evidence_id] = execution_id
                 result_format = str(evidence.get("result_format") or target.get("result_format") or "regex")
                 semantic_status = str(evidence.get("semantic_status") or "") or "pass"
-                sandbox_status = str(evidence.get("sandbox_status") or "") or "not-requested"
+                sandbox_status = str(evidence.get("sandbox_status") or "")
                 runner = (
                     "container"
                     if sandbox_status == "available" or evidence.get("no_network") == 1
@@ -913,8 +967,13 @@ def _copy_schema29_local_facts(
         values = normalize_cycle(values)
         source_type = str(values.get("source_type") or "").replace("-", "_")
         target_type = str(values.get("target_type") or "").replace("-", "_")
-        if source_type not in LOCAL_ENTITY_TYPES or target_type not in LOCAL_ENTITY_TYPES:
+        if (
+            source_type not in LOCAL_INVALIDATION_SOURCE_TYPES
+            or target_type not in LOCAL_INVALIDATION_TARGET_TYPES
+        ):
             return None
+        values["source_type"] = source_type
+        values["target_type"] = target_type
         return values
 
     _copy_intersection(source, destination, "invalidations", transform=local_invalidation)
@@ -961,11 +1020,12 @@ def _copy_schema29_local_facts(
 
 def _validate_staging_database(conn: sqlite3.Connection, *, fail_at: str | None = None) -> None:
     _inject_failure(fail_at, "during_invariant_validation")
-    tables = set(_table_names(conn))
-    if tables != SCHEMA30_TABLES:
+    tables = set(_catalog_table_names(conn))
+    if tables != SCHEMA30_CATALOG_TABLES:
         raise LocalCoreMigrationError(
-            f"staging table inventory mismatch: missing={sorted(SCHEMA30_TABLES - tables)} "
-            f"extra={sorted(tables - SCHEMA30_TABLES)}"
+            "staging table inventory mismatch: "
+            f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
+            f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
         )
     integrity = [str(row[0]) for row in conn.execute("pragma integrity_check")]
     if integrity != ["ok"]:
@@ -1088,6 +1148,39 @@ def _sqlite_backup_copy(source_path: Path, destination_path: Path) -> None:
             destination.commit()
 
 
+def _validate_legacy_trust_revisions(source_path: Path, source_version: int) -> None:
+    """Reject malformed trust revisions before legacy SQLite arithmetic can coerce them."""
+
+    source_uri = f"file:{source_path.as_posix()}?mode=ro"
+    with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source:
+        project = source.execute(
+            "select revision from project where id=1"
+        ).fetchone()
+        if project is None:
+            raise LocalCoreMigrationError(
+                f"schema {source_version} source is missing project revision metadata"
+            )
+        _positive_sqlite_integer(
+            project[0],
+            field="project.revision",
+            source_schema=source_version,
+        )
+
+        if (
+            "quality_gates" not in _table_names(source)
+            or "project_revision" not in _columns(source, "quality_gates")
+        ):
+            return
+        for gate_id, revision in source.execute(
+            "select id, project_revision from quality_gates order by rowid"
+        ):
+            _positive_sqlite_integer(
+                revision,
+                field=f"quality gate {gate_id}.project_revision",
+                source_schema=source_version,
+            )
+
+
 def stage_supported_schema_to_schema30(
     source_path: Path,
     staging_path: Path,
@@ -1113,6 +1206,7 @@ def stage_supported_schema_to_schema30(
             "install the last v1 release and migrate to schema 27, 28, or 29 first"
         )
 
+    _validate_legacy_trust_revisions(source_path, source_version)
     staging_path.parent.mkdir(parents=True, exist_ok=True)
     source_fingerprint = _database_fingerprint(source_path)
     source_sha256 = _sha256_file(source_path)
@@ -1390,7 +1484,7 @@ def _restore_projection_backup(root: Path, projection_backup: dict[str, object])
 
 
 @contextmanager
-def _project_migration_lock(root: Path) -> Iterator[Path]:
+def _project_migration_lock(root: Path) -> Iterator[_MigrationGuard]:
     state_dir = root / ".ai-team/state"
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "local-core-migration.lock"
@@ -1413,11 +1507,49 @@ def _project_migration_lock(root: Path) -> Iterator[Path]:
     except BaseException:
         lock_path.unlink(missing_ok=True)
         raise
+    guard = _MigrationGuard(lock_path=lock_path)
+    completed = False
     try:
         with project_db_operation(root, purpose="migration"):
-            yield lock_path
+            yield guard
+            completed = True
     finally:
-        lock_path.unlink(missing_ok=True)
+        if completed or guard.clear_allowed:
+            lock_path.unlink(missing_ok=True)
+        elif guard.recovery_required:
+            try:
+                payload: dict[str, object] = {
+                    "pid": os.getpid(),
+                    "created_at": _timestamp(),
+                    "target_schema": SCHEMA30_VERSION,
+                    "status": "rollback-incomplete",
+                }
+                if guard.manifest_path is not None:
+                    payload["manifest_path"] = str(guard.manifest_path)
+                _write_json_atomic(
+                    lock_path,
+                    payload,
+                )
+            except BaseException:
+                # The original sentinel is still the fail-closed authority if its
+                # recovery-required metadata cannot be refreshed.
+                pass
+        elif guard.manifest_path is not None:
+            try:
+                _write_json_atomic(
+                    lock_path,
+                    {
+                        "pid": os.getpid(),
+                        "created_at": _timestamp(),
+                        "target_schema": SCHEMA30_VERSION,
+                        "status": "migration-failed",
+                        "manifest_path": str(guard.manifest_path),
+                    },
+                )
+            except BaseException:
+                # Preserve the original diagnostic sentinel if the richer
+                # pre-activation failure metadata cannot be published.
+                pass
 
 
 def _checkpoint_active_database(active_path: Path) -> None:
@@ -1507,10 +1639,57 @@ def _schema30_doctor(path: Path) -> None:
             raise LocalCoreMigrationError("schema 30 activation record is missing or incomplete")
 
 
+def _database_sidecars(path: Path) -> tuple[Path, Path]:
+    return Path(str(path) + "-wal"), Path(str(path) + "-shm")
+
+
+def _quarantine_failed_database_sidecars(
+    active_path: Path,
+    failed_path: Path,
+) -> tuple[Path, ...]:
+    quarantined: list[Path] = []
+    for source, destination in zip(
+        _database_sidecars(active_path),
+        _database_sidecars(failed_path),
+        strict=True,
+    ):
+        if not source.exists() and not source.is_symlink():
+            continue
+        if source.is_symlink() or not source.is_file():
+            raise LocalCoreMigrationError(
+                f"failed schema30 sidecar is not a regular file: {source}"
+            )
+        if destination.exists() or destination.is_symlink():
+            raise LocalCoreMigrationError(
+                f"failed schema30 sidecar quarantine target already exists: {destination}"
+            )
+        os.replace(source, destination)
+        _fsync_directory(destination.parent)
+        if source.exists() or source.is_symlink():
+            raise LocalCoreMigrationError(
+                f"failed schema30 sidecar remained active after quarantine: {source}"
+            )
+        if destination.is_symlink() or not destination.is_file():
+            raise LocalCoreMigrationError(
+                f"failed schema30 sidecar quarantine verification failed: {destination}"
+            )
+        quarantined.append(destination)
+    return tuple(quarantined)
+
+
 def _restore_verified_backup(active_path: Path, backup: SQLiteBackupManifest) -> None:
     backup_path = Path(backup.backup_path)
     if not backup_path.is_file() or _sha256_file(backup_path) != backup.sha256:
         raise LocalCoreMigrationError("verified migration backup is missing or has a digest mismatch")
+    active_sidecars = _database_sidecars(active_path)
+    remaining_sidecars = [
+        str(path) for path in active_sidecars if path.exists() or path.is_symlink()
+    ]
+    if remaining_sidecars:
+        raise LocalCoreMigrationError(
+            "failed schema30 sidecars were not quarantined before authority restore: "
+            + ", ".join(remaining_sidecars)
+        )
     restore_path = active_path.with_name(active_path.name + ".restore")
     shutil.copyfile(backup_path, restore_path)
     os.chmod(restore_path, 0o600)
@@ -1519,11 +1698,18 @@ def _restore_verified_backup(active_path: Path, backup: SQLiteBackupManifest) ->
     _fsync_directory(active_path.parent)
     if _sha256_file(active_path) != backup.sha256:
         raise LocalCoreMigrationError("restored active database does not match the verified backup digest")
-    uri = f"file:{active_path.as_posix()}?mode=ro&immutable=1"
+    uri = f"file:{active_path.as_posix()}?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
         integrity = [str(row[0]) for row in conn.execute("pragma integrity_check")]
         foreign_keys = conn.execute("pragma foreign_key_check").fetchall()
         version = conn.execute("select schema_version from project where id=1").fetchone()
+    for sidecar in active_sidecars:
+        sidecar.unlink(missing_ok=True)
+    _fsync_directory(active_path.parent)
+    if any(path.exists() or path.is_symlink() for path in active_sidecars):
+        raise LocalCoreMigrationError(
+            "restored database validation left an active WAL/SHM sidecar"
+        )
     if integrity != ["ok"] or foreign_keys or version is None or int(version[0]) != backup.source_version:
         raise LocalCoreMigrationError(
             "automatic backup restore failed validation: "
@@ -1536,12 +1722,15 @@ def _preserve_failed_schema30(active_path: Path, failed_path: Path) -> tuple[str
 
     try:
         active_digest = _sha256_file(active_path)
-    except Exception as digest_exc:
-        return ("failed", f"failed schema30 digest unavailable: {digest_exc}")
+    except BaseException as digest_exc:
+        return (
+            "failed",
+            f"failed schema30 digest unavailable: {_exception_text(digest_exc)}",
+        )
 
     try:
         os.replace(active_path, failed_path)
-    except Exception as move_exc:
+    except BaseException as move_exc:
         try:
             shutil.copyfile(active_path, failed_path)
             os.chmod(failed_path, 0o600)
@@ -1549,31 +1738,51 @@ def _preserve_failed_schema30(active_path: Path, failed_path: Path) -> tuple[str
             _fsync_directory(failed_path.parent)
             if _sha256_file(failed_path) != active_digest:
                 raise LocalCoreMigrationError("fallback failed-schema30 copy digest mismatch")
-        except Exception as copy_exc:
+        except BaseException as copy_exc:
             cleanup_error = ""
             try:
                 failed_path.unlink(missing_ok=True)
-            except Exception as cleanup_exc:
-                cleanup_error = f"; partial-copy cleanup failed: {cleanup_exc}"
+            except BaseException as cleanup_exc:
+                cleanup_error = (
+                    "; partial-copy cleanup failed: "
+                    f"{_exception_text(cleanup_exc)}"
+                )
             return (
                 "failed",
-                f"atomic move failed: {move_exc}; fallback copy failed: {copy_exc}"
+                f"atomic move failed: {_exception_text(move_exc)}; "
+                f"fallback copy failed: {_exception_text(copy_exc)}"
                 f"{cleanup_error}",
             )
-        return ("copied-after-move-failure", str(move_exc))
+        preservation_status = "copied-after-move-failure"
+        preservation_error = _exception_text(move_exc)
+    else:
+        try:
+            _fsync_directory(failed_path.parent)
+            if _sha256_file(failed_path) != active_digest:
+                raise LocalCoreMigrationError("moved failed-schema30 digest mismatch")
+        except BaseException as verify_exc:
+            return (
+                "failed",
+                "atomic move completed but verification failed: "
+                f"{_exception_text(verify_exc)}",
+            )
+        preservation_status = "moved"
+        preservation_error = ""
 
     try:
-        _fsync_directory(failed_path.parent)
-        if _sha256_file(failed_path) != active_digest:
-            raise LocalCoreMigrationError("moved failed-schema30 digest mismatch")
-    except Exception as verify_exc:
-        return ("failed", f"atomic move completed but verification failed: {verify_exc}")
-    return ("moved", "")
+        _quarantine_failed_database_sidecars(active_path, failed_path)
+    except BaseException as sidecar_exc:
+        return (
+            "failed",
+            f"{preservation_error + '; ' if preservation_error else ''}"
+            "failed schema30 sidecar quarantine failed: "
+            f"{_exception_text(sidecar_exc)}",
+        )
+    return preservation_status, preservation_error
 
 
 def _remove_empty_active_sidecars(active_path: Path) -> None:
-    wal_path = Path(str(active_path) + "-wal")
-    shm_path = Path(str(active_path) + "-shm")
+    wal_path, shm_path = _database_sidecars(active_path)
     if wal_path.exists() and wal_path.stat().st_size > 0:
         raise LocalCoreMigrationError(
             "active database has a non-empty WAL; stop project writers and checkpoint SQLite before activation"
@@ -1591,6 +1800,10 @@ def migrate_project_to_schema30(
 ) -> LocalCoreMigrationResult:
     """Back up, stage, atomically activate, and automatically roll back schema 30."""
 
+    if active_validator is None:
+        raise LocalCoreMigrationError(
+            "post-activation projection publication and validator callback is required"
+        )
     if fail_at is not None and fail_at not in MIGRATION_FAILURE_POINTS:
         raise LocalCoreMigrationError(
             f"unknown migration failure point {fail_at!r}; expected one of {sorted(MIGRATION_FAILURE_POINTS)}"
@@ -1600,7 +1813,7 @@ def migrate_project_to_schema30(
     if not active_path.is_file():
         raise LocalCoreMigrationError(f"runtime database is missing: {active_path}")
 
-    with _project_migration_lock(root):
+    with _project_migration_lock(root) as migration_guard:
         _checkpoint_active_database(active_path)
         source_version = _read_source_version(active_path)
         if source_version not in {27, 28, 29}:
@@ -1626,6 +1839,7 @@ def migrate_project_to_schema30(
             "failure_point": fail_at or "",
         }
         _write_json_atomic(migration_manifest_path, manifest_payload)
+        migration_guard.record_manifest(migration_manifest_path)
         try:
             projection_backup = _create_projection_backup(root, backup_dir)
         except Exception as exc:
@@ -1637,6 +1851,8 @@ def migrate_project_to_schema30(
         manifest_payload["projection_backup"] = projection_backup
         _write_json_atomic(migration_manifest_path, manifest_payload)
         activated = False
+        activation_attempted = False
+        expected_active_sha256 = ""
         report: LocalCoreStagingReport | None = None
         try:
             _inject_failure(fail_at, "before_copy")
@@ -1661,13 +1877,44 @@ def migrate_project_to_schema30(
                 raise LocalCoreMigrationError("active source changed after staging and before activation")
             _inject_failure(fail_at, "before_atomic_replace")
             _remove_empty_active_sidecars(active_path)
+            expected_active_sha256 = _sha256_file(staging_path)
+            migration_guard.require_recovery(migration_manifest_path)
+            activation_attempted = True
             os.replace(staging_path, active_path)
-            _fsync_directory(active_path.parent)
             activated = True
+            _fsync_directory(active_path.parent)
             _inject_failure(fail_at, "after_atomic_replace")
             _schema30_doctor(active_path)
+            with closing(sqlite3.connect(active_path, timeout=5.0)) as callback_prep:
+                journal_mode = callback_prep.execute("pragma journal_mode=wal").fetchone()
+                if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+                    raise LocalCoreMigrationError(
+                        f"cannot stabilize callback database journal mode: {journal_mode}"
+                    )
+                checkpoint = callback_prep.execute(
+                    "pragma wal_checkpoint(truncate)"
+                ).fetchone()
+                if checkpoint is None or int(checkpoint[0]) != 0:
+                    raise LocalCoreMigrationError(
+                        f"cannot stabilize callback database WAL: {checkpoint}"
+                    )
+            pre_callback_fingerprint = _database_fingerprint(active_path)
             if active_validator:
                 active_validator(active_path)
+            post_callback_fingerprint = _database_fingerprint(active_path)
+            if post_callback_fingerprint != pre_callback_fingerprint:
+                raise LocalCoreMigrationError(
+                    "projection callback mutated the active database authority"
+                )
+            _schema30_doctor(active_path)
+            from core.projections import projection_content_issues
+
+            projection_issues = projection_content_issues(root)
+            if projection_issues:
+                raise LocalCoreMigrationError(
+                    "post-activation projection content verification failed: "
+                    + "; ".join(projection_issues)
+                )
             manifest_payload["status"] = "activated"
             manifest_payload["active_sha256"] = _sha256_file(active_path)
             _write_json_atomic(migration_manifest_path, manifest_payload)
@@ -1680,8 +1927,32 @@ def migrate_project_to_schema30(
                 staging=report,
                 migration_manifest_path=str(migration_manifest_path),
             )
-        except Exception as exc:
+        except BaseException as exc:
+            primary_error = _exception_text(exc)
+            if (
+                not activated
+                and activation_attempted
+                and active_path.is_file()
+                and not staging_path.exists()
+            ):
+                activated = True
+                try:
+                    active_digest = _sha256_file(active_path)
+                except BaseException as detection_exc:
+                    manifest_payload["activation_detection_status"] = (
+                        "staging-missing-active-digest-unavailable"
+                    )
+                    manifest_payload["activation_detection_error"] = _exception_text(
+                        detection_exc
+                    )
+                else:
+                    manifest_payload["activation_detection_status"] = (
+                        "matched-staging-digest"
+                        if active_digest == expected_active_sha256
+                        else "staging-missing-active-digest-mismatch"
+                    )
             if activated:
+                migration_guard.require_recovery(migration_manifest_path)
                 failed_path = backup_dir / "harness.schema30.failed-after-activation.db"
                 if failed_path.exists():
                     failed_path = backup_dir / f"harness.schema30.failed-after-activation-{uuid.uuid4().hex[:8]}.db"
@@ -1695,40 +1966,45 @@ def migrate_project_to_schema30(
                     manifest_payload["failed_schema30_preservation_error"] = preservation_error
                 try:
                     _restore_verified_backup(active_path, backup)
-                except Exception as restore_exc:
+                except BaseException as restore_exc:
+                    restore_error = _exception_text(restore_exc)
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["database_restore_status"] = "failed"
-                    manifest_payload["database_restore_error"] = str(restore_exc)
+                    manifest_payload["database_restore_error"] = restore_error
                     manifest_payload["projection_restore_status"] = "failed"
                     manifest_payload["projection_restore_error"] = (
                         "not attempted because database restore failed"
                     )
-                    manifest_payload["error"] = str(exc)
+                    manifest_payload["error"] = primary_error
                     _write_json_atomic(migration_manifest_path, manifest_payload)
                     raise LocalCoreMigrationError(
-                        f"migration failed after activation and database rollback failed: {restore_exc}"
+                        f"migration failed after activation and database rollback failed: {restore_error}"
+                        f"; recovery manifest: {migration_manifest_path}"
                     ) from restore_exc
                 manifest_payload["database_restore_status"] = "restored"
                 try:
                     _restore_projection_backup(root, projection_backup)
-                except Exception as restore_exc:
+                except BaseException as restore_exc:
+                    restore_error = _exception_text(restore_exc)
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["projection_restore_status"] = "failed"
-                    manifest_payload["projection_restore_error"] = str(restore_exc)
-                    manifest_payload["error"] = str(exc)
+                    manifest_payload["projection_restore_error"] = restore_error
+                    manifest_payload["error"] = primary_error
                     _write_json_atomic(migration_manifest_path, manifest_payload)
                     raise LocalCoreMigrationError(
-                        f"{exc}; database restored but projection restore failed: {restore_exc}"
+                        f"{primary_error}; database restored but projection restore failed: {restore_error}"
+                        f"; recovery manifest: {migration_manifest_path}"
                     ) from restore_exc
                 manifest_payload["status"] = "rolled-back"
                 manifest_payload["projection_restore_status"] = "restored"
                 if preservation_status == "failed":
                     manifest_payload["status"] = "rollback-incomplete"
-                    manifest_payload["error"] = str(exc)
+                    manifest_payload["error"] = primary_error
                     _write_json_atomic(migration_manifest_path, manifest_payload)
                     raise LocalCoreMigrationError(
-                        f"{exc}; database and projections restored but failed schema30 diagnostic "
-                        f"preservation was incomplete: {preservation_error}"
+                        f"{primary_error}; database and projections restored but failed schema30 diagnostic "
+                        f"preservation was incomplete: {preservation_error}; "
+                        f"recovery manifest: {migration_manifest_path}"
                     ) from exc
             else:
                 if staging_path.exists():
@@ -1737,12 +2013,30 @@ def migrate_project_to_schema30(
                     manifest_payload["failed_schema30_path"] = str(failed_path)
                 if _database_fingerprint(active_path) != source_fingerprint:
                     manifest_payload["status"] = "source-changed-before-activation"
-                    manifest_payload["error"] = str(exc)
+                    manifest_payload["error"] = primary_error
                     _write_json_atomic(migration_manifest_path, manifest_payload)
                     raise LocalCoreMigrationError(
                         "active source changed before activation; refusing to overwrite concurrent facts"
                     ) from exc
+                manifest_payload["database_restore_status"] = "unchanged-verified"
+                try:
+                    _restore_projection_backup(root, projection_backup)
+                except BaseException as restore_exc:
+                    restore_error = _exception_text(restore_exc)
+                    migration_guard.require_recovery(migration_manifest_path)
+                    manifest_payload["status"] = "rollback-incomplete"
+                    manifest_payload["projection_restore_status"] = "failed"
+                    manifest_payload["projection_restore_error"] = restore_error
+                    manifest_payload["error"] = primary_error
+                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    raise LocalCoreMigrationError(
+                        f"{primary_error}; pre-activation projection rollback failed: "
+                        f"{restore_error}; recovery manifest: {migration_manifest_path}"
+                    ) from restore_exc
+                manifest_payload["projection_restore_status"] = "restored"
                 manifest_payload["status"] = "failed-before-activation"
-            manifest_payload["error"] = str(exc)
+            manifest_payload["error"] = primary_error
             _write_json_atomic(migration_manifest_path, manifest_payload)
+            if manifest_payload["status"] in {"rolled-back", "failed-before-activation"}:
+                migration_guard.mark_safe()
             raise

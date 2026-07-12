@@ -50,8 +50,16 @@ from core.schema_guard import (
     TASK_STATUSES,
     TEST_TARGET_KINDS,
 )
-from core.store import DB_PATH, InMemoryStore, SqliteStore, Store, project_db_operation
+from core.store import (
+    DB_PATH,
+    InMemoryStore,
+    SqliteStore,
+    Store,
+    project_db_operation,
+    raise_if_project_migration_announced,
+)
 from core.schema_lifecycle import (
+    SCHEMA30_CATALOG_TABLES,
     SCHEMA30_TABLES,
     backup_sqlite_database,
     create_schema as create_schema29,
@@ -154,13 +162,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
     tables = {
         str(row[0])
         for row in conn.execute(
-            "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            "select name from sqlite_master where type='table'"
         )
     }
     if not tables:
         create_schema30(conn)
         return
-    if tables == SCHEMA30_TABLES:
+    if tables == SCHEMA30_CATALOG_TABLES:
         return
     project_version = None
     if "project" in tables:
@@ -173,7 +181,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         )
     raise HarnessError(
         "active schema 30 table inventory mismatch: "
-        f"missing={sorted(SCHEMA30_TABLES - tables)} extra={sorted(tables - SCHEMA30_TABLES)}"
+        f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
+        f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
     )
 
 
@@ -193,8 +202,10 @@ def db_file(root: Path) -> Path:
 
 def runtime_initialized(root: Path) -> bool:
     store = get_store(root)
-    if isinstance(store, SqliteStore) and not db_file(root).exists():
-        return False
+    if isinstance(store, SqliteStore):
+        raise_if_project_migration_announced(root)
+        if not db_file(root).exists():
+            return False
     try:
         with store.connection() as conn:
             exists = conn.execute("select 1 from sqlite_master where type='table' and name = 'project'").fetchone()
@@ -2526,12 +2537,9 @@ def doctor(
 
         issues.extend(check_runtime_invariants(conn, root))
         if require_views:
-            from core.projections import PROJECTION_PATHS
+            from core.projections import projection_content_issues
 
-            for relpath in PROJECTION_PATHS:
-                view_path = root / relpath
-                if view_path.is_symlink() or not view_path.is_file():
-                    issues.append(f"missing or unsafe view: {relpath.as_posix()}")
+            issues.extend(projection_content_issues(root))
     return issues
 
 
@@ -2540,14 +2548,14 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
     tables = {
         str(row[0])
         for row in conn.execute(
-            "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            "select name from sqlite_master where type='table'"
         )
     }
-    if tables != SCHEMA30_TABLES:
+    if tables != SCHEMA30_CATALOG_TABLES:
         issues.append(
             "schema 30 table inventory mismatch: "
-            f"missing={sorted(SCHEMA30_TABLES - tables)} "
-            f"extra={sorted(tables - SCHEMA30_TABLES)}"
+            f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
+            f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
         )
         return issues
     enum_checks = [
@@ -3151,12 +3159,14 @@ def repair(root: Path, *, dry_run: bool = False, clear_invariant: str = "", conf
     return []
 
 
+@_project_mutation
 def render_all(root: Path) -> None:
     from core.projections import render_all as core_render_all
 
     core_render_all(root)
 
 
+@_project_mutation
 def render_affected(root: Path, *projections: str) -> None:
     from core.projections import render_affected as core_render_affected
 

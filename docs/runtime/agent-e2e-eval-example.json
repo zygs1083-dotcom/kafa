@@ -2,23 +2,24 @@
   "agent_runtime_seconds": null,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T00:25:20+00:00",
+    "generated_at": "2026-07-12T16:25:36+00:00",
     "git_dirty": true,
-    "git_head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "git_head": "8eb593354b9701fec819b569643044cce31bb2bc",
     "source_scope": [
       "kafa/",
       "plugins/",
       "tests/",
       "benchmarks/",
+      ".gitattributes",
       "VERSION",
       "docs/runtime/fresh-skill-eval-prompts.md",
       "docs/runtime/skill-eval-transcript-fixture.txt",
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 180,
-    "status_sha256": "b3fbe64a646b2ff3fe1e5c0743c50bb358fc7ade9afd776cbe7857a3e58f3046",
-    "workspace_sha256": "b44236242d636c9ed01d5bd9e14dc7e81de54034d34cf28d3d52bd6eb003de70"
+    "status_entry_count": 21,
+    "status_sha256": "c61560878f1826f473475d89b75d26396eb118b4ee1885c5e84695bdc3d5a541",
+    "workspace_sha256": "c8c9c85c6be1ec07bd2b81fb6c4d2a3c14be291e4bd496491d58120dd830ac0e"
   },
   "evidence_scope": "deterministic-local-runtime",
   "live_skipped": false,
@@ -35,6 +36,7 @@
   },
   "mode": "stability",
   "native_host": null,
+  "report_version": 1,
   "scenarios": [
     {
       "category": "cold-start",
@@ -49,7 +51,7 @@
           "qa-reviewer.toml"
         ]
       },
-      "duration_seconds": 0.52021,
+      "duration_seconds": 0.166581,
       "mode": "local",
       "name": "fresh_local_install_and_init",
       "pass": true,
@@ -66,7 +68,7 @@
         "task_status": "submitted",
         "validations": 1
       },
-      "duration_seconds": 0.691255,
+      "duration_seconds": 0.334797,
       "mode": "local",
       "name": "quickstart_stops_before_independent_review",
       "pass": true,
@@ -77,11 +79,11 @@
       "details": {
         "candidate_count": 2,
         "validation_statuses": [
-          "superseded",
-          "active"
+          "active",
+          "superseded"
         ]
       },
-      "duration_seconds": 0.710424,
+      "duration_seconds": 0.537788,
       "mode": "local",
       "name": "current_candidate_supersedes_stale_validation",
       "pass": true,
@@ -96,7 +98,7 @@
         "false_pass_count": 0,
         "forged_evidence_block_count": 1
       },
-      "duration_seconds": 1.367216,
+      "duration_seconds": 0.965925,
       "mode": "local",
       "name": "manual_evidence_cannot_satisfy_delivery",
       "pass": true,
@@ -109,7 +111,7 @@
         "false_pass_count": 0,
         "finding_block_count": 1
       },
-      "duration_seconds": 0.786899,
+      "duration_seconds": 0.55395,
       "mode": "local",
       "name": "open_high_finding_blocks_delivery",
       "pass": true,
@@ -123,7 +125,7 @@
         "false_pass_count": 0,
         "human_intervention_count": 0
       },
-      "duration_seconds": 1.734551,
+      "duration_seconds": 1.242014,
       "mode": "local",
       "name": "high_risk_requires_human_review",
       "pass": true,
@@ -137,7 +139,7 @@
         "policy_block_count": 2,
         "structured_zero_blocked": true
       },
-      "duration_seconds": 0.939602,
+      "duration_seconds": 0.707149,
       "mode": "local",
       "name": "structured_and_no_network_policy_fail_closed",
       "pass": true,
@@ -152,7 +154,7 @@
           "CYCLE-next"
         ]
       },
-      "duration_seconds": 0.59765,
+      "duration_seconds": 0.414072,
       "mode": "local",
       "name": "cycle_isolation",
       "pass": true,
@@ -168,7 +170,7 @@
         "sqlite_lock_error_count": 0,
         "thread_leak_count": 0
       },
-      "duration_seconds": 0.449616,
+      "duration_seconds": 0.553395,
       "mode": "local",
       "name": "sqlite_contention_stress",
       "pass": true,
@@ -193,7 +195,7 @@
         "schema27_success_version": 30,
         "schema27_target_version": 30
       },
-      "duration_seconds": 0.223764,
+      "duration_seconds": 0.276071,
       "mode": "local",
       "name": "schema27_29_migration_and_rollback",
       "pass": true,
@@ -210,7 +212,7 @@
         "skill_count": 7,
         "template_count": 3
       },
-      "duration_seconds": 0.465939,
+      "duration_seconds": 0.47823,
       "mode": "local",
       "name": "installed_plugin_surface",
       "pass": true,
@@ -218,7 +220,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 8.517755,
+    "duration_seconds": 6.259562,
     "expected_human_review_required_count": 1,
     "failed_count": 0,
     "false_pass_count": 0,

@@ -148,6 +148,11 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
 
 `validation record` 只记录判断。没有 controller execution 支撑的自由文本，不会变成 delivery gate 可接受的命令证据。
 
+如果 structured runner 通过 `--result-path` 生成结果文件，建议把路径放在
+`.ai-team/runtime/` 下，或直接从 stdout 解析。命令若在普通项目路径创建或修改结果
+文件，post-execution candidate 会正确变化，该次 execution 将以 stale candidate
+丢弃；Kafa 不会为了结果文件而动态排除任意业务源码路径。
+
 ## Delivery trust
 
 本地信任状态分为：
@@ -160,6 +165,44 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
 High/critical failure mode 至少需要当前 candidate 的 structured execution 和不同 producer/reviewer context。即使满足这两项，没有独立可验证 provenance 时仍必须返回 `human-review-required`。只有用户明确接受或豁免全部剩余高风险，并完整记录 actor、reason、范围、revision 和 expiry，才可以沿 accepted-risk 路径继续；该记录是程序性审计，不是密码学证明。
 
 `skipped`、`blocked`、`not-run`、fixture-only 和零测试数都不能描述为通过。代码在 execution 或 quality gate 之后发生变化时，旧事实仍可审计，但不再满足当前 candidate。
+
+Candidate identity 会纳入普通 ignored runtime source，但把未版本化且精确命名的
+top-level dependency/tool environment（`.venv/`、`venv/`、`.tox/`、
+`.nox/`、`node_modules/`）与生成工具缓存排除在源码身份之外。任何位于这些根目录
+下的 Git versioned path 都会让整个根目录重新进入严格源码扫描；`.venvish/` 等相邻
+前缀不会被排除。项目 lockfile 和 dependency manifest 始终参与 candidate identity。
+在保留的项目路径中，只有 exact generated projection、retired projection 和三个静态
+agent template 会被排除；`.gitignore`、额外的 `.codex/agents/` 或
+`docs/harness/` runtime 文件仍属于 candidate。No-Git 项目遇到 FIFO、socket 或
+其他非普通路径会 fail closed。Git 模式会分别检查 index 与 HEAD，因此即使 gitlink
+只存在于 HEAD、删除已暂存且 worktree 路径不存在，也不能生成可用 candidate。
+Identity Git 命令同时禁用 replace-object lookup；仓库内的 `refs/replace/*`
+不能用替代 commit/tree/blob 隐藏真实 HEAD gitlink 或缺失对象。
+受控 `GIT_WORK_TREE` 同时固定实际评估根目录，repo-local `core.worktree`
+不能重定向 source inventory 或触发 Git 到 content identity 的静默降级。
+
+持久 Native 报告只接受四个精确 mode，并绑定 `evidence_scope`、matrix profile、
+有序 scenario inventory、local scenario category/mode、正数且有限的 token/runtime/
+duration，以及 parallel task-to-scope/context/target/acceptance 映射。生成时还会核对
+当前 Native Codex binary 与 CLI version；未知 Connector/Host 标签、零 telemetry、
+producer 互换或自洽但错误的 binary metadata 都不能保留 passing 状态。
+Passing matrix 必须同时记录 Codex available 且无 skip reason，成功 producer 的
+error 必须为空，Git dirty/status count 必须一致；Host 未暴露可信金额时
+`estimated_cost` 固定为 `null`。生成时 platform、Python、Git 和 container facts
+必须与当前环境一致；跨平台读取持久报告时只把它们作为经过类型校验的历史事实，
+不伪称是在当前机器生成。
+Compact evidence 使用 closed `report_version=1`；passing live detail/producer
+出现未声明字段会失败，显式 test binary override 只能用于 evaluator 回归，不能通过
+`--evidence-out` 写成 persistent real-Native evidence。evaluation-scoped Git
+source 只要存在 unmerged entry，也不会生成可用 workspace digest。版本、summary
+counter、return code、execution/validation/workload/producer count 与 token count
+均使用递归 exact JSON 类型校验，`true`/`false` 或浮点数不能冒充整数。
+Fixture/stability 的每个 detail counter 在聚合前必须是 exact non-negative
+integer；passing single/parallel 还要求 active table inventory 精确等于 schema 30
+的 27 张表，并且 catalog 只额外允许 `sqlite_sequence`；任何其他 `sqlite_*`
+或 Connector/Host/runtime 表都会 fail closed。Real Native controller command 从
+启动身份验证过的 private Git-backed snapshot 执行，报告绑定 start identity 并复核
+completion identity，短暂替换后恢复的源码也不会成为实际执行字节。
 
 ## Public CLI
 
@@ -210,6 +253,22 @@ Plugin 只定义三个 Hooks：
 支持的 v1 schema 迁移通过 side-by-side conversion 完成：先创建带 digest 和完整性结果的 SQLite backup，再把有效本地事实复制到 staging schema 30，验证 foreign keys、invariants 和 projection dry-run，最后原子替换 active DB。
 
 被移除的远程协作、执行者生命周期和历史恢复子系统数据只保留在 pre-migration backup，不会进入 active schema 30。激活后 doctor 失败时，运行时使用已验证 backup 自动恢复；schema 30 写入新事实后不承诺自动 downgrade。
+
+迁移在原子替换前会持久化 `recovery-required` sentinel 和 manifest 路径。只有迁移成功或 DB 与 projections 都达到 verified complete rollback 后才会清除 sentinel；`rollback-incomplete`、hard process exit 或 recovery interruption 会保留它并阻止普通命令。Operator must not remove 该 sentinel，直到根据 manifest 恢复并验证 database/projection authority。任何缺少 mandatory projection activation validator 的 core migration 调用都会在激活前被拒绝。
+
+所有 production projection publication（包括 `projection rebuild`、same-schema
+migrate、repair 和普通 mutation）从 DB read 到最终文件写入的完整生命周期持有同一个
+operation lock。迁移成功前会在私有 DB snapshot 中独立渲染 13 个 view，并逐字节比较
+live projection；仅有文件存在不等于验证通过。`project-state.yaml` 使用 SQLite
+`project.updated_at`，不使用 render-time clock，并在 rebuild 时 replace rather than merge，
+字段集合严格匹配 schema（含 DB `id/current_cycle_id`，不伪造 `blocked_reason`），
+因此相同 DB 产生相同字节且陈旧附加键不会残留。失败 schema-30 的 WAL/SHM 必须先隔离，
+恢复后的 source DB 再通过普通 SQLite read-only 语义验证；无法隔离 handle/sidecar 时
+保持 `rollback-incomplete`。即使 active DB 缺失，status/doctor/validate/quickstart
+status 也会先显示 recovery manifest 和 do-not-remove guidance，而不会建议重新 init。
+Core 会在 callback 返回后自行比较 projection bytes；callback self-report 不能成为成功
+依据。Callback 前后 active DB fingerprint 也必须不变，即使注入值能通过 doctor 也会
+rollback。Operation lock 的 descriptor/open/unlock cleanup 对 `BaseException` 安全。
 
 具体 dry-run、backup 路径和恢复边界见 [INSTALL.md](INSTALL.md)。
 

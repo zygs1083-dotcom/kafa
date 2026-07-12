@@ -1,24 +1,25 @@
 {
-  "agent_runtime_seconds": 48.974109,
+  "agent_runtime_seconds": 35.421646,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T08:41:08+00:00",
+    "generated_at": "2026-07-12T16:25:48+00:00",
     "git_dirty": true,
-    "git_head": "72da2f0661d4d821d5fa31fe1781ad483cba5a02",
+    "git_head": "8eb593354b9701fec819b569643044cce31bb2bc",
     "source_scope": [
       "kafa/",
       "plugins/",
       "tests/",
       "benchmarks/",
+      ".gitattributes",
       "VERSION",
       "docs/runtime/fresh-skill-eval-prompts.md",
       "docs/runtime/skill-eval-transcript-fixture.txt",
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 1,
-    "status_sha256": "fd0c300989a9f6a3a40f438b72cb71e370f5c6f8152abba71fd4414c4069d269",
-    "workspace_sha256": "05dbf61b46e5e3d177cae528568203f5b6b8b613f2d17aab0df3e3506acd587a"
+    "status_entry_count": 21,
+    "status_sha256": "c61560878f1826f473475d89b75d26396eb118b4ee1885c5e84695bdc3d5a541",
+    "workspace_sha256": "c8c9c85c6be1ec07bd2b81fb6c4d2a3c14be291e4bd496491d58120dd830ac0e"
   },
   "evidence_scope": "live-codex",
   "live_skipped": false,
@@ -40,6 +41,7 @@
     "source": "path-discovery",
     "trust": "local-capability-only-not-delivery-provenance"
   },
+  "report_version": 1,
   "scenarios": [
     {
       "category": "live-codex",
@@ -64,18 +66,19 @@
         ],
         "last_message_recorded": true,
         "native_returncode": 0,
-        "native_runtime_seconds": 48.974109,
+        "native_runtime_seconds": 35.421646,
         "native_runtime_source": "controller-wall-clock",
-        "native_token_count": 63259,
+        "native_token_count": 49862,
         "native_token_scope": "native-producers-only",
         "native_token_source": "codex-json-turn.completed",
         "native_usage": {
-          "cached_input_tokens": 40832,
-          "input_tokens": 62566,
-          "output_tokens": 693,
+          "cached_input_tokens": 28672,
+          "input_tokens": 49266,
+          "output_tokens": 596,
           "reasoning_output_tokens": 0,
-          "token_count": 63259
+          "token_count": 49862
         },
+        "pre_edit_returncode": 1,
         "producer_changed_files": [
           "candidate.py"
         ],
@@ -84,13 +87,14 @@
         "provider_surface_absent": true,
         "retired_host_tables": [],
         "task_status": "submitted",
+        "task_submit_returncode": 0,
         "test_file_unchanged": true,
         "validation_count": 1,
         "workload_family": "isolated-one-file-value-flip-v1",
         "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
         "workload_units": 1
       },
-      "duration_seconds": 50.173734,
+      "duration_seconds": 36.63386,
       "mode": "live-codex",
       "name": "native_codex_edit_and_controller_verify",
       "pass": true,
@@ -98,7 +102,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 50.173763,
+    "duration_seconds": 36.633886,
     "expected_human_review_required_count": 0,
     "failed_count": 0,
     "false_pass_count": 0,
@@ -110,12 +114,12 @@
     "skipped_count": 0,
     "sqlite_lock_error_count": 0
   },
-  "token_count": 63259,
+  "token_count": 49862,
   "token_usage": {
-    "cached_input_tokens": 40832,
-    "input_tokens": 62566,
-    "output_tokens": 693,
+    "cached_input_tokens": 28672,
+    "input_tokens": 49266,
+    "output_tokens": 596,
     "reasoning_output_tokens": 0,
-    "token_count": 63259
+    "token_count": 49862
   }
 }

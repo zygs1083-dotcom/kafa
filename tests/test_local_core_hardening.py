@@ -23,13 +23,24 @@ for path in (PLUGIN_ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 import harness_db  # noqa: E402
+import harness_lib  # noqa: E402
 from core import local_core_migration  # noqa: E402
 from core import store as store_module  # noqa: E402
 from core.local_core_migration import migrate_project_to_schema30  # noqa: E402
-from core.projections import render_decisions  # noqa: E402
+from core.projections import render_decisions, render_project_state  # noqa: E402
 from core.schema_lifecycle import backup_sqlite_database  # noqa: E402
 from core.store import InMemoryStore, SqliteStore, project_db_operation  # noqa: E402
 from tests.test_schema30_migration import init_schema29_fixture  # noqa: E402
+
+
+def _active_projection_validator(root: Path):
+    def validate(_active_path: Path) -> None:
+        harness_db.render_all(root)
+        issues = harness_db.doctor(root, require_project_files=False)
+        if issues:
+            raise RuntimeError("projection validation failed: " + "; ".join(issues))
+
+    return validate
 
 
 def _active_writer(
@@ -79,7 +90,11 @@ def _paused_migration(
             "project_db_operation",
             side_effect=announced_operation,
         ):
-            migrate_project_to_schema30(root, staging_validator=validate_staging)
+            migrate_project_to_schema30(
+                root,
+                staging_validator=validate_staging,
+                active_validator=_active_projection_validator(root),
+            )
         result.put(("ok", ""))
     except Exception as exc:  # pragma: no cover - returned to the parent assertion
         result.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -184,11 +199,178 @@ def _rollback_migration_with_lock_observation(
                 root,
                 fail_at="after_atomic_replace",
                 staging_validator=validate_staging,
+                active_validator=_active_projection_validator(root),
             )
         result.put(("unexpected-success", ""))
     except local_core_migration.InjectedLocalCoreMigrationFailure as exc:
         result.put(("rolled-back", str(exc)))
     except Exception as exc:  # pragma: no cover - returned to the parent assertion
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _projection_rebuild_paused_before_write(
+    root_value: str,
+    project_state_read: multiprocessing.synchronize.Event,
+    release_projection: multiprocessing.synchronize.Event,
+    captured_schema: multiprocessing.queues.Queue,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    root = Path(root_value)
+    from core import api, projections
+
+    original_write_state = projections.write_state
+
+    def paused_write_state(
+        render_root: Path,
+        state: dict[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured_schema.put(int(state["schema_version"]))
+        project_state_read.set()
+        if not release_projection.wait(10):
+            raise RuntimeError("projection rebuild release event timed out")
+        return original_write_state(render_root, state, **kwargs)
+
+    try:
+        with mock.patch.object(
+            projections,
+            "write_state",
+            side_effect=paused_write_state,
+        ), mock.patch.object(
+            projections,
+            "PROJECTION_RENDERERS",
+            (("project-state", projections.render_project_state),),
+        ), mock.patch.object(
+            projections,
+            "PROJECTION_NAMES",
+            ("project-state",),
+        ):
+            api.projection_rebuild(root)
+        result.put(("ok", ""))
+    except Exception as exc:  # pragma: no cover - returned to the parent assertion
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _migration_with_first_lock_observation(
+    root_value: str,
+    first_lock_outcome: multiprocessing.queues.Queue,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    root = Path(root_value)
+    original_try_os_lock = store_module._try_os_lock
+    reported = False
+
+    def observed_try_os_lock(descriptor: int) -> None:
+        nonlocal reported
+        try:
+            original_try_os_lock(descriptor)
+        except OSError:
+            if not reported:
+                reported = True
+                first_lock_outcome.put("blocked")
+            raise
+        if not reported:
+            reported = True
+            first_lock_outcome.put("acquired")
+
+    try:
+        with mock.patch.object(
+            store_module,
+            "_try_os_lock",
+            side_effect=observed_try_os_lock,
+        ):
+            migrate_project_to_schema30(
+                root,
+                active_validator=_active_projection_validator(root),
+            )
+        result.put(("ok", ""))
+    except Exception as exc:  # pragma: no cover - returned to the parent assertion
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _unlock_baseexception_probe(
+    root_value: str,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    root = Path(root_value)
+    try:
+        try:
+            with mock.patch.object(
+                store_module,
+                "_unlock_os_lock",
+                side_effect=KeyboardInterrupt("cancel during unlock"),
+            ):
+                with project_db_operation(root):
+                    pass
+        except KeyboardInterrupt:
+            pass
+        else:  # pragma: no cover - the injected cancellation must propagate
+            result.put(("error", "unlock cancellation did not propagate", -1))
+            return
+
+        try:
+            with project_db_operation(root, timeout=0.25):
+                pass
+        except BaseException as exc:  # pragma: no cover - returned to parent
+            result.put(
+                (
+                    "blocked",
+                    f"{type(exc).__name__}: {exc}",
+                    len(store_module._HELD_FDS),
+                )
+            )
+        else:
+            result.put(("released", "", len(store_module._HELD_FDS)))
+    except BaseException as exc:  # pragma: no cover - returned to parent
+        result.put(("error", f"{type(exc).__name__}: {exc}", -1))
+
+
+def _open_baseexception_probe(
+    lock_path_value: str,
+    result: multiprocessing.queues.Queue,
+) -> None:
+    lock_path = Path(lock_path_value)
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+
+    def tracked_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    try:
+        with (
+            mock.patch.object(store_module.os, "open", side_effect=tracked_open),
+            mock.patch.object(
+                store_module.os,
+                "fsync",
+                side_effect=KeyboardInterrupt("cancel during lock open"),
+            ),
+        ):
+            try:
+                store_module._open_operation_lock(lock_path)
+            except KeyboardInterrupt:
+                pass
+            else:  # pragma: no cover - the injected cancellation must propagate
+                result.put(("error", "open cancellation did not propagate"))
+                return
+
+        descriptor = opened[0]
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            closed = True
+        else:
+            closed = False
+            real_close(descriptor)
+        result.put(("closed" if closed else "leaked", ""))
+    except BaseException as exc:  # pragma: no cover - returned to parent
+        for descriptor in opened:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
         result.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
@@ -198,6 +380,79 @@ def _join_process(process: multiprocessing.Process) -> None:
         process.terminate()
         process.join(5)
         raise AssertionError(f"child process did not exit: pid={process.pid}")
+
+
+class ProjectionDeterminismTests(unittest.TestCase):
+    def test_project_state_keys_and_values_exactly_match_database_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness_db.init_runtime(root)
+            state = harness_lib.read_state(root)
+            schema = json.loads(
+                (
+                    PLUGIN_ROOT / "schemas/project-state.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            with harness_db.connection(root) as conn:
+                row = harness_db.project_row(conn)
+                expected = {
+                    key: str(row[key])
+                    for key in schema["properties"]
+                }
+
+        self.assertEqual(set(state), set(schema["properties"]))
+        self.assertEqual(state, expected)
+
+    def test_unchanged_database_renders_byte_identical_project_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness_db.init_runtime(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+
+            with mock.patch.object(
+                harness_lib,
+                "now_iso",
+                return_value="2030-01-01T00:00:00+00:00",
+            ):
+                render_project_state(root)
+            first = projection.read_bytes()
+
+            with mock.patch.object(
+                harness_lib,
+                "now_iso",
+                return_value="2031-01-01T00:00:00+00:00",
+            ):
+                render_project_state(root)
+            second = projection.read_bytes()
+
+            with harness_db.connection(root) as conn:
+                authoritative_updated_at = str(
+                    conn.execute(
+                        "select updated_at from project where id=1"
+                    ).fetchone()[0]
+                )
+
+        self.assertEqual(second, first)
+        self.assertIn(
+            f"updated_at: {authoritative_updated_at}\n".encode("utf-8"),
+            second,
+        )
+
+    def test_project_state_rebuild_removes_stale_ad_hoc_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness_db.init_runtime(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.write_text(
+                projection.read_text(encoding="utf-8")
+                + "unexpected_stale_key: must-be-removed\n",
+                encoding="utf-8",
+            )
+
+            render_project_state(root)
+            rebuilt = projection.read_text(encoding="utf-8")
+
+        self.assertNotIn("unexpected_stale_key", rebuilt)
 
 
 class MigrationOperationLockTests(unittest.TestCase):
@@ -257,6 +512,32 @@ class MigrationOperationLockTests(unittest.TestCase):
                 ).fetchone()[0]
 
         self.assertEqual((version, decision), (30, "keep"))
+
+    def test_unlock_baseexception_releases_descriptor_and_local_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = self.context.Queue()
+            process = self.context.Process(
+                target=_unlock_baseexception_probe,
+                args=(temp, result),
+            )
+            process.start()
+            _join_process(process)
+            outcome = result.get(timeout=2)
+
+        self.assertEqual(outcome, ("released", "", 0))
+
+    def test_open_baseexception_closes_partial_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = self.context.Queue()
+            process = self.context.Process(
+                target=_open_baseexception_probe,
+                args=(str(Path(temp) / "operation.lock"), result),
+            )
+            process.start()
+            _join_process(process)
+            outcome = result.get(timeout=2)
+
+        self.assertEqual(outcome, ("closed", ""))
 
     def test_mutation_projection_finishes_before_migration_backup_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -345,6 +626,68 @@ class MigrationOperationLockTests(unittest.TestCase):
         self.assertEqual(manifest["database_restore_status"], "restored")
         self.assertEqual(manifest["projection_restore_status"], "restored")
 
+    def test_public_projection_rebuild_finishes_before_migration_can_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            init_schema29_fixture(root)
+            project_state_read = self.context.Event()
+            release_projection = self.context.Event()
+            captured_schema = self.context.Queue()
+            rebuild_result = self.context.Queue()
+            rebuild = self.context.Process(
+                target=_projection_rebuild_paused_before_write,
+                args=(
+                    str(root),
+                    project_state_read,
+                    release_projection,
+                    captured_schema,
+                    rebuild_result,
+                ),
+            )
+            rebuild.start()
+            self.assertTrue(
+                project_state_read.wait(10),
+                "projection rebuild did not read the schema-29 project state",
+            )
+            self.assertEqual(captured_schema.get(timeout=2), 29)
+
+            first_lock_outcome = self.context.Queue()
+            migration_result = self.context.Queue()
+            migration = self.context.Process(
+                target=_migration_with_first_lock_observation,
+                args=(str(root), first_lock_outcome, migration_result),
+            )
+            migration.start()
+            lock_outcome = first_lock_outcome.get(timeout=10)
+            if lock_outcome == "acquired":
+                _join_process(migration)
+
+            release_projection.set()
+            _join_process(rebuild)
+            if migration.is_alive():
+                _join_process(migration)
+
+            rebuild_outcome = rebuild_result.get(timeout=2)
+            migration_outcome = migration_result.get(timeout=2)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+            project_state = (
+                root / ".ai-team/control/project-state.yaml"
+            ).read_text(encoding="utf-8")
+            doctor_issues = harness_db.doctor(
+                root,
+                require_project_files=False,
+            )
+
+        self.assertEqual(lock_outcome, "blocked")
+        self.assertEqual(rebuild_outcome, ("ok", ""))
+        self.assertEqual(migration_outcome, ("ok", ""))
+        self.assertEqual(version, 30)
+        self.assertIn("schema_version: 30", project_state)
+        self.assertEqual(doctor_issues, [])
+
     def test_new_connection_fails_closed_when_migration_is_announced(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -421,7 +764,10 @@ class MigrationOperationLockTests(unittest.TestCase):
                 "_remove_empty_active_sidecars",
                 side_effect=pause_after_fingerprint,
             ):
-                migrate_project_to_schema30(root)
+                migrate_project_to_schema30(
+                    root,
+                    active_validator=_active_projection_validator(root),
+                )
             _join_process(writer)
 
             writer_outcome = writer_result.get(timeout=2)
@@ -514,7 +860,10 @@ class MigrationOperationLockTests(unittest.TestCase):
                 side_effect=OSError("injected sentinel write failure"),
             ):
                 with self.assertRaisesRegex(OSError, "injected sentinel write failure"):
-                    migrate_project_to_schema30(root)
+                    migrate_project_to_schema30(
+                        root,
+                        active_validator=_active_projection_validator(root),
+                    )
 
             self.assertFalse(sentinel.exists())
             self.assertFalse(operation_lock.exists())

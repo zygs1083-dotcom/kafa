@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import multiprocessing
+import os
 import sqlite3
 import sys
 import tempfile
@@ -23,10 +26,11 @@ import harness_db  # noqa: E402
 from core import local_core_migration  # noqa: E402
 from core.event_bus import validate_audit_events  # noqa: E402
 from core.schema_lifecycle import SchemaLifecycleError, backup_sqlite_database  # noqa: E402
+from core.store import ProjectOperationLockError, SqliteStore  # noqa: E402
 from core.local_core_migration import (  # noqa: E402
     InjectedLocalCoreMigrationFailure,
     LocalCoreMigrationError,
-    migrate_project_to_schema30,
+    migrate_project_to_schema30 as _core_migrate_project_to_schema30,
     stage_schema29_to_schema30,
     stage_supported_schema_to_schema30,
 )
@@ -66,6 +70,34 @@ def init_schema29_fixture(root: Path) -> None:
         )
         harness_db.ensure_delivery_cycles(conn)
         conn.commit()
+
+
+def _hard_exit_active_validator(_active_path: Path) -> None:
+    os._exit(17)
+
+
+def _active_projection_validator(root: Path):
+    def validate(_active_path: Path) -> None:
+        harness_db.render_all(root)
+        issues = harness_db.doctor(root, require_project_files=False)
+        if issues:
+            raise LocalCoreMigrationError(
+                "test projection activation validation failed: " + "; ".join(issues)
+            )
+
+    return validate
+
+
+def migrate_project_to_schema30(root: Path, **kwargs):
+    kwargs.setdefault("active_validator", _active_projection_validator(root))
+    return _core_migrate_project_to_schema30(root, **kwargs)
+
+
+def _run_hard_exit_after_schema30_activation(root_value: str) -> None:
+    migrate_project_to_schema30(
+        Path(root_value),
+        active_validator=_hard_exit_active_validator,
+    )
 
 
 def add_retired_schema29_fixture_surface(conn: sqlite3.Connection) -> None:
@@ -695,7 +727,7 @@ class Schema30StagingTests(unittest.TestCase):
             report = stage_schema29_to_schema30(source, staging)
             with closing(sqlite3.connect(staging)) as conn:
                 execution = conn.execute(
-                    "select candidate_sha, target_id, command, exit_code, stdout_sha256, executed_count, semantic_status, runner from executions"
+                    "select candidate_sha, target_id, command, exit_code, stdout_sha256, executed_count, semantic_status, runner, sandbox_status from executions"
                 ).fetchone()
                 validation_rows = conn.execute(
                     "select id, validation_status from validations order by id"
@@ -718,7 +750,17 @@ class Schema30StagingTests(unittest.TestCase):
 
         self.assertEqual(
             execution,
-            (candidate_sha, "UNIT", "python3 -m unittest", 0, artifact_sha, 1, "pass", "local"),
+            (
+                candidate_sha,
+                "UNIT",
+                "python3 -m unittest",
+                0,
+                artifact_sha,
+                1,
+                "pass",
+                "local",
+                "",
+            ),
         )
         self.assertEqual(
             validation_rows,
@@ -889,6 +931,9 @@ class Schema30LegacyStagingTests(unittest.TestCase):
                     )
                 }
                 foreign_key_issues = conn.execute("pragma foreign_key_check").fetchall()
+                invalidations = conn.execute(
+                    "select source_type, target_type from invalidations order by id"
+                ).fetchall()
 
         self.assertEqual(source_digest_after, source_digest_before)
         self.assertEqual(report.source_version, source_version)
@@ -909,6 +954,13 @@ class Schema30LegacyStagingTests(unittest.TestCase):
         self.assertNotIn("ci_verifications", tables)
         self.assertNotIn("external_session_verifications", tables)
         self.assertEqual(foreign_key_issues, [])
+        self.assertTrue(
+            all(
+                source_type in {"requirement", "acceptance", "failure_mode"}
+                and target_type in {"acceptance", "task", "validation", "quality_gate"}
+                for source_type, target_type in invalidations
+            )
+        )
         if source_version == 27:
             self.assertEqual(
                 (report.converted_execution_count, report.converted_validation_count),
@@ -922,26 +974,48 @@ class Schema30LegacyStagingTests(unittest.TestCase):
     def test_development_schema28_uses_isolated_legacy_stage(self) -> None:
         self._assert_legacy_fixture_migrates(28)
 
-    def test_legacy_staging_rejects_fractional_project_revision(self) -> None:
+    def test_legacy_staging_rejects_non_positive_or_non_integer_trust_revisions(
+        self,
+    ) -> None:
+        invalid_revisions = (1.9, "not-an-integer", 0, -1)
         for source_version, fixture in (
             (27, _create_schema27_fixture),
             (28, create_schema28_fixture),
         ):
-            with self.subTest(source_version=source_version), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
-                fixture(root)
-                source = root / ".ai-team/state/harness.db"
-                with closing(sqlite3.connect(source)) as conn:
-                    conn.execute("update project set revision = 1.9 where id = 1")
-                    conn.commit()
+            for surface in ("project", "quality-gate"):
+                for revision in invalid_revisions:
+                    with (
+                        self.subTest(
+                            source_version=source_version,
+                            surface=surface,
+                            revision=revision,
+                        ),
+                        tempfile.TemporaryDirectory() as temp,
+                    ):
+                        root = Path(temp)
+                        fixture(root)
+                        source = root / ".ai-team/state/harness.db"
+                        with closing(sqlite3.connect(source)) as conn:
+                            if surface == "project":
+                                conn.execute(
+                                    "update project set revision = ? where id = 1",
+                                    (revision,),
+                                )
+                            else:
+                                updated = conn.execute(
+                                    "update quality_gates set project_revision = ?",
+                                    (revision,),
+                                )
+                                self.assertGreater(updated.rowcount, 0)
+                            conn.commit()
 
-                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
-                with self.assertRaisesRegex(
-                    LocalCoreMigrationError,
-                    "positive SQLite integer",
-                ):
-                    stage_supported_schema_to_schema30(source, staging)
-                self.assertFalse(staging.exists())
+                        staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+                        with self.assertRaisesRegex(
+                            LocalCoreMigrationError,
+                            "positive SQLite integer",
+                        ):
+                            stage_supported_schema_to_schema30(source, staging)
+                        self.assertFalse(staging.exists())
 
     def test_legacy_session_ids_do_not_replace_shared_context_identity(self) -> None:
         for source_version, fixture in (
@@ -1043,6 +1117,74 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             conn.commit()
         return source
 
+    def test_hard_exit_after_activation_leaves_durable_recovery_required_sentinel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_text("schema_version: 29\n", encoding="utf-8")
+            context = multiprocessing.get_context("spawn")
+            process = context.Process(
+                target=_run_hard_exit_after_schema30_activation,
+                args=(str(root),),
+            )
+            process.start()
+            process.join(30)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+                self.fail("hard-exit migration child did not terminate")
+
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            payload = json.loads(sentinel.read_text(encoding="utf-8"))
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+
+            self.assertEqual(process.exitcode, 17)
+            self.assertEqual(active_version, 30)
+            self.assertEqual(
+                projection.read_text(encoding="utf-8"),
+                "schema_version: 29\n",
+            )
+            self.assertEqual(payload["status"], "recovery-required")
+            manifest_path = Path(str(payload["manifest_path"]))
+            self.assertTrue(manifest_path.is_file())
+            with self.assertRaisesRegex(
+                ProjectOperationLockError,
+                "recovery-required.*do not remove",
+            ):
+                with SqliteStore(root).connection():
+                    self.fail("Store opened a split-authority hard-exit migration")
+
+    def test_core_migration_cannot_report_success_without_projection_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_text("schema_version: 29\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                LocalCoreMigrationError,
+                "projection.*validator",
+            ):
+                _core_migrate_project_to_schema30(root)
+
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+            self.assertEqual(active_version, 29)
+            self.assertEqual(
+                projection.read_text(encoding="utf-8"),
+                "schema_version: 29\n",
+            )
+
     def test_failure_injection_preserves_or_restores_active_database(self) -> None:
         points = (
             "before_copy",
@@ -1093,7 +1235,362 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                         )
                 else:
                     self.assertEqual(manifest["status"], "failed-before-activation")
+                    self.assertEqual(
+                        manifest["database_restore_status"],
+                        "unchanged-verified",
+                    )
+                    self.assertEqual(
+                        manifest["projection_restore_status"],
+                        "restored",
+                    )
                     self.assertEqual(active_digest, source_digest)
+
+    def test_unverified_projection_backup_failure_retains_diagnostic_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._prepare_source(root)
+            with patch.object(
+                local_core_migration,
+                "_create_projection_backup",
+                side_effect=OSError("projection-backup-unavailable"),
+            ):
+                with self.assertRaisesRegex(OSError, "projection-backup-unavailable"):
+                    migrate_project_to_schema30(root)
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest_path = backup_dir / "migration-manifest.json"
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["status"], "failed-before-activation")
+            self.assertTrue(sentinel.is_file())
+            sentinel_payload = json.loads(sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(sentinel_payload["status"], "migration-failed")
+            self.assertEqual(
+                Path(sentinel_payload["manifest_path"]).resolve(),
+                manifest_path.resolve(),
+            )
+
+    def test_post_activation_cancellation_restores_database_and_projections(self) -> None:
+        cancellation_types = (KeyboardInterrupt, SystemExit, asyncio.CancelledError)
+        for cancellation_type in cancellation_types:
+            with self.subTest(cancellation_type=cancellation_type.__name__), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                active = self._prepare_source(root)
+                projection = root / ".ai-team/control/project-state.yaml"
+                projection.parent.mkdir(parents=True, exist_ok=True)
+                projection.write_bytes(b"schema_version: 29\nstate: before-cancellation\n")
+                projection.chmod(0o640)
+                projection_bytes = projection.read_bytes()
+                projection_mode = projection.stat().st_mode & 0o7777
+                cancellation = cancellation_type("interrupt-after-activation")
+
+                def interrupt_after_activation(_active_path: Path) -> None:
+                    raise cancellation
+
+                with self.assertRaises(cancellation_type) as raised:
+                    migrate_project_to_schema30(
+                        root,
+                        active_validator=interrupt_after_activation,
+                    )
+
+                backup_dir = next(
+                    (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+                )
+                manifest = json.loads(
+                    (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+                )
+                with closing(sqlite3.connect(active)) as conn:
+                    active_version = int(
+                        conn.execute(
+                            "select schema_version from project where id=1"
+                        ).fetchone()[0]
+                    )
+                failed_schema30 = Path(manifest["failed_schema30_path"])
+                with closing(sqlite3.connect(failed_schema30)) as conn:
+                    failed_version = int(
+                        conn.execute(
+                            "select schema_version from project where id=1"
+                        ).fetchone()[0]
+                    )
+
+                self.assertIs(raised.exception, cancellation)
+                self.assertEqual(active_version, 29)
+                self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+                self.assertEqual(projection.read_bytes(), projection_bytes)
+                self.assertEqual(projection.stat().st_mode & 0o7777, projection_mode)
+                self.assertEqual(failed_version, 30)
+                self.assertEqual(manifest["status"], "rolled-back")
+                self.assertEqual(manifest["database_restore_status"], "restored")
+                self.assertEqual(manifest["projection_restore_status"], "restored")
+                self.assertIn("interrupt-after-activation", manifest["error"])
+                self.assertFalse(
+                    (root / ".ai-team/state/local-core-migration.lock").exists()
+                )
+
+    def test_interrupt_between_atomic_replace_and_activation_flag_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_bytes(b"schema_version: 29\nstate: before-replace\n")
+            original_replace = local_core_migration.os.replace
+            interrupted = False
+
+            def interrupt_after_replace(source: Path, destination: Path) -> None:
+                nonlocal interrupted
+                if (
+                    not interrupted
+                    and Path(source).name == "harness.schema30.new.db"
+                    and Path(destination).resolve() == active.resolve()
+                ):
+                    original_replace(source, destination)
+                    interrupted = True
+                    raise KeyboardInterrupt(
+                        "interrupt-between-replace-and-activated-flag"
+                    )
+                original_replace(source, destination)
+
+            with patch.object(
+                local_core_migration.os,
+                "replace",
+                side_effect=interrupt_after_replace,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "interrupt-between-replace-and-activated-flag",
+                ):
+                    migrate_project_to_schema30(root)
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0]
+                )
+
+            self.assertTrue(interrupted)
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(
+                projection.read_bytes(),
+                b"schema_version: 29\nstate: before-replace\n",
+            )
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertEqual(
+                manifest["activation_detection_status"],
+                "matched-staging-digest",
+            )
+            self.assertIn(
+                "interrupt-between-replace-and-activated-flag",
+                manifest["error"],
+            )
+            self.assertFalse(
+                (root / ".ai-team/state/local-core-migration.lock").exists()
+            )
+
+    def test_public_migrate_interrupt_during_projection_publish_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            (root / ".gitignore").write_text(
+                "\n".join(harness_db.RUNTIME_GITIGNORE_PATTERNS) + "\n",
+                encoding="utf-8",
+            )
+            projection = root / ".ai-team/control/project-state.yaml"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_bytes(b"schema_version: 29\nstate: public-before\n")
+            original_projection = projection.read_bytes()
+            render_calls = 0
+
+            def interrupt_live_projection(render_root: Path) -> None:
+                nonlocal render_calls
+                render_calls += 1
+                if Path(render_root).resolve() != root.resolve():
+                    return
+                projection.write_bytes(
+                    b"schema_version: 30\nstate: partial-publication\n"
+                )
+                raise KeyboardInterrupt("interrupt-during-live-projection")
+
+            with patch.object(
+                harness_db,
+                "render_all",
+                side_effect=interrupt_live_projection,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "interrupt-during-live-projection",
+                ):
+                    harness_db.migrate(root, "29", 30)
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0]
+                )
+
+            self.assertGreaterEqual(render_calls, 2)
+            self.assertEqual(active_version, 29)
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            self.assertEqual(projection.read_bytes(), original_projection)
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertIn("interrupt-during-live-projection", manifest["error"])
+            self.assertFalse(
+                (root / ".ai-team/state/local-core-migration.lock").exists()
+            )
+
+    def test_database_restore_cancellation_keeps_normal_store_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            with patch.object(
+                local_core_migration,
+                "_restore_verified_backup",
+                side_effect=SystemExit("cancel-during-db-restore"),
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "database rollback failed",
+                ):
+                    migrate_project_to_schema30(
+                        root,
+                        fail_at="after_atomic_replace",
+                    )
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest_path = backup_dir / "migration-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+
+            self.assertFalse(active.exists())
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "failed")
+            self.assertIn(
+                "cancel-during-db-restore",
+                manifest["database_restore_error"],
+            )
+            self.assertTrue(sentinel.is_file())
+            sentinel_payload = json.loads(sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(sentinel_payload["status"], "rollback-incomplete")
+            self.assertEqual(
+                Path(sentinel_payload["manifest_path"]).resolve(),
+                manifest_path.resolve(),
+            )
+            with self.assertRaisesRegex(
+                ProjectOperationLockError,
+                "rollback-incomplete",
+            ) as blocked:
+                with SqliteStore(root).connection():
+                    self.fail("normal Store opened while recovery-required sentinel existed")
+            self.assertIn(str(manifest_path.resolve()), str(blocked.exception))
+            self.assertFalse(active.exists())
+
+    def test_rollback_manifest_write_failure_keeps_normal_store_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_write_json = local_core_migration._write_json_atomic
+
+            def fail_terminal_manifest(path: Path, payload: dict[str, object]) -> None:
+                if (
+                    Path(path).name == "migration-manifest.json"
+                    and payload.get("status") == "rollback-incomplete"
+                ):
+                    raise OSError("manifest-write-failed-during-rollback")
+                original_write_json(path, payload)
+
+            with (
+                patch.object(
+                    local_core_migration,
+                    "_restore_verified_backup",
+                    side_effect=SystemExit("cancel-during-db-restore"),
+                ),
+                patch.object(
+                    local_core_migration,
+                    "_write_json_atomic",
+                    side_effect=fail_terminal_manifest,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "manifest-write-failed-during-rollback",
+                ):
+                    migrate_project_to_schema30(
+                        root,
+                        fail_at="after_atomic_replace",
+                    )
+
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            self.assertFalse(active.exists())
+            self.assertTrue(sentinel.is_file())
+            with self.assertRaisesRegex(
+                ProjectOperationLockError,
+                "rollback-incomplete",
+            ):
+                with SqliteStore(root).connection():
+                    self.fail("normal Store recreated a DB after manifest-write failure")
+            self.assertFalse(active.exists())
+
+    def test_second_cancellation_during_recovery_keeps_normal_store_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_preserve = local_core_migration._preserve_failed_schema30
+
+            def preserve_then_interrupt(
+                active_path: Path,
+                failed_path: Path,
+            ) -> tuple[str, str]:
+                original_preserve(active_path, failed_path)
+                raise KeyboardInterrupt("cancel-after-schema30-preservation")
+
+            with patch.object(
+                local_core_migration,
+                "_preserve_failed_schema30",
+                side_effect=preserve_then_interrupt,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "cancel-after-schema30-preservation",
+                ):
+                    migrate_project_to_schema30(
+                        root,
+                        fail_at="after_atomic_replace",
+                    )
+
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            self.assertFalse(active.exists())
+            self.assertTrue(sentinel.is_file())
+            with self.assertRaisesRegex(
+                ProjectOperationLockError,
+                "rollback-incomplete",
+            ):
+                with SqliteStore(root).connection():
+                    self.fail("normal Store recreated a DB after recovery cancellation")
+            self.assertFalse(active.exists())
 
     def test_post_activation_projection_failure_restores_verified_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1199,10 +1696,17 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             entries = {
                 entry["path"]: entry for entry in manifest["projection_backup"]["entries"]
             }
-            self.assertEqual(entries[str(PROJECTION_PATHS[0])]["sha256"], original_digest)
-            self.assertEqual(entries[str(PROJECTION_PATHS[0])]["mode"], original_mode)
-            self.assertFalse(entries[str(Path("docs/harness/executions.md"))]["existed"])
-            self.assertEqual(entries[str(Path("docs/harness/evidence.md"))]["sha256"], retired_digest)
+            self.assertEqual(
+                entries[PROJECTION_PATHS[0].as_posix()]["sha256"], original_digest
+            )
+            self.assertEqual(entries[PROJECTION_PATHS[0].as_posix()]["mode"], original_mode)
+            self.assertFalse(
+                entries[Path("docs/harness/executions.md").as_posix()]["existed"]
+            )
+            self.assertEqual(
+                entries[Path("docs/harness/evidence.md").as_posix()]["sha256"],
+                retired_digest,
+            )
 
     def test_projection_restore_failure_is_never_reported_as_complete_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1378,6 +1882,68 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 manifest["failed_schema30_preservation_error"],
             )
 
+    def test_empty_cancellation_during_failed_schema30_preservation_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_sha256 = local_core_migration._sha256_file
+
+            def interrupt_failed_active_digest(path: Path) -> str:
+                resolved = Path(path)
+                if resolved.resolve() == active.resolve() and resolved.is_file():
+                    with closing(sqlite3.connect(resolved)) as conn:
+                        version = int(
+                            conn.execute(
+                                "select schema_version from project where id=1"
+                            ).fetchone()[0]
+                        )
+                    if version == 30:
+                        raise KeyboardInterrupt()
+                return original_sha256(resolved)
+
+            with patch.object(
+                local_core_migration,
+                "_sha256_file",
+                side_effect=interrupt_failed_active_digest,
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "KeyboardInterrupt",
+                ):
+                    migrate_project_to_schema30(
+                        root,
+                        fail_at="after_atomic_replace",
+                    )
+
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                active_version = int(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0]
+                )
+
+            self.assertEqual(active_version, 29)
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "restored")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertEqual(
+                manifest["failed_schema30_preservation_status"],
+                "failed",
+            )
+            self.assertIn(
+                "KeyboardInterrupt",
+                manifest["failed_schema30_preservation_error"],
+            )
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
     def test_failed_schema30_cleanup_denial_cannot_prevent_authority_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1481,6 +2047,9 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             with closing(sqlite3.connect(result.backup.backup_path)) as conn:
                 backup_version = int(conn.execute("select schema_version from project where id=1").fetchone()[0])
             active_digest = sha256(active)
+            migration_sentinel_exists = (
+                root / ".ai-team/state/local-core-migration.lock"
+            ).exists()
 
         self.assertEqual(result.source_version, 29)
         self.assertEqual(result.target_version, 30)
@@ -1496,6 +2065,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         self.assertEqual(migration_status, "activated")
         self.assertEqual(foreign_key_issues, [])
         self.assertEqual(backup_version, 29)
+        self.assertFalse(migration_sentinel_exists)
 
     def test_successful_runtime_migration_publishes_and_verifies_all_projections(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1529,6 +2099,192 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             )
             self.assertTrue(evidence_entry["existed"])
             self.assertEqual(len(evidence_entry["sha256"]), 64)
+
+    def test_public_migration_rejects_silent_stale_projection_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            (root / ".gitignore").write_text(
+                "\n".join(harness_db.RUNTIME_GITIGNORE_PATTERNS) + "\n",
+                encoding="utf-8",
+            )
+            stale = b"STALE-SCHEMA-29\n"
+            for relative_path in PROJECTION_PATHS:
+                projection = root / relative_path
+                projection.parent.mkdir(parents=True, exist_ok=True)
+                projection.write_bytes(stale)
+
+            with patch.object(harness_db, "render_all", return_value=None):
+                with self.assertRaisesRegex(
+                    harness_db.HarnessError,
+                    "projection verification",
+                ):
+                    harness_db.migrate(root, "29", 30)
+
+            with closing(sqlite3.connect(active)) as conn:
+                version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(version, 29)
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertTrue(
+                all((root / path).read_bytes() == stale for path in PROJECTION_PATHS)
+            )
+
+    def test_core_migration_independently_rejects_noop_projection_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            stale = b"STALE-SCHEMA-29\n"
+            for relative_path in PROJECTION_PATHS:
+                projection = root / relative_path
+                projection.parent.mkdir(parents=True, exist_ok=True)
+                projection.write_bytes(stale)
+
+            with self.assertRaisesRegex(
+                LocalCoreMigrationError,
+                "projection.*verification",
+            ):
+                _core_migrate_project_to_schema30(
+                    root,
+                    active_validator=lambda _active_path: None,
+                )
+
+            with closing(sqlite3.connect(active)) as conn:
+                version = int(
+                    conn.execute("select schema_version from project where id=1").fetchone()[0]
+                )
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(version, 29)
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertTrue(
+                all((root / path).read_bytes() == stale for path in PROJECTION_PATHS)
+            )
+            self.assertFalse(
+                (root / ".ai-team/state/local-core-migration.lock").exists()
+            )
+
+    def test_core_migration_rejects_callback_database_fact_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            stale = b"STALE-SCHEMA-29\n"
+            for relative_path in PROJECTION_PATHS:
+                projection = root / relative_path
+                projection.parent.mkdir(parents=True, exist_ok=True)
+                projection.write_bytes(stale)
+
+            def mutate_and_publish(active_path: Path) -> None:
+                with closing(sqlite3.connect(active_path)) as conn:
+                    conn.execute(
+                        "update project set current_owner='callback-injected' where id=1"
+                    )
+                    conn.commit()
+                harness_db.render_all(root)
+
+            with self.assertRaisesRegex(
+                LocalCoreMigrationError,
+                "callback.*database",
+            ):
+                _core_migrate_project_to_schema30(
+                    root,
+                    active_validator=mutate_and_publish,
+                )
+
+            with closing(sqlite3.connect(active)) as conn:
+                version, owner = conn.execute(
+                    "select schema_version, current_owner from project where id=1"
+                ).fetchone()
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual((int(version), str(owner)), (29, "project-manager"))
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(manifest["projection_restore_status"], "restored")
+            self.assertTrue(
+                all((root / path).read_bytes() == stale for path in PROJECTION_PATHS)
+            )
+            self.assertFalse(
+                (root / ".ai-team/state/local-core-migration.lock").exists()
+            )
+
+    def test_live_schema30_wal_cannot_corrupt_reported_complete_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            leaked: list[sqlite3.Connection] = []
+
+            def fail_with_live_wal(active_path: Path) -> None:
+                conn = sqlite3.connect(active_path)
+                leaked.append(conn)
+                conn.execute("pragma journal_mode = wal")
+                conn.execute(
+                    "update project set updated_at='schema30-live-wal' where id=1"
+                )
+                conn.commit()
+                self.assertGreater(
+                    Path(str(active_path) + "-wal").stat().st_size,
+                    0,
+                )
+                raise RuntimeError("schema30-live-wal-validator-failure")
+
+            caught: BaseException | None = None
+            try:
+                try:
+                    _core_migrate_project_to_schema30(
+                        root,
+                        active_validator=fail_with_live_wal,
+                    )
+                except BaseException as exc:  # cancellation/handle behavior is platform-specific
+                    caught = exc
+
+                sentinel = root / ".ai-team/state/local-core-migration.lock"
+                wal = Path(str(active) + "-wal")
+                shm = Path(str(active) + "-shm")
+                self.assertIsNotNone(caught)
+                if sentinel.exists():
+                    payload = json.loads(sentinel.read_text(encoding="utf-8"))
+                    self.assertEqual(payload["status"], "rollback-incomplete")
+                    with self.assertRaisesRegex(
+                        ProjectOperationLockError,
+                        "rollback-incomplete",
+                    ):
+                        with SqliteStore(root).connection():
+                            self.fail("Store opened an incomplete WAL recovery state")
+                else:
+                    self.assertFalse(wal.exists(), "schema-30 WAL survived complete rollback")
+                    self.assertFalse(shm.exists(), "schema-30 SHM survived complete rollback")
+                    with closing(sqlite3.connect(active)) as conn:
+                        version = int(
+                            conn.execute(
+                                "select schema_version from project where id=1"
+                            ).fetchone()[0]
+                        )
+                        integrity = conn.execute("pragma integrity_check").fetchone()[0]
+                        foreign_keys = conn.execute("pragma foreign_key_check").fetchall()
+                    self.assertEqual((version, integrity, foreign_keys), (29, "ok", []))
+            finally:
+                for conn in leaked:
+                    conn.close()
 
 
 class Schema30FactPreservationTests(unittest.TestCase):

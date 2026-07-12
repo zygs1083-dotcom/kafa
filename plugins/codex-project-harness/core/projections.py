@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -26,15 +27,20 @@ def render_project_state(root: Path) -> None:
     write_state(
         root,
         {
+            "id": row["id"],
             "status": row["status"],
             "phase": row["phase"],
+            "current_cycle_id": row["current_cycle_id"],
             "scope_status": row["scope_status"],
             "current_owner": row["current_owner"],
             "schema_version": row["schema_version"],
             "runtime_version": row["runtime_version"],
             "project_id": row["project_id"],
             "revision": row["revision"],
+            "updated_at": row["updated_at"],
         },
+        merge_existing=False,
+        include_blocked_reason=False,
     )
 
 
@@ -414,3 +420,46 @@ def render_affected(root: Path, projections: Iterable[str]) -> None:
     for name, renderer in PROJECTION_RENDERERS:
         if name in selected:
             renderer(root)
+
+
+def projection_content_issues(root: Path) -> list[str]:
+    """Compare every live projection with an independently rendered DB snapshot."""
+
+    runtime = _runtime()
+    try:
+        with tempfile.TemporaryDirectory(prefix="kafa-projection-verify-") as temp:
+            expected_root = Path(temp)
+            expected_db = expected_root / runtime.DB_PATH
+            ensure_parent(expected_db)
+            runtime.get_store(root).backup_to(expected_db)
+            render_all(expected_root)
+
+            issues: list[str] = []
+            for relative_path in PROJECTION_PATHS:
+                actual = root / relative_path
+                expected = expected_root / relative_path
+                if actual.is_symlink() or not actual.is_file():
+                    issues.append(
+                        f"missing or unsafe view: {relative_path.as_posix()}"
+                    )
+                    continue
+                if expected.is_symlink() or not expected.is_file():
+                    issues.append(
+                        "projection verifier did not generate expected view: "
+                        f"{relative_path.as_posix()}"
+                    )
+                    continue
+                if actual.read_bytes() != expected.read_bytes():
+                    issues.append(
+                        f"stale or invalid view content: {relative_path.as_posix()}"
+                    )
+
+            retired = root / PROJECTION_ROLLBACK_PATHS[-1]
+            if retired.exists() or retired.is_symlink():
+                issues.append(
+                    "retired projection is still present: "
+                    f"{PROJECTION_ROLLBACK_PATHS[-1].as_posix()}"
+                )
+            return issues
+    except Exception as exc:
+        return [f"projection content verification failed: {exc}"]

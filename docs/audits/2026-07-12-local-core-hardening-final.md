@@ -2,341 +2,233 @@
 
 ## Audit identity and disposition
 
-- OpenSpec change: `local-core-hardening`
-- Parent change: `local-core-slimming`
-- Candidate branch: `v2-local-core-slimming`
-- Baseline `main` and `origin/main`:
-  `adba3691d859c0ffc93d75cc148d8f916314cc49`
-- Native evaluation `HEAD`:
-  `72da2f0661d4d821d5fa31fe1781ad483cba5a02`
-- Executable workspace SHA-256:
-  `05dbf61b46e5e3d177cae528568203f5b6b8b613f2d17aab0df3e3506acd587a`
-- Executable status SHA-256:
-  `fd0c300989a9f6a3a40f438b72cb71e370f5c6f8152abba71fd4414c4069d269`
-- Executable status entries: 1
-- Schema/runtime: 30 / 5.0.0
-- Candidate source release: `2.0.0-beta.1` / `2.0.0b1`
-- Native evaluation state: intentionally uncommitted and dirty with an empty
-  cached diff. Those Git fields are historical run metadata; publication
-  changes HEAD/status without changing the bound executable bytes.
+- Change: `local-core-hardening`; parent: `local-core-slimming`.
+- Branch: `v2-local-core-slimming`.
+- Pre-publication HEAD: `8eb593354b9701fec819b569643044cce31bb2bc`.
+- Baseline `main` / `origin/main` at implementation start:
+  `adba3691d859c0ffc93d75cc148d8f916314cc49`.
+- Runtime / kernel / schema: `5.0.0` / `5.0.0` / `30`.
+- Source candidate: `2.0.0-beta.1` (`2.0.0b1`, development state).
+- OpenSpec checklist before publication: 134 checked, 46 open, 180 total.
 
-The hardening implementation and authorized local verification are complete.
-The OpenSpec checklist is 43/45: publication checkpoints 8.3 and 9.2 remain
-open until the current Windows path-alias fix completes both a push and
-pull-request Ubuntu/macOS/Windows matrix. The change closes the three original
-stop-ship findings, seven High and seven Medium adversarial or publication-QA findings, and
-the cross-platform defects exposed by the remote matrices. It adds no table,
-command, Skill, Hook, template, network
-dependency, Connector, or Host lifecycle. The source remains a local-only
-verified delivery kernel.
+All implementation items are complete. The 46 open items are publication
+checkpoints whose wording requires the final pushed revision, fresh QA, and the
+complete push and pull-request Ubuntu/macOS/Windows matrices. They remain open
+until those exact conditions are observed; old, skipped, cancelled, fixture-only,
+or not-run evidence is not reused.
 
-The quality conclusion in
-`docs/audits/2026-07-12-local-core-slimming-final.md` is superseded where it
-claimed the pre-hardening candidate had complete migration and trust coverage.
-That audit remains the historical slimming and accepted-LOC record; this audit
-is the current authority for migration concurrency, projection rollback, and
-review-status behavior.
+The earlier quality conclusion in
+`docs/audits/2026-07-12-local-core-slimming-final.md` is superseded for
+migration concurrency, DB/projection recovery, trust evaluation, candidate
+identity, Native evidence, and artifact completeness. That document remains the
+historical slimming and user-accepted LOC-deviation record.
 
-## Finding closure
+## Delivered behavior
 
-### Original hardening findings
+The candidate preserves schema 30 and the local-only kernel boundary:
 
-| ID | Original defect | Closed behavior |
+- every file-backed Store connection, transaction, backup, migration, repair,
+  and production projection publication uses one cross-platform, same-thread
+  reentrant project operation lock;
+- migration announces with a durable sentinel before waiting, fails new
+  operations closed, rereads authority after acquiring the lock, and keeps the
+  lock through success or complete rollback;
+- migration backup and recovery cover all 13 generated projection paths with
+  original existence, bytes, mode, and SHA-256, as well as the verified DB;
+- callback self-report is not trusted: core checks DB immutability, reruns doctor,
+  independently renders expected projection bytes, and compares every live path;
+- WAL/SHM, hard exit, cancellation, restore failure, and interrupted recovery
+  retain actionable `recovery-required` or `rollback-incomplete` state;
+- `evaluate_local_trust()` requires explicit `review_status`; high/critical
+  accepted-risk still requires structured current-candidate execution,
+  `reviewed-local`, distinct non-empty producer/reviewer contexts, and complete
+  current unexpired metadata for every residual risk;
+- production and Native source identity fail closed on Git replacement objects,
+  redirected worktrees, missing objects, gitlinks, symlinks, unmerged entries,
+  unexpected SQLite tables, and transient controller-source replacement;
+- real Native controller commands execute from a verified private Git-backed
+  snapshot captured at profile start;
+- the sdist now contains one installable release root with `release.json`,
+  `VERSION`, and the complete plugin bundle; CI builds real wheel/sdist artifacts
+  before isolated installation on each platform.
+
+No Connector, provider worker, Connector token, direct SaaS API, Host SDK
+lifecycle, fabricated receipt, new business table, new schema version, new CLI
+domain, new Skill, new Hook, or new agent template was introduced. Native
+Codex/ChatGPT remains the only owner of task/thread, subagent, worktree,
+approval, model, cancellation, steering, and handoff lifecycle.
+
+## Red/green finding closure
+
+| Finding | Red evidence | Closed behavior |
 | --- | --- | --- |
-| HC-MIG-1 | Store operations could commit between the last migration fingerprint and `os.replace` | Every file-backed connection, transaction, and backup now holds the same five-second, same-thread-reentrant project operation lock. Migration announces through the sentinel before acquiring that lock, waits for earlier work, then rereads and backs up the committed state. New work fails before SQLite opens. |
-| HC-PROJ-1 | A post-activation failure restored SQLite but could leave schema-30 projections live | Migration backs up all 14 possible filesystem side effects, including 13 live projections and the retired evidence view. Final doctor runs before live publication; later failure restores verified DB bytes and exact projection bytes/modes, removes newly created views, and reports `rollback-incomplete` if projection restoration fails. |
-| HC-TRUST-1 | Distinct-looking IDs could promote `same-context-degraded` high-risk review into accepted-risk | `review_status` is a required keyword-only trust input. High/critical accepted-risk requires exact `reviewed-local`, distinct non-empty context metadata, current structured execution, and complete current unexpired accepted/exempt metadata for every remaining risk. Degraded review remains `human-review-required`. |
+| Migration TOCTOU | An active writer could commit between fingerprint and replace | Deterministic process barriers prove the active writer finishes first and is included; operations beginning after announcement fail closed before SQLite opens. |
+| Projection split rollback | Activation failure could restore DB but leave schema-30 views | DB and all generated views restore atomically to verified pre-migration state; incomplete recovery remains fail closed. |
+| High-risk degraded review | Distinct-looking IDs plus accepted risk could bypass independent review | `same-context-degraded` can never satisfy high/critical independent review. |
+| Callback authority bypass | A callback could no-op or inject doctor-valid DB facts | Core independently rejects missing views, projection byte mismatch, and every callback DB fingerprint change. |
+| Source/report identity bypass | Git config, replace refs, transient source, coercive JSON types, or hidden SQLite tables could overstate Native evidence | Identity is isolated and pinned; reports are closed, exact-type contracts; private snapshot bytes and exact table inventory are verified. |
+| Source artifact incomplete | A PEP 517 sdist omitted `release.json`, `VERSION`, and the plugin, causing artifact-mode install to fail | `MANIFEST.in` defines the release root; the same real wheel/sdist pair passes isolated venv/HOME install. |
 
-The deterministic initial red checkpoint ran eight new tests. All eight failed
-for the intended three defect families while five surrounding positive
-migration and trust cases remained green. The same eight tests passed after the
-production changes.
+The artifact defect was found only because the final plan required a real source
+artifact rather than a copied checkout. A deterministic manifest test was red
+before `MANIFEST.in` and green afterward. No negative trust, migration, or
+delivery test was removed or relaxed.
 
-### Findings discovered during adversarial remediation
+## Local validation
 
-| Severity | Finding | Remediation and regression |
-| --- | --- | --- |
-| High | Schema 27/28/29 migration could use a legacy session ID as if it were producer/reviewer context | Migration now copies only real, non-empty context metadata. Missing or shared context remains empty and `same-context-degraded`; session identity never promotes review. |
-| High | Whitespace, case variants, or unknown `review_status` could cross a trust branch inconsistently | Only canonical `reviewed-local` and `same-context-degraded` values are accepted. Every noncanonical value fails closed; JSON schema enums match runtime behavior. |
-| High | Active schema-30 REAL revision values such as `1.9` could be truncated with `int()` and appear current | Runtime revision parsing rejects non-integral REAL/TEXT/negative values across project, gate, accepted-risk, and finding checks. |
-| High | Schema 27/28/29 migration could truncate or clamp malformed project/gate revisions and make stale risk acceptance current | Project, task, and gate revisions now require exact positive SQLite integers; fractional, textual, zero, and negative values fail staging with no activatable database. |
-| High | A complete accepted high/critical finding was treated as nonblocking without making the trust path high-risk | Every unresolved or accepted high/critical finding now contributes a named risk; accepted metadata is revalidated, structured execution is required, degraded review remains blocked, and reviewed-local delivery is labeled `accepted-risk`. |
-| High | Fractional legacy `exit_code`, `executed_count`, or policy flags could be coerced into immutable schema-30 execution evidence | Migration now accepts only exact SQLite integers/flags; malformed evidence is ineligible and its validation is invalidated, while malformed target flags abort staging. |
-| High | Active delivery evaluation could similarly coerce fractional execution or target metadata after direct DB tampering | Delivery evaluation independently checks exact gateable/sandbox/no-network flags, exact zero exit code, and positive integer execution count before trusting an immutable execution. |
-| Medium | Invalidated legacy validations could lose a valid `superseded_by` chain | Schema 27/29 migration retains valid supersession edges while invalidating unauthoritative judgments. The published schema-28 fixture has no source `validations` table and therefore no chain to preserve. |
-| Medium | Unknown low/medium review state could be promoted to `reviewed-local` | Unknown state fails closed; canonical low/medium degraded review remains allowed only with the explicit degraded label. |
-| Medium | Delivery status did not persist/project the exact `same-context-degraded` or `accepted-risk` result | Delivery facts and Markdown projections now retain the evaluated decision status; `delivery.schema.json` and `quality-gate.schema.json` use exact enums. |
-| Medium | A committed Native report could never keep matching the current `HEAD/status`, because committing the report necessarily changes both | Report generation and `should_fail` keep strict current-Git validation. Persisted evidence may retain its historical Git metadata, but current executable bytes and source scope must still match exactly. Time must be timezone-aware ISO-8601 and Git identity must be a nonzero object-ID shape; source-digest changes remain blocking. |
-| Medium | Packaged Skill/template instructions implied that risk acceptance could waive structured execution or independent review prerequisites | All packaged operating instructions now require structured current-candidate execution, exact `reviewed-local`, and distinct non-empty contexts first; acceptance covers only each named remaining risk. |
-| Medium | The final audit retained the prior Native identity, 303-test count, benchmark, and an obsolete multi-agent optimization claim after the Windows handle follow-up | The audit now binds to the current executable digest, 304-test regression, benchmark and Native reports. It records the paired cross-run range instead of selecting one favorable sample and makes no general token-saving claim. |
-| Medium | The audit claimed the Windows 8.3 short-path assertion had been fixed, but a shared install-release test still compared `RUNNER~1` with `runneradmin` lexically | The two `72da2f0` Windows failures are preserved below. The regression now compares `sentinel.resolve()` with the canonical diagnostic path and independently requires the migration code, sentinel filename, PID, and operator remediation. |
+Every row below is an executed pass. No skipped, blocked, not-run,
+expected-failure, fixture-only, or zero-test result is substituted for a
+different profile.
 
-Eight additional adversarial test methods produced 13 expected assertion
-failures plus one schema-contract `KeyError` before these corrections. All
-eight passed after remediation. No negative trust test was removed or relaxed.
-
-The publication-boundary regression first failed because the persisted-report
-mode did not exist, then the existing documentation contract failed on the old
-workspace digest after the focused fix changed executable source. After new
-real Native single and parallel runs, the focused report contract passed 2/2,
-the evaluator module passed, and that pre-push suite passed 296/296.
-
-Fresh publication QA then added six deterministic red methods. They produced
-19 intended assertion failures and five intended error paths across revision
-laundering, accepted-finding review, migrated command evidence, active runtime
-tampering, and instruction drift. After remediation, all cases were green and
-the complete strict suite passed 303/303. No negative trust or migration test
-was weakened or removed.
-
-## Migration and recovery evidence
-
-The verified ordering is:
-
-1. create `local-core-migration.lock` atomically;
-2. acquire `.ai-team/state/harness.db.operation.lock`;
-3. checkpoint WAL, reread source, and create the verified DB backup;
-4. back up and hash all 14 bounded projection paths;
-5. build staging, verify fingerprint, and replace the active DB;
-6. run schema/FK/domain doctor;
-7. render and verify all 13 live projections;
-8. on failure, restore the verified DB and exact projection state before
-   releasing the operation lock;
-9. release the operation lock, then remove the sentinel.
-
-Multiprocessing Event/Pipe tests, not timing sleeps, prove that an already
-active writer finishes and is included, while reads/writes starting after the
-sentinel fail closed. Success, injected exceptions, and process exit release
-the OS lock. A POSIX fork probe proves a child cannot inherit the parent's
-reentrant entitlement and can acquire only after the parent releases it.
-`kafa project doctor` returns `migration-in-progress` without opening SQLite
-when the sentinel exists.
-
-Failure injection covers five migration points, final-doctor failure, partial
-projection publication, DB rollback, projection restore, and an incomplete
-projection restore. Exact bytes, modes, SHA-256 values, absence/presence state,
-backup manifest paths, and schema 27/28/29 facts are checked. No operation lock,
-sentinel, partial, restore, or temporary database remains after handled runs.
-
-Independent migration QA reran 60 strict operation-lock, schema migration,
-schema lifecycle, backup, store, and doctor tests plus three read-only
-projection probes. It found no remaining Critical, High, or Medium finding and
-changed no file.
-
-## Delivery-trust and ownership evidence
-
-The trust matrix covers exact review-status propagation, current candidate and
-revision binding, structured execution, immutable execution rows, complete
-accepted/exempt risk metadata, expiry, waiver text, same-context spoofing,
-dirty Git, malformed SQLite values, and direct SQL tampering. Execution UPDATE
-and DELETE are rejected by database triggers. Invalid or stale provenance does
-not become a synthetic receipt.
-
-Low/medium `same-context-degraded` remains an honest local delivery result and
-is persisted and projected with that label. High/critical degraded review
-remains `human-review-required` even with distinct-looking IDs and complete
-risk acceptance. Only a canonical fresh distinct `reviewed-local` gate can
-enter the procedural `accepted-risk` path.
-
-Independent trust QA reran the complete 27-test delivery-policy suite, five
-focused caller/delta tests, three original exploit probes, and an AST audit of
-all 13 `evaluate_local_trust` call sites. It found no remaining Critical, High,
-or Medium finding and changed no file.
-
-Native Codex/ChatGPT remains sole owner of task execution, subagents,
-worktrees, approvals, model selection, cancellation, and handoff. Kafa owns
-only local facts, projections, validation, and delivery decisions. Active
-runtime scans and structure tests find no GitHub, Linear, Notion, Figma, Slack,
-Connector-token, `gh api`, Host SDK worker, provider, or fabricated-receipt
-execution path.
-
-## Regression and local E2E
-
-All counts below are executable passes; skipped, expected-failure, blocked,
-not-run, or fixture-only results are not included as substitutes for another
-profile.
-
-| Gate | Result |
+| Gate | Current result |
 | --- | --- |
-| Final affected strict matrix | 73/73, `ResourceWarning` promoted to error |
-| Windows handle install/release targeted matrix | 45/45, 18.652 s internal / 18.76 s wall, `ResourceWarning` promoted to error |
-| Windows path-alias install/release targeted matrix | 30/30, 17.573 s internal / 17.81 s wall, `ResourceWarning` promoted to error |
-| Complete strict unittest discovery | 304/304, 79.772 s internal / 80.02 s wall, no skip or expected failure |
-| Runtime smoke | 2/2; directed/full invariant ratio 47.126x against the 10x minimum |
-| Skill evaluation | 17/17 required markers |
-| Fixture E2E | 6/6 in 4.373 s; zero skip, false-pass, or SQLite-lock errors |
-| Stability E2E | 11/11 in 6.742 s; zero skip, false-pass, or SQLite-lock errors |
-| Final migration QA | 61/61, including the Windows handle regression; no Critical, High, or Medium finding |
-| Final trust QA | 27/27 plus 5/5 caller/delta tests and three exploit probes |
+| Complete strict unittest discovery | 375/375 in 136.538 s internal / 136.80 s wall; `ResourceWarning` promoted to error; no skip or expected-failure summary |
+| Install/release targeted suites | 47/47 |
+| Runtime smoke | 2/2; 15 lifecycle commands rc=0; directed/full invariant ratio 48.0696 vs 10x minimum |
+| Skill evaluation | 17/17 ordered markers |
+| Fixture E2E | 6/6 in 3.828667 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| Stability E2E | 11/11 in 6.259562 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| OpenSpec | `local-core-slimming` and `local-core-hardening` both 4/4 artifacts and valid |
+| Structure/release | plugin structure valid; source release contract valid |
+| Repo-scoped source doctor | pass after `--help`, `--dry-run`, temporary repo install, and cleanup |
+| JSON/YAML | release, plugin, hooks, 16 schemas, runtime reports, benchmark, and workflow syntax valid |
+| Native report consistency | both persistent reports return no consistency error against current executable source |
+| Diff hygiene | secret-pattern scan empty; `git diff --check` pass |
 
-Python compilation, release and plugin structure validation, all 25 JSON
-documents, both OpenSpec changes, both Native report consistency checks, and
-`git diff --check` all passed again at the final checkpoint.
-The hardening benchmark is persisted in
-`docs/audits/2026-07-12-local-core-hardening-benchmark.json`.
+The Kafa source repository intentionally has no `.ai-team` runtime. Therefore
+`harness.py --root . validate --delivery` reports `harness is not initialized`.
+The repository was not initialized merely to manufacture a handoff record;
+OpenSpec `tasks.md`, the test evidence, independent QA, PR checks, and this audit
+are the delivery authorities for this Kafa-source change.
 
-## Before/after performance and scale
+## Real Native Codex evidence
 
-The hardening measurements are compared first with the pre-hardening schema-30
-candidate because that isolates the cost of the safety changes. The older
-schema-29 baseline is included for the like-for-like mutation and init budget
-context.
+Both compact reports bind:
 
-| Metric | Schema 29 baseline | Pre-hardening schema 30 | Hardened schema 30 | Hardening delta |
-| --- | ---: | ---: | ---: | ---: |
-| Fresh DB | 552,960 B | 315,392 B | 315,392 B | 0 B |
-| Fresh init median | 0.310000 s | 0.114920 s | 0.102425 s | -10.87% |
-| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.005680 s | +29.38% |
-| Full 13-projection median | not recorded | 0.021977 s | 0.026911 s | +22.45% |
-| Full strict suite | 370 / 406.72 s | 258 / 82.99 s | 304 / 80.02 s | +46 tests; timings not workload-equivalent |
-| Total Python LOC | 33,521 | 23,927 | 27,107 | +3,180 / +13.29% |
-| Test Python LOC | 13,251 | 8,940 | 11,045 | +2,105 / +23.55% |
-| Plugin Python LOC | 18,878 | 12,971 | 13,934 | +963 / +7.42% |
+- executable workspace SHA-256:
+  `c8c9c85c6be1ec07bd2b81fb6c4d2a3c14be291e4bd496491d58120dd830ac0e`;
+- status SHA-256:
+  `c61560878f1826f473475d89b75d26396eb118b4ee1885c5e84695bdc3d5a541`;
+- status entries: 21;
+- Codex CLI: `0.143.0`;
+- Native binary SHA-256:
+  `d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406`.
 
-The 5k mutation median is 0.005680 seconds, 88.6% below the mandatory
-0.050-second ceiling. Full projection is 0.026911 seconds. The safety
-tests and implementation increase LOC relative to the slimmer candidate, but
-the user-approved original slimming deviation remains unchanged in status: the
-35%-45% total/test reduction target was not met and is not relabeled as a pass.
+| Profile | Result | Tokens | Native runtime | Controller verification |
+| --- | --- | ---: | ---: | --- |
+| Single | passed; only `candidate.py` integrated | 49,862 | 35.421646 s | one structured target, rc=0 |
+| Parallel | passed; disjoint `alpha.py` / `beta.py` producers | 99,832 | 38.463248 s; 38.455276 s producer overlap | two targeted plus combined verification, all rc=0 |
 
-## Real Native Host and multi-agent evidence
+The parallel run demonstrates latency reduction for two disjoint ready tasks,
+not a universal token reduction. Its per-unit token use is essentially the same
+as single and duplicates substantial input context. The conservative default is
+single/shared-context work; parallel fan-out is appropriate only for independent,
+bounded tasks with deterministic integration checks. Host-selected model identity
+and monetary cost are not exposed, so neither is inferred.
 
-Both real reports are bound to the executable source identity above and to
-Codex binary SHA-256
-`d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406`.
-Independent recomputation returned no validator error for source, binary,
-scope, tokens, integration, or timing.
+## Performance and size
 
-The persisted report contract distinguishes executable identity from Git
-publication metadata. Source digest and scope must still match the current
-checkout byte-for-byte. The recorded HEAD, dirty flag, status digest, and entry
-count remain the historical run state after a later commit instead of creating
-an impossible self-referential commit hash.
+| Metric | Schema-29 baseline | Slim schema-30 checkpoint | Hardened candidate | Result |
+| --- | ---: | ---: | ---: | --- |
+| Runtime tables | 54 | 27 | 27 | exact |
+| Fresh DB | 552,960 B | 315,392 B | 315,392 B | within 320 KiB budget |
+| Plugin payload, caches excluded | 1,276 KiB | 752 KiB | 856 KiB | within 1.0 MiB budget |
+| Fresh init median | 0.310000 s | 0.114920 s | 0.092236 s | pass |
+| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004849 s | pass vs 0.050 s budget |
+| Full 13-view projection median | not recorded | 0.021977 s | 0.023311 s | measured, not thresholded |
+| Strict full suite | 370 / 406.72 s | 258 / 82.99 s | 375 / 136.538 s | pass vs 300 s local reference budget |
+| In-scope Python LOC | 33,521 | 23,927 | 32,748 | 2.31% below baseline |
+| Test Python LOC | 13,251 | 8,940 | 14,708 | 11.00% above baseline |
+| Plugin Python LOC | 18,878 | 12,971 | 15,899 | 15.78% below baseline |
 
-| Profile | Work | Tokens | Controller wall | Native producer wall | Verification |
-| --- | --- | ---: | ---: | ---: | --- |
-| Single | one isolated producer; only `candidate.py` changed | 63,259 | 50.174 s | 48.974 s | one targeted controller check, rc=0 |
-| Parallel | two isolated producers; only `alpha.py` and `beta.py` changed | 99,364 | 39.826 s | 37.194 s; 33.437 s overlap | two targeted plus one combined check, all rc=0 |
-
-Two sequential current single units project to 100.348 controller seconds. The
-current parallel profile takes 39.826 seconds, a 60.31% latency reduction
-(`2.520x`), and averages 49,682 tokens per unit, 21.46% below this single run.
-The immediately preceding matched pair pointed the other way: only 1.13%
-latency improvement and 13.61% more tokens per parallel unit. An earlier pair
-showed a large latency gain but approximately equal per-unit tokens. Direction
-and magnitude are therefore not stable enough to claim a general token saving.
-The evidence supports one producer or a shared-context batch as the
-token-conservative default. Parallel fan-out is justified for ready, disjoint
-work with deterministic tests and a real latency SLA; task-level telemetry
-should decide whether its variable context duplication is worth paying.
-Actual model identity and monetary cost are not exposed and are not inferred.
+The safety and adversarial coverage materially increased code and tests after
+the slimming checkpoint. The locked 35%-45% Python/test LOC target remains a
+deviation; the user explicitly accepted that LOC deviation and authorized
+closing slimming task 11.16. This audit preserves it as an accepted deviation,
+not a metric pass. Plugin size is measured from a same-filesystem copy excluding
+`__pycache__` and bytecode, matching the locked method; the apparent 1.42 MiB
+working-directory size was cache pollution, not payload.
 
 ## Artifact and installation evidence
 
-The committed Windows handle-fix revision `72da2f0` produced real source and
-wheel artifacts:
+The final local artifact run used a real PEP 517 wheel and sdist in a temporary
+venv and temporary HOME:
 
 - wheel SHA-256:
-  `49d3cd83910a0f46ca87d9392660b89e58a52193de9de96003ee5dffb01acb51`
-- source archive SHA-256:
-  `58e593f43247d48ac71ee192832c64b21351ceba3f372d97bebcd40798051d1a`
+  `d53c901f532fbc57ced6cf3a5bbc21c25bd3456422c43d5fca6efa93ea385812`;
+- sdist SHA-256:
+  `146f50ba32cc5e7c5feaf4d2ab699ccbb9c5ec1fc8d21e3ff5cbe7496b526dab`.
 
-Those hashes predate the Windows path-alias regression correction and are not
-presented as final artifacts for the current candidate. The correction commit
-will be rebuilt and reinstalled before publication checkpoints 8.3 and 9.2
-close; its hashes replace these historical values in the final
-documentation-only closure.
+It verified wheel import isolation, marketplace discovery, Codex app-server
+discovery, exact 7 Skills / 3 Hooks / 3 templates / 16 schemas / 7 runtime
+scripts, cache identity, schema-30 init, quickstart, doctor, Hook execution,
+retired-surface absence, and uninstall. Temporary artifacts, HOME, venv,
+repo-scoped marketplace, and Python caches are removed before commit.
 
-Each artifact passed installation in a temporary venv and temporary HOME. The
-installed payload had exactly 7 Skills, 3 Hooks, 3 templates, 16 schemas, and
-7 runtime scripts. Plugin installation, Codex app-server discovery, cache
-digest, schema-30 quickstart, candidate doctor, Hook execution, uninstall, and
-retired-runtime absence all passed. Temporary artifacts and environments were
-removed.
+The active user installation was not overwritten. The PATH `kafa` remains
+`1.25.0-beta.1`; the source candidate reports `2.0.0-beta.1` only through
+`python3 -m kafa.cli` and isolated artifacts.
 
-The active user installation was never replaced. Final live inspection still
-reports global `kafa` and enabled `codex-project-harness@personal` as
-`1.25.0-beta.1`.
+## Independent QA
 
-## CI and authorization truth
+Three independent read-only reviews passed with no open Critical, High, or
+Medium finding:
 
-`.github/workflows/validate.yml` places the migration-concurrency and trust
-targeted suites before the full suite and isolated install in Ubuntu, macOS,
-and Windows jobs. At this audit's local checkpoint, commit/push authorization
-had not yet been granted, so the recorded pre-publication statuses were:
+- migration/recovery: all eight reviewed production file hashes remained equal
+  to the previously adversarially reviewed revision; combined production SHA
+  `4e4ade10777b6862fb6e5729d2014710ff478e92c70c157d8946aa407d29e201`;
+  an independent strict rerun passed 375/375 in 142.032 s;
+- trust/source/Native: reviewed production and test hashes were unchanged;
+  both persistent reports returned `[]` with `should_fail=False`; an independent
+  strict rerun passed 375/375 in 139.024 s;
+- artifact/CI: install/release tests passed 47/47, an independent temporary-copy
+  real wheel/sdist artifact smoke passed end to end, and workflow YAML/contract
+  validation passed. The initial unpinned-build Low finding was closed by fixing
+  the verified build tool version to `build==1.5.1`.
 
-| Remote gate | Status at local audit checkpoint |
-| --- | --- |
-| Ubuntu GitHub Actions | `not-run` |
-| macOS GitHub Actions | `not-run` |
-| Windows GitHub Actions | `not-run` |
+The remaining Low observation is that the workflow contract test checks the
+build command generically rather than asserting the exact pin. The implementation
+is pinned and the risk is future regression only; avoiding a new test-only
+source-identity churn and another 150k-token pair of real Native reruns is the
+more token-conservative final-candidate choice. Remote CI still provides the
+required executable artifact proof.
 
-These are not passes. In particular, Windows `msvcrt.locking`, open-handle, and
-replace behavior has static coverage and a configured CI path, but no Windows
-runtime evidence in this delivery.
+Any production change after these QA identities invalidates the corresponding
+review. The final pushed revision must pass both complete three-platform
+matrices before merge.
 
-### Publication follow-up
+## Remote CI and publication truth
 
-After the user authorized publication, PR #14's remote matrices exposed four
-additional portability defects and one incomplete test remediation rather than
-converting `not-run` into a pass:
+PR: [#14](https://github.com/zygs1083-dotcom/kafa/pull/14).
 
-- Windows rejected `os.fsync()` on read-only file descriptors during the
-  verified backup path. The backup and migration file helpers now open existing
-  files update-capable before flushing; a regression locks this descriptor
-  contract. The resulting migration barrier timeouts were secondary failures.
-- Windows represented the same temporary directory once through its 8.3 alias
-  and once through its canonical user name. The sentinel regression now checks
-  the actionable error code, sentinel filename, PID, and operator instruction
-  instead of requiring lexical path identity.
-- Ubuntu correctly could not resolve the macOS Codex binary path recorded by a
-  historical Native report. Cross-host persisted validation now verifies the
-  binary metadata and digest shape without claiming that the historical binary
-  is installed locally; source digest and scope remain mandatory.
-- On the next published candidate, both Windows jobs reached the isolated
-  install smoke and failed with `[WinError 32]` while deleting
-  `harness.db`. Python's SQLite connection context manager handled only the
-  transaction and did not close the handle. `read_quickstart_facts()` now owns
-  the reader with `contextlib.closing`, and a deterministic regression requires
-  `close()` exactly once. The red evidence is the
-  [pull-request Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29185088379/job/86629628860)
-  and [push Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29185087298/job/86629625806).
-- The published handle-fix revision `72da2f0` proved the isolated install smoke
-  itself on Windows, then both Windows jobs failed in the separate
-  install-release suite because one retained assertion still compared the 8.3
-  alias `RUNNER~1` with the canonical `runneradmin` path lexically. The runtime
-  diagnostic was already canonical and actionable. The regression now compares
-  `sentinel.resolve()` and separately requires the migration code, PID, and
-  operator instruction. Red evidence is the
-  [pull-request Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29186024025/job/86632147207)
-  and [push Windows job](https://github.com/zygs1083-dotcom/kafa/actions/runs/29186022910/job/86632144289).
+Before the new commit, PR #14 still points to `8eb5933`. Its two Ubuntu and two
+macOS checks passed; its two Windows checks failed. Those are old-candidate facts
+and are not evidence for this candidate.
 
-The portability and publication-QA fixes passed 304/304 local tests and
-regenerated both Native reports against the final executable digest above.
-At the current local checkpoint, the published `72da2f0` head has four passing
-Ubuntu/macOS jobs and the two path-alias Windows failures above. The corrected
-assertion is still unpublished, so its new push and pull-request six-job matrix
-is `not-run`, not passed. Remote follow-up results remain PR-owned evidence and
-are not backfilled into the historical pre-publication table.
+| Required new revision | Push matrix | Pull-request matrix |
+| --- | --- | --- |
+| Ubuntu | `not-run` | `not-run` |
+| macOS | `not-run` | `not-run` |
+| Windows | `not-run` | `not-run` |
 
-## Residual risks and explicit boundaries
+The validate workflow now runs hardening targets, complete strict regression,
+fixture/stability evidence, and real artifact-mode install on the matrix. All
+six jobs for the exact pushed revision must pass before the 46 publication
+checkpoints close or PR merge occurs.
 
-- Windows operation locking and replacement require the authorization-gated
-  remote Windows run before they can be called platform-verified.
-- Context IDs, SQLite facts, accepted-risk metadata, and Markdown projections
-  are procedural local records, not cryptographic provenance. A principal with
-  arbitrary file-write access can modify the DB or triggers. This is an
-  explicit OpenSpec non-goal; high/critical ambiguity still fails closed.
-- The real Native reports prove local capability and report consistency, not
-  trusted delivery provenance. Their trust label remains
-  `local-capability-only-not-delivery-provenance`.
-- The hardened candidate adds safety code and tests to the already accepted LOC
-  deviation. No supported migration, rollback, or trust coverage was deleted
-  to improve the metric.
-- The Native run captured an uncommitted candidate; a later commit may publish
-  the same bound executable bytes while retaining that run metadata. The
-  enabled user installation remains the old version and is not replaced by Git
-  publication.
+## Residual boundaries
 
-Within those declared limits, both independent QA reviews passed with no
-Critical, High, or Medium finding, all authorized local verification gates are
-green, and the three original stop-ship defects are closed.
+- Windows `msvcrt`, open-handle rollback, path, and CRLF behavior remains
+  platform-unverified for this unpushed candidate until the Windows matrices pass.
+- Local context IDs, accepted-risk metadata, and SQLite facts are procedural
+  records, not cryptographic provenance; ambiguous high/critical delivery remains
+  `human-review-required`.
+- Real Native reports prove local capability and internal consistency, not
+  independent delivery provenance.
+- The accepted LOC deviation remains explicit.
+- No tag, release, deploy, production migration, secret change, or user-plugin
+  replacement is authorized or performed.
+
+At this checkpoint local implementation and validation are green. Merge remains
+blocked on final independent QA, the exact new-HEAD push and PR matrices, and a
+post-CI audit/checklist update.

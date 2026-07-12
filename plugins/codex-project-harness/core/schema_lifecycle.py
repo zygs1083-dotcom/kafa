@@ -70,6 +70,8 @@ SCHEMA30_TABLES = frozenset(
         "events",
     }
 )
+SCHEMA30_SQLITE_INTERNAL_TABLES = frozenset({"sqlite_sequence"})
+SCHEMA30_CATALOG_TABLES = SCHEMA30_TABLES | SCHEMA30_SQLITE_INTERNAL_TABLES
 SCHEMA30_JSON_SCHEMAS = frozenset(
     {
         "project-state.schema.json",
@@ -467,7 +469,7 @@ def create_schema30(conn: sqlite3.Connection) -> None:
     existing = {
         str(row[0])
         for row in conn.execute(
-            "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'"
+            "select name from sqlite_master where type = 'table'"
         )
     }
     if existing:
@@ -479,12 +481,12 @@ def create_schema30(conn: sqlite3.Connection) -> None:
     actual = {
         str(row[0])
         for row in conn.execute(
-            "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'"
+            "select name from sqlite_master where type = 'table'"
         )
     }
-    if actual != SCHEMA30_TABLES:
-        missing = sorted(SCHEMA30_TABLES - actual)
-        extra = sorted(actual - SCHEMA30_TABLES)
+    if actual != SCHEMA30_CATALOG_TABLES:
+        missing = sorted(SCHEMA30_CATALOG_TABLES - actual)
+        extra = sorted(actual - SCHEMA30_CATALOG_TABLES)
         raise SchemaLifecycleError(f"schema 30 table inventory mismatch: missing={missing} extra={extra}")
 
 

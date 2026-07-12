@@ -55,8 +55,22 @@ def scenario_local_delivery() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         create_candidate(root)
+        initialized = run(root, "init")
+        if initialized.returncode == 0:
+            subprocess.run(
+                ["git", "add", ".gitignore"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "record harness runtime ignore policy"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
         commands = [
-            run(root, "init"),
+            initialized,
             run(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "User can create a task"),
             run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"),
             run(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),

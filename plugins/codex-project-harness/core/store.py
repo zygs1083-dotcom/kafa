@@ -106,8 +106,8 @@ def _sentinel_error(sentinel_path: Path) -> ProjectOperationLockError | None:
     except OSError as exc:
         return ProjectOperationLockError(
             "migration-in-progress: local-core migration sentinel exists at "
-            f"{sentinel_path} (metadata unreadable: {exc}); inspect the owner and remove it only "
-            "after confirming no migration is active"
+            f"{sentinel_path} (metadata unreadable: {exc}); inspect the owner and verify "
+            "database/projection authority before considering removal"
         )
 
     metadata: list[str] = []
@@ -116,14 +116,27 @@ def _sentinel_error(sentinel_path: Path) -> ProjectOperationLockError | None:
     except json.JSONDecodeError:
         payload = None
     if isinstance(payload, dict):
-        for field in ("pid", "created_at", "target_schema"):
+        for field in ("pid", "created_at", "target_schema", "status", "manifest_path"):
             value = payload.get(field)
             if value not in (None, ""):
                 metadata.append(f"{field}={value}")
     details = f" ({', '.join(metadata)})" if metadata else " (metadata invalid or incomplete)"
+    recovery_required = isinstance(payload, dict) and payload.get("status") in {
+        "recovery-required",
+        "rollback-incomplete",
+    }
+    guidance = (
+        "recover and verify database/projection authority using the recorded manifest; "
+        "do not remove the sentinel until recovery is complete"
+        if recovery_required
+        else (
+            "inspect the owner, confirm no migration is active, and verify database/projection "
+            "authority before considering sentinel removal"
+        )
+    )
     return ProjectOperationLockError(
         "migration-in-progress: local-core migration sentinel exists at "
-        f"{sentinel_path}{details}; inspect the owner and remove it only after confirming no migration is active"
+        f"{sentinel_path}{details}; {guidance}"
     )
 
 
@@ -131,6 +144,13 @@ def _raise_if_migration_announced(sentinel_path: Path) -> None:
     error = _sentinel_error(sentinel_path)
     if error is not None:
         raise error
+
+
+def raise_if_project_migration_announced(root: Path) -> None:
+    """Fail closed on a migration sentinel without opening or creating SQLite."""
+
+    _, sentinel_path, _ = _operation_paths(root)
+    _raise_if_migration_announced(sentinel_path)
 
 
 def _open_operation_lock(path: Path) -> int:
@@ -145,7 +165,7 @@ def _open_operation_lock(path: Path) -> int:
             os.chmod(path, 0o600)
             _HELD_FDS.add(descriptor)
             return descriptor
-        except Exception:
+        except BaseException:
             os.close(descriptor)
             raise
 
@@ -257,14 +277,18 @@ def project_db_operation(
         finally:
             held.pop(key, None)
     finally:
-        if descriptor is not None:
-            if os_locked:
+        try:
+            if descriptor is not None and os_locked:
                 try:
                     _unlock_os_lock(descriptor)
                 except OSError:
                     pass
-            _close_operation_lock(descriptor)
-        local_lock.release()
+        finally:
+            try:
+                if descriptor is not None:
+                    _close_operation_lock(descriptor)
+            finally:
+                local_lock.release()
 
 
 class Store(Protocol):
