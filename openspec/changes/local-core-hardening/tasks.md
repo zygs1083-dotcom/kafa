@@ -339,3 +339,9 @@
 - [x] 54.1 Main model: preserve the real artifact-mode install failure and add a red test proving the source distribution contains one release root with `release.json`, `VERSION`, the complete plugin bundle, and no generated Python cache files.
 - [x] 54.2 Main model: define an explicit source-distribution manifest that packages the local-only plugin release root required by isolated install without adding runtime dependencies or retired surfaces.
 - [ ] 54.3 Checkpoint: rebuild real wheel/source artifacts, run artifact-mode isolated install, install/release targeted tests, complete strict regression, both OpenSpec validations, fresh QA, and both complete three-platform matrices before merge.
+
+## 55. Windows newline and Git-object fixture portability follow-up
+
+- [x] 55.1 Main model: preserve the first new-HEAD Windows matrix failures proving projection text-mode writes produce CRLF bytes, a post-commit fixture rewrite fabricates a dirty candidate, and read-only loose Git objects cannot be removed by the missing-object tests.
+- [x] 55.2 Main model: publish projection and project-state content as explicit UTF-8 LF bytes, make the delivery fixture rewrite tracked source with exact LF bytes, and restore the user-write bit only when a Windows loose-object deletion reports `PermissionError`.
+- [ ] 55.3 Checkpoint: rerun projection determinism, delivery identity, missing/replace-object tests, complete strict regression, artifacts, both OpenSpec validations, fresh QA, and both complete new-HEAD three-platform matrices before merge.

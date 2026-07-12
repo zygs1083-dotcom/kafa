@@ -98,7 +98,7 @@ def write_state(
     lines = [f"{key}: {state[key]}" for key in ordered_keys if key in state]
     for key in sorted(k for k in state if k not in ordered_keys):
         lines.append(f"{key}: {state[key]}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
     return state
 
 

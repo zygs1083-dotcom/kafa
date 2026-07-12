@@ -433,6 +433,7 @@ class ProjectionDeterminismTests(unittest.TestCase):
                 )
 
         self.assertEqual(second, first)
+        self.assertNotIn(b"\r\n", second)
         self.assertIn(
             f"updated_at: {authoritative_updated_at}\n".encode("utf-8"),
             second,

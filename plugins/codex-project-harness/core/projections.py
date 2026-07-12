@@ -47,7 +47,7 @@ def render_project_state(root: Path) -> None:
 def write_view(root: Path, relpath: str, content: str) -> None:
     path = root / relpath
     ensure_parent(path)
-    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    path.write_bytes((content.rstrip() + "\n").encode("utf-8"))
 
 
 def _remove_retired_projection(path: Path) -> None:

@@ -4,14 +4,15 @@
 
 - Change: `local-core-hardening`; parent: `local-core-slimming`.
 - Branch: `v2-local-core-slimming`.
-- Pre-publication HEAD: `8eb593354b9701fec819b569643044cce31bb2bc`.
+- First publication HEAD: `cff9f4a2483405a76d72c19941ba4aa0c9bcb0d7`.
 - Baseline `main` / `origin/main` at implementation start:
   `adba3691d859c0ffc93d75cc148d8f916314cc49`.
 - Runtime / kernel / schema: `5.0.0` / `5.0.0` / `30`.
 - Source candidate: `2.0.0-beta.1` (`2.0.0b1`, development state).
-- OpenSpec checklist before publication: 134 checked, 46 open, 180 total.
+- OpenSpec checklist before the corrected publication: 136 checked, 47 open,
+  183 total.
 
-All implementation items are complete. The 46 open items are publication
+All implementation items are complete. The 47 open items are publication
 checkpoints whose wording requires the final pushed revision, fresh QA, and the
 complete push and pull-request Ubuntu/macOS/Windows matrices. They remain open
 until those exact conditions are observed; old, skipped, cancelled, fixture-only,
@@ -68,6 +69,7 @@ approval, model, cancellation, steering, and handoff lifecycle.
 | Callback authority bypass | A callback could no-op or inject doctor-valid DB facts | Core independently rejects missing views, projection byte mismatch, and every callback DB fingerprint change. |
 | Source/report identity bypass | Git config, replace refs, transient source, coercive JSON types, or hidden SQLite tables could overstate Native evidence | Identity is isolated and pinned; reports are closed, exact-type contracts; private snapshot bytes and exact table inventory are verified. |
 | Source artifact incomplete | A PEP 517 sdist omitted `release.json`, `VERSION`, and the plugin, causing artifact-mode install to fail | `MANIFEST.in` defines the release root; the same real wheel/sdist pair passes isolated venv/HOME install. |
+| Windows LF/object fixture portability | The first new-HEAD Windows run exposed CRLF projection bytes, a post-commit fixture rewrite that fabricated dirty source, and read-only loose Git objects that the negative tests could not delete | Production projections publish explicit UTF-8 LF bytes; the delivery fixture writes exact LF bytes; missing-object tests add the user-write bit only after Windows returns `PermissionError`. |
 
 The artifact defect was found only because the final plan required a real source
 artifact rather than a copied checkout. A deterministic manifest test was red
@@ -82,12 +84,12 @@ different profile.
 
 | Gate | Current result |
 | --- | --- |
-| Complete strict unittest discovery | 375/375 in 136.538 s internal / 136.80 s wall; `ResourceWarning` promoted to error; no skip or expected-failure summary |
+| Complete strict unittest discovery | 375/375 in 137.684 s internal / 137.96 s wall; `ResourceWarning` promoted to error; no skip or expected-failure summary |
 | Install/release targeted suites | 47/47 |
 | Runtime smoke | 2/2; 15 lifecycle commands rc=0; directed/full invariant ratio 48.0696 vs 10x minimum |
 | Skill evaluation | 17/17 ordered markers |
-| Fixture E2E | 6/6 in 3.828667 s; skipped=0, false-pass=0, SQLite-lock=0 |
-| Stability E2E | 11/11 in 6.259562 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| Fixture E2E | 6/6 in 4.230512 s; skipped=0, false-pass=0, SQLite-lock=0 |
+| Stability E2E | 11/11 in 6.277928 s; skipped=0, false-pass=0, SQLite-lock=0 |
 | OpenSpec | `local-core-slimming` and `local-core-hardening` both 4/4 artifacts and valid |
 | Structure/release | plugin structure valid; source release contract valid |
 | Repo-scoped source doctor | pass after `--help`, `--dry-run`, temporary repo install, and cleanup |
@@ -106,18 +108,18 @@ are the delivery authorities for this Kafa-source change.
 Both compact reports bind:
 
 - executable workspace SHA-256:
-  `c8c9c85c6be1ec07bd2b81fb6c4d2a3c14be291e4bd496491d58120dd830ac0e`;
+  `4edfcdf365dff5e058a0badcfbf5185a7783b00a15d8636d54a8176106823f89`;
 - status SHA-256:
-  `c61560878f1826f473475d89b75d26396eb118b4ee1885c5e84695bdc3d5a541`;
-- status entries: 21;
+  `b16a52dec1d25f1478e35748d1667f0df99b4f4563f791eb2343c0b4dbc5ccfa`;
+- status entries: 4;
 - Codex CLI: `0.143.0`;
 - Native binary SHA-256:
   `d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406`.
 
 | Profile | Result | Tokens | Native runtime | Controller verification |
 | --- | --- | ---: | ---: | --- |
-| Single | passed; only `candidate.py` integrated | 49,862 | 35.421646 s | one structured target, rc=0 |
-| Parallel | passed; disjoint `alpha.py` / `beta.py` producers | 99,832 | 38.463248 s; 38.455276 s producer overlap | two targeted plus combined verification, all rc=0 |
+| Single | passed; only `candidate.py` integrated | 49,530 | 26.678560 s | one structured target, rc=0 |
+| Parallel | passed; disjoint `alpha.py` / `beta.py` producers | 99,918 | 27.004120 s; 26.636331 s producer overlap | two targeted plus combined verification, all rc=0 |
 
 The parallel run demonstrates latency reduction for two disjoint ready tasks,
 not a universal token reduction. Its per-unit token use is essentially the same
@@ -133,12 +135,12 @@ and monetary cost are not exposed, so neither is inferred.
 | Runtime tables | 54 | 27 | 27 | exact |
 | Fresh DB | 552,960 B | 315,392 B | 315,392 B | within 320 KiB budget |
 | Plugin payload, caches excluded | 1,276 KiB | 752 KiB | 856 KiB | within 1.0 MiB budget |
-| Fresh init median | 0.310000 s | 0.114920 s | 0.092236 s | pass |
-| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004849 s | pass vs 0.050 s budget |
-| Full 13-view projection median | not recorded | 0.021977 s | 0.023311 s | measured, not thresholded |
-| Strict full suite | 370 / 406.72 s | 258 / 82.99 s | 375 / 136.538 s | pass vs 300 s local reference budget |
-| In-scope Python LOC | 33,521 | 23,927 | 32,748 | 2.31% below baseline |
-| Test Python LOC | 13,251 | 8,940 | 14,708 | 11.00% above baseline |
+| Fresh init median | 0.310000 s | 0.114920 s | 0.094813 s | pass |
+| One mutation after 5k facts | 0.146113 s | 0.004390 s | 0.004918 s | pass vs 0.050 s budget |
+| Full 13-view projection median | not recorded | 0.021977 s | 0.023758 s | measured, not thresholded |
+| Strict full suite | 370 / 406.72 s | 258 / 82.99 s | 375 / 137.684 s | pass vs 300 s local reference budget |
+| In-scope Python LOC | 33,521 | 23,927 | 32,760 | 2.27% below baseline |
+| Test Python LOC | 13,251 | 8,940 | 14,720 | 11.09% above baseline |
 | Plugin Python LOC | 18,878 | 12,971 | 15,899 | 15.78% below baseline |
 
 The safety and adversarial coverage materially increased code and tests after
@@ -155,9 +157,9 @@ The final local artifact run used a real PEP 517 wheel and sdist in a temporary
 venv and temporary HOME:
 
 - wheel SHA-256:
-  `d53c901f532fbc57ced6cf3a5bbc21c25bd3456422c43d5fca6efa93ea385812`;
+  `d93234ce395b709b52665cc4e0cfd789a78c857655bfd193a286d51eeb78c9cd`;
 - sdist SHA-256:
-  `146f50ba32cc5e7c5feaf4d2ab699ccbb9c5ec1fc8d21e3ff5cbe7496b526dab`.
+  `85bbb308caadfcb59fccea017865d314931f7290a102a8e3a27867a43f1bbf97`.
 
 It verified wheel import isolation, marketplace discovery, Codex app-server
 discovery, exact 7 Skills / 3 Hooks / 3 templates / 16 schemas / 7 runtime
@@ -197,13 +199,33 @@ Any production change after these QA identities invalidates the corresponding
 review. The final pushed revision must pass both complete three-platform
 matrices before merge.
 
+After the first Windows matrix exposed the newline/object-fixture failures, the
+same independent reviewers rechecked the incremental correction:
+
+- migration/projection QA confirmed explicit binary publication preserves the
+  same truncate/write lifecycle, outer operation lock, file mode, key ordering,
+  trailing newline, merge behavior, and exact UTF-8 LF bytes; PASS;
+- trust/source QA reran nine replace-ref, missing-object, gitlink, worktree, and
+  Native identity cases; the writable-bit retry catches only `PermissionError`
+  and does not weaken any fail-closed assertion; 9/9 PASS;
+- both latest Native reports bind source `4edfcdf3...` and pass strict current
+  source/binary/Git/matrix validation.
+
+One Low coverage observation remains: the permanent CRLF byte assertion names
+project-state explicitly rather than adding a second standalone assertion for a
+Markdown view. The shared `write_view` implementation and an independent direct
+mode/LF probe cover the latter, and the new Windows full suite is the required
+platform proof.
+
 ## Remote CI and publication truth
 
 PR: [#14](https://github.com/zygs1083-dotcom/kafa/pull/14).
 
-Before the new commit, PR #14 still points to `8eb5933`. Its two Ubuntu and two
-macOS checks passed; its two Windows checks failed. Those are old-candidate facts
-and are not evidence for this candidate.
+The first publication revision `cff9f4a` completed both Ubuntu and both macOS
+jobs successfully, including real artifact build/install. Both Windows jobs
+failed the hardening target with the four exact newline/read-only-fixture
+findings recorded above. Those failures are red evidence, not a pass. The
+corrected uncommitted candidate requires two entirely new matrices.
 
 | Required new revision | Push matrix | Pull-request matrix |
 | --- | --- | --- |
@@ -211,9 +233,9 @@ and are not evidence for this candidate.
 | macOS | `not-run` | `not-run` |
 | Windows | `not-run` | `not-run` |
 
-The validate workflow now runs hardening targets, complete strict regression,
+The validate workflow runs hardening targets, complete strict regression,
 fixture/stability evidence, and real artifact-mode install on the matrix. All
-six jobs for the exact pushed revision must pass before the 46 publication
+six jobs for the exact pushed revision must pass before the 47 publication
 checkpoints close or PR merge occurs.
 
 ## Residual boundaries

@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -64,7 +65,7 @@ def create_schema30_delivery_fixture(
     no_network: int = 1,
     failure_mode_status: str | None = None,
 ) -> Path:
-    (root / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "candidate.py").write_bytes(b"VALUE = 1\n")
     artifact = root / ".ai-team/runtime/execution.out"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text(
@@ -179,6 +180,16 @@ def create_schema30_delivery_fixture(
             )
         conn.commit()
     return db
+
+
+def unlink_git_object(path: Path) -> None:
+    """Remove a loose Git object even when Windows marks it read-only."""
+
+    try:
+        path.unlink()
+    except PermissionError:
+        os.chmod(path, path.stat().st_mode | stat.S_IWUSR)
+        path.unlink()
 
 
 def schema30_issues(root: Path) -> list[str]:
@@ -1571,7 +1582,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
             )
             loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
             self.assertTrue(loose_object.is_file())
-            loose_object.unlink()
+            unlink_git_object(loose_object)
 
             with self.assertRaisesRegex(RuntimeError, "Git object"):
                 current_candidate_sha(root)
@@ -1668,7 +1679,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
             ).stdout.strip()
             loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
             self.assertTrue(loose_object.is_file())
-            loose_object.unlink()
+            unlink_git_object(loose_object)
 
             with self.assertRaisesRegex(RuntimeError, "Git object"):
                 current_candidate_sha(root)
