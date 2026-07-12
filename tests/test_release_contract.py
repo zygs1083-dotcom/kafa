@@ -9,7 +9,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from tests import run_isolated_install_smoke as install_smoke
 from tests.run_isolated_install_smoke import codex_command
 
 
@@ -307,6 +309,22 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertEqual(Path(command[0]).name.lower(), "cmd.exe")
         self.assertEqual(command[1:4], ["/d", "/s", "/c"])
         self.assertEqual(command[4:], [r"C:\npm\codex.cmd", "plugin", "list", "--json"])
+
+    def test_install_smoke_closes_quickstart_database_reader(self) -> None:
+        connection = Mock()
+        connection.execute.side_effect = [
+            Mock(fetchone=Mock(return_value=(1,))),
+            Mock(fetchone=Mock(return_value=(1,))),
+            Mock(fetchone=Mock(return_value=(0,))),
+            Mock(fetchone=Mock(return_value=(0,))),
+            Mock(fetchone=Mock(return_value=("submitted",))),
+        ]
+        with patch.object(install_smoke.sqlite3, "connect", return_value=connection):
+            facts, task_status = install_smoke.read_quickstart_facts(Path("harness.db"))
+
+        self.assertEqual(facts, (1, 1, 0, 0))
+        self.assertEqual(task_status, "submitted")
+        connection.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import venv
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,20 @@ from kafa.codex_app_server import (
 
 
 PLUGIN_ID = "codex-project-harness@kafa-local"
+
+
+def read_quickstart_facts(database: Path) -> tuple[tuple[int, int, int, int], str]:
+    with closing(sqlite3.connect(database)) as conn:
+        facts = tuple(
+            int(conn.execute(f"select count(*) from {table}").fetchone()[0])
+            for table in ("executions", "validations", "quality_gates", "deliveries")
+        )
+        task_status = str(
+            conn.execute(
+                "select status from tasks where id='INSTALL-T1'"
+            ).fetchone()[0]
+        )
+    return facts, task_status
 
 
 def discover_with_app_server(codex: str, *, env: dict[str, str], cwd: Path) -> dict[str, Any]:
@@ -232,9 +247,9 @@ def run_smoke(
             env=env,
             cwd=business_repo,
         ))
-        with sqlite3.connect(business_repo / ".ai-team/state/harness.db") as conn:
-            quickstart_facts = tuple(conn.execute(f"select count(*) from {table}").fetchone()[0] for table in ("executions", "validations", "quality_gates", "deliveries"))
-            quickstart_task_status = conn.execute("select status from tasks where id='INSTALL-T1'").fetchone()[0]
+        quickstart_facts, quickstart_task_status = read_quickstart_facts(
+            business_repo / ".ai-team/state/harness.db"
+        )
         if "OK: quickstart minimal verified setup INSTALL" not in quickstart or quickstart_facts != (1, 1, 0, 0) or quickstart_task_status != "submitted" or quickstart_status["ready_for_delivery"] or "controller_execution" in quickstart_status["missing"]:
             raise RuntimeError(f"installed quickstart contract failed: facts={quickstart_facts} task={quickstart_task_status} status={quickstart_status} output={quickstart}")
 

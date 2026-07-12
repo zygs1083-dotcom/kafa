@@ -58,3 +58,9 @@
 - [x] 7.7 Main model: make schema-30 delivery evaluation require exact SQLite integers and flags for all gateable execution metadata.
 - [x] 7.8 Checkpoint: rerun migration/trust targeted suites, complete strict regression, Native identity checks, artifact install, and both independent reviews against the fixed workspace.
 - [x] 7.9 Publication gate: record the final audit evidence and retain the PR rule that the new pushed HEAD's complete Ubuntu/macOS/Windows matrix is required before merge.
+
+## 8. Windows isolated-install handle follow-up
+
+- [x] 8.1 Main model: preserve the real Windows `WinError 32` log as red evidence and add a deterministic regression requiring the quickstart database reader to close its connection.
+- [x] 8.2 Main model: explicitly close the isolated-install SQLite reader without changing user installation scope or plugin behavior.
+- [ ] 8.3 Checkpoint: rerun install/release tests, full regression, Native reports, artifact smoke, OpenSpec validation, fresh QA, and the complete new three-platform CI matrix.
