@@ -1,0 +1,164 @@
+{
+  "baseline": {
+    "empty_db_bytes": 552960,
+    "fact_count": 5000,
+    "full_test_count": 370,
+    "full_test_seconds": 406.72,
+    "full_test_status": "passed",
+    "init_seconds": 0.31,
+    "schema_version": 29,
+    "single_mutation_seconds": 0.146113,
+    "targeted_projection_seconds": null,
+    "targeted_projection_status": "not-recorded"
+  },
+  "baseline_source": "docs/audits/2026-07-11-local-core-slimming-baseline.md:58",
+  "benchmark_kind": "comparative-report-only",
+  "comparison": {
+    "current_full_over_targeted_projection": {
+      "baseline": 0.002922,
+      "current": 0.021977,
+      "current_over_baseline": 7.521218,
+      "delta": 0.019055,
+      "status": "measured"
+    },
+    "empty_db_bytes": {
+      "baseline": 552960,
+      "current": 315392,
+      "current_over_baseline": 0.57037,
+      "delta": -237568.0,
+      "status": "measured"
+    },
+    "full_test_seconds": {
+      "baseline": 406.72,
+      "current": 82.99,
+      "current_over_baseline": 0.204047,
+      "delta": -323.73,
+      "status": "measured"
+    },
+    "init_seconds": {
+      "baseline": 0.31,
+      "current": 0.11492,
+      "current_over_baseline": 0.37071,
+      "delta": -0.19508,
+      "status": "measured"
+    },
+    "single_mutation_seconds": {
+      "baseline": 0.146113,
+      "current": 0.00439,
+      "current_over_baseline": 0.030045,
+      "delta": -0.141723,
+      "status": "measured"
+    },
+    "targeted_projection_seconds": {
+      "baseline": null,
+      "current": 0.002922,
+      "current_over_baseline": null,
+      "delta": null,
+      "status": "not-comparable"
+    }
+  },
+  "created_at": "2026-07-12T00:27:16.232632+00:00",
+  "environment": {
+    "head": "adba3691d859c0ffc93d75cc148d8f916314cc49",
+    "machine": "arm64",
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "python": "3.14.5",
+    "working_tree_dirty": true
+  },
+  "notes": [
+    "Wall-clock values are evidence, not CI pass/fail thresholds.",
+    "Baseline targeted projection timing was not recorded and is reported as not-comparable.",
+    "Task 11.16 full-test evidence is current: ResourceWarning-as-error passed 258 tests in 82.99 wall seconds."
+  ],
+  "report_version": 1,
+  "schema30": {
+    "empty_db": {
+      "median_bytes": 315392,
+      "sample_count": 5,
+      "samples_bytes": [
+        315392,
+        315392,
+        315392,
+        315392,
+        315392
+      ]
+    },
+    "full_projection": {
+      "median_seconds": 0.021977,
+      "projection_count": 13,
+      "projections": [
+        "project-state",
+        "requirements",
+        "traceability",
+        "acceptance",
+        "failure-modes",
+        "tasks",
+        "test-targets",
+        "validation",
+        "executions",
+        "findings",
+        "gates",
+        "deliveries",
+        "decisions"
+      ],
+      "sample_count": 5,
+      "samples_seconds": [
+        0.024023,
+        0.02262,
+        0.021708,
+        0.021919,
+        0.021977
+      ]
+    },
+    "full_test": {
+      "command": "python3 -W error::ResourceWarning -m unittest discover -s tests -p test_*.py",
+      "seconds": 82.99,
+      "status": "passed",
+      "test_count": 258
+    },
+    "init": {
+      "median_seconds": 0.11492,
+      "sample_count": 5,
+      "samples_seconds": [
+        0.114789,
+        0.114233,
+        0.117543,
+        0.11706,
+        0.11492
+      ]
+    },
+    "runtime_version": "5.0.0",
+    "schema_version": 30,
+    "single_mutation_after_local_facts": {
+      "fact_count": 5000,
+      "median_seconds": 0.00439,
+      "projection_count": 3,
+      "sample_count": 5,
+      "samples_seconds": [
+        0.00439,
+        0.004138,
+        0.004252,
+        0.00447,
+        0.004521
+      ]
+    },
+    "targeted_projection": {
+      "median_seconds": 0.002922,
+      "projection_count": 3,
+      "projections": [
+        "project-state",
+        "requirements",
+        "traceability"
+      ],
+      "sample_count": 5,
+      "samples_seconds": [
+        0.002971,
+        0.003004,
+        0.002895,
+        0.00276,
+        0.002922
+      ]
+    }
+  },
+  "timing_assertions": false
+}

@@ -17,7 +17,7 @@ Review:
 - review findings,
 - user feedback,
 - delivery issues,
-- collaboration tool friction or useful automation,
+- local workflow friction or useful automation,
 - decisions and assumptions,
 - useful prompts or workflows.
 
@@ -28,7 +28,7 @@ Review:
 - Which checks caught real issues?
 - Which checks were noisy?
 - Which skill or agent should be added, edited, merged, or removed?
-- Which GitHub/Linear/Notion/Figma/Slack integration helped or created noise?
+- Which local workflow step helped or created noise?
 - What should be measured next time?
 
 ## Output
@@ -42,6 +42,6 @@ Review:
 ## Root Causes
 ## Process Changes
 ## Skill / Agent Changes
-## Tooling Changes
+## Runtime Changes
 ## Follow-Up Tasks
 ```

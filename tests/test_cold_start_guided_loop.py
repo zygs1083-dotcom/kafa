@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -116,16 +115,42 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             status = run_harness(root, "status").stdout
 
             self.assertIn("OK: quickstart minimal verified setup SMOKE", result.stdout)
-            self.assertIn("NEXT: reviewer must review", result.stdout)
-            self.assertIn("fresh requires an attested independent session", result.stdout)
+            self.assertIn("OK: verify run execution=", result.stdout)
+            self.assertIn("OK: task submitted SMOKE-T1", result.stdout)
+            self.assertIn("NEXT: stop for independent review of SMOKE-T1", result.stdout)
+            self.assertNotIn("task accept", result.stdout)
+            self.assertNotIn("gate record", result.stdout)
+            self.assertNotIn("delivery record", result.stdout)
             self.assertEqual(cycle["status"], "active")
-            self.assertIn("phase: implementation", status)
+            self.assertIn("schema_version: 30", status)
+            self.assertIn("tasks: 1", status)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                self.assertEqual(conn.execute("select count(*) from evidence").fetchone()[0], 1)
+                self.assertEqual(conn.execute("select count(*) from executions").fetchone()[0], 1)
+                self.assertEqual(conn.execute("select count(*) from validations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("select count(*) from validation_executions").fetchone()[0], 1)
+                self.assertEqual(
+                    conn.execute(
+                        "select count(*) from events where event_type = 'verification_recorded'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        """
+                        select e.target_id, e.exit_code, e.executed_count, e.semantic_status,
+                               v.result, v.validation_status
+                        from executions e
+                        join validation_executions ve on ve.execution_id = e.id
+                        join validations v on v.id = ve.validation_id
+                        """
+                    ).fetchone(),
+                    ("SMOKE-UNIT", 0, 1, "pass", "pass", "active"),
+                )
+                self.assertEqual(conn.execute("select count(*) from quality_gates").fetchone()[0], 0)
                 self.assertEqual(conn.execute("select count(*) from deliveries").fetchone()[0], 0)
                 self.assertEqual(conn.execute("select status from tasks where id = 'SMOKE-T1'").fetchone()[0], "submitted")
 
-    def test_quickstart_guidance_uses_executable_commands_real_ids_and_legal_phases(self) -> None:
+    def test_quickstart_status_stops_at_independent_review_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             git_init(root)
@@ -148,102 +173,91 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             )
 
             report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
-            accept_command = next(command for command in report["next_commands"] if "task accept-ready" in command)
-            self.assertIn(str(HARNESS.resolve()), accept_command)
-            self.assertIn("--id SMOKE-T1", accept_command)
-            self.assertNotIn("--id T1 ", accept_command)
-            self.assertEqual(run_guided_command(root, accept_command).returncode, 0)
 
-            report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
-            gate_command = next(command for command in report["next_commands"] if "gate record" in command)
-            self.assertIn("--reviewer-context same-context-degraded", gate_command)
-            self.assertEqual(run_guided_command(root, gate_command).returncode, 0)
-
-            report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
-            completion_commands = [
-                command
-                for command in report["next_commands"]
-                if " phase " in command or " delivery record " in command
-            ]
-            self.assertEqual(len(completion_commands), 3)
-            self.assertIn("phase qa", completion_commands[0])
-            self.assertIn("phase delivery_readiness", completion_commands[1])
-            self.assertIn("delivery record", completion_commands[2])
-            for command in completion_commands:
-                result = run_guided_command(root, command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-            cycle = json.loads(run_harness(root, "cycle", "status", "--json").stdout)
-
-        self.assertEqual(cycle["status"], "delivered")
-
-    def test_new_cycle_guidance_requires_current_cycle_evidence_and_reuses_target(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            git_init(root)
-            write_tiny_python_project(root)
-            run_harness(
-                root,
-                "quickstart",
-                "minimal",
-                "--id",
-                "SMOKE",
-                "--goal",
-                "Keep add working",
-                "--acceptance",
-                "add(2, 3) returns 5",
-                "--task",
-                "Verify calculator add",
-                "--test-command",
-                "python3 -B -m unittest discover -s . -p 'test_*.py'",
-                "--execute",
-            )
-            run_harness(root, "task", "accept-ready", "--id", "SMOKE-T1", "--agent", "qa-reviewer", "--evidence", "reviewed")
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass")
-            run_harness(root, "phase", "qa")
-            run_harness(root, "phase", "delivery_readiness")
-            run_harness(root, "delivery", "record", "--scope", "first cycle")
-            run_harness(root, "cycle", "start", "--id", "CYCLE-2", "--name", "Second cycle", "--goal", "Continue")
+            self.assertFalse(report["ready_for_delivery"])
+            self.assertEqual(report["cycle_status"], "active")
+            self.assertIn("accepted_task", report["missing"])
+            self.assertIn("quality_gate", report["missing"])
+            self.assertIn("delivery", report["missing"])
+            self.assertNotIn("controller_execution", report["missing"])
+            self.assertFalse(any("task accept" in command for command in report["next_commands"]))
+            self.assertFalse(any("gate record" in command for command in report["next_commands"]))
+            self.assertFalse(any(" delivery record" in command for command in report["next_commands"]))
+            self.assertFalse(any(" phase " in command for command in report["next_commands"]))
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                started_at = conn.execute("select started_at from delivery_cycles where id = 'CYCLE-2'").fetchone()[0]
-                conn.execute("update evidence set created_at = ?", (started_at,))
-                conn.commit()
+                self.assertEqual(conn.execute("select count(*) from quality_gates").fetchone()[0], 0)
+                self.assertEqual(conn.execute("select count(*) from deliveries").fetchone()[0], 0)
+
+    def test_candidate_change_requires_new_verify_run_and_reuses_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_init(root)
+            write_tiny_python_project(root)
+            run_harness(
+                root,
+                "quickstart",
+                "minimal",
+                "--id",
+                "SMOKE",
+                "--goal",
+                "Keep add working",
+                "--acceptance",
+                "add(2, 3) returns 5",
+                "--task",
+                "Verify calculator add",
+                "--test-command",
+                "python3 -B -m unittest discover -s . -p 'test_*.py'",
+                "--execute",
+            )
+
+            (root / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\n# candidate revision\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "calc.py"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate revision"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
             report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            verify_command = next(
+                command for command in report["next_commands"] if "verify run" in command
+            )
 
-            for command in report["next_commands"]:
-                result = run_guided_command(root, command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("controller_execution", report["missing"])
+            self.assertIn(str(HARNESS.resolve()), verify_command)
+            self.assertIn("verify run --target SMOKE-UNIT --acceptance SMOKE-AC1", verify_command)
+            self.assertFalse(any("test-target add" in command for command in report["next_commands"]))
+            self.assertFalse(any("test-target link" in command for command in report["next_commands"]))
+            verified = run_guided_command(root, verify_command)
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
             followup = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
-            for command in followup["next_commands"]:
-                result = run_guided_command(root, command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            cycle = json.loads(run_harness(root, "cycle", "status", "--json").stdout)
+            self.assertNotIn("controller_execution", followup["missing"])
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                self.assertEqual(conn.execute("select count(*) from executions").fetchone()[0], 2)
+                self.assertEqual(conn.execute("select count(*) from validation_executions").fetchone()[0], 2)
 
-        self.assertIn("controller_evidence", report["missing"])
-        target_commands = [command for command in report["next_commands"] if "test-target" in command]
-        self.assertTrue(any("test-target link --task T1 --target SMOKE-UNIT" in command for command in target_commands))
-        self.assertFalse(any("test-target add" in command for command in target_commands))
-        self.assertEqual(cycle["status"], "delivered")
-
-    def test_task_accept_ready_hides_review_lease_mechanics(self) -> None:
+    def test_task_lifecycle_needs_no_review_lease_mechanics(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example")
             run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
-            claim = run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", "1").stdout
-            token = claim.split("token=", 1)[1].split()[0]
-            run_harness(root, "task", "start", "T1", "--agent", "developer", "--lease-token", token, "--expected-revision", "2")
-            run_harness(root, "task", "submit", "T1", "--agent", "developer", "--lease-token", token, "--expected-revision", "3", "--evidence", "done")
+            run_harness(root, "task", "start", "T1")
+            run_harness(root, "task", "submit", "T1", "--context-id", "producer-context", "--evidence", "done")
 
-            result = run_harness(root, "task", "accept-ready", "--id", "T1", "--agent", "qa-reviewer", "--evidence", "reviewed")
+            result = run_harness(root, "task", "accept", "T1", "--evidence", "reviewed")
 
             self.assertIn("OK: task accepted T1", result.stdout)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select status from tasks where id = 'T1'").fetchone()[0], "accepted")
 
-    def test_validation_without_evidence_warns_audit_only(self) -> None:
+    def test_manual_validation_judgment_without_execution_is_audit_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             run_harness(root, "init")
@@ -257,8 +271,6 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
                 "unit",
                 "--acceptance",
                 "AC1",
-                "--commands",
-                "echo ok",
                 "--findings",
                 "manual ok",
                 "--result",
@@ -266,7 +278,11 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             )
 
             self.assertIn("audit-only", result.stdout)
-            self.assertIn("will not satisfy delivery gate", result.stdout)
+            self.assertIn("use verify run", result.stdout)
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                self.assertEqual(conn.execute("select count(*) from validations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("select count(*) from executions").fetchone()[0], 0)
+                self.assertEqual(conn.execute("select count(*) from validation_executions").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

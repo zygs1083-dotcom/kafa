@@ -1,6 +1,0 @@
-interface:
-  display_name: "交付就绪"
-  short_description: "整理已验证代码交付证据，不执行部署。"
-  default_prompt: "Use $delivery-readiness to package scope, changed files, validation, QA, collaboration links, gaps, and handoff notes."
-policy:
-  allow_implicit_invocation: true

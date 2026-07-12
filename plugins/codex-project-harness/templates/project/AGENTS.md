@@ -11,10 +11,14 @@ This project uses Codex Project Harness.
 - Explain the reason behind key decisions, not only the implementation steps.
 - Before handoff, run an adversarial review against logic gaps, incorrect facts, simpler alternatives, and verification evidence.
 - Do not claim "looks good" without verification evidence or explicit residual risk.
+- Only the root controller writes Kafa SQLite facts and uses Kafa v2 runtime commands to record task, validation, decision, and delivery facts.
 - Maintain `.ai-team/` control files for substantial work.
-- Use project runtime scripts to update phase, task, validation, decision, and delivery records.
-- Let Codex decide whether GitHub, Linear, Notion, Figma, or Slack is useful from context; use local harness files as fallback.
-- Ask before high-impact external actions such as Slack messages, public/shared artifact creation, permission or secret changes, paid resources, destructive edits, or production-related changes.
+- Keep Kafa runtime local-only: use the project filesystem, local Git or content identity, per-project SQLite, and optional local container execution.
+- Treat Native Codex/ChatGPT as the sole owner of task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle.
+- Subagents return code or review evidence through the Native Host without mutating Kafa state.
+- Independently verify the current local candidate before recording delivery facts; never substitute self-reported or fabricated evidence.
+- High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata.
+- If any high/critical prerequisite is missing, require `human-review-required`.
 - Separate producer and reviewer roles.
 - Stop at verified code handoff; deployment and production operations are outside this harness.
 - Report verification evidence with every completed task.

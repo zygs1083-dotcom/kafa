@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Run executable runtime smoke scenarios for Codex Project Harness."""
+"""Run executable schema-30 runtime smoke scenarios."""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
+import argparse
 import json
 import sqlite3
 import subprocess
@@ -16,138 +15,129 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PLUGIN_ROOT = ROOT / "plugins" / "codex-project-harness"
+PLUGIN_ROOT = ROOT / "plugins/codex-project-harness"
 SCRIPTS_ROOT = PLUGIN_ROOT / "scripts"
-for path in [PLUGIN_ROOT, SCRIPTS_ROOT]:
+for path in (PLUGIN_ROOT, SCRIPTS_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
-HARNESS = ROOT / "plugins" / "codex-project-harness" / "scripts" / "harness.py"
-RESULT_PATH = ROOT / "docs" / "runtime" / "runtime-smoke-results.json"
+
+HARNESS = SCRIPTS_ROOT / "harness.py"
+RESULT_PATH = ROOT / "docs/runtime/runtime-smoke-results.json"
 TEST_COMMAND = "python3 -B -m unittest test_harness_dummy.py"
-
-
-def connector_hmac(key: str, payload: str) -> str:
-    return hmac.new(key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+DIRECTED_INVARIANT_MIN_RATIO = 10.0
 
 
 def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["python3", str(HARNESS), "--root", str(root), *args],
+        [sys.executable, str(HARNESS), "--root", str(root), *args],
         text=True,
         capture_output=True,
         check=False,
     )
 
 
-def task_revision(root: Path, task_id: str) -> str:
-    with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-        return str(conn.execute("select revision from tasks where id = ?", (task_id,)).fetchone()[0])
-
-
-def token(stdout: str) -> str:
-    return stdout.split("token=", 1)[1].split(None, 1)[0].strip()
-
-
-def stdout_field(stdout: str, name: str) -> str:
-    return stdout.split(f"{name}=", 1)[1].split(None, 1)[0].strip()
-
-
-def ensure_dummy_unittest(root: Path) -> None:
-    (root / "test_harness_dummy.py").write_text(
-        "import unittest\n\n"
-        "class HarnessSmokeTest(unittest.TestCase):\n"
-        "    def test_smoke(self):\n"
-        "        self.assertTrue(True)\n",
-        encoding="utf-8",
+def create_candidate(root: Path) -> None:
+    (root / "test_harness_dummy.py").write_bytes(
+        b"import unittest\n\n"
+        b"class HarnessSmokeTest(unittest.TestCase):\n"
+        b"    def test_smoke(self):\n"
+        b"        self.assertTrue(True)\n"
     )
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.email", "smoke@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Smoke Runner"], cwd=root, check=True)
+    subprocess.run(["git", "add", "test_harness_dummy.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "smoke baseline"], cwd=root, check=True, capture_output=True)
 
 
-def scenario_full_project() -> dict[str, object]:
+def scenario_local_delivery() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        ensure_dummy_unittest(root)
-        subprocess.run(["git", "init"], cwd=root, text=True, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.email", "smoke@example.com"], cwd=root, text=True, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.name", "Smoke Runner"], cwd=root, text=True, capture_output=True, check=True)
-        subprocess.run(["git", "add", "test_harness_dummy.py"], cwd=root, text=True, capture_output=True, check=True)
-        subprocess.run(["git", "commit", "-m", "smoke baseline"], cwd=root, text=True, capture_output=True, check=True)
-        commit_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
-        commands = []
-        commands.append(run(root, "init"))
-        commands.append(run(root, "phase", "project_bootstrap"))
-        commands.append(run(root, "phase", "requirement_baseline"))
-        commands.append(run(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "User can create a task", "--priority", "must"))
-        commands.append(run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"))
-        commands.append(run(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1"))
-        commands.append(run(root, "phase", "confirmation"))
-        commands.append(run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "high", "--acceptance", "AC1"))
-        commands.append(run(root, "task", "add", "--id", "T1", "--task", "Implement task creation", "--acceptance", "AC1", "--failure-mode", "FM1"))
-        commands.append(run(root, "scope", "confirm", "--by", "project-manager", "--summary", "Task creation scope confirmed"))
-        commands.append(run(root, "baseline", "freeze", "--id", "B1", "--summary", "Task creation baseline"))
-        commands.append(run(root, "phase", "planning"))
-        commands.append(run(root, "phase", "implementation"))
-        claim = run(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", task_revision(root, "T1"))
-        commands.append(claim)
-        producer_token = token(claim.stdout) if claim.returncode == 0 else ""
-        commands.append(run(root, "task", "start", "T1", "--agent", "developer", "--lease-token", producer_token, "--expected-revision", task_revision(root, "T1")))
-        commands.append(run(root, "task", "submit", "T1", "--agent", "developer", "--lease-token", producer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "unit test passed"))
-        commands.append(run(root, "phase", "qa"))
-        review = run(root, "task", "review", "T1", "--agent", "qa-reviewer", "--expected-revision", task_revision(root, "T1"))
-        commands.append(review)
-        reviewer_token = token(review.stdout) if review.returncode == 0 else ""
-        commands.append(run(root, "task", "accept", "T1", "--agent", "qa-reviewer", "--lease-token", reviewer_token, "--expected-revision", task_revision(root, "T1"), "--evidence", "reviewed"))
-        commands.append(run(root, "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", TEST_COMMAND, "--description", "Smoke unit target"))
-        evidence = run(root, "dispatch", "run", "--agent", "developer", "--target", "TARGET1", "--command", TEST_COMMAND, "--code-identity", "git")
-        commands.append(evidence)
-        evidence_id = evidence.stdout.strip().rsplit(" ", 1)[-1] if evidence.returncode == 0 else "EV1"
-        commands.append(run(root, "test", "record", "--id", "TEST1", "--surface", "Task creation", "--command", TEST_COMMAND, "--result", "pass", "--evidence", evidence_id))
-        key_file = root / ".ai-team/runtime/connector.key"
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        connector_key = "smoke-connector-key"
-        key_file.write_text(f"{connector_key}\n", encoding="utf-8")
-        key_path_file = root / ".ai-team/control/connector-key-path.txt"
-        key_path_file.parent.mkdir(parents=True, exist_ok=True)
-        key_path_file.write_text(".ai-team/runtime/connector.key\n", encoding="utf-8")
-        external_token = connector_hmac(
-            connector_key,
-            f"external-session:smoke-session-1:smoke-verifier:{commit_sha}:verified",
-        )
-        session = run(root, "adapter", "external-session-verify", "--session-id", "smoke-session-1", "--verifier", "smoke-verifier", "--conclusion", "verified", "--commit-sha", commit_sha, "--origin", "connector", "--verification-token", external_token)
-        commands.append(session)
-        session_id = session.stdout.strip().rsplit(" ", 1)[-1] if session.returncode == 0 else "smoke-session-1:smoke-verifier"
-        commands.append(run(root, "validation", "record", "--surface", "Task creation", "--acceptance", "AC1", "--commands", TEST_COMMAND, "--findings", "passed", "--result", "pass", "--failure-mode", "FM1", "--test", "TEST1", "--evidence", evidence_id, "--target", "TARGET1", "--trust-anchor", "external-session", "--trust-anchor-id", session_id, "--code-identity", "git"))
-        reviewer_token = connector_hmac(
-            connector_key,
-            "agent-session:smoke-qa-session:qa-reviewer:qa-reviewer:smoke-qa-context",
-        )
-        reviewer_session = run(root, "session", "attest", "--session-id", "smoke-qa-session", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "smoke-qa-context", "--origin", "connector", "--verification-token", reviewer_token)
-        commands.append(reviewer_session)
-        reviewer_attestation_id = stdout_field(reviewer_session.stdout, "attestation") if reviewer_session.returncode == 0 else ""
-        commands.append(run(root, "gate", "record", "--reviewer-context", "fresh", "--result", "pass", "--commands", "unit test", "--evidence", "reviewed", "--reviewer-session-id", "smoke-qa-session", "--reviewer-attestation-id", reviewer_attestation_id))
-        commands.append(run(root, "phase", "delivery_readiness"))
-        commands.append(run(root, "delivery", "record", "--scope", "Task creation", "--acceptance", "AC1", "--validation", "unit test passed", "--qa", "gate passed", "--failure-mode-coverage", "FM1 covered", "--quality-gate", "pass"))
-        ok = all(command.returncode == 0 for command in commands)
-        files = [
-            ".ai-team/state/harness.db",
-            ".ai-team/planning/task-board.md",
-            "docs/harness/validation.md",
-            "docs/harness/delivery.md",
-        ]
-        ok = ok and all((root / file).exists() for file in files)
-        return {"name": "full_project_runtime", "pass": ok, "commands": [command.returncode for command in commands]}
-
-
-def scenario_tool_mapping() -> dict[str, object]:
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
+        create_candidate(root)
+        initialized = run(root, "init")
+        if initialized.returncode == 0:
+            subprocess.run(
+                ["git", "add", ".gitignore"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "record harness runtime ignore policy"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
         commands = [
-            run(root, "init"),
-            run(root, "adapter", "record", "--tool", "figma", "--mode", "read-only", "--artifact", "Design", "--external-id", "figma-frame-1", "--idempotency-key", "codex-project-harness:eval:design:figma-frame-1"),
-            run(root, "adapter", "record", "--tool", "linear", "--mode", "draft-write", "--artifact", "Tasks", "--external-id", "LIN-1", "--idempotency-key", "codex-project-harness:eval:task:LIN-1"),
+            initialized,
+            run(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "User can create a task"),
+            run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"),
+            run(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),
+            run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "medium", "--acceptance", "AC1"),
+            run(root, "task", "add", "--id", "T1", "--task", "Implement task creation", "--acceptance", "AC1", "--failure-mode", "FM1"),
+            run(root, "baseline", "freeze", "--id", "B1", "--summary", "Task creation baseline"),
+            run(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND),
+            run(root, "test-target", "link", "--task", "T1", "--target", "UNIT"),
+            run(root, "task", "start", "T1"),
+            run(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1", "--failure-mode", "FM1"),
+            run(root, "task", "submit", "T1", "--context-id", "smoke-producer", "--evidence", "verified immutable execution"),
+            run(root, "task", "accept", "T1", "--evidence", "independent review returned"),
+            run(root, "gate", "record", "--reviewer-context", "fresh", "--reviewer-context-id", "smoke-reviewer", "--result", "pass"),
+            run(root, "delivery", "record", "--scope", "Task creation"),
         ]
-        tooling = (root / ".ai-team/control/tooling-map.md").read_text(encoding="utf-8")
-        ok = all(command.returncode == 0 for command in commands) and "figma-frame-1" in tooling and "LIN-1" in tooling
-        return {"name": "tool_mapping_runtime", "pass": ok, "commands": [command.returncode for command in commands]}
+        with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+            counts = {
+                table: int(conn.execute(f"select count(*) from {table}").fetchone()[0])
+                for table in ("executions", "validations", "deliveries")
+            }
+            task_status = conn.execute("select status from tasks where id='T1'").fetchone()[0]
+        required = (
+            root / ".ai-team/state/harness.db",
+            root / ".ai-team/planning/task-board.md",
+            root / "docs/harness/executions.md",
+            root / "docs/harness/delivery.md",
+        )
+        passed = (
+            all(command.returncode == 0 for command in commands)
+            and counts == {"executions": 1, "validations": 1, "deliveries": 1}
+            and task_status == "accepted"
+            and all(path.is_file() for path in required)
+        )
+        return {
+            "name": "local_delivery_runtime",
+            "pass": passed,
+            "commands": [command.returncode for command in commands],
+            "facts": counts,
+        }
+
+
+def directed_invariant_benchmark_result(
+    *,
+    initialized_returncode: int,
+    full_issue_count: int,
+    directed_issue_count: int,
+    full_seconds: float,
+    directed_seconds: float,
+) -> dict[str, object]:
+    ratio = full_seconds / max(directed_seconds, 0.000001)
+    return {
+        "name": "directed_invariant_benchmark",
+        "pass": (
+            initialized_returncode == 0
+            and full_issue_count == 0
+            and directed_issue_count == 0
+            and ratio >= DIRECTED_INVARIANT_MIN_RATIO
+        ),
+        "full_seconds": full_seconds,
+        "directed_seconds": directed_seconds,
+        "ratio": ratio,
+        "minimum_ratio": DIRECTED_INVARIANT_MIN_RATIO,
+    }
 
 
 def scenario_directed_invariant_benchmark() -> dict[str, object]:
@@ -155,43 +145,48 @@ def scenario_directed_invariant_benchmark() -> dict[str, object]:
 
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        init = run(root, "init")
+        initialized = run(root, "init")
         with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
             conn.row_factory = sqlite3.Row
             now = "2026-01-01T00:00:00+00:00"
             conn.executemany(
-                "insert into tasks (id, task, owner, status, updated_at) values (?, ?, 'developer', 'ready', ?)",
-                [(f"B{i}", f"Benchmark {i}", now) for i in range(5000)],
-            )
-            conn.executemany(
                 """
-                insert into events (id, schema_version, type, source, target, payload_json, created_at)
-                values (?, 13, 'benchmark_event', 'smoke', 'project', '{}', ?)
+                insert into tasks (id, cycle_id, task, owner, status, updated_at)
+                values (?, 'CYCLE-current', ?, 'developer', 'planned', ?)
                 """,
-                [(f"bench-event-{i}", now) for i in range(5000)],
+                [(f"B{index}", f"Benchmark {index}", now) for index in range(5000)],
             )
             conn.commit()
             start = time.perf_counter()
             full_issues = check_runtime_invariants(conn, root)
             full_seconds = time.perf_counter() - start
             start = time.perf_counter()
-            directed_issues = check_runtime_invariants(conn, root, scope=[("task", "B1")], full=False)
+            directed_issues = check_runtime_invariants(
+                conn, root, scope=[("task", "B1")], full=False
+            )
             directed_seconds = time.perf_counter() - start
-        ratio = full_seconds / max(directed_seconds, 0.000001)
-        ok = init.returncode == 0 and not full_issues and not directed_issues and ratio >= 10
-        return {
-            "name": "directed_invariant_benchmark",
-            "pass": ok,
-            "full_seconds": round(full_seconds, 6),
-            "directed_seconds": round(directed_seconds, 6),
-            "ratio": round(ratio, 2),
-        }
+        return directed_invariant_benchmark_result(
+            initialized_returncode=initialized.returncode,
+            full_issue_count=len(full_issues),
+            directed_issue_count=len(directed_issues),
+            full_seconds=full_seconds,
+            directed_seconds=directed_seconds,
+        )
 
 
-def main() -> int:
-    results = [scenario_full_project(), scenario_tool_mapping(), scenario_directed_invariant_benchmark()]
-    RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RESULT_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run executable schema-30 runtime smoke scenarios")
+    parser.add_argument(
+        "--out",
+        default=str(RESULT_PATH),
+        help="JSON report path (defaults to docs/runtime/runtime-smoke-results.json)",
+    )
+    args = parser.parse_args(argv)
+
+    results = [scenario_local_delivery(), scenario_directed_invariant_benchmark()]
+    result_path = Path(args.out)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     failed = [result for result in results if not result["pass"]]
     if failed:
         print(json.dumps(failed, ensure_ascii=False, indent=2))

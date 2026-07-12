@@ -10,7 +10,7 @@ Fix the root cause, not just the symptom.
 ## Workflow
 
 1. Capture the reported behavior and expected behavior.
-2. Inspect related GitHub/Linear issues, PRs, logs, Notion notes, or Slack-reported context when useful.
+2. Inspect related local issues, logs, specifications, and recorded delivery evidence when useful.
 3. Reproduce the issue or explain why reproduction is blocked.
 4. Locate the smallest failing path.
 5. Add a regression test or executable check when practical.
@@ -18,7 +18,7 @@ Fix the root cause, not just the symptom.
 7. Apply a focused fix.
 8. Re-run the reproduction and relevant tests.
 9. Check nearby integration boundaries for related breakage.
-10. Update local or external task status when useful.
+10. Update the local task or specification status when useful.
 
 ## Output
 
@@ -27,6 +27,6 @@ Root cause:
 Fix:
 Regression coverage:
 Verification:
-Tool links:
+Evidence paths:
 Residual risk:
 ```

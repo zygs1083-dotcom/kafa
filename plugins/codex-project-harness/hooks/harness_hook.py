@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""Codex lifecycle hook dispatcher for Codex Project Harness.
+"""Warn-only Native Codex lifecycle hooks for the local Kafa Kernel.
 
-Hooks are advisory lifecycle guardrails. They never create delivery evidence,
-and strict enforcement remains in the harness runtime and delivery gates.
+Hooks are advisory and never create delivery facts or evidence. Runtime
+preconditions and delivery gates remain the enforcement boundary.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import subprocess
 import sys
-from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 
-EVENTS = {"SessionStart", "SubagentStart", "PreToolUse", "PostToolUse", "Stop"}
+EVENTS = {"SessionStart", "SubagentStart", "Stop"}
 SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "API")
-MUTATING_TOOLS = {"Bash", "apply_patch", "Edit", "Write"}
 MAX_LINES = 12
 
 
@@ -33,24 +30,19 @@ def main(argv: list[str] | None = None) -> int:
 
     plugin_root = Path(__file__).resolve().parents[1]
     repo_root = locate_repo_root()
-    payload, payload_ok = read_payload()
-    strict = os.environ.get("HARNESS_HOOK_STRICT") == "1"
-
     if event == "Stop":
-        return stop(plugin_root, repo_root, strict)
+        return stop(plugin_root, repo_root)
 
     print(f"Codex Project Harness hook: {event}")
     print(f"repo: {repo_root}")
+    if not harness_db_exists(repo_root):
+        print("skipped: harness is not initialized in this project")
+        return 0
 
+    payload, payload_ok = read_payload()
     if event == "SessionStart":
         return session_start(plugin_root, repo_root)
-    if event == "SubagentStart":
-        return subagent_start(payload, payload_ok)
-    if event == "PreToolUse":
-        return pre_tool_use(repo_root, payload, strict)
-    if event == "PostToolUse":
-        return post_tool_use(repo_root)
-    return 0
+    return subagent_start(payload, payload_ok)
 
 
 def locate_repo_root() -> Path:
@@ -64,10 +56,10 @@ def locate_repo_root() -> Path:
             capture_output=True,
             check=False,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return Path(result.stdout.strip()).resolve()
     except OSError:
-        pass
+        result = None
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve()
     return Path.cwd().resolve()
 
 
@@ -86,19 +78,9 @@ def read_payload() -> tuple[dict[str, Any], bool]:
 
 
 def session_start(plugin_root: Path, repo_root: Path) -> int:
-    print("purpose: inject read-only project status; delivery gates remain in the harness runtime.")
-    version = plugin_version(plugin_root)
-    print(f"version: {version}")
-    if not harness_db_exists(repo_root):
-        print("harness status:")
-        print("- not initialized in this project")
-        print("dispatch status:")
-        print("- not initialized in this project")
-        return 0
-    status = run_harness(plugin_root, repo_root, ["status"])
-    print_block("harness status", status)
-    dispatch = run_harness(plugin_root, repo_root, ["dispatch", "status"])
-    print_block("dispatch status", dispatch, max_lines=6)
+    print("purpose: inject read-only local status; delivery gates remain in the Kafa Kernel.")
+    print(f"version: {plugin_version(plugin_root)}")
+    print_block("harness status", run_harness(plugin_root, repo_root, ["status"]))
     return 0
 
 
@@ -113,57 +95,21 @@ def plugin_version(plugin_root: Path) -> str:
 
 
 def subagent_start(payload: dict[str, Any], payload_ok: bool) -> int:
-    agent_type = safe_scalar(payload.get("subagent_type") or payload.get("agent") or payload.get("type") or "unknown")
+    agent_type = safe_scalar(
+        payload.get("subagent_type")
+        or payload.get("agent")
+        or payload.get("type")
+        or "unknown"
+    )
     print(f"subagent: {agent_type}")
     print(f"stdin: {'available' if payload_ok else 'unavailable'}")
-    print("role boundary: stay inside the assigned role, task, acceptance criteria, file claims, and test target.")
-    print("acceptance: return concrete files changed, validation run, remaining risk, and any blocker.")
-    print("raw provider or worker reports are not trusted evidence until controller verification records them.")
+    print("role boundary: stay inside the assigned task, files, acceptance, and tests.")
+    print("return: changed files, commands, results, risks, and blockers to the root controller.")
+    print("trust: subagents do not write Kafa facts or fabricate evidence; the root controller verifies results.")
     return 0
 
 
-def pre_tool_use(repo_root: Path, payload: dict[str, Any], strict: bool) -> int:
-    tool = safe_scalar(payload.get("tool_name") or payload.get("tool") or payload.get("name") or "unknown")
-    warnings = []
-    if tool in MUTATING_TOOLS or tool == "unknown":
-        project = project_state(repo_root)
-        if project and project.get("scope_status") != "confirmed":
-            warnings.append(f"scope is not confirmed ({project.get('scope_status')}); freeze requirements before broad writes.")
-        if project and project.get("phase") in {"intake", "baseline"}:
-            warnings.append(f"project phase is {project.get('phase')}; prefer baseline/task setup before edits.")
-        if active_task_count(repo_root) == 0:
-            warnings.append("no active task/assignment detected; bind writes to a task, claim, and validation target.")
-        if changed_files(repo_root):
-            warnings.append("working tree already has changes; avoid mixing unrelated work.")
-
-    if warnings:
-        print(f"tool: {tool}")
-        for warning in warnings:
-            print(f"warning: {warning}")
-        if strict:
-            print("strict mode: blocking clear harness guardrail violation.")
-            return 1
-    else:
-        print(f"tool: {tool}")
-        print("OK: no clear harness pre-tool warning detected.")
-    return 0
-
-
-def post_tool_use(repo_root: Path) -> int:
-    files = changed_files(repo_root)
-    print("git status:")
-    if files:
-        for line in files[:MAX_LINES]:
-            print(f"- {line}")
-        if len(files) > MAX_LINES:
-            print(f"- ... {len(files) - MAX_LINES} more")
-    else:
-        print("- clean or unavailable")
-    print("next: record validation/evidence through harness commands only after controller verification or trusted test execution.")
-    return 0
-
-
-def stop(plugin_root: Path, repo_root: Path, strict: bool) -> int:
+def stop(plugin_root: Path, repo_root: Path) -> int:
     lines = [
         "Codex Project Harness hook: Stop",
         f"repo: {repo_root}",
@@ -178,17 +124,14 @@ def stop(plugin_root: Path, repo_root: Path, strict: bool) -> int:
         )
         print(stop_output(lines))
         return 0
+
     delivery = os.environ.get("HARNESS_HOOK_DELIVERY") == "1"
     args = ["validate", "--delivery"] if delivery else ["validate"]
     lines.append(f"readiness command: harness {' '.join(args)}")
-    result = run_harness(plugin_root, repo_root, args, check=False)
+    result = run_harness(plugin_root, repo_root, args)
     lines.extend(block_lines("readiness result", result))
     if result.returncode != 0:
-        lines.append("validation failed; hook is warn-only unless HARNESS_HOOK_STRICT=1.")
-        if strict:
-            lines.append("strict mode: blocking stop on failed harness validation.")
-            print("\n".join(lines), file=sys.stderr)
-            return 2
+        lines.append("validation failed; Stop is warn-only and does not create or alter delivery facts.")
     print(stop_output(lines))
     return 0
 
@@ -205,90 +148,50 @@ def stop_output(lines: list[str]) -> str:
     )
 
 
-def run_harness(plugin_root: Path, repo_root: Path, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+def run_harness(
+    plugin_root: Path,
+    repo_root: Path,
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
     script = plugin_root / "scripts" / "harness.py"
     return subprocess.run(
-        ["python3", str(script), "--root", str(repo_root), *args],
+        [sys.executable, str(script), "--root", str(repo_root), *args],
         text=True,
         capture_output=True,
-        check=check,
+        check=False,
     )
 
 
 def harness_db_exists(repo_root: Path) -> bool:
-    return (repo_root / ".ai-team" / "state" / "harness.db").exists()
+    return (repo_root / ".ai-team" / "state" / "harness.db").is_file()
 
 
-def print_block(title: str, result: subprocess.CompletedProcess[str], *, max_lines: int = MAX_LINES) -> None:
+def print_block(
+    title: str,
+    result: subprocess.CompletedProcess[str],
+    *,
+    max_lines: int = MAX_LINES,
+) -> None:
     for line in block_lines(title, result, max_lines=max_lines):
         print(line)
 
 
-def block_lines(title: str, result: subprocess.CompletedProcess[str], *, max_lines: int = MAX_LINES) -> list[str]:
+def block_lines(
+    title: str,
+    result: subprocess.CompletedProcess[str],
+    *,
+    max_lines: int = MAX_LINES,
+) -> list[str]:
     lines = [f"{title}:"]
     text = (result.stdout or result.stderr or "").strip()
     if not text:
         lines.append("- no output")
         return lines
-    for line in text.splitlines()[:max_lines]:
-        lines.append(sanitize_line(line))
-    remaining = len(text.splitlines()) - max_lines
-    if remaining > 0:
-        lines.append(f"... {remaining} more line(s)")
+    source_lines = text.splitlines()
+    lines.extend(sanitize_line(line) for line in source_lines[:max_lines])
+    if len(source_lines) > max_lines:
+        lines.append(f"... {len(source_lines) - max_lines} more line(s)")
     return lines
-
-
-def project_state(repo_root: Path) -> dict[str, str]:
-    db = repo_root / ".ai-team" / "state" / "harness.db"
-    if not db.exists():
-        return {}
-    try:
-        with closing(sqlite3.connect(db)) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("select phase, status, scope_status from project where id = 1").fetchone()
-            return dict(row) if row else {}
-    except sqlite3.Error:
-        return {}
-
-
-def active_task_count(repo_root: Path) -> int:
-    db = repo_root / ".ai-team" / "state" / "harness.db"
-    if not db.exists():
-        return 0
-    try:
-        with closing(sqlite3.connect(db)) as conn:
-            task_count = conn.execute(
-                "select count(*) from tasks where status in ('ready', 'claimed', 'in_progress', 'submitted', 'reviewed')"
-            ).fetchone()[0]
-            assignment_count = conn.execute(
-                "select count(*) from dispatch_assignments where status in ('planned', 'claimed', 'reported', 'completed')"
-            ).fetchone()[0]
-            return int(task_count) + int(assignment_count)
-    except sqlite3.Error:
-        return 0
-
-
-def changed_files(repo_root: Path) -> list[str]:
-    try:
-        result = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
-        return []
-    if result.returncode != 0:
-        return []
-    return [sanitize_line(line) for line in result.stdout.splitlines() if line.strip()]
-
-
-def read_text(path: Path) -> str:
-    try:
-        return path.resolve().read_text(encoding="utf-8")
-    except OSError:
-        return ""
 
 
 def safe_scalar(value: object) -> str:
@@ -304,12 +207,8 @@ def sanitize_line(line: str) -> str:
     words = []
     for word in line.split():
         upper = word.upper()
-        if any(marker in upper for marker in SECRET_MARKERS):
-            words.append("[redacted]")
-        else:
-            words.append(word)
-    sanitized = " ".join(words)
-    return sanitized[:240]
+        words.append("[redacted]" if any(marker in upper for marker in SECRET_MARKERS) else word)
+    return " ".join(words)[:240]
 
 
 if __name__ == "__main__":

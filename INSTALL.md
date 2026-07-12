@@ -4,65 +4,52 @@ Codex Project Harness is distributed as a local Git/Codex plugin bundle. The `ka
 
 `release.json` is the source/tag/package contract. A source checkout marked `release_state=development` is not a published release even when its `VERSION` is newer than the latest GitHub tag. Use `python3 -m kafa.release --json` to inspect that distinction.
 
+The business-project runtime is local-only. Installation and normal delivery do not require project-management credentials, remote service tokens, or an optional model SDK.
+
 ## Requirements
 
 - Python 3.11 or newer.
-- Git on `PATH`.
+- Git on `PATH` for local repository and candidate identity checks.
 - Codex with plugin marketplace support.
 - A checkout of this repository.
-- The base `kafa` package is stdlib-only. Host Codex Provider users install the optional SDK extra separately.
 
-Check the repository:
+## Validate the source checkout
+
+Run these commands from the Kafa repository root:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
+python3 plugins/codex-project-harness/scripts/validate_structure.py \
+  plugins/codex-project-harness
 python3 -m pip install -e .
 kafa --version
-kafa plugin install --repo .
 kafa doctor --repo .
 ```
 
-Only when using `dispatch provider start --provider host-codex`, install the optional provider dependency:
+`validate_structure.py` and source-repo doctor fail closed when the plugin inventory, schema files, Hooks, templates, runtime boundary, or package metadata drift from the approved contract.
 
-```bash
-python3 -m pip install -e '.[host-codex]'
-```
-
-Ordinary plugin installation, doctor, project launchers, fixture providers, and Kernel commands do not require the Host Codex SDK.
-
-Expected:
-
-```text
-OK: plugin structure is valid
-1.25.0-beta.1
-```
-
-`kafa doctor --repo .` also checks the architecture control plane contract: Skill Entry, Plugin Distribution, Hooks Advisory Layer, Host Bridge/Provider Layer, Kernel Trust Layer, and Connector/Eval Boundary must still declare their non-bypass responsibilities.
-
-`kafa doctor` is for this Kafa/plugin source repository. To inspect an ordinary project that uses Kafa, run:
+`kafa doctor --repo .` is for the Kafa source repository. To inspect an ordinary project that uses Kafa, run:
 
 ```bash
 kafa project doctor --repo /path/to/business-project
 ```
 
-Project doctor checks whether the business project has initialized `.ai-team/state/harness.db`, has runtime ignore rules, and has clear next commands. It does not require or look for `plugins/codex-project-harness/` inside the business project.
+Project doctor checks initialized local state, runtime ignore rules, schema compatibility, and actionable next commands. It does not expect the Kafa source tree inside the business project.
 
-Installation does not configure business-project connector scopes. After installing the plugin, each project that wants real GitHub/Linear/Notion/Figma/Slack writes must bind existing external targets with `harness.py --root <project> connector profile set ...`. Harness does not create external workspaces, projects, channels, files, repositories, or connector tokens.
+## Repo-scoped installation
 
-## Install For This Repo
-
-Repo scope is the default. It writes `.agents/plugins/marketplace.json` and points Codex at the plugin already stored under `plugins/codex-project-harness`.
+Repo scope writes `.agents/plugins/marketplace.json` and points Codex at the plugin under `plugins/codex-project-harness`:
 
 ```bash
 python3 -m pip install -e .
 kafa plugin install --repo .
+kafa doctor --repo .
 ```
 
-Restart Codex, open the plugin directory, choose the `kafa-local` marketplace, and install `codex-project-harness`.
+Restart Codex, open the plugin directory, select the `kafa-local` marketplace, and install `codex-project-harness`.
 
-## Install For Your User Account
+## User-scoped installation
 
-User scope copies the plugin to `~/.agents/plugins/codex-project-harness` and writes `~/.agents/plugins/marketplace.json`.
+User scope copies the plugin to `~/.agents/plugins/codex-project-harness` and writes `~/.agents/plugins/marketplace.json`:
 
 ```bash
 python3 -m pip install -e .
@@ -71,17 +58,55 @@ codex plugin add codex-project-harness@kafa-local
 kafa doctor --scope user --repo .
 ```
 
-The user-scope doctor is fail-closed: it statically verifies the marketplace entry, copied plugin identity and content, hook definition, Codex cache, and `codex plugin list --json` registration. Creating the marketplace file alone is not reported as a completed Codex installation. The isolated install smoke proves discovery of the installed plugin, 12 Skills, and five Hooks; the authenticated `live-codex` profile proves host Hook execution through real `hook/started` and `hook/completed` events.
+The user-scope doctor verifies the marketplace entry, managed plugin copy, Codex registration, cache identity, and exact local plugin inventory. A copied directory or marketplace entry alone is not reported as a completed installation.
 
-Use `--force` only when you intentionally want to replace an existing copied user plugin:
+Use `--force` only when you intentionally want to replace an existing managed user copy:
 
 ```bash
 kafa plugin install --scope user --repo . --force
 ```
 
+## Expected plugin inventory
+
+An isolated installation must expose exactly:
+
+- seven Skills: `project-harness`, `minimal-safe-change`, `bug-fix-loop`, `test-first-delivery`, `independent-quality-gate`, `harness-audit`, and `project-retrospective`;
+- three Hooks: `SessionStart`, `SubagentStart`, and `Stop`;
+- three agent templates: `architect.toml`, `developer.toml`, and `qa-reviewer.toml`;
+- the approved local runtime, core, schemas, and project templates.
+
+Initialization copies only the three approved agent templates into `.codex/agents/` when they do not already exist. Existing files are not overwritten. Native Codex/ChatGPT remains the sole owner of task, subagent, worktree, approval, model, cancel, steer, and handoff behavior.
+
+Hooks are advisory:
+
+- `SessionStart` reads initialized local status.
+- `SubagentStart` injects the root-controller single-writer boundary.
+- `Stop` warns only.
+
+When a project is not initialized, all three return a concise not-initialized result without creating `.ai-team` or raising a traceback.
+
+## Initialize a business project
+
+Use the consolidated `project-harness` proxy from the installed plugin or source checkout:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project init
+
+kafa project doctor --repo /path/to/business-project
+```
+
+Initialization creates the schema 30 local runtime at:
+
+```text
+.ai-team/state/harness.db
+```
+
+It also creates local Markdown views and the approved Native Codex agent templates. No remote credentials are requested, and no network call is part of project initialization.
+
 ## Upgrade
 
-Pull or checkout the desired repository version first, then refresh the marketplace entry.
+First pull or checkout the desired Kafa source version, then refresh the installation:
 
 ```bash
 git pull
@@ -95,56 +120,199 @@ For user scope:
 kafa plugin upgrade --scope user --repo .
 ```
 
-Restart Codex after upgrading so it reloads plugin metadata and hooks.
+Restart Codex after upgrading so it reloads plugin metadata and Hooks.
 
-## Release Compatibility Gate
+## Migrate an initialized project to schema 30
 
-Tag publication requires both the Linux/macOS/Windows deterministic matrix and an authenticated real Codex host profile. Configure a protected GitHub environment named `codex-live-release` and a self-hosted runner labelled `kafa-codex-live`. The runner must have file-based Codex authentication available to its account; credentials must not be committed to this repository or uploaded as evidence.
+Always inspect the current project first:
 
-The release job installs the Codex CLI version pinned by `release.json`, runs `run_agent_e2e_eval.py --mode live-codex`, and retains the JSON report. A missing runner, missing authentication, `not-run`, `blocked`, or failed live scenario prevents `publish`.
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project status
+```
+
+For a schema 29 project, verify the CLI contract and run the dry-run before the real migration:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project migrate --help
+
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project migrate \
+  --from-version 29 \
+  --to-version 30 \
+  --dry-run
+
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project migrate \
+  --from-version 29 \
+  --to-version 30
+```
+
+Published schema 27 and development schema 28 projects use the isolated legacy conversion stage before the same schema 30 conversion. Pass the actual source version reported by the project; never guess `--from-version`.
+
+The migration is side-by-side and recoverable:
+
+1. Validate the source database and compare-and-swap its schema version.
+2. Create a consistent SQLite backup with SHA-256, integrity result, foreign-key result, and row counts.
+3. Convert only approved local delivery facts into a staging schema 30 database.
+4. Validate schema inventory, foreign keys, invariants, and projection dry-run.
+5. Atomically activate the staging database.
+6. Run final doctor; if it fails after activation, restore the verified backup and preserve the failed database for diagnosis.
+
+Before atomic replacement, migration atomically persists and fsyncs a
+`recovery-required` sentinel with the manifest path. The sentinel is removed
+only after successful migration or a verified complete rollback of both the DB
+and every generated projection. A `rollback-incomplete`, hard process exit, or
+interrupted recovery keeps the sentinel fail-closed; operators must not remove
+it until the manifest has been used to recover and verify database/projection
+authority. A core caller without the mandatory projection activation validator
+is rejected and cannot report schema 30 activated.
+
+The validator proves content, not only path presence: it renders all 13 views
+from an independent temporary database snapshot and compares the live bytes.
+All production projection publication holds the project operation lock from its
+first database read through its final file write. `project-state.yaml` derives
+its timestamp from SQLite `project.updated_at`, not the render-time clock, and
+rebuild uses replace rather than merge semantics so unchanged facts are
+byte-stable and stale ad-hoc keys are removed. The exact keys include database
+`id` and `current_cycle_id` and exclude generic `blocked_reason`. During rollback, failed
+schema-30 WAL/SHM files are quarantined with the failed main database before the
+source backup is restored and opened through ordinary read-only SQLite
+semantics. A handle or sidecar that cannot be neutralized leaves
+`rollback-incomplete`; it is never masked by an immutable SQLite open.
+Core repeats independent projection content verification after the publication
+callback; callback self-report cannot activate migration. Operation-lock open
+and unlock cleanup is `BaseException`-safe and preserves the cancellation after
+releasing local and OS resources.
+Core also fingerprints the stabilized active DB before and after the callback;
+any callback database write rolls back even when its value and regenerated
+views would otherwise pass doctor.
+
+Migration artifacts are stored under `.ai-team/backups/`. Removed remote-collaboration and execution-lifecycle rows remain only in that backup and never enter the active schema 30 database.
+
+Git source inspection pins the requested root with controlled `GIT_WORK_TREE`.
+Schema 30 permits exactly 27 active tables plus SQLite's `sqlite_sequence`;
+other reserved-prefix tables are corruption, not hidden internals. Real Native
+controller verification runs from a start-verified private Git-backed snapshot
+and compares the original source again at completion. Snapshot initialization,
+hashing, and index construction ignore ambient `GIT_DIR`/global config and use
+an explicit empty template.
+
+After migration:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project doctor
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project validate
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project status
+```
+
+Do not delete the verified backup until the migrated project has passed its required local checks. After new schema 30 facts are written, Kafa does not promise an automatic downgrade.
+
+## Repair and local recovery
+
+Inspect the planned repair first:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project repair --dry-run
+```
+
+Any mutating repair creates and verifies a SQLite backup before changing the active database. `projection rebuild` regenerates supported Markdown views from SQLite and does not make those views a recovery source:
+
+```bash
+python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
+  --root /path/to/business-project projection rebuild
+```
+
+Do not manually replace `harness.db` unless a diagnosed failure requires operator recovery and the selected backup digest and integrity results have been independently checked.
+
+If Store or `kafa project doctor` reports `recovery-required` or
+`rollback-incomplete`, preserve the sentinel, active DB, manifest, failed DB,
+and projection backup together. Complete and verify recovery first. Only an
+ordinary pre-activation stale sentinel may be considered for removal after the
+owner is confirmed inactive and database/projection authority has been checked;
+operators must not remove a recovery-required sentinel as stale.
+
+The project `status`, `doctor`, `validate`, and `quickstart status` paths check
+this sentinel before deciding that a missing `harness.db` means uninitialized.
+They report the manifest and do-not-remove guidance and do not recommend `init`
+as a recovery action. A handled pre-activation failure clears its diagnostic
+sentinel only after the source database is verified unchanged and the bounded
+projection backup has been restored and verified; an unverified backup failure
+keeps the diagnostic sentinel.
+
+## Isolated installation verification
+
+The isolated smoke test proves plugin discovery and exact inventory in a temporary HOME:
+
+```bash
+python3 tests/run_isolated_install_smoke.py --repo .
+```
+
+A real Native Codex compatibility profile is a separate, explicit opt-in check. If it is unavailable, not run, blocked, or fails a scenario, report that state exactly; isolated discovery or fixture results do not replace it.
 
 ## Uninstall
 
-Remove only the marketplace entry:
+Remove only the repo-scoped marketplace entry:
 
 ```bash
 kafa plugin uninstall --repo .
 ```
 
-For user scope, remove the marketplace entry and the managed copied plugin directory:
+For user scope, remove the marketplace entry and managed copied plugin directory:
 
 ```bash
 kafa plugin uninstall --scope user --repo . --remove-files
 ```
 
-Uninstall does not delete Codex caches or project `.ai-team/` state.
+Uninstall does not delete Codex caches, business-project `.ai-team/` state, migration backups, or generated project views.
 
-## Migration From Manual Install
+## Migration from a manual plugin path
 
-If you previously pointed Codex at the plugin directory manually:
+If Codex previously pointed at this plugin manually:
 
-1. Keep the full `plugins/codex-project-harness` directory in the repository.
+1. Keep the complete `plugins/codex-project-harness` directory.
 2. Run `python3 -m pip install -e .`.
 3. Run `kafa plugin install --repo .`.
 4. Restart Codex and install from the `kafa-local` marketplace.
-5. Remove any old hand-written marketplace entry only after the new entry appears.
+5. Remove the old hand-written marketplace entry only after the managed entry is discoverable.
 
-## macOS, Linux, And Windows Notes
+## macOS, Linux, and Windows
 
-- macOS/Linux examples use `python3`; Windows can use `py -3.11 -m pip install -e .` and then `kafa ...`.
-- If Python reports `externally-managed-environment` (common with Homebrew Python), create a virtual environment first: `python3 -m venv .venv && . .venv/bin/activate && python -m pip install -e .`.
-- Paths with spaces are supported when passed as quoted `--repo` or `--plugin-path` values.
-- Repo-scope install writes inside the current repository. User-scope install writes under the current user's home directory.
-- No secrets or connector tokens are required for installation.
-- Connector profile bindings are per project runtime state, not installation state. `kafa doctor` can remind you of the boundary, but it does not create or migrate profiles.
+- macOS/Linux examples use `python3`; Windows can use `py -3.11`.
+- If Python reports `externally-managed-environment`, create a virtual environment: `python3 -m venv .venv`, activate it, then run `python -m pip install -e .`.
+- Quote paths that contain spaces when passing `--repo`, `--plugin-path`, or `--root`.
+- Repo-scope installation writes inside the Kafa checkout. User scope writes under the current user's home directory.
+- Business-project runtime state and backups must remain ignored by Git unless the project has an explicit, reviewed policy to do otherwise.
+
+在项目根创建文档建议的 `.venv/` 不会使 candidate identity 因解释器符号链接失效。
+Kafa 仅排除精确、未版本化的 top-level dependency/tool environment：`.venv/`、
+`venv/`、`.tox/`、`.nox/` 和 `node_modules/`，以及生成工具缓存；普通 ignored
+runtime source 仍会被哈希，`.venvish/` 不会被模糊排除，项目 lockfile 与依赖
+manifest 仍会改变 candidate identity。
+
+除 reserved `.ai-team/` 状态外，Kafa 只排除 exact generated projection、retired
+projection 和三个静态 agent template。`.gitignore` 以及额外的
+`.codex/agents/`、`docs/harness/` runtime 文件仍会改变 candidate；no-Git 项目中的
+FIFO、socket、device 或其他非普通路径会 fail closed。Git index 和 HEAD 都会独立
+检查非普通 mode；HEAD-only gitlink 即使删除已暂存也会使 identity fail closed。
+Identity commands also disable Git replace-object lookup, so `refs/replace`
+cannot substitute a clean commit/tree/blob for the original local authority.
+
+Structured result 文件若由 verification command 生成，应使用 `.ai-team/runtime/`
+下的项目相对路径或 stdout。普通项目路径中的新结果文件属于 candidate source，生成后
+会触发 stale-candidate 保护，而不会被动态加入排除清单。
 
 ## Troubleshooting
 
-- `kafa: command not found`: run `python3 -m pip install -e .` again, then reopen the terminal.
-- `externally-managed-environment`: use a virtual environment or pipx-style app environment rather than forcing a system install.
-- `plugin manifest not found`: run commands from the repository root or pass `--repo /path/to/kafa`.
-- `target plugin already exists`: use `kafa plugin upgrade --scope user --repo .` or pass `--force`.
-- Plugin does not appear in Codex: restart Codex and confirm `.agents/plugins/marketplace.json` exists.
-- Hooks do not run: review and trust plugin hooks with `/hooks`; set `CODEX_PROJECT_HARNESS_PLUGIN_ROOT` if the plugin is outside the default repo path.
-- `control plane contract` fails in `kafa doctor`: inspect the named layer and restore the boundary text or implementation path before release.
-- Connector writes fail with missing profile or scope mismatch: run `harness.py --root <project> connector profile status --json`, then bind only the existing external target that project may write.
+- `kafa: command not found`: reinstall with `python3 -m pip install -e .`, then reopen the terminal.
+- `plugin manifest not found`: run from the Kafa repository root or pass `--repo /path/to/kafa`.
+- `target plugin already exists`: use `kafa plugin upgrade --scope user --repo .` or intentionally pass `--force`.
+- Plugin does not appear in Codex: restart Codex, confirm the marketplace file exists, and run the matching doctor command.
+- Hook reports not initialized: run `init` in the intended business-project root; the Hook itself will not create state.
+- Schema mismatch: run `status`, verify the current schema, inspect `migrate --help`, and use `--dry-run` before any migration.
+- Repair is blocked: preserve the active database and backup artifacts, then investigate the reported invariant or integrity failure instead of bypassing it.

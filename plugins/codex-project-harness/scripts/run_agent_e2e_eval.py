@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Run deterministic agent E2E evaluation scenarios.
-
-The default fixture mode exercises the harness control plane with real CLI
-commands and temporary git repositories. It intentionally does not require a
-Codex service, network, Docker, or host credentials.
-"""
+"""Run the deterministic local-only Kafa evaluation matrix."""
 
 from __future__ import annotations
 
 import argparse
-import csv
+import base64
+import gzip
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -19,13 +16,13 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+from contextvars import ContextVar
+from datetime import datetime
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 
@@ -36,11 +33,35 @@ for path in [ROOT, PLUGIN_ROOT, SCRIPTS_ROOT]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from kafa.codex_app_server import AppServerClient, validate_app_server_discovery  # noqa: E402
-
 HARNESS = SCRIPTS_ROOT / "harness.py"
-PYTHON = json.dumps(sys.executable)
-TEST_COMMAND = "python3 -B -m unittest"
+_CONTROLLER_HARNESS: ContextVar[Path] = ContextVar(
+    "kafa_controller_harness",
+    default=HARNESS,
+)
+
+import harness_db  # noqa: E402
+from harness_lib import (  # noqa: E402
+    framed_source_digest,
+    git_blob_objects_available,
+    isolated_git_environment,
+    now_iso,
+)
+from core.local_core_migration import (  # noqa: E402
+    InjectedLocalCoreMigrationFailure,
+    migrate_project_to_schema30,
+)
+from core.schema_lifecycle import (  # noqa: E402
+    SCHEMA30_CATALOG_TABLES,
+    SCHEMA30_TABLES,
+    SCHEMA30_VERSION,
+)
+from kafa.codex_app_server import (  # noqa: E402
+    APPROVED_AGENT_TEMPLATES,
+    APPROVED_RUNTIME_SCRIPTS,
+    APPROVED_SCHEMA_FILES,
+    APPROVED_SKILLS,
+    RETIRED_RUNTIME_PATHS,
+)
 
 
 def run_harness(
@@ -54,7 +75,13 @@ def run_harness(
     if env:
         command_env.update(env)
     result = subprocess.run(
-        [sys.executable, str(HARNESS), "--root", str(root), *args],
+        [
+            sys.executable,
+            str(_CONTROLLER_HARNESS.get()),
+            "--root",
+            str(root),
+            *args,
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -66,547 +93,24 @@ def run_harness(
     return result
 
 
-def run_git(root: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=True)
-    return result.stdout.strip()
-
-
-def git_porcelain_paths(output: str) -> set[str]:
-    paths: set[str] = set()
-    for line in output.splitlines():
-        if len(line) < 4:
-            continue
-        path = line[3:]
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[1]
-        paths.add(path)
-    return paths
-
-
-def stdout_field(stdout: str, name: str) -> str:
-    return stdout.split(f"{name}=", 1)[1].split(None, 1)[0].strip()
-
-
-def task_revision(root: Path, task_id: str) -> str:
-    return str(db_rows(root, "select revision from tasks where id = ?", (task_id,))[0]["revision"])
-
-
-def init_git_repo(root: Path) -> None:
-    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Eval Runner"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.email", "eval@example.invalid"], cwd=root, check=True)
-    (root / "README.md").write_text("eval\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
-
-
-def add_unittest(root: Path, *, failing_on_integration: bool = False) -> None:
-    body = [
-        "import pathlib",
-        "import unittest",
-        "",
-        "class EvalTest(unittest.TestCase):",
-        "    def test_ok(self):",
-        "        self.assertTrue(True)",
-    ]
-    if failing_on_integration:
-        body.extend(
-            [
-                "",
-                "    def test_no_integration_regression(self):",
-                "        self.assertFalse(pathlib.Path('file_a.txt').exists() and pathlib.Path('file_b.txt').exists())",
-            ]
-        )
-    (root / "test_eval.py").write_text("\n".join(body) + "\n", encoding="utf-8")
-    subprocess.run(["git", "add", "test_eval.py"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "add eval test"], cwd=root, check=True, capture_output=True)
-
-
-def setup_basic_harness(root: Path, task_ids: list[str]) -> str:
-    run_harness(root, "init")
-    commit_harness_scaffold(root)
-    run_harness(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "Agent E2E requirement")
-    run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Eval acceptance")
-    run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
-    run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
-    for task_id in task_ids:
-        run_harness(root, "task", "add", "--id", task_id, "--task", f"Task {task_id}", "--owner", f"agent-{task_id.lower()}", "--acceptance", "AC1")
-        run_harness(root, "test-target", "link", "--task", task_id, "--target", "UNIT")
-    run_harness(root, "scope", "confirm", "--by", "eval-controller", "--summary", "Agent E2E scope confirmed")
-    run_harness(root, "baseline", "freeze", "--id", "E2E-BL", "--summary", "Agent E2E delivery baseline")
-    return run_harness(root, "dispatch", "plan", "--scope", "Agent E2E").stdout.strip().split()[-1]
-
-
-def commit_harness_scaffold(root: Path) -> None:
-    subprocess.run(["git", "add", ".gitignore", ".codex", "docs"], cwd=root, check=True, capture_output=True)
-    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root, check=False)
-    if diff.returncode != 0:
-        subprocess.run(["git", "commit", "-m", "add harness scaffold"], cwd=root, check=True, capture_output=True)
-
-
-def commit_branch(root: Path, branch_name: str, file_name: str, content: str) -> tuple[str, str, str]:
-    worktree = root / ".ai-team/runtime/e2e-worktrees" / branch_name.replace("/", "-")
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "worktree", "add", "-B", branch_name, str(worktree), "HEAD"], cwd=root, check=True, capture_output=True)
-    target = worktree / file_name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    subprocess.run(["git", "add", file_name], cwd=worktree, check=True)
-    subprocess.run(["git", "commit", "-m", f"agent change {file_name}"], cwd=worktree, check=True, capture_output=True)
-    head = run_git(root, "rev-parse", branch_name)
-    tree = run_git(root, "rev-parse", f"{branch_name}^{{tree}}")
-    rel = worktree.relative_to(root).as_posix()
-    subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, check=True, capture_output=True)
-    return head, tree, rel
-
-
-def fixture_report(root: Path, run_id: str, task_id: str, branch_name: str, *, status: str = "success") -> None:
-    path = root / ".ai-team/runtime/provider-fixtures" / run_id / f"{task_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "status": status,
-                "last_error": "" if status == "success" else status,
-                "result": {
-                    "command": "forged worker command",
-                    "exit_code": 0,
-                    "stdout_sha256": "0" * 64,
-                    "artifact_path": ".ai-team/runtime/forged/stdout.txt",
-                    "executed_count": 999,
-                    "executed_count_source": "manual",
-                    "source_tree_hash": "forged",
-                    "branch_name": branch_name,
-                    "status": "success",
-                    "target_id": "UNIT",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-def fake_codex_sdk(temp: Path) -> tuple[Path, Path]:
-    package_root = temp / "fake_sdk"
-    package_dir = package_root / "openai_codex"
-    package_dir.mkdir(parents=True)
-    log_path = temp / "fake_codex_sdk_log.jsonl"
-    package_dir.joinpath("__init__.py").write_text(
-        textwrap.dedent(
-            r'''
-            import json
-            import os
-            import re
-            from pathlib import Path
-
-            class ApprovalMode:
-                deny_all = "deny_all"
-                auto_review = "auto_review"
-
-            class Sandbox:
-                read_only = "read_only"
-                workspace_write = "workspace_write"
-                full_access = "full_access"
-
-            class CodexConfig:
-                def __init__(self, codex_bin=None, client_name="", client_title="", client_version="", **kwargs):
-                    self.codex_bin = codex_bin
-                    self.client_name = client_name
-                    self.client_title = client_title
-                    self.client_version = client_version
-
-            class TurnResult:
-                def __init__(self, final_response):
-                    self.final_response = final_response
-
-            def log(message):
-                log_path = os.environ["FAKE_CODEX_SDK_LOG"]
-                with open(log_path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(message, sort_keys=True) + "\n")
-
-            def prompt_value(prompt, name, default=""):
-                match = re.search(rf'"{name}": "([^"]*)"', prompt)
-                return match.group(1) if match else default
-
-            def prompt_int(prompt, name, default=0):
-                match = re.search(rf'"{name}": ([0-9]+)', prompt)
-                return int(match.group(1)) if match else default
-
-            def report(prompt):
-                return {
-                    "command": prompt_value(prompt, "command", "python3 -B -m unittest"),
-                    "exit_code": 0,
-                    "stdout_sha256": "0" * 64,
-                    "artifact_path": ".ai-team/runtime/fake/stdout.txt",
-                    "executed_count": 1,
-                    "executed_count_source": "parsed",
-                    "source_tree_hash": "fake-source-tree",
-                    "branch_name": prompt_value(prompt, "branch_name"),
-                    "status": "success",
-                    "target_id": prompt_value(prompt, "target_id", "UNIT"),
-                    "fence": prompt_int(prompt, "fence", 0),
-                    "agent_id": prompt_value(prompt, "agent_id", "agent-t1"),
-                }
-
-            class Thread:
-                id = "thr_fake"
-
-                def run(self, input, *, cwd=None, sandbox=None, approval_mode=None, output_schema=None, model=None, **kwargs):
-                    log({
-                        "method": "thread.run",
-                        "cwd": str(cwd),
-                        "sandbox": str(sandbox),
-                        "approval_mode": str(approval_mode),
-                        "model": model,
-                        "output_schema_required": sorted((output_schema or {}).get("required", [])),
-                    })
-                    Path(str(cwd)).joinpath("agent.txt").write_text("host codex sdk work\n", encoding="utf-8")
-                    return TurnResult(report(input))
-
-            class Codex:
-                def __init__(self, config=None):
-                    self.config = config
-
-                def __enter__(self):
-                    log({"method": "codex.__enter__", "client_name": getattr(self.config, "client_name", "")})
-                    return self
-
-                def __exit__(self, exc_type, exc, tb):
-                    log({"method": "codex.__exit__"})
-
-                def thread_start(self, *, cwd=None, sandbox=None, approval_mode=None, model=None, **kwargs):
-                    log({"method": "thread_start", "cwd": str(cwd), "sandbox": str(sandbox), "approval_mode": str(approval_mode), "model": model})
-                    return Thread()
-            '''
-        ).strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    return package_root, log_path
-
-
-def plan_action(root: Path, tool: str, operation: str, params: dict[str, object], *, key: str = "") -> str:
-    payload = json.dumps({"execute": True, "operation": operation, "params": params}, sort_keys=True)
-    result = run_harness(
-        root,
-        "adapter",
-        "plan",
-        "--tool",
-        tool,
-        "--mode",
-        "write-confirm",
-        "--artifact",
-        f"{tool} mock artifact",
-        "--action",
-        operation,
-        "--payload-json",
-        payload,
-        "--idempotency-key",
-        key or f"e2e:{tool}:{operation}",
-    )
-    return result.stdout.strip().split()[-1]
-
-
-def set_connector_profiles(root: Path, project_key: str = "e2e") -> None:
-    run_harness(
-        root,
-        "connector",
-        "profile",
-        "set",
-        "--project-key",
-        project_key,
-        "--github-repo",
-        "owner/repo",
-        "--linear-team",
-        "TEAM",
-        "--notion-parent",
-        "PARENT",
-        "--slack-channel",
-        "C123",
-        "--figma-file",
-        "FILE1",
-    )
-
-
-def fake_gh(temp: Path) -> tuple[Path, Path]:
-    bin_dir = temp / "bin"
-    bin_dir.mkdir()
-    log_path = temp / "gh-log.jsonl"
-    script = bin_dir / "gh"
-    script.write_text(
-        textwrap.dedent(
-            f"""\
-            #!/usr/bin/env python3
-            import json
-            import sys
-
-            log_path = {str(log_path)!r}
-            with open(log_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(sys.argv[1:], sort_keys=True) + "\\n")
-            endpoint = sys.argv[2] if len(sys.argv) > 2 else ""
-            if endpoint.endswith("/issues"):
-                print(json.dumps({{"id": 123, "number": 7, "html_url": "https://github.example/repo/issues/7"}}))
-            else:
-                print(json.dumps({{"viewer": {{"login": "fake"}}}}))
-            """
-        ),
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
-    (bin_dir / "gh.cmd").write_text("@echo off\r\npython \"%~dp0gh\" %*\r\n", encoding="utf-8")
-    return bin_dir, log_path
-
-
-class ConnectorMockHandler(BaseHTTPRequestHandler):
-    requests: list[dict[str, object]] = []
-    marker: str = ""
-
-    def do_POST(self) -> None:  # noqa: N802
-        body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
-        record = {"path": self.path, "headers": dict(self.headers), "body": json.loads(body) if body else {}}
-        self.__class__.requests.append(record)
-        if self.path == "/slack/api/search.messages":
-            matches = [{"ts": "1710000000.000123", "channel": {"id": "C123"}, "permalink": "https://slack.example/existing"}] if self.__class__.marker else []
-            response = {"ok": True, "messages": {"matches": matches}}
-        elif self.path == "/linear/graphql":
-            response = {"data": {"issueCreate": {"success": True, "issue": {"id": "LIN-1", "identifier": "ENG-1", "url": "https://linear.example/ENG-1"}}}}
-        elif self.path == "/notion/v1/pages":
-            response = {"id": "notion-page-1", "url": "https://notion.example/page-1"}
-        elif self.path == "/figma/v1/files/FILE1/comments":
-            response = {"id": "figma-comment-1", "file_key": "FILE1", "created_at": "2026-01-01T00:00:00Z"}
-        elif self.path == "/slack/api/chat.postMessage":
-            response = {"ok": True, "channel": "C123", "ts": "1710000000.000100", "permalink": "https://slack.example/archives/C123/p1710000000000100"}
-        else:
-            response = {"id": "unknown", "url": "https://example.invalid/unknown"}
-        data = json.dumps(response).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
-
-
-class ConnectorMockServer:
-    def __init__(self, *, marker: str = "") -> None:
-        self.marker = marker
-
-    def __enter__(self) -> "ConnectorMockServer":
-        ConnectorMockHandler.requests = []
-        ConnectorMockHandler.marker = self.marker
-        self.server = HTTPServer(("127.0.0.1", 0), ConnectorMockHandler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.server.shutdown()
-        self.thread.join(timeout=5)
-        self.server.server_close()
-
-    @property
-    def base_url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    @property
-    def requests(self) -> list[dict[str, object]]:
-        return ConnectorMockHandler.requests
-
-
 def db_rows(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
     with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(query, params).fetchall()
 
 
-def accept_task_via_cli(root: Path, task_id: str) -> None:
-    review = run_harness(root, "task", "review", task_id, "--agent", "qa-reviewer", "--expected-revision", task_revision(root, task_id))
-    token = stdout_field(review.stdout, "token")
-    fence = stdout_field(review.stdout, "fence")
-    run_harness(
-        root,
-        "task",
-        "accept",
-        task_id,
-        "--agent",
-        "qa-reviewer",
-        "--lease-token",
-        token,
-        "--expected-revision",
-        task_revision(root, task_id),
-        "--fence",
-        fence,
-        "--evidence",
-        "fixture review accepted",
-    )
+def active_table_contract(root: Path) -> tuple[list[str], bool]:
+    """Return unexpected tables and exact schema-30 inventory status."""
 
-
-def add_file_claim(root: Path, run_id: str, task_id: str, agent: str, path: str, worktree_path: str, branch_name: str) -> None:
-    import harness_db
-
-    harness_db.dispatch_file_claim_add(root, task_id, agent, path, run_id=run_id, worktree_path=worktree_path, branch_name=branch_name)
-
-
-def collect_and_verify(root: Path, run_id: str, branches: dict[str, str]) -> None:
-    run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture", "--max-concurrency", str(len(branches)))
-    sessions = db_rows(root, "select task_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))
-    for session in sessions:
-        fixture_report(root, run_id, session["task_id"], branches[session["task_id"]])
-    run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
-    for task_id in branches:
-        run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", task_id)
-
-
-@contextmanager
-def integration_candidate(root: Path, run_id: str, branches: dict[str, str]):
-    original_branch = run_git(root, "branch", "--show-current")
-    preview_branch = f"e2e-preview/{run_id}"
-    subprocess.run(["git", "switch", "-C", preview_branch, original_branch], cwd=root, check=True, capture_output=True)
-    try:
-        for branch in branches.values():
-            merge = subprocess.run(
-                ["git", "merge", "--no-ff", "--no-edit", branch],
-                cwd=root,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if merge.returncode != 0:
-                raise AssertionError(merge.stdout + merge.stderr)
-        yield
-    finally:
-        subprocess.run(["git", "switch", original_branch], cwd=root, check=True, capture_output=True)
-        subprocess.run(["git", "branch", "-D", preview_branch], cwd=root, check=False, capture_output=True)
-
-
-def record_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> list[str]:
-    with integration_candidate(root, run_id, branches):
-        evidence_id = run_harness(
+    tables = {
+        str(row[0])
+        for row in db_rows(
             root,
-            "dispatch",
-            "run",
-            "--agent",
-            "controller",
-            "--target",
-            "UNIT",
-            "--command",
-            TEST_COMMAND,
-        ).stdout.strip().rsplit(" ", 1)[-1]
-        run_harness(
-            root,
-            "validation",
-            "record",
-            "--surface",
-            "Agent E2E integration candidate",
-            "--acceptance",
-            "AC1",
-            "--commands",
-            TEST_COMMAND,
-            "--findings",
-            "passed",
-            "--result",
-            "pass",
-            "--evidence",
-            evidence_id,
-            "--target",
-            "UNIT",
+            "select name from sqlite_master where type='table'",
         )
-        run_harness(
-            root,
-            "gate",
-            "record",
-            "--reviewer-context",
-            "same-context-degraded",
-            "--result",
-            "pass",
-            "--commands",
-            TEST_COMMAND,
-            "--evidence",
-            "integration candidate independently reviewed",
-        )
-        validation = run_harness(root, "validate", "--delivery", check=False)
-        if validation.returncode == 0:
-            return []
-        return [line for line in (validation.stdout + validation.stderr).splitlines() if line.strip()]
-
-
-def record_failing_integration_candidate_gate(root: Path, run_id: str, branches: dict[str, str]) -> dict[str, Any]:
-    with integration_candidate(root, run_id, branches):
-        execution = run_harness(
-            root,
-            "dispatch",
-            "run",
-            "--agent",
-            "controller",
-            "--target",
-            "UNIT",
-            "--command",
-            TEST_COMMAND,
-            check=False,
-        )
-        output = execution.stdout + execution.stderr
-        if "evidence=" not in output:
-            raise AssertionError(f"failed controller execution did not record evidence: {output}")
-        evidence_id = output.split("evidence=", 1)[1].split(None, 1)[0].strip()
-        evidence = db_rows(root, "select * from evidence where id = ?", (evidence_id,))[0]
-        artifact = root / evidence["artifact_path"]
-        test_output = artifact.read_text(encoding="utf-8", errors="replace")
-        run_harness(
-            root,
-            "validation",
-            "record",
-            "--surface",
-            "Agent E2E merged regression candidate",
-            "--acceptance",
-            "AC1",
-            "--commands",
-            TEST_COMMAND,
-            "--findings",
-            "merged candidate test failed",
-            "--result",
-            "fail",
-            "--evidence",
-            evidence_id,
-            "--target",
-            "UNIT",
-        )
-        run_harness(
-            root,
-            "gate",
-            "record",
-            "--reviewer-context",
-            "same-context-degraded",
-            "--result",
-            "fail",
-            "--commands",
-            TEST_COMMAND,
-            "--evidence",
-            "merged candidate regression observed",
-            "--blocking-findings",
-            "merged integration test failed",
-        )
-        validation = run_harness(root, "validate", "--delivery", check=False)
-        return {
-            "test_exit_code": int(evidence["exit_code"]),
-            "executed_count": int(evidence["executed_count"]),
-            "executed_count_source": evidence["executed_count_source"],
-            "test_output_tail": test_output[-2000:],
-            "preintegration_validation": (validation.stdout + validation.stderr)[-2000:],
-        }
-
-
-def wait_for_provider_collect(root: Path, run_id: str, *, expected: str = "collected 1 provider report", timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
-    deadline = time.perf_counter() + timeout
-    result = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
-    while time.perf_counter() < deadline:
-        if expected in result.stdout:
-            return result
-        time.sleep(0.1)
-        result = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
-    return result
+    }
+    expected = set(SCHEMA30_CATALOG_TABLES)
+    return sorted(tables - expected), tables == expected
 
 
 def scenario_result(
@@ -630,6 +134,328 @@ def scenario_result(
     }
 
 
+NATIVE_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+LIVE_WORKLOAD_FAMILY = "isolated-one-file-value-flip-v1"
+LIVE_WORKLOAD_UNIT_SHA256 = hashlib.sha256(
+    b"one exclusive Python module: VALUE before-to-after; immutable one-file unittest"
+).hexdigest()
+NATIVE_TOKEN_SCOPE = "native-producers-only"
+REPORT_VERSION = 1
+REPORT_MODES = frozenset(
+    {"fixture", "stability", "live-codex", "live-codex-parallel"}
+)
+LOCAL_SCENARIO_CONTRACT: dict[str, tuple[str, str]] = {
+    "fresh_local_install_and_init": ("cold-start", "local"),
+    "quickstart_stops_before_independent_review": ("quickstart", "local"),
+    "current_candidate_supersedes_stale_validation": ("candidate", "local"),
+    "manual_evidence_cannot_satisfy_delivery": ("trust", "local"),
+    "open_high_finding_blocks_delivery": ("findings", "local"),
+    "high_risk_requires_human_review": ("trust", "local"),
+    "structured_and_no_network_policy_fail_closed": ("execution-policy", "local"),
+    "cycle_isolation": ("cycle", "local"),
+    "sqlite_contention_stress": ("sqlite", "local"),
+    "schema27_29_migration_and_rollback": ("migration", "local"),
+    "installed_plugin_surface": ("installation", "local"),
+}
+EXPECTED_CODEX_CLI_VERSION = (
+    "codex-cli "
+    + str(json.loads((ROOT / "release.json").read_text(encoding="utf-8"))["codex_cli_smoke_version"])
+)
+PARALLEL_PRODUCER_CONTRACT: dict[str, dict[str, object]] = {
+    "LIVE-P1": {
+        "exclusive_files": ["alpha.py"],
+        "changed_files": ["alpha.py"],
+        "scope_valid": True,
+        "test_file_unchanged": True,
+        "capability_hint": "fast",
+        "context_id": "native-alpha-producer",
+        "target": "LIVE-ALPHA",
+        "acceptance": "LIVE-AC-A",
+        "returncode": 0,
+        "token_source": "codex-json-turn.completed",
+        "last_message_recorded": True,
+        "error": "",
+    },
+    "LIVE-P2": {
+        "exclusive_files": ["beta.py"],
+        "changed_files": ["beta.py"],
+        "scope_valid": True,
+        "test_file_unchanged": True,
+        "capability_hint": "fast",
+        "context_id": "native-beta-producer",
+        "target": "LIVE-BETA",
+        "acceptance": "LIVE-AC-B",
+        "returncode": 0,
+        "token_source": "codex-json-turn.completed",
+        "last_message_recorded": True,
+        "error": "",
+    },
+}
+
+
+def parse_native_usage_jsonl(output: str) -> dict[str, int] | None:
+    """Read the Codex JSONL turn-completion usage event, never assistant text."""
+
+    completed: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed":
+            completed.append(event)
+    if len(completed) != 1:
+        return None
+    usage = completed[0].get("usage")
+    if not isinstance(usage, dict):
+        return None
+    normalized: dict[str, int] = {}
+    for field in NATIVE_USAGE_FIELDS:
+        value = usage.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        normalized[field] = value
+    if normalized["cached_input_tokens"] > normalized["input_tokens"]:
+        return None
+    if normalized["reasoning_output_tokens"] > normalized["output_tokens"]:
+        return None
+    normalized["token_count"] = normalized["input_tokens"] + normalized["output_tokens"]
+    return normalized
+
+
+def normalize_live_eval_path(value: object) -> str:
+    raw = str(value).replace("\\", "/")
+    path = PurePosixPath(raw)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"unsafe live eval path: {raw}")
+    normalized = PurePosixPath(*(part for part in path.parts if part not in {"", "."})).as_posix()
+    if not normalized or normalized == ".":
+        raise ValueError(f"unsafe live eval path: {raw}")
+    return normalized
+
+
+def live_eval_scope_conflicts(producers: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Return overlapping write scopes before an opt-in parallel Host eval starts."""
+
+    owners: dict[str, list[str]] = {}
+    invalid: dict[str, list[str]] = {}
+    for producer in producers:
+        task = str(producer["task"])
+        for value in producer.get("exclusive_files", []):
+            try:
+                relative = normalize_live_eval_path(value)
+            except ValueError:
+                invalid.setdefault(f"<invalid:{value}>", []).append(task)
+                continue
+            owners.setdefault(relative, []).append(task)
+    conflicts = {
+        relative: tasks
+        for relative, tasks in sorted(owners.items())
+        if len(set(tasks)) > 1
+    }
+    conflicts.update(invalid)
+    return conflicts
+
+
+VERBOSE_NATIVE_OUTPUT_KEYS = {
+    "native_stdout_tail",
+    "native_stderr_tail",
+    "controller_verify_output",
+    "stdout_tail",
+    "stderr_tail",
+}
+REPORT_KEYS = frozenset(
+    {
+        "report_version",
+        "mode",
+        "evaluation_source",
+        "live_skipped",
+        "live_status",
+        "matrix",
+        "native_host",
+        "evidence_scope",
+        "token_count",
+        "token_usage",
+        "estimated_cost",
+        "agent_runtime_seconds",
+        "summary",
+        "scenarios",
+    }
+)
+SUMMARY_KEYS = frozenset(
+    {
+        "scenario_count",
+        "passed_count",
+        "failed_count",
+        "skipped_count",
+        "scenario_pass_rate",
+        "false_pass_count",
+        "forged_evidence_block_count",
+        "expected_human_review_required_count",
+        "sqlite_lock_error_count",
+        "human_intervention_count",
+        "duration_seconds",
+    }
+)
+SUMMARY_INTEGER_FIELDS = frozenset(
+    {
+        "scenario_count",
+        "passed_count",
+        "failed_count",
+        "skipped_count",
+        "false_pass_count",
+        "forged_evidence_block_count",
+        "expected_human_review_required_count",
+        "sqlite_lock_error_count",
+        "human_intervention_count",
+    }
+)
+EVALUATION_SOURCE_KEYS = frozenset(
+    {
+        "generated_at",
+        "git_head",
+        "git_dirty",
+        "workspace_sha256",
+        "status_sha256",
+        "status_entry_count",
+        "source_scope",
+    }
+)
+MATRIX_KEYS = frozenset(
+    {
+        "profile",
+        "platform",
+        "python_version",
+        "git_version",
+        "codex_available",
+        "container_available",
+        "sqlite_stress",
+        "live_skipped_reasons",
+    }
+)
+NATIVE_HOST_KEYS = frozenset({"resolved_path", "sha256", "source", "trust"})
+SCENARIO_KEYS = frozenset(
+    {"name", "category", "mode", "pass", "duration_seconds", "skip_reason", "details"}
+)
+USAGE_KEYS = frozenset({*NATIVE_USAGE_FIELDS, "token_count"})
+COMMON_PASSING_LIVE_DETAIL_KEYS = frozenset(
+    {
+        "capability_status",
+        "codex_version",
+        "pre_edit_returncode",
+        "native_runtime_seconds",
+        "native_runtime_source",
+        "native_usage",
+        "native_token_count",
+        "native_token_source",
+        "native_token_scope",
+        "workload_family",
+        "workload_unit_sha256",
+        "workload_units",
+        "changed_files",
+        "integrated_files",
+        "controller_state_unchanged_during_native",
+        "execution_count",
+        "validation_count",
+        "retired_host_tables",
+        "provider_surface_absent",
+        "human_intervention_count",
+        "false_pass_count",
+    }
+)
+SINGLE_PASSING_DETAIL_KEYS = COMMON_PASSING_LIVE_DETAIL_KEYS | frozenset(
+    {
+        "native_returncode",
+        "exclusive_files",
+        "producer_changed_files",
+        "producer_scope_valid",
+        "producer_workspace_isolated",
+        "test_file_unchanged",
+        "controller_test_unchanged",
+        "controller_verify_returncode",
+        "controller_verify_status",
+        "controller_verify_output",
+        "task_submit_returncode",
+        "task_status",
+        "last_message_recorded",
+        "native_stdout_tail",
+        "native_stderr_tail",
+    }
+)
+PARALLEL_PASSING_DETAIL_KEYS = COMMON_PASSING_LIVE_DETAIL_KEYS | frozenset(
+    {
+        "producer_count",
+        "producers",
+        "producer_overlap_seconds",
+        "producer_attribution_valid",
+        "scope_enforcement",
+        "test_files_unchanged",
+        "targeted_verify_returncodes",
+        "producer_state_returncodes",
+        "integration_start_returncode",
+        "combined_verify_returncode",
+        "combined_verify_status",
+        "integration_submit_returncode",
+        "integration_dependency_blocked_before_producers",
+        "task_statuses",
+        "scope_conflicts",
+        "overlap_policy",
+    }
+)
+PARALLEL_PRODUCER_KEYS = frozenset(
+    {
+        "task",
+        "exclusive_files",
+        "changed_files",
+        "scope_valid",
+        "test_file_unchanged",
+        "capability_hint",
+        "context_id",
+        "target",
+        "acceptance",
+        "returncode",
+        "runtime_seconds",
+        "native_usage",
+        "token_count",
+        "token_source",
+        "stdout_tail",
+        "stderr_tail",
+        "last_message_recorded",
+        "error",
+        "started_offset_seconds",
+        "finished_offset_seconds",
+    }
+)
+
+
+def _unexpected_key_errors(
+    prefix: str,
+    value: dict[str, Any],
+    allowed: frozenset[str],
+) -> list[str]:
+    unexpected = sorted(set(value) - allowed)
+    return [f"{prefix} contains unsupported fields: {','.join(unexpected)}"] if unexpected else []
+
+
+def compact_evidence_report(value: Any) -> Any:
+    """Remove verbose Native Host output while preserving result and telemetry facts."""
+
+    if isinstance(value, dict):
+        return {
+            key: compact_evidence_report(item)
+            for key, item in value.items()
+            if key not in VERBOSE_NATIVE_OUTPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [compact_evidence_report(item) for item in value]
+    return value
+
+
 def skipped_scenario(name: str, reason: str, *, category: str, mode: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -642,12 +468,540 @@ def skipped_scenario(name: str, reason: str, *, category: str, mode: str) -> dic
     }
 
 
-def command_version(command: list[str]) -> str:
+def command_version(command: list[str], *, env: dict[str, str] | None = None) -> str:
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=5)
+        result = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return (result.stdout or result.stderr).strip().splitlines()[0] if (result.stdout or result.stderr).strip() else ""
+
+
+EVALUATION_SOURCE_PREFIXES = ("kafa/", "plugins/", "tests/", "benchmarks/")
+EVALUATION_SOURCE_FILES = {
+    ".gitattributes",
+    "VERSION",
+    "release.json",
+    "pyproject.toml",
+    "docs/runtime/fresh-skill-eval-prompts.md",
+    "docs/runtime/skill-eval-transcript-fixture.txt",
+}
+
+
+def _in_evaluation_source_scope(relative: str) -> bool:
+    return relative in EVALUATION_SOURCE_FILES or relative.startswith(EVALUATION_SOURCE_PREFIXES)
+
+
+def _is_evaluation_cache_path(relative: str) -> bool:
+    parts = Path(relative).parts
+    return "__pycache__" in parts or ".pytest_cache" in parts
+
+
+def _git_blob_oid(content: bytes, object_format: str) -> str:
+    digest = hashlib.new(object_format)
+    digest.update(f"blob {len(content)}\0".encode("ascii"))
+    digest.update(content)
+    return digest.hexdigest()
+
+
+def _absolute_path_flavor(value: str) -> str | None:
+    if not value or "\0" in value:
+        return None
+    windows_path = PureWindowsPath(value)
+    if windows_path.is_absolute() and windows_path.name:
+        return "windows"
+    posix_path = PurePosixPath(value)
+    if posix_path.is_absolute() and posix_path.name:
+        return "posix"
+    return None
+
+
+def _is_cross_platform_absolute_path(value: str) -> bool:
+    return _absolute_path_flavor(value) is not None
+
+
+def _source_identity_git_environment(root: Path = ROOT) -> dict[str, str]:
+    """Return a Git environment isolated from ambient repository overrides."""
+
+    return isolated_git_environment(work_tree=root)
+
+
+def _invalid_evaluation_source_identity() -> dict[str, Any]:
+    return {
+        "generated_at": now_iso(),
+        "git_head": "",
+        "git_dirty": None,
+        "workspace_sha256": "",
+        "status_sha256": "",
+        "status_entry_count": 0,
+        "source_scope": [],
+    }
+
+
+def evaluation_source_identity(root: Path = ROOT) -> dict[str, Any]:
+    """Bind a report to actual executable bytes without running Git content filters."""
+
+    root = root.resolve()
+    git_environment = _source_identity_git_environment(root)
+    try:
+        head = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "rev-parse", "--verify", "HEAD"],
+            cwd=root,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout.strip()
+        listed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "ls-files",
+                "--cached",
+                "--others",
+                "-z",
+            ],
+            cwd=root,
+            env=git_environment,
+            capture_output=True,
+            check=True,
+        ).stdout.split(b"\0")
+        staged = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+            cwd=root,
+            env=git_environment,
+            capture_output=True,
+            check=True,
+        ).stdout.split(b"\0")
+        object_format = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "rev-parse", "--show-object-format"],
+            cwd=root,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        head_tree = (
+            subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "ls-tree", "-r", "-z", "HEAD"],
+                cwd=root,
+                env=git_environment,
+                capture_output=True,
+                check=True,
+            ).stdout.split(b"\0")
+            if head
+            else []
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return _invalid_evaluation_source_identity()
+    if object_format not in {"sha1", "sha256"}:
+        return _invalid_evaluation_source_identity()
+    tracked_entries: dict[bytes, tuple[bytes, str]] = {}
+    unmerged_paths: set[bytes] = set()
+    for raw_entry in (entry for entry in staged if entry):
+        try:
+            metadata, raw_relative = raw_entry.split(b"\t", 1)
+            mode, object_id, stage = metadata.split(b" ", 2)
+        except ValueError:
+            return _invalid_evaluation_source_identity()
+        if stage == b"0":
+            tracked_entries[raw_relative] = (mode, object_id.decode("ascii"))
+        else:
+            unmerged_paths.add(raw_relative)
+
+    head_entries: dict[bytes, tuple[bytes, str]] = {}
+    for raw_entry in (entry for entry in head_tree if entry):
+        try:
+            metadata, raw_relative = raw_entry.split(b"\t", 1)
+            mode, _object_type, object_id = metadata.split(b" ", 2)
+        except ValueError:
+            return _invalid_evaluation_source_identity()
+        head_entries[raw_relative] = (mode, object_id.decode("ascii"))
+
+    scoped_unmerged = {
+        raw_relative
+        for raw_relative in unmerged_paths
+        if _in_evaluation_source_scope(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+        and not _is_evaluation_cache_path(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+    }
+    if scoped_unmerged:
+        return _invalid_evaluation_source_identity()
+
+    for entries in (tracked_entries, head_entries):
+        for raw_relative, (mode, _object_id) in entries.items():
+            relative = raw_relative.decode("utf-8", errors="surrogateescape")
+            if (
+                _in_evaluation_source_scope(relative)
+                and not _is_evaluation_cache_path(relative)
+                and mode not in {b"100644", b"100755"}
+            ):
+                return _invalid_evaluation_source_identity()
+
+    required_objects = {
+        object_id
+        for entries in (tracked_entries, head_entries)
+        for raw_relative, (mode, object_id) in entries.items()
+        if mode in {b"100644", b"100755"}
+        and _in_evaluation_source_scope(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+        and not _is_evaluation_cache_path(
+            raw_relative.decode("utf-8", errors="surrogateescape")
+        )
+    }
+    if not git_blob_objects_available(
+        root,
+        required_objects,
+        environment=git_environment,
+    ):
+        return _invalid_evaluation_source_identity()
+
+    source_entries: list[tuple[bytes, bytes, bytes, str, str]] = []
+    for raw_relative in sorted(relative for relative in listed if relative):
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        if not _in_evaluation_source_scope(relative):
+            continue
+        if _is_evaluation_cache_path(relative):
+            continue
+        path = root / relative
+        tracked = tracked_entries.get(raw_relative)
+        if (
+            path.is_symlink()
+            or (tracked is not None and tracked[0] not in {b"100644", b"100755"})
+            or (path.exists() and not path.is_file())
+        ):
+            return _invalid_evaluation_source_identity()
+        if not path.is_file():
+            continue
+        content = path.read_bytes()
+        actual_mode = b"100755" if path.stat().st_mode & 0o111 else b"100644"
+        workspace_mode = (
+            tracked[0] if os.name == "nt" and tracked is not None else actual_mode
+        )
+        source_entries.append(
+            (
+                raw_relative,
+                workspace_mode,
+                actual_mode,
+                hashlib.sha256(content).hexdigest(),
+                _git_blob_oid(content, object_format),
+            )
+        )
+    actual_entries: dict[bytes, tuple[bytes, str]] = {}
+    for (
+        raw_relative,
+        workspace_mode,
+        actual_mode,
+        runtime_sha256,
+        actual_object_id,
+    ) in source_entries:
+        actual_entries[raw_relative] = (actual_mode, actual_object_id)
+    workspace_sha256 = framed_source_digest(
+        (raw_relative, workspace_mode, runtime_sha256)
+        for raw_relative, workspace_mode, _actual_mode, runtime_sha256, _actual_object_id
+        in source_entries
+    )
+
+    status_lines: list[str] = []
+    all_paths = set(head_entries) | set(tracked_entries) | set(actual_entries) | unmerged_paths
+    for raw_relative in sorted(all_paths):
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        if not _in_evaluation_source_scope(relative) or _is_evaluation_cache_path(relative):
+            continue
+        if raw_relative in unmerged_paths:
+            status_lines.append(f"UU {relative}")
+            continue
+        head_entry = head_entries.get(raw_relative)
+        index_entry = tracked_entries.get(raw_relative)
+        actual_entry = actual_entries.get(raw_relative)
+        if head_entry is None and index_entry is None and actual_entry is not None:
+            status_lines.append(f"?? {relative}")
+            continue
+        if head_entry is None and index_entry is not None:
+            index_status = "A"
+        elif head_entry is not None and index_entry is None:
+            index_status = "D"
+        elif head_entry != index_entry:
+            index_status = "M"
+        else:
+            index_status = " "
+        if index_entry is None:
+            worktree_status = "?" if actual_entry is not None else " "
+        elif actual_entry is None:
+            worktree_status = "D"
+        else:
+            actual_mode, actual_object_id = actual_entry
+            mode_changed = (
+                os.name != "nt"
+                and index_entry[0] in {b"100644", b"100755"}
+                and actual_mode != index_entry[0]
+            )
+            worktree_status = (
+                "M" if actual_object_id != index_entry[1] or mode_changed else " "
+            )
+        if index_status != " " or worktree_status != " ":
+            status_lines.append(f"{index_status}{worktree_status} {relative}")
+    status = "\n".join(status_lines) + ("\n" if status_lines else "")
+    return {
+        "generated_at": now_iso(),
+        "git_head": head,
+        "git_dirty": bool(status_lines),
+        "workspace_sha256": workspace_sha256,
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "status_entry_count": len(status_lines),
+        "source_scope": [*EVALUATION_SOURCE_PREFIXES, *sorted(EVALUATION_SOURCE_FILES)],
+    }
+
+
+def _copy_evaluation_source_scope(source_root: Path, snapshot_root: Path) -> None:
+    def ignore_generated(_directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name in {"__pycache__", ".pytest_cache"}
+        }
+
+    for prefix in EVALUATION_SOURCE_PREFIXES:
+        source = source_root / prefix.rstrip("/")
+        if not source.exists():
+            continue
+        shutil.copytree(
+            source,
+            snapshot_root / prefix.rstrip("/"),
+            copy_function=shutil.copy2,
+            symlinks=True,
+            ignore=ignore_generated,
+        )
+    for relative in EVALUATION_SOURCE_FILES:
+        source = source_root / relative
+        if not source.is_file() or source.is_symlink():
+            continue
+        destination = snapshot_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _tracked_evaluation_modes(root: Path) -> dict[str, bytes]:
+    environment = _source_identity_git_environment(root)
+    try:
+        entries = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        ).stdout.split(b"\0")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot capture evaluation source index modes") from exc
+    modes: dict[str, bytes] = {}
+    for entry in (value for value in entries if value):
+        try:
+            metadata, raw_relative = entry.split(b"\t", 1)
+            mode, _object_id, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise RuntimeError("malformed evaluation source index entry") from exc
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        if stage == b"0" and _in_evaluation_source_scope(relative):
+            modes[relative] = mode
+    return modes
+
+
+@contextmanager
+def pinned_evaluation_source(
+    root: Path,
+    expected_identity: dict[str, Any],
+) -> Any:
+    """Run controller subprocesses from a start-identity-verified private snapshot."""
+
+    root = root.resolve()
+    expected_workspace = expected_identity.get("workspace_sha256")
+    if not isinstance(expected_workspace, str) or len(expected_workspace) != 64:
+        raise RuntimeError("live evaluation source identity is unavailable at profile start")
+    tracked_modes = _tracked_evaluation_modes(root)
+    with tempfile.TemporaryDirectory(prefix="kafa-controller-source-") as temp:
+        snapshot_root = Path(temp) / "source"
+        snapshot_root.mkdir()
+        _copy_evaluation_source_scope(root, snapshot_root)
+        init_environment = isolated_git_environment()
+        init_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        )
+        empty_template = Path(temp) / "empty-git-template"
+        empty_template.mkdir()
+        subprocess.run(
+            ["git", "init", f"--template={empty_template}"],
+            cwd=snapshot_root,
+            env=init_environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        snapshot_environment = isolated_git_environment(work_tree=snapshot_root)
+        snapshot_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        )
+        for snapshot_path in sorted(snapshot_root.rglob("*")):
+            relative = snapshot_path.relative_to(snapshot_root).as_posix()
+            if relative == ".git" or relative.startswith(".git/"):
+                continue
+            if not _in_evaluation_source_scope(relative) or _is_evaluation_cache_path(
+                relative
+            ):
+                continue
+            if snapshot_path.is_symlink() or (
+                snapshot_path.exists() and not snapshot_path.is_file()
+            ):
+                if snapshot_path.is_dir() and not snapshot_path.is_symlink():
+                    continue
+                raise RuntimeError(
+                    f"private controller snapshot contains unsafe source: {relative}"
+                )
+            if not snapshot_path.is_file():
+                continue
+            mode = tracked_modes.get(relative)
+            if mode is None:
+                mode = (
+                    b"100755"
+                    if snapshot_path.stat().st_mode & 0o111
+                    else b"100644"
+                )
+            if mode not in {b"100644", b"100755"}:
+                raise RuntimeError(
+                    f"unsupported tracked evaluation source mode: {relative} {mode!r}"
+                )
+            object_id = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=snapshot_root,
+                env=snapshot_environment,
+                input=snapshot_path.read_bytes(),
+                capture_output=True,
+                check=True,
+            ).stdout.decode("ascii").strip()
+            subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"{mode.decode('ascii')},{object_id},{relative}",
+                ],
+                cwd=snapshot_root,
+                env=snapshot_environment,
+                check=True,
+                capture_output=True,
+            )
+        snapshot_identity = evaluation_source_identity(snapshot_root)
+        if snapshot_identity.get("workspace_sha256") != expected_workspace:
+            raise RuntimeError(
+                "live evaluation source changed while the controller snapshot was captured"
+            )
+        pinned_harness = (
+            snapshot_root
+            / "plugins/codex-project-harness/scripts/harness.py"
+        )
+        if not pinned_harness.is_file() or pinned_harness.is_symlink():
+            raise RuntimeError("private controller snapshot is missing a safe harness.py")
+        token = _CONTROLLER_HARNESS.set(pinned_harness)
+        try:
+            yield pinned_harness
+        finally:
+            _CONTROLLER_HARNESS.reset(token)
+
+
+def _evaluation_identity_matches(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+) -> bool:
+    return all(
+        expected.get(field) == actual.get(field)
+        for field in (
+            "git_head",
+            "git_dirty",
+            "workspace_sha256",
+            "status_sha256",
+            "status_entry_count",
+            "source_scope",
+        )
+    )
+
+
+def _source_failure_report(
+    mode: str,
+    scenario_name: str,
+    started: float,
+    identity: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    report = summarize(
+        mode,
+        [
+            scenario_result(
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "failed", "reason": reason},
+                category=mode,
+                mode=mode,
+            )
+        ],
+        started,
+        live_status="failed",
+    )
+    report["evaluation_source"] = identity
+    return report
+
+
+def _run_pinned_live_profile(
+    *,
+    mode: str,
+    scenario_name: str,
+    enable_env: str,
+    runner: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    if os.environ.get(enable_env) != "1":
+        return runner()
+    started = time.perf_counter()
+    start_identity = evaluation_source_identity()
+    try:
+        with pinned_evaluation_source(ROOT, start_identity):
+            report = runner()
+    except Exception as exc:
+        return _source_failure_report(
+            mode,
+            scenario_name,
+            started,
+            start_identity,
+            str(exc),
+        )
+    end_identity = evaluation_source_identity()
+    report["evaluation_source"] = start_identity
+    if not _evaluation_identity_matches(start_identity, end_identity):
+        return _source_failure_report(
+            mode,
+            scenario_name,
+            started,
+            start_identity,
+            "evaluation source changed before profile completion",
+        )
+    return report
 
 
 def matrix_info(profile: str, *, live_skipped_reasons: list[str] | None = None) -> dict[str, Any]:
@@ -656,454 +1010,493 @@ def matrix_info(profile: str, *, live_skipped_reasons: list[str] | None = None) 
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "git_version": command_version(["git", "--version"]),
-        "codex_available": bool(live_codex_binary()) if profile == "live-codex" else shutil.which("codex") is not None,
+        "codex_available": bool(live_codex_binary()) if profile.startswith("live-codex") else shutil.which("codex") is not None,
         "container_available": shutil.which("docker") is not None or shutil.which("podman") is not None,
-        "connector_mock": profile == "stability",
         "sqlite_stress": profile == "stability",
         "live_skipped_reasons": live_skipped_reasons or [],
     }
 
 
-def scenario_parallel_success() -> dict[str, Any]:
+def _scalar(root: Path, query: str, params: tuple[object, ...] = ()) -> object:
+    rows = db_rows(root, query, params)
+    if not rows:
+        raise AssertionError(f"query returned no rows: {query}")
+    return rows[0][0]
+
+
+def _require_ok(result: subprocess.CompletedProcess[str]) -> None:
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+
+
+def _write_passing_unittest(root: Path, name: str = "test_candidate.py") -> None:
+    (root / name).write_text(
+        "import unittest\n\n"
+        "class CandidateTest(unittest.TestCase):\n"
+        "    def test_candidate(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scenario_fresh_local_install_and_init() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        init_git_repo(root)
-        add_unittest(root)
-        run_id = setup_basic_harness(root, ["T1", "T2"])
-        sessions = db_rows(root, "select da.task_id, t.owner as agent_id from dispatch_assignments da join tasks t on t.id = da.task_id where run_id = ? order by da.task_id", (run_id,))
-        branches: dict[str, str] = {}
-        for session, file_name, content in zip(sessions, ["a.txt", "b.txt"], ["A\n", "B\n"], strict=True):
-            branch = f"agent/{run_id}/{session['task_id']}/{session['agent_id']}"
-            head, tree, worktree = commit_branch(root, branch, file_name, content)
-            branches[session["task_id"]] = branch
-            add_file_claim(root, run_id, session["task_id"], session["agent_id"], file_name, worktree, branch)
-        collect_and_verify(root, run_id, branches)
-        for task_id in branches:
-            accept_task_via_cli(root, task_id)
-        delivery_validation_issues = record_integration_candidate_gate(root, run_id, branches)
-        integrate = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
-        target = integrate.stdout.strip().rsplit(" ", 1)[-1] if integrate.returncode == 0 else ""
-        integrated_a = bool(target) and run_git(root, "show", f"{target}:a.txt") == "A"
-        integrated_b = bool(target) and run_git(root, "show", f"{target}:b.txt") == "B"
-        status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        return scenario_result(
-            "parallel_success",
-            started,
-            not delivery_validation_issues and integrate.returncode == 0 and integrated_a and integrated_b and status == "integrated",
-            {
-                "run_id": run_id,
-                "target_branch": target,
-                "integrate_via_public_cli": True,
-                "integrate_returncode": integrate.returncode,
-                "delivery_validation_issues": delivery_validation_issues,
-                "integrate_stdout_tail": integrate.stdout[-1000:],
-                "integrate_stderr_tail": integrate.stderr[-1000:],
-            },
-        )
-
-
-def scenario_dependency_blocked() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
-        run_harness(root, "init")
-        run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Dependency acceptance")
-        run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
-        run_harness(root, "task", "add", "--id", "T1", "--task", "Prerequisite", "--owner", "prereq", "--acceptance", "AC1")
-        run_harness(root, "task", "add", "--id", "T2", "--task", "Dependent", "--owner", "developer", "--acceptance", "AC1", "--depends-on", "T1")
-        run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
-        run_harness(root, "test-target", "link", "--task", "T2", "--target", "UNIT")
-        run_id = run_harness(root, "dispatch", "plan", "--scope", "Dependency").stdout.strip().split()[-1]
-        planned = [row["task_id"] for row in db_rows(root, "select task_id from dispatch_assignments where run_id = ? order by task_id", (run_id,))]
-        run_harness(root, "dispatch", "export-csv", run_id)
-        input_csv = root / ".ai-team/runtime/codex-fanout" / run_id / "input.csv"
-        with input_csv.open(encoding="utf-8") as handle:
-            exported = [row["item_id"] for row in csv.DictReader(handle)]
-        provider = run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture")
-        claim = run_harness(root, "dispatch", "claim-next", "--agent", "developer", check=False)
-        ok = planned == ["T1"] and exported == ["T1"] and "started 1 provider session" in provider.stdout and claim.returncode != 0
-        return scenario_result("dependency_blocked", started, ok, {"planned": planned, "exported": exported, "claim_returncode": claim.returncode})
-
-
-def scenario_same_file_conflict() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
-        run_harness(root, "init")
-        first = run_harness(root, "dispatch", "file-claim", "add", "--task", "T1", "--agent", "developer", "--path", "shared.py")
-        second = run_harness(root, "dispatch", "file-claim", "add", "--task", "T2", "--agent", "qa-reviewer", "--path", "shared.py", check=False)
-        claims = db_rows(root, "select task_id, path from task_file_claims where status = 'active'")
-        ok = first.returncode == 0 and second.returncode != 0 and "file-claim-conflict" in second.stdout and len(claims) == 1
-        return scenario_result("same_file_conflict", started, ok, {"active_claims": len(claims)})
-
-
-def scenario_forged_evidence_blocked() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
-        init_git_repo(root)
-        add_unittest(root)
-        run_id = setup_basic_harness(root, ["T1"])
-        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture")
-        session = db_rows(root, "select task_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
-        commit_branch(root, session["branch_name"], "agent.txt", "work\n")
-        fixture_report(root, run_id, "T1", session["branch_name"])
-        run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id)
-        delivery = run_harness(root, "validate", "--delivery", check=False)
-        evidence_count = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
-        ok = delivery.returncode != 0 and evidence_count == 0
-        return scenario_result("forged_evidence_blocked", started, ok, {"delivery_returncode": delivery.returncode, "controller_evidence_count": evidence_count})
-
-
-def scenario_integration_regression_blocked() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
-        init_git_repo(root)
-        add_unittest(root, failing_on_integration=True)
-        run_id = setup_basic_harness(root, ["T1", "T2"])
-        assignments = db_rows(root, "select da.task_id, t.owner as agent_id from dispatch_assignments da join tasks t on t.id = da.task_id where run_id = ? order by da.task_id", (run_id,))
-        branches: dict[str, str] = {}
-        for assignment, file_name in zip(assignments, ["file_a.txt", "file_b.txt"], strict=True):
-            branch = f"agent/{run_id}/{assignment['task_id']}/{assignment['agent_id']}"
-            _head, _tree, worktree = commit_branch(root, branch, file_name, "break\n")
-            branches[assignment["task_id"]] = branch
-            add_file_claim(root, run_id, assignment["task_id"], assignment["agent_id"], file_name, worktree, branch)
-        collect_and_verify(root, run_id, branches)
-        for task_id in branches:
-            accept_task_via_cli(root, task_id)
-        regression = record_failing_integration_candidate_gate(root, run_id, branches)
-        result = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
-        status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        finding = db_rows(root, "select summary from findings where surface = 'dispatch-integration' order by created_at desc limit 1")
-        ok = result.returncode != 0 and status != "integrated"
-        return scenario_result(
-            "integration_regression_blocked",
-            started,
-            ok,
-            {
-                "integrate_returncode": result.returncode,
-                "status": status,
-                "finding_recorded": bool(finding),
-                "stdout_tail": result.stdout[-500:],
-                "stderr_tail": result.stderr[-500:],
-                **regression,
-            },
-        )
-
-
-def scenario_host_codex_fake_sdk_e2e() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        temp_path = Path(temp)
-        root = temp_path / "repo"
-        root.mkdir()
-        init_git_repo(root)
-        add_unittest(root)
-        run_id = setup_basic_harness(root, ["T1"])
-        package_root, log_path = fake_codex_sdk(temp_path)
-        env = {
-            "HARNESS_CODEX_LEGACY_HOST_POLICY": "isolated-deny-all",
-            "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
-            "FAKE_CODEX_SDK_LOG": str(log_path),
-            "PYTHONPATH": str(package_root),
+        initialized = run_harness(root, "init", check=False)
+        status = run_harness(root, "status", check=False)
+        tables = {
+            str(row[0])
+            for row in db_rows(
+                root,
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'",
+            )
         }
-        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
-        collect = wait_for_provider_collect(root, run_id)
-        session = db_rows(root, "select task_id, agent_id, branch_name, worktree_path from agent_provider_sessions where run_id = ?", (run_id,))[0]
-        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "agent.txt", session["worktree_path"], session["branch_name"])
-        evidence_before = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
-        run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
-        evidence_after = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
-        accept_task_via_cli(root, "T1")
-        branches = {"T1": session["branch_name"]}
-        delivery_validation_issues = record_integration_candidate_gate(root, run_id, branches)
-        integrate = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
-        target = integrate.stdout.strip().rsplit(" ", 1)[-1] if integrate.returncode == 0 else ""
-        integrate_returncode = integrate.returncode
-        status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        sdk_methods = [json.loads(line)["method"] for line in log_path.read_text(encoding="utf-8").splitlines()]
-        ok = "collected 1 provider report" in collect.stdout and evidence_before == 0 and evidence_after == 1 and not delivery_validation_issues and integrate_returncode == 0 and status == "integrated"
+        templates = {path.name for path in (root / ".codex/agents").glob("*.toml")}
+        retired_views = [
+            relative
+            for relative in (
+                ".ai-team/control/tooling-map.md",
+                ".ai-team/control/advisory-fallbacks.md",
+            )
+            if (root / relative).exists()
+        ]
+        ok = (
+            initialized.returncode == 0
+            and status.returncode == 0
+            and f"schema_version: {SCHEMA30_VERSION}" in status.stdout
+            and tables == set(SCHEMA30_TABLES)
+            and templates == APPROVED_AGENT_TEMPLATES
+            and not retired_views
+        )
         return scenario_result(
-            "host_codex_fake_sdk_e2e",
+            "fresh_local_install_and_init",
             started,
             ok,
             {
-                "run_id": run_id,
-                "sdk_methods": sdk_methods[:4],
-                "integrate_returncode": integrate_returncode,
-                "status": status,
-                "target_branch": target,
-                "integrate_via_public_cli": True,
-                "delivery_validation_issues": delivery_validation_issues,
+                "schema_version": SCHEMA30_VERSION,
+                "table_count": len(tables),
+                "template_names": sorted(templates),
+                "retired_views": retired_views,
+                "external_credentials_required": False,
             },
-            category="host-codex",
-            mode="stability",
+            category="cold-start",
+            mode="local",
         )
 
 
-def scenario_host_codex_spark_policy_fake_sdk_e2e() -> dict[str, Any]:
+def scenario_quickstart_stops_before_independent_review() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
-        temp_path = Path(temp)
-        root = temp_path / "repo"
-        root.mkdir()
-        init_git_repo(root)
-        add_unittest(root)
-        run_harness(root, "init")
-        commit_harness_scaffold(root)
-        run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Spark policy acceptance")
-        run_harness(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND)
-        run_harness(root, "task", "add", "--id", "T1", "--task", "Spark eligible developer task", "--owner", "developer", "--acceptance", "AC1")
-        run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
-        run_id = run_harness(root, "dispatch", "plan", "--scope", "Spark Policy").stdout.strip().split()[-1]
-        package_root, log_path = fake_codex_sdk(temp_path)
-        env = {
-            "HARNESS_CODEX_LEGACY_HOST_POLICY": "isolated-deny-all",
-            "HARNESS_CODEX_TURN_TIMEOUT_SECONDS": "5",
-            "HARNESS_CODEX_MODEL_POLICY": "spark-deterministic",
-            "HARNESS_CODEX_SPARK_MODEL": "gpt-5.3-codex-spark",
-            "FAKE_CODEX_SDK_LOG": str(log_path),
-            "PYTHONPATH": str(package_root),
+        root = Path(temp)
+        _write_passing_unittest(root)
+        quickstart = run_harness(
+            root,
+            "quickstart",
+            "minimal",
+            "--id",
+            "EVAL",
+            "--goal",
+            "verify a local candidate",
+            "--acceptance",
+            "candidate test passes",
+            "--task",
+            "implement candidate",
+            "--test-command",
+            "python3 -B -m unittest test_candidate.py",
+            "--execute",
+            check=False,
+        )
+        delivery_check = run_harness(root, "validate", "--delivery", check=False)
+        task_status = str(_scalar(root, "select status from tasks where id='EVAL-T1'"))
+        counts = {
+            table: int(_scalar(root, f"select count(*) from {table}"))
+            for table in ("executions", "validations", "quality_gates", "deliveries")
         }
-        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "host-codex", env=env)
-        collect = wait_for_provider_collect(root, run_id)
-        session = db_rows(root, "select input_json from agent_provider_sessions where run_id = ?", (run_id,))[0]
-        metadata = json.loads(session["input_json"])["provider_metadata"]
-        events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-        by_method = {event["method"]: event for event in events}
-        evidence_count = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
         ok = (
-            "collected 1 provider report" in collect.stdout
-            and by_method["thread_start"]["model"] == "gpt-5.3-codex-spark"
-            and by_method["thread.run"]["model"] == "gpt-5.3-codex-spark"
-            and metadata["selected_model"] == "gpt-5.3-codex-spark"
-            and metadata["model_policy"] == "spark-deterministic"
-            and metadata["spark_eligible"] is True
-            and evidence_count == 0
+            quickstart.returncode == 0
+            and task_status == "submitted"
+            and counts == {"executions": 1, "validations": 1, "quality_gates": 0, "deliveries": 0}
+            and delivery_check.returncode != 0
+            and "independent review" in quickstart.stdout.lower()
         )
         return scenario_result(
-            "host_codex_spark_policy_fake_sdk_e2e",
+            "quickstart_stops_before_independent_review",
             started,
             ok,
             {
-                "run_id": run_id,
-                "thread_start_model": by_method.get("thread_start", {}).get("model"),
-                "thread_run_model": by_method.get("thread.run", {}).get("model"),
-                "selected_model": metadata.get("selected_model"),
-                "model_policy": metadata.get("model_policy"),
-                "spark_eligible": metadata.get("spark_eligible"),
-                "evidence_count": evidence_count,
+                "task_status": task_status,
+                **counts,
+                "delivery_validation_returncode": delivery_check.returncode,
+                "false_pass_count": int(delivery_check.returncode == 0),
             },
-            category="host-codex",
-            mode="stability",
+            category="quickstart",
+            mode="local",
         )
 
 
-def scenario_multi_role_thread_lifecycle() -> dict[str, Any]:
+def scenario_current_candidate_supersedes_stale_validation() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        run_harness(root, "init")
-        run_harness(root, "agents", "install", "--force")
-        run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Role lifecycle")
-        run_harness(root, "task", "add", "--id", "T1", "--task", "Role lifecycle task", "--owner", "developer", "--acceptance", "AC1")
-        run_harness(root, "session", "attest", "--session-id", "DEV-S1", "--agent", "developer", "--role", "developer", "--context-id", "run:T1")
-        run_harness(root, "session", "attest", "--session-id", "ARCH-S1", "--agent", "architect", "--role", "architect", "--context-id", "run:T1")
-        run_harness(root, "session", "attest", "--session-id", "QA-S1", "--agent", "qa-reviewer", "--role", "qa-reviewer", "--context-id", "run:T1")
-        claim = run_harness(root, "task", "claim", "T1", "--agent", "developer", "--expected-revision", task_revision(root, "T1"))
-        token = stdout_field(claim.stdout, "token")
-        fence = stdout_field(claim.stdout, "fence")
-        run_harness(root, "task", "start", "T1", "--agent", "developer", "--lease-token", token, "--expected-revision", task_revision(root, "T1"), "--fence", fence)
-        run_harness(
+        _write_passing_unittest(root)
+        for args in (
+            ("init",),
+            ("acceptance", "add", "--id", "AC1", "--criterion", "candidate passes"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "UNIT",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -B -m unittest test_candidate.py",
+            ),
+        ):
+            _require_ok(run_harness(root, *args, check=False))
+        _require_ok(run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1", check=False))
+        candidate = root / "test_candidate.py"
+        candidate.write_text(candidate.read_text(encoding="utf-8") + "\n# second candidate\n", encoding="utf-8")
+        _require_ok(run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1", check=False))
+        rows = db_rows(
             root,
-            "task",
-            "submit",
-            "T1",
-            "--agent",
-            "developer",
-            "--session-id",
-            "DEV-S1",
-            "--lease-token",
-            token,
-            "--expected-revision",
-            task_revision(root, "T1"),
-            "--fence",
-            fence,
-            "--evidence",
-            "developer submitted",
+            "select candidate_sha, validation_status, superseded_by from validations order by created_at, id",
         )
-        producer_review = run_harness(root, "task", "review", "T1", "--agent", "developer", "--session-id", "DEV-S1", "--expected-revision", task_revision(root, "T1"), check=False)
-        review = run_harness(root, "task", "review", "T1", "--agent", "qa-reviewer", "--session-id", "QA-S1", "--expected-revision", task_revision(root, "T1"))
-        qa_token = stdout_field(review.stdout, "token")
-        qa_fence = stdout_field(review.stdout, "fence")
-        run_harness(
-            root,
-            "task",
-            "accept",
-            "T1",
-            "--agent",
-            "qa-reviewer",
-            "--session-id",
-            "QA-S1",
-            "--lease-token",
-            qa_token,
-            "--expected-revision",
-            task_revision(root, "T1"),
-            "--fence",
-            qa_fence,
-            "--evidence",
-            "qa accepted",
-        )
-        task = db_rows(root, "select status, submitted_session_id, accepted_session_id from tasks where id = 'T1'")[0]
-        sessions = [row["role"] for row in db_rows(root, "select role from agent_sessions order by role")]
-        ok = producer_review.returncode != 0 and task["status"] == "accepted" and task["submitted_session_id"] == "DEV-S1" and task["accepted_session_id"] == "QA-S1"
-        return scenario_result(
-            "multi_role_thread_lifecycle",
-            started,
-            ok,
-            {"producer_review_returncode": producer_review.returncode, "task_status": task["status"], "roles": sessions},
-            category="session",
-            mode="stability",
-        )
-
-
-def scenario_connector_mock_server_e2e() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        temp_path = Path(temp)
-        root = temp_path / "repo"
-        root.mkdir()
-        run_harness(root, "init")
-        set_connector_profiles(root)
-        bin_dir, gh_log = fake_gh(temp_path)
-        with ConnectorMockServer() as server:
-            cases = [
-                ("github", "github.issue.create", {"repo": "owner/repo", "title": "Issue title", "body": "Body"}, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HARNESS_GH_BIN": subprocess.list2cmdline([sys.executable, str(bin_dir / "gh")])}),
-                ("linear", "linear.issue.create", {"team_id": "TEAM", "title": "Linear issue", "description": "Body"}, {"LINEAR_API_KEY": "linear-token", "HARNESS_LINEAR_API_URL": server.base_url}),
-                ("notion", "notion.page.create", {"parent_page_id": "PARENT", "title": "Notion page", "content": "Body"}, {"NOTION_TOKEN": "notion-token", "HARNESS_NOTION_API_URL": server.base_url}),
-                ("figma", "figma.comment.create", {"file_key": "FILE1", "message": "Review note"}, {"FIGMA_TOKEN": "figma-token", "HARNESS_FIGMA_API_URL": server.base_url}),
-                ("slack", "slack.message.post", {"channel": "C123", "text": "Ship it"}, {"SLACK_BOT_TOKEN": "slack-token", "HARNESS_SLACK_API_URL": server.base_url}),
-            ]
-            action_ids = []
-            for tool, operation, params, env in cases:
-                action = plan_action(root, tool, operation, params)
-                action_ids.append(action)
-                run_harness(root, "adapter", "confirm", "--id", action, "--request-id", f"REQ-{tool}", env=env)
-            reconcile = run_harness(root, "adapter", "reconcile", check=False)
-            completed = db_rows(root, "select count(*) as count from adapter_actions where status = 'completed'")[0]["count"]
-            adapters = db_rows(root, "select count(*) as count from adapters")[0]["count"]
-            evidence = db_rows(root, "select count(*) as count from evidence")[0]["count"]
-            gh_calls = len(gh_log.read_text(encoding="utf-8").splitlines())
-            token_leak = bool(db_rows(root, "select 1 from adapter_actions where payload_json like '%linear-token%' or payload_json like '%slack-token%' limit 1"))
-            ok = completed == 5 and adapters == 5 and evidence == 0 and reconcile.returncode == 0 and gh_calls == 2 and not token_leak and len(server.requests) == 7
-            return scenario_result(
-                "connector_mock_server_e2e",
-                started,
-                ok,
-                {
-                    "actions": len(action_ids),
-                    "completed": completed,
-                    "adapters": adapters,
-                    "evidence_count": evidence,
-                    "http_requests": len(server.requests),
-                    "gh_calls": gh_calls,
-                    "token_leak": token_leak,
-                },
-                category="connector",
-                mode="stability",
-            )
-
-
-def scenario_connector_exactly_once_recovery() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp) / "repo"
-        root.mkdir()
-        run_harness(root, "init")
-        set_connector_profiles(root)
-        key = "e2e:slack:exactly-once-recovery"
-        marker = f"codex-project-harness:project-key=e2e\ncodex-project-harness:idempotency-key={key}"
-        with ConnectorMockServer(marker=marker) as server:
-            action = plan_action(root, "slack", "slack.message.post", {"channel": "C123", "text": "Ship it"}, key=key)
-            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                conn.execute(
-                    "update adapter_actions set status = 'unknown', connector_status = 'degraded', blocked_reason = 'remote success local commit unknown' where id = ?",
-                    (action,),
-                )
-                conn.commit()
-            confirm = run_harness(root, "adapter", "confirm", "--id", action, env={"SLACK_BOT_TOKEN": "slack-token", "HARNESS_SLACK_API_URL": server.base_url}, check=False)
-            row = db_rows(root, "select status, external_id, remote_recovery_count from adapter_actions where id = ?", (action,))[0]
-            adapter_count = db_rows(root, "select count(*) as count from adapters where idempotency_key = ?", (key,))[0]["count"]
-            evidence_count = db_rows(root, "select count(*) as count from evidence")[0]["count"]
-            writes = [request for request in server.requests if request["path"] == "/slack/api/chat.postMessage"]
-            searches = [request for request in server.requests if request["path"] == "/slack/api/search.messages"]
-            ok = (
-                confirm.returncode == 0
-                and row["status"] == "completed"
-                and row["external_id"] == "slack:message:C123:1710000000.000123"
-                and row["remote_recovery_count"] == 1
-                and adapter_count == 1
-                and evidence_count == 0
-                and len(writes) == 0
-                and len(searches) >= 1
-            )
-            return scenario_result(
-                "connector_exactly_once_recovery",
-                started,
-                ok,
-                {
-                    "status": row["status"],
-                    "remote_recovery_count": row["remote_recovery_count"],
-                    "adapter_count": adapter_count,
-                    "evidence_count": evidence_count,
-                    "writes": len(writes),
-                    "searches": len(searches),
-                },
-                category="connector",
-                mode="stability",
-            )
-
-
-def scenario_crash_retry_recovery() -> dict[str, Any]:
-    started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp)
-        init_git_repo(root)
-        add_unittest(root)
-        run_id = setup_basic_harness(root, ["T1"])
-        run_harness(root, "dispatch", "provider", "start", "--run-id", run_id, "--provider", "fixture", "--request-id", "REQ-START")
-        session = db_rows(root, "select task_id, agent_id, branch_name from agent_provider_sessions where run_id = ?", (run_id,))[0]
-        _head, _tree, worktree = commit_branch(root, session["branch_name"], "retry.txt", "retry work\n")
-        add_file_claim(root, run_id, session["task_id"], session["agent_id"], "retry.txt", worktree, session["branch_name"])
-        fixture_report(root, run_id, "T1", session["branch_name"])
-        first_collect = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id, "--request-id", "REQ-COLLECT")
-        second_collect = run_harness(root, "dispatch", "provider", "collect", "--run-id", run_id, "--request-id", "REQ-COLLECT")
-        first_verify = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1", "--request-id", "REQ-VERIFY")
-        second_verify = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1", "--request-id", "REQ-VERIFY")
-        first_reconcile = run_harness(root, "dispatch", "provider", "reconcile", "--run-id", run_id, "--request-id", "REQ-RECONCILE")
-        second_reconcile = run_harness(root, "dispatch", "provider", "reconcile", "--run-id", run_id, "--request-id", "REQ-RECONCILE")
-        reports = db_rows(root, "select count(*) as count from agent_reports")[0]["count"]
-        attempts = db_rows(root, "select count(*) as count from task_attempts")[0]["count"]
-        evidence = db_rows(root, "select count(*) as count from evidence where id like 'CODEX-%'")[0]["count"]
-        findings = db_rows(root, "select count(*) as count from findings")[0]["count"]
+        statuses = [str(row["validation_status"]) for row in rows]
+        candidates = {str(row["candidate_sha"]) for row in rows}
         ok = (
-            reports == 1
-            and attempts == 1
-            and evidence == 1
-            and findings == 0
-            and second_collect.stdout == first_collect.stdout
-            and second_verify.stdout == first_verify.stdout
-            and second_reconcile.stdout == first_reconcile.stdout
+            len(rows) == 2
+            and statuses.count("superseded") == 1
+            and statuses.count("active") == 1
+            and len(candidates) == 2
+            and any(str(row["superseded_by"] or "") for row in rows if row["validation_status"] == "superseded")
         )
         return scenario_result(
-            "crash_retry_recovery",
+            "current_candidate_supersedes_stale_validation",
             started,
             ok,
-            {"reports": reports, "attempts": attempts, "evidence": evidence, "findings": findings},
-            category="recovery",
-            mode="stability",
+            {"validation_statuses": statuses, "candidate_count": len(candidates)},
+            category="candidate",
+            mode="local",
+        )
+
+
+def scenario_manual_evidence_cannot_satisfy_delivery() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        commands = (
+            ("init",),
+            ("requirement", "add", "--id", "R1", "--kind", "functional", "--body", "local requirement"),
+            ("acceptance", "add", "--id", "AC1", "--criterion", "local acceptance"),
+            ("requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),
+            ("baseline", "freeze", "--id", "B1", "--summary", "locked baseline"),
+            ("task", "add", "--id", "T1", "--task", "implement", "--acceptance", "AC1"),
+            ("task", "start", "T1"),
+            ("task", "submit", "T1", "--context-id", "producer", "--evidence", "claimed complete"),
+            ("task", "accept", "T1", "--evidence", "manual review"),
+            (
+                "validation",
+                "record",
+                "--surface",
+                "manual claim",
+                "--acceptance",
+                "AC1",
+                "--findings",
+                "claimed pass",
+                "--result",
+                "pass",
+            ),
+            ("gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass"),
+        )
+        for args in commands:
+            _require_ok(run_harness(root, *args, check=False))
+        delivery = run_harness(root, "delivery", "record", "--scope", "forged", "--acceptance", "AC1", check=False)
+        delivery_count = int(_scalar(root, "select count(*) from deliveries"))
+        execution_count = int(_scalar(root, "select count(*) from executions"))
+        output = (delivery.stdout + delivery.stderr).lower()
+        blocked = delivery.returncode != 0 and "no linked immutable execution" in output
+        return scenario_result(
+            "manual_evidence_cannot_satisfy_delivery",
+            started,
+            blocked and delivery_count == 0 and execution_count == 0,
+            {
+                "delivery_returncode": delivery.returncode,
+                "delivery_count": delivery_count,
+                "execution_count": execution_count,
+                "forged_evidence_block_count": int(blocked),
+                "false_pass_count": int(delivery.returncode == 0),
+            },
+            category="trust",
+            mode="local",
+        )
+
+
+def scenario_open_high_finding_blocks_delivery() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        _write_passing_unittest(root)
+        _require_ok(
+            run_harness(
+                root,
+                "quickstart",
+                "minimal",
+                "--id",
+                "FINDING",
+                "--goal",
+                "verify finding gate",
+                "--acceptance",
+                "candidate passes",
+                "--task",
+                "implement",
+                "--test-command",
+                "python3 -B -m unittest test_candidate.py",
+                "--execute",
+                check=False,
+            )
+        )
+        _require_ok(run_harness(root, "task", "accept", "FINDING-T1", "--evidence", "reviewed", check=False))
+        _require_ok(
+            run_harness(
+                root,
+                "finding",
+                "record",
+                "--id",
+                "F1",
+                "--surface",
+                "delivery",
+                "--severity",
+                "high",
+                "--status",
+                "open",
+                "--summary",
+                "blocking finding",
+                check=False,
+            )
+        )
+        _require_ok(
+            run_harness(
+                root,
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--reviewer-context-id",
+                "reviewer",
+                "--result",
+                "pass",
+                check=False,
+            )
+        )
+        delivery = run_harness(root, "delivery", "record", "--scope", "finding", check=False)
+        output = (delivery.stdout + delivery.stderr).lower()
+        blocked = delivery.returncode != 0 and "high finding blocks delivery" in output
+        return scenario_result(
+            "open_high_finding_blocks_delivery",
+            started,
+            blocked and int(_scalar(root, "select count(*) from deliveries")) == 0,
+            {
+                "delivery_returncode": delivery.returncode,
+                "finding_block_count": int(blocked),
+                "false_pass_count": int(delivery.returncode == 0),
+            },
+            category="findings",
+            mode="local",
+        )
+
+
+def scenario_high_risk_requires_human_review() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        (root / "emit_result.py").write_text(
+            "from pathlib import Path\n"
+            "Path('.ai-team/runtime/eval-result.json').parent.mkdir(parents=True, exist_ok=True)\n"
+            "Path('.ai-team/runtime/eval-result.json').write_text("
+            "'{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        commands = (
+            ("init",),
+            ("requirement", "add", "--id", "R1", "--kind", "functional", "--body", "high-risk flow"),
+            ("acceptance", "add", "--id", "AC1", "--criterion", "structured pass"),
+            ("requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),
+            (
+                "failure-mode",
+                "add",
+                "--id",
+                "FM1",
+                "--feature",
+                "delivery",
+                "--scenario",
+                "critical failure",
+                "--trigger",
+                "bad candidate",
+                "--expected",
+                "fail closed",
+                "--risk",
+                "high",
+                "--acceptance",
+                "AC1",
+            ),
+            ("baseline", "freeze", "--id", "B1", "--summary", "high risk baseline"),
+            ("task", "add", "--id", "T1", "--task", "implement", "--acceptance", "AC1", "--failure-mode", "FM1"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "STRUCTURED",
+                "--kind",
+                "build",
+                "--command-template",
+                "python3 emit_result.py",
+                "--result-format",
+                "pytest-json",
+                "--result-path",
+                ".ai-team/runtime/eval-result.json",
+            ),
+            ("test-target", "link", "--task", "T1", "--target", "STRUCTURED"),
+            ("task", "start", "T1"),
+            ("verify", "run", "--target", "STRUCTURED", "--acceptance", "AC1", "--failure-mode", "FM1"),
+            ("task", "submit", "T1", "--context-id", "producer", "--evidence", "verified"),
+            ("task", "accept", "T1", "--evidence", "reviewed"),
+            (
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--reviewer-context-id",
+                "reviewer",
+                "--result",
+                "pass",
+            ),
+        )
+        for args in commands:
+            _require_ok(run_harness(root, *args, check=False))
+        delivery = run_harness(root, "delivery", "record", "--scope", "high-risk", check=False)
+        output = (delivery.stdout + delivery.stderr).lower()
+        human_review = delivery.returncode != 0 and "human-review-required" in output
+        return scenario_result(
+            "high_risk_requires_human_review",
+            started,
+            human_review and int(_scalar(root, "select count(*) from deliveries")) == 0,
+            {
+                "delivery_returncode": delivery.returncode,
+                "expected_human_review_required_count": int(human_review),
+                "human_intervention_count": 0,
+                "false_pass_count": int(delivery.returncode == 0),
+            },
+            category="trust",
+            mode="local",
+        )
+
+
+def scenario_structured_and_no_network_policy_fail_closed() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        structured_root = base / "structured"
+        structured_root.mkdir()
+        (structured_root / "emit_zero.py").write_text(
+            "from pathlib import Path\n"
+            "Path('.ai-team/runtime/zero.json').parent.mkdir(parents=True, exist_ok=True)\n"
+            "Path('.ai-team/runtime/zero.json').write_text("
+            "'{\"summary\":{\"total\":0,\"passed\":0,\"failed\":0,\"errors\":0}}', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        for args in (
+            ("init",),
+            ("acceptance", "add", "--id", "AC1", "--criterion", "positive count"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "ZERO",
+                "--kind",
+                "build",
+                "--command-template",
+                "python3 emit_zero.py",
+                "--result-format",
+                "pytest-json",
+                "--result-path",
+                ".ai-team/runtime/zero.json",
+            ),
+        ):
+            _require_ok(run_harness(structured_root, *args, check=False))
+        zero = run_harness(structured_root, "verify", "run", "--target", "ZERO", "--acceptance", "AC1", check=False)
+
+        network_root = base / "network"
+        network_root.mkdir()
+        _write_passing_unittest(network_root)
+        for args in (
+            ("init",),
+            ("acceptance", "add", "--id", "AC1", "--criterion", "no network"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "NO-NET",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -B -m unittest test_candidate.py",
+                "--requires-no-network",
+            ),
+        ):
+            _require_ok(run_harness(network_root, *args, check=False))
+        no_network = run_harness(network_root, "verify", "run", "--target", "NO-NET", "--acceptance", "AC1", check=False)
+        zero_facts = int(_scalar(structured_root, "select count(*) from executions"))
+        network_facts = int(_scalar(network_root, "select count(*) from executions"))
+        zero_blocked = zero.returncode != 0 and "executed_count" in (zero.stdout + zero.stderr)
+        network_blocked = no_network.returncode != 0 and "no-network" in (no_network.stdout + no_network.stderr)
+        return scenario_result(
+            "structured_and_no_network_policy_fail_closed",
+            started,
+            zero_blocked and network_blocked and zero_facts == 0 and network_facts == 0,
+            {
+                "structured_zero_blocked": zero_blocked,
+                "local_no_network_blocked": network_blocked,
+                "policy_block_count": int(zero_blocked) + int(network_blocked),
+                "false_pass_count": int(zero.returncode == 0) + int(no_network.returncode == 0),
+            },
+            category="execution-policy",
+            mode="local",
+        )
+
+
+def scenario_cycle_isolation() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        commands = (
+            ("init",),
+            ("requirement", "add", "--id", "R1", "--kind", "functional", "--body", "first cycle"),
+            ("cycle", "close", "--status", "archived"),
+            ("cycle", "start", "--id", "CYCLE-next", "--name", "Next", "--goal", "iterate"),
+            ("requirement", "add", "--id", "R1", "--kind", "functional", "--body", "second cycle"),
+        )
+        for args in commands:
+            _require_ok(run_harness(root, *args, check=False))
+        rows = db_rows(root, "select cycle_id, id, body from requirements where id='R1' order by cycle_id")
+        current = str(_scalar(root, "select current_cycle_id from project where id=1"))
+        ok = len(rows) == 2 and current == "CYCLE-next" and {str(row["body"]) for row in rows} == {"first cycle", "second cycle"}
+        return scenario_result(
+            "cycle_isolation",
+            started,
+            ok,
+            {"current_cycle": current, "cycle_ids": [str(row["cycle_id"]) for row in rows]},
+            category="cycle",
+            mode="local",
         )
 
 
@@ -1111,12 +1504,13 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        run_harness(root, "init")
+        _require_ok(run_harness(root, "init", check=False))
+        results: list[subprocess.CompletedProcess[str]] = []
+        result_lock = threading.Lock()
 
-        def mutate(index: int) -> subprocess.CompletedProcess[str]:
-            request_id = f"REQ-SQLITE-{index // 2}"
+        def worker(index: int) -> None:
             acceptance_id = f"AC{index // 2}"
-            return run_harness(
+            result = run_harness(
                 root,
                 "acceptance",
                 "add",
@@ -1124,67 +1518,212 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
                 acceptance_id,
                 "--criterion",
                 f"contention criterion {acceptance_id}",
-                "--request-id",
-                request_id,
                 check=False,
                 timeout=30,
             )
-
-        results: list[subprocess.CompletedProcess[str]] = []
-        threads: list[threading.Thread] = []
-        lock = threading.Lock()
-
-        def worker(index: int) -> None:
-            result = mutate(index)
-            with lock:
+            with result_lock:
                 results.append(result)
 
-        for index in range(12):
-            thread = threading.Thread(target=worker, args=(index,))
-            threads.append(thread)
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(12)]
+        for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
-
+        alive = sum(thread.is_alive() for thread in threads)
         lock_errors = sum("database is locked" in (result.stdout + result.stderr).lower() for result in results)
         failed = [result.returncode for result in results if result.returncode != 0]
-        doctor = run_harness(root, "kernel", "doctor", check=False)
-        invariant = run_harness(root, "invariant", "validate", check=False)
-        acceptance_count = db_rows(root, "select count(*) as count from acceptance")[0]["count"]
-        ok = len(results) == 12 and not failed and lock_errors == 0 and doctor.returncode == 0 and invariant.returncode == 0 and acceptance_count == 6
+        doctor = run_harness(root, "doctor", check=False)
+        acceptance_count = int(_scalar(root, "select count(*) from acceptance"))
+        ok = len(results) == 12 and alive == 0 and not failed and lock_errors == 0 and doctor.returncode == 0 and acceptance_count == 6
         return scenario_result(
             "sqlite_contention_stress",
             started,
             ok,
             {
                 "operation_count": len(results),
+                "thread_leak_count": alive,
                 "failed_returncodes": failed,
                 "sqlite_lock_error_count": lock_errors,
                 "acceptance_count": acceptance_count,
                 "doctor_returncode": doctor.returncode,
-                "invariant_returncode": invariant.returncode,
             },
             category="sqlite",
-            mode="stability",
+            mode="local",
+        )
+
+
+def _create_schema27_fixture(root: Path) -> Path:
+    db = root / ".ai-team/state/harness.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (SCRIPTS_ROOT / "fixtures/schema27-v1.21.3.sql.gz.b64").read_bytes()
+    ddl = gzip.decompress(base64.b64decode(encoded))
+    if hashlib.sha256(ddl).hexdigest() != "62c1046ed093ab3acdd1ceb22994b8c8c81242b26a997f5c2e77840e08b205f8":
+        raise AssertionError("published schema 27 fixture digest mismatch")
+    artifact = root / ".ai-team/runtime/executions/legacy/stdout.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("schema27 execution\n", encoding="utf-8")
+    seed = (SCRIPTS_ROOT / "fixtures/schema27-v1.21.3-seed.sql").read_text(encoding="utf-8")
+    seed = seed.replace("__CANDIDATE__", "a" * 64).replace("__ARTIFACT_PATH__", str(artifact.relative_to(root))).replace("__ARTIFACT_SHA__", _sha256(artifact)).replace("__RETIRED_SECRET__", "SCHEMA27-RETIRED-SENTINEL-9e4f")
+    with closing(sqlite3.connect(db)) as conn:
+        conn.executescript(ddl.decode("utf-8"))
+        conn.executescript(seed)
+        inventory = (
+            conn.execute("select count(*) from sqlite_master where type='table' and name not like 'sqlite_%'").fetchone()[0],
+            conn.execute("select count(*) from sqlite_master where type='index'").fetchone()[0],
+        )
+        if inventory != (53, 60):
+            raise AssertionError(f"published schema 27 inventory mismatch: {inventory}")
+        conn.commit()
+    return db
+
+
+def _migration_projection_validator(root: Path) -> Callable[[Path], None]:
+    def validate(_active_path: Path) -> None:
+        harness_db.render_all(root)
+        issues = harness_db.doctor(root, require_project_files=False)
+        if issues:
+            raise AssertionError("migration projection validation failed: " + "; ".join(issues))
+
+    return validate
+
+
+def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        success_root = base / "schema27-success"
+        _create_schema27_fixture(success_root)
+        success = migrate_project_to_schema30(
+            success_root,
+            active_validator=_migration_projection_validator(success_root),
+        )
+        success_version = int(_scalar(success_root, "select schema_version from project where id=1"))
+        preserved = tuple(_scalar(success_root, f"select count(*) from {table}") for table in ("requirements", "tasks", "executions", "validations", "decisions"))
+        retired_tables = int(_scalar(success_root, "select count(*) from sqlite_master where type='table' and name in ('adapter_actions','agent_provider_sessions','runtime_snapshots','command_log')"))
+
+        rollback_root = base / "schema27-rollback"
+        rollback_source = _create_schema27_fixture(rollback_root)
+        rolled_back = False
+        try:
+            migrate_project_to_schema30(
+                rollback_root,
+                fail_at="after_atomic_replace",
+                active_validator=_migration_projection_validator(rollback_root),
+            )
+        except InjectedLocalCoreMigrationFailure:
+            rolled_back = True
+        rollback_version = int(_scalar(rollback_root, "select schema_version from project where id=1"))
+        sentinel = str(_scalar(rollback_root, "select decision from decisions where id='D-sentinel'"))
+        backup_dirs = list((rollback_root / ".ai-team/backups").glob("schema-27-before-local-core-*"))
+        ok = (
+            success.source_version == 27
+            and success.target_version == SCHEMA30_VERSION
+            and success_version == SCHEMA30_VERSION
+            and preserved == (1, 2, 1, 1, 1)
+            and retired_tables == 0
+            and Path(success.migration_manifest_path).is_file()
+            and rolled_back
+            and rollback_source.is_file()
+            and rollback_version == 27
+            and sentinel == "keep"
+            and len(backup_dirs) == 1
+        )
+        return scenario_result(
+            "schema27_29_migration_and_rollback",
+            started,
+            ok,
+            {
+                "schema27_source_table_count": 53,
+                "schema27_target_version": success.target_version,
+                "schema27_success_version": success_version,
+                "schema27_rollback_version": rollback_version,
+                "preserved_local_fact_counts": list(preserved),
+                "retired_active_table_count": retired_tables,
+                "rollback_observed": rolled_back,
+                "rollback_backup_count": len(backup_dirs),
+                "migration_rollback_count": int(rolled_back and rollback_version == 27),
+            },
+            category="migration",
+            mode="local",
+        )
+
+
+def scenario_installed_plugin_surface() -> dict[str, Any]:
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        home = root / "home"
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PYTHONPATH"] = str(ROOT)
+        installed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "kafa.cli",
+                "plugin",
+                "install",
+                "--scope",
+                "user",
+                "--repo",
+                str(ROOT),
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        plugin = home / ".agents/plugins/codex-project-harness"
+        skills = {path.name for path in (plugin / "skills").iterdir() if path.is_dir()} if plugin.is_dir() else set()
+        hooks_payload = json.loads((plugin / "hooks/hooks.json").read_text(encoding="utf-8")) if plugin.is_dir() else {}
+        hooks = set(hooks_payload.get("hooks", {}))
+        templates = {path.name for path in (plugin / "templates/agents").glob("*.toml")}
+        scripts = {path.name for path in (plugin / "scripts").glob("*.py")}
+        schemas = {path.name for path in (plugin / "schemas").glob("*.json")}
+        retired = [relative for relative in RETIRED_RUNTIME_PATHS if (plugin / relative).exists()]
+        ok = (
+            installed.returncode == 0
+            and skills == APPROVED_SKILLS
+            and hooks == {"SessionStart", "SubagentStart", "Stop"}
+            and templates == APPROVED_AGENT_TEMPLATES
+            and scripts == APPROVED_RUNTIME_SCRIPTS
+            and schemas == APPROVED_SCHEMA_FILES
+            and not retired
+        )
+        return scenario_result(
+            "installed_plugin_surface",
+            started,
+            ok,
+            {
+                "discovery_scope": "isolated installed filesystem contract",
+                "skill_count": len(skills),
+                "hook_count": len(hooks),
+                "template_count": len(templates),
+                "runtime_script_count": len(scripts),
+                "schema_count": len(schemas),
+                "retired_paths": sorted(retired),
+            },
+            category="installation",
+            mode="local",
         )
 
 
 FIXTURE_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
-    scenario_parallel_success,
-    scenario_dependency_blocked,
-    scenario_same_file_conflict,
-    scenario_forged_evidence_blocked,
-    scenario_integration_regression_blocked,
+    scenario_fresh_local_install_and_init,
+    scenario_quickstart_stops_before_independent_review,
+    scenario_current_candidate_supersedes_stale_validation,
+    scenario_manual_evidence_cannot_satisfy_delivery,
+    scenario_open_high_finding_blocks_delivery,
+    scenario_high_risk_requires_human_review,
 ]
 
 STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
-    scenario_host_codex_fake_sdk_e2e,
-    scenario_host_codex_spark_policy_fake_sdk_e2e,
-    scenario_multi_role_thread_lifecycle,
-    scenario_connector_mock_server_e2e,
-    scenario_connector_exactly_once_recovery,
-    scenario_crash_retry_recovery,
+    scenario_structured_and_no_network_policy_fail_closed,
+    scenario_cycle_isolation,
     scenario_sqlite_contention_stress,
+    scenario_schema27_29_migration_and_rollback,
+    scenario_installed_plugin_surface,
 ]
 
 
@@ -1196,43 +1735,84 @@ def summarize(
     live_skipped: bool = False,
     live_skipped_reasons: list[str] | None = None,
     live_status: str = "",
+    native_host: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
     passed = sum(1 for scenario in scenarios if scenario["pass"] and not scenario.get("skip_reason"))
     failed = sum(1 for scenario in scenarios if not scenario["pass"] and not scenario.get("skip_reason"))
-    forged_blocks = sum(1 for scenario in scenarios if scenario["name"] == "forged_evidence_blocked" and scenario["pass"])
-    false_pass_count = sum(1 for scenario in scenarios if scenario["name"] in {"forged_evidence_blocked", "integration_regression_blocked"} and not scenario["pass"])
     sqlite_lock_errors = sum(int(scenario.get("details", {}).get("sqlite_lock_error_count", 0) or 0) for scenario in scenarios)
+    false_passes = sum(int(scenario.get("details", {}).get("false_pass_count", 0) or 0) for scenario in scenarios)
+    forged_blocks = sum(int(scenario.get("details", {}).get("forged_evidence_block_count", 0) or 0) for scenario in scenarios)
+    expected_human_reviews = sum(
+        int(scenario.get("details", {}).get("expected_human_review_required_count", 0) or 0)
+        for scenario in scenarios
+    )
+    human_interventions = sum(
+        int(scenario.get("details", {}).get("human_intervention_count", 0) or 0)
+        for scenario in scenarios
+    )
+    pass_rate = round(passed / max(len(scenarios), 1), 4)
     summary = {
         "scenario_count": len(scenarios),
         "passed_count": passed,
         "failed_count": failed,
         "skipped_count": skipped,
-        "task_once_completion_rate": round(passed / max(len(scenarios), 1), 4),
-        "false_pass_count": false_pass_count,
+        "scenario_pass_rate": pass_rate,
+        "false_pass_count": false_passes,
         "forged_evidence_block_count": forged_blocks,
-        "retry_count": 0,
-        "merge_conflict_count": 0,
+        "expected_human_review_required_count": expected_human_reviews,
         "sqlite_lock_error_count": sqlite_lock_errors,
-        "human_intervention_count": 0,
+        "human_intervention_count": human_interventions,
         "duration_seconds": round(time.perf_counter() - started, 6),
     }
     resolved_live_status = live_status or "not-applicable"
-    if not live_status and mode in {"live-command", "live-codex"}:
+    if not live_status and mode.startswith("live-codex"):
         if live_skipped:
             resolved_live_status = "not-run"
         elif failed:
             resolved_live_status = "failed"
         elif scenarios:
             resolved_live_status = "passed"
+    native_token_counts = [
+        scenario.get("details", {}).get("native_token_count")
+        for scenario in scenarios
+        if isinstance(scenario.get("details", {}).get("native_token_count"), int)
+    ]
+    native_runtime_seconds = [
+        scenario.get("details", {}).get("native_runtime_seconds")
+        for scenario in scenarios
+        if isinstance(scenario.get("details", {}).get("native_runtime_seconds"), (int, float))
+    ]
+    native_usages = [
+        scenario.get("details", {}).get("native_usage")
+        for scenario in scenarios
+        if isinstance(scenario.get("details", {}).get("native_usage"), dict)
+    ]
+    aggregate_usage = (
+        {
+            field: sum(int(usage[field]) for usage in native_usages)
+            for field in (*NATIVE_USAGE_FIELDS, "token_count")
+        }
+        if native_usages
+        else None
+    )
     return {
+        "report_version": REPORT_VERSION,
         "mode": mode,
+        "evaluation_source": evaluation_source_identity(),
         "live_skipped": live_skipped,
         "live_status": resolved_live_status,
         "matrix": matrix_info(mode, live_skipped_reasons=live_skipped_reasons),
-        "token_count": None,
+        "native_host": native_host,
+        "evidence_scope": "deterministic-local-runtime" if mode in {"fixture", "stability"} else mode,
+        "token_count": sum(native_token_counts) if native_token_counts else None,
+        "token_usage": aggregate_usage,
         "estimated_cost": None,
-        "agent_runtime_seconds": None,
+        "agent_runtime_seconds": (
+            round(sum(float(value) for value in native_runtime_seconds), 6)
+            if native_runtime_seconds
+            else None
+        ),
         "summary": summary,
         "scenarios": scenarios,
     }
@@ -1245,14 +1825,16 @@ def run_fixture() -> dict[str, Any]:
         try:
             scenarios.append(scenario())
         except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
+            name = scenario.__name__.replace("scenario_", "")
+            category, scenario_mode = LOCAL_SCENARIO_CONTRACT[name]
             scenarios.append(
                 scenario_result(
-                    scenario.__name__.replace("scenario_", ""),
+                    name,
                     started,
                     False,
                     {"error": str(exc)},
-                    category="fixture",
-                    mode="fixture",
+                    category=category,
+                    mode=scenario_mode,
                 )
             )
     return summarize("fixture", scenarios, started)
@@ -1266,26 +1848,18 @@ def run_stability() -> dict[str, Any]:
             scenarios.append(scenario())
         except Exception as exc:  # noqa: BLE001 - eval output should show scenario failure.
             name = scenario.__name__.replace("scenario_", "")
-            scenarios.append(scenario_result(name, started, False, {"error": str(exc)}, category="stability", mode="stability"))
+            category, scenario_mode = LOCAL_SCENARIO_CONTRACT[name]
+            scenarios.append(
+                scenario_result(
+                    name,
+                    started,
+                    False,
+                    {"error": str(exc)},
+                    category=category,
+                    mode=scenario_mode,
+                )
+            )
     return summarize("stability", scenarios, started)
-
-
-def run_live_command() -> dict[str, Any]:
-    started = time.perf_counter()
-    command = os.environ.get("CODEX_AGENT_EVAL_CMD", "").strip()
-    if not command:
-        return summarize("live-command", [], started, live_skipped=True, live_skipped_reasons=["CODEX_AGENT_EVAL_CMD is not set"])
-    result = subprocess.run(command, shell=True, text=True, capture_output=True, check=False, timeout=1800)
-    scenario = {
-        "name": "live_command",
-        "category": "live-command",
-        "mode": "live-command",
-        "pass": result.returncode == 0,
-        "duration_seconds": round(time.perf_counter() - started, 6),
-        "skip_reason": "",
-        "details": {"returncode": result.returncode, "stdout_tail": result.stdout[-2000:], "stderr_tail": result.stderr[-2000:]},
-    }
-    return summarize("live-command", [scenario], started)
 
 
 class LiveCapabilityBlocked(RuntimeError):
@@ -1308,12 +1882,69 @@ def live_codex_binary() -> str:
     return shutil.which("codex") or ""
 
 
-def run_live_preflight(codex: str) -> str:
+def live_codex_binary_metadata(codex: str) -> dict[str, Any]:
+    path = Path(codex).expanduser().resolve()
+    return {
+        "resolved_path": str(path),
+        "sha256": _sha256(path) if path.is_file() else "",
+        "source": (
+            "explicit-test-override"
+            if os.environ.get("HARNESS_E2E_CODEX_BIN", "").strip()
+            else "path-discovery"
+        ),
+        "trust": "local-capability-only-not-delivery-provenance",
+    }
+
+
+LIVE_ENV_ALLOWLIST = {
+    "PATH",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "NO_COLOR",
+    "CODEX_CI",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+}
+
+
+def isolated_live_codex_environment(target: Path) -> dict[str, str]:
+    """Copy portable auth and an explicit non-secret process environment."""
+
+    source_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    source_auth = source_home / "auth.json"
+    if not source_auth.is_file():
+        raise LiveCapabilityBlocked("authenticated Codex home has no portable auth.json")
+    target.mkdir(parents=True, mode=0o700, exist_ok=True)
+    target_auth = target / "auth.json"
+    shutil.copy2(source_auth, target_auth)
+    target_auth.chmod(0o600)
+    env = {key: value for key, value in os.environ.items() if key in LIVE_ENV_ALLOWLIST}
+    env["HOME"] = str(target)
+    env["CODEX_HOME"] = str(target)
+    if os.name == "nt":
+        env["USERPROFILE"] = str(target)
+        env["APPDATA"] = str(target / "AppData/Roaming")
+        env["LOCALAPPDATA"] = str(target / "AppData/Local")
+    return env
+
+
+def run_live_preflight(codex: str, env: dict[str, str]) -> str:
     try:
         login = subprocess.run(
             codex_cli_command(codex, "login", "status"),
             cwd=ROOT,
-            env=os.environ.copy(),
+            env=env,
             text=True,
             capture_output=True,
             check=False,
@@ -1322,515 +1953,1955 @@ def run_live_preflight(codex: str) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LiveCapabilityBlocked(f"Codex login capability is unavailable: {exc}") from exc
     if login.returncode != 0:
-        detail = (login.stdout + login.stderr).strip()[-1000:]
-        raise LiveCapabilityBlocked(f"Codex is not authenticated: {detail or 'login status failed'}")
-    version = command_version(codex_cli_command(codex, "--version"))
-    expected = f"codex-cli {json.loads((ROOT / 'release.json').read_text(encoding='utf-8'))['codex_cli_smoke_version']}"
-    if version != expected:
-        raise LiveCapabilityBlocked(f"Codex CLI version mismatch: actual={version or '<missing>'} expected={expected}")
+        raise LiveCapabilityBlocked(f"Codex login status failed (exit {login.returncode})")
+    version = command_version(codex_cli_command(codex, "--version"), env=env)
+    if version != EXPECTED_CODEX_CLI_VERSION:
+        raise LiveCapabilityBlocked(
+            f"Codex CLI version mismatch; expected {EXPECTED_CODEX_CLI_VERSION}"
+        )
     return version
 
 
-def prepare_live_codex_env(temp_path: Path, codex: str) -> dict[str, str]:
-    live_env = os.environ.copy()
-    live_env.pop("PYTHONPATH", None)
-    home = temp_path / "home"
-    codex_home = temp_path / "codex-home"
-    home.mkdir()
-    codex_home.mkdir()
-    live_env["HOME"] = str(home)
-    live_env["CODEX_HOME"] = str(codex_home)
+def prepare_live_profile(
+    *,
+    mode: str,
+    scenario_name: str,
+    enable_env: str,
+    started: float,
+) -> tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve an opt-in Native Host capability without selecting a model."""
 
-    configured_auth = os.environ.get("HARNESS_E2E_CODEX_AUTH_FILE", "").strip()
-    source_codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-    auth_path = Path(configured_auth).expanduser() if configured_auth else source_codex_home / "auth.json"
-    if auth_path.is_file():
-        target = codex_home / "auth.json"
-        shutil.copyfile(auth_path, target)
-        target.chmod(0o600)
-    elif not os.environ.get("OPENAI_API_KEY"):
-        raise LiveCapabilityBlocked(
-            "live profile needs file-based Codex auth or OPENAI_API_KEY; set HARNESS_E2E_CODEX_AUTH_FILE for an explicit auth file"
-        )
-
-    login = subprocess.run(
-        codex_cli_command(codex, "login", "status"),
-        cwd=temp_path,
-        env=live_env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-    if login.returncode != 0:
-        raise LiveCapabilityBlocked("isolated Codex home could not use the supplied authentication")
-    return live_env
-
-
-def run_required(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 120) -> str:
-    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError((result.stdout + result.stderr)[-4000:])
-    return result.stdout
-
-
-def add_live_codex_fixture(root: Path) -> None:
-    (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (root / "test_live_codex.py").write_text(
-        textwrap.dedent(
-            """\
-            import unittest
-
-            import app
-
-
-            class LiveCodexTest(unittest.TestCase):
-                def test_value(self):
-                    self.assertEqual(app.VALUE, 2)
-            """
-        ),
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "add", "app.py", "test_live_codex.py"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "add live Codex fixture"], cwd=root, check=True, capture_output=True)
-
-
-def export_native_package(root: Path, run_id: str) -> tuple[Path, dict[str, Any]]:
-    exported = run_harness(root, "dispatch", "native-export", run_id)
-    manifest_path = Path(exported.stdout.strip().split()[-1])
-    if not manifest_path.is_absolute():
-        manifest_path = root / manifest_path
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    package_path = root / str(manifest["packages"][0]["path"])
-    return package_path, json.loads(package_path.read_text(encoding="utf-8"))
-
-
-def rfc3339_timestamp(value: object) -> str:
-    try:
-        timestamp = float(value)
-    except (TypeError, ValueError):
-        timestamp = time.time()
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
-
-
-def live_receipt_path(root: Path, run_id: str) -> Path:
-    return root / ".ai-team" / "runtime" / "live-codex" / run_id / "native-receipt.json"
-
-
-def effective_assignment_agent(assignment: dict[str, object]) -> str:
-    return str(assignment.get("agent_id") or assignment.get("capability") or assignment.get("owner") or "developer")
-
-
-def execute_live_codex_profile(codex: str, codex_version: str) -> dict[str, Any]:
-    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    plugin_id = "codex-project-harness@kafa-local"
-    expected_skills = {
-        f"codex-project-harness:{skill.parent.name}"
-        for skill in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")
-    }
-    expected_hook_events = {"sessionStart", "subagentStart", "preToolUse", "postToolUse", "stop"}
-    timeout = max(60, int(os.environ.get("HARNESS_E2E_LIVE_TIMEOUT_SECONDS", "600")))
-    with tempfile.TemporaryDirectory() as temp:
-        temp_path = Path(temp)
-        live_env = prepare_live_codex_env(temp_path, codex)
-        run_required(
-            [sys.executable, "-m", "kafa.cli", "plugin", "install", "--scope", "user", "--repo", str(ROOT)],
-            cwd=ROOT,
-            env=live_env,
-        )
-        added = json.loads(
-            run_required(codex_cli_command(codex, "plugin", "add", plugin_id, "--json"), cwd=temp_path, env=live_env)
-        )
-        cache_root = Path(str(added["installedPath"]))
-
-        root = temp_path / "business"
-        root.mkdir()
-        init_git_repo(root)
-        add_live_codex_fixture(root)
-        run_id = setup_basic_harness(root, ["T1"])
-        assignment = db_rows(
-            root,
-            """
-            select da.task_id, da.agent_id, da.capability, t.owner
-            from dispatch_assignments da
-            join tasks t on t.cycle_id = da.cycle_id and t.id = da.task_id
-            where da.run_id = ? and da.task_id = 'T1'
-            """,
-            (run_id,),
-        )[0]
-        claim_agent = effective_assignment_agent(dict(assignment))
-        add_file_claim(root, run_id, "T1", claim_agent, "app.py", "", "")
-        _package_path, package = export_native_package(root, run_id)
-        branch = str(package["target_branch"])
-        base_sha = str(package["base_sha"])
-        worktree = temp_path / "codex-worktree"
-        subprocess.run(
-            ["git", "worktree", "add", "-b", branch, str(worktree), base_sha],
-            cwd=root,
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-
-        output_schema = {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string", "enum": ["completed"]},
-                "summary": {"type": "string"},
-            },
-            "required": ["status", "summary"],
-            "additionalProperties": False,
-        }
-        prompt = textwrap.dedent(
-            f"""\
-            Complete one narrow compatibility task in this isolated git worktree.
-            Edit only app.py so `{TEST_COMMAND}` passes, then run exactly `{TEST_COMMAND}`.
-            Do not edit tests, .ai-team, .codex, docs, or git configuration.
-            Return the required JSON object. This is a live compatibility probe; Kafa will independently verify the branch.
-
-            Native package hash: {package['package_sha256']}
-            Target branch: {branch}
-            """
-        )
-        discovery: dict[str, Any]
-        thread_id = ""
-        turn_id = ""
-        turn_completed: dict[str, Any] = {}
-        hook_runs: list[dict[str, Any]] = []
-        thread_result: dict[str, Any] = {}
-        app_server_command = codex_cli_command(codex, "app-server", "--stdio")
-        with AppServerClient(app_server_command, env=live_env, cwd=worktree, timeout=timeout) as client:
-            initialized = client.request(
-                "initialize",
-                {
-                    "clientInfo": {"name": "kafa-live-compatibility", "version": "1"},
-                    "capabilities": {"experimentalApi": True},
-                },
-            )
-            client.notify("initialized", {})
-            discovery = {
-                "initialize": initialized,
-                "skills": client.request("skills/list", {"cwds": [str(worktree)], "forceReload": True}),
-                "hooks": client.request("hooks/list", {"cwds": [str(worktree)]}),
-                "plugin": client.request("plugin/installed", {"cwds": [str(worktree)]}),
-            }
-            discovery_report = validate_app_server_discovery(
-                discovery,
-                cache_root=cache_root,
-                plugin_id=plugin_id,
-                version=version,
-                expected_skills=expected_skills,
-                expected_hook_events=expected_hook_events,
-            )
-            thread_result = client.request(
-                "thread/start",
-                {
-                    "cwd": str(worktree),
-                    "ephemeral": True,
-                    "approvalPolicy": "never",
-                    "sandbox": "workspace-write",
-                    "config": {"bypass_hook_trust": True},
-                },
-            )
-            thread_id = str(thread_result["thread"]["id"])
-            turn_result = client.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": prompt}],
-                    "outputSchema": output_schema,
-                    "approvalPolicy": "never",
-                },
-                timeout=60,
-            )
-            turn_id = str(turn_result["turn"]["id"])
-            turn_completed = client.wait_for_notification(
-                "turn/completed",
-                predicate=lambda message: str(message.get("params", {}).get("turn", {}).get("id", "")) == turn_id,
-                timeout=timeout,
-            )
-            hook_runs = [
-                message["params"]["run"]
-                for message in client.notifications
-                if message.get("method") == "hook/completed"
-                and message.get("params", {}).get("run", {}).get("source") == "plugin"
-                and Path(str(message.get("params", {}).get("run", {}).get("sourcePath", ""))).resolve().is_relative_to(cache_root.resolve())
-            ]
-
-        turn = turn_completed.get("params", {}).get("turn", {})
-        if turn.get("status") != "completed":
-            error = turn.get("error", {})
-            message = str(error.get("message", error))
-            if any(token in message.lower() for token in ["unauthorized", "usage limit", "rate limit", "not available"]):
-                raise LiveCapabilityBlocked(f"live Codex turn capability blocked: {message[-1500:]}")
-            raise RuntimeError(f"live Codex turn failed: {message[-1500:]}")
-        required_host_hook_events = {"sessionStart", "preToolUse", "postToolUse", "stop"}
-        completed_hook_events = {
-            str(run.get("eventName", ""))
-            for run in hook_runs
-            if run.get("status") == "completed"
-        }
-        if not required_host_hook_events.issubset(completed_hook_events):
-            raise RuntimeError(
-                f"host Hook execution incomplete: completed={sorted(completed_hook_events)} runs={hook_runs}"
-            )
-
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=worktree,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        changed_paths = git_porcelain_paths(status.stdout)
-        if changed_paths != {"app.py"}:
-            raise RuntimeError(f"live Codex changed unexpected paths: {sorted(changed_paths)}")
-        if (worktree / "app.py").read_text(encoding="utf-8").strip() != "VALUE = 2":
-            raise RuntimeError("live Codex did not produce the expected app.py change")
-        subprocess.run(["git", "add", "app.py"], cwd=worktree, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "live Codex compatibility change"], cwd=worktree, check=True, capture_output=True)
-        head_sha = run_git(worktree, "rev-parse", "HEAD")
-        tree_sha = run_git(worktree, "rev-parse", "HEAD^{tree}")
-        worktree_id = "git-worktree-" + hashlib.sha256(str(worktree.resolve()).encode("utf-8")).hexdigest()[:20]
-        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, check=True, capture_output=True)
-
-        artifact = root / ".ai-team" / "runtime" / "live-codex" / run_id / "turn-completed.json"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact_payload = {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "turn_status": turn.get("status"),
-            "hook_events": sorted(completed_hook_events),
-        }
-        artifact.write_text(json.dumps(artifact_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        turn_digest = hashlib.sha256(json.dumps(turn_completed, sort_keys=True).encode("utf-8")).hexdigest()
-        receipt = {
-            "receipt_version": "1",
-            "package_sha256": package["package_sha256"],
-            "run_id": run_id,
-            "assignment_id": package["assignment_id"],
-            "host": {
-                "surface": "codex-app-server-live-eval",
-                "task_id": turn_id,
-                "thread_id": thread_id,
-                "parent_thread_id": "",
-                "worktree_id": worktree_id,
-                "worktree_path": str(worktree),
-                "worktree_owner": "live-eval-runner",
-                "handoff_id": "",
-            },
-            "policy": {
-                "approval_mode": "never",
-                "sandbox": "workspace-write",
-                "network": "disabled",
-                "selected_model": str(thread_result.get("model", "host-default")),
-                "reasoning": str(thread_result.get("reasoningEffort") or "host-default"),
-            },
-            "status": "completed",
-            "branch": branch,
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "report": {
-                "command": TEST_COMMAND,
-                "exit_code": 0,
-                "stdout_sha256": turn_digest,
-                "artifact_path": artifact.relative_to(root).as_posix(),
-                "executed_count": 1,
-                "executed_count_source": "manual",
-                "source_tree_hash": tree_sha,
-                "branch_name": branch,
-                "status": "success",
-                "target_id": "UNIT",
-            },
-            "started_at": rfc3339_timestamp(turn.get("startedAt")),
-            "completed_at": rfc3339_timestamp(turn.get("completedAt")),
-            "provenance": {
-                "kind": "audit-only",
-                "issuer": "codex-app-server-live-eval",
-                "payload_sha256": turn_digest,
-                "signature": "",
-            },
-        }
-        receipt_path = live_receipt_path(root, run_id)
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-        evidence_before = len(db_rows(root, "select id from evidence"))
-        imported = run_harness(root, "dispatch", "native-import", run_id, "--receipt", str(receipt_path))
-        evidence_after_import = len(db_rows(root, "select id from evidence"))
-        verified = run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
-        evidence_after_verify = len(db_rows(root, "select id from evidence"))
-        accept_task_via_cli(root, "T1")
-        delivery_issues = record_integration_candidate_gate(root, run_id, {"T1": branch})
-        integrated = run_harness(root, "dispatch", "integrate", "--run-id", run_id, check=False)
-        target_branch = integrated.stdout.strip().rsplit(" ", 1)[-1] if integrated.returncode == 0 else ""
-        run_status = db_rows(root, "select status from dispatch_runs where id = ?", (run_id,))[0]["status"]
-        integrated_value = run_git(root, "show", f"{target_branch}:app.py").strip() if target_branch else ""
-        if not (
-            evidence_before == 0
-            and evidence_after_import == 0
-            and evidence_after_verify > 0
-            and not delivery_issues
-            and integrated.returncode == 0
-            and run_status == "integrated"
-            and integrated_value == "VALUE = 2"
-        ):
-            raise RuntimeError(
-                "live native receipt delivery flow failed: "
-                f"evidence={evidence_before}/{evidence_after_import}/{evidence_after_verify} "
-                f"delivery_issues={delivery_issues} integrate={integrated.returncode} status={run_status} "
-                f"stdout={(integrated.stdout or '')[-1500:]} stderr={(integrated.stderr or '')[-1500:]}"
-            )
-
-        return {
-            "discovery": {
-                "codex_version": codex_version,
-                "plugin_id": discovery_report["plugin_id"],
-                "plugin_version": discovery_report["plugin_local_version"],
-                "skill_count": discovery_report["skill_count"],
-                "hook_events_discovered": discovery_report["hook_events"],
-                "hook_events_executed": sorted(completed_hook_events),
-                "host_hook_execution_observed": True,
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "turn_status": turn.get("status"),
-                "sandbox": thread_result.get("sandbox"),
-                "approval_policy": thread_result.get("approvalPolicy"),
-            },
-            "delivery": {
-                "run_id": run_id,
-                "assignment_id": package["assignment_id"],
-                "branch": branch,
-                "base_sha": base_sha,
-                "head_sha": head_sha,
-                "worktree_id": worktree_id,
-                "worktree_owner": "live-eval-runner",
-                "receipt_provenance": "audit-only",
-                "native_subagent_observed": False,
-                "native_subagent_reason": "Codex app-server exposed a real thread/turn but no host child-subagent receipt was requested",
-                "import_stdout": imported.stdout.strip(),
-                "verify_stdout": verified.stdout.strip(),
-                "evidence_before": evidence_before,
-                "evidence_after_import": evidence_after_import,
-                "evidence_after_verify": evidence_after_verify,
-                "integration_returncode": integrated.returncode,
-                "integration_status": run_status,
-                "target_branch": target_branch,
-            },
-        }
-
-
-def run_live_codex() -> dict[str, Any]:
-    started = time.perf_counter()
-    if os.environ.get("HARNESS_E2E_ENABLE_LIVE_CODEX") != "1":
-        reasons = ["HARNESS_E2E_ENABLE_LIVE_CODEX is not set to 1"]
+    if os.environ.get(enable_env) != "1":
+        reasons = [f"{enable_env} is not set to 1"]
         scenarios = [
-            skipped_scenario("live_codex_app_server_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
-            skipped_scenario("live_codex_native_receipt_e2e", "; ".join(reasons), category="live-codex", mode="live-codex"),
+            skipped_scenario(
+                scenario_name,
+                "; ".join(reasons),
+                category=mode,
+                mode=mode,
+            )
         ]
-        return summarize("live-codex", scenarios, started, live_skipped=True, live_skipped_reasons=reasons)
+        return "", "", None, summarize(
+            mode,
+            scenarios,
+            started,
+            live_skipped=True,
+            live_skipped_reasons=reasons,
+        )
+    if (
+        os.environ.get("HARNESS_E2E_CODEX_BIN", "").strip()
+        and os.environ.get("HARNESS_E2E_ALLOW_CODEX_BIN_OVERRIDE") != "1"
+    ):
+        reason = (
+            "HARNESS_E2E_CODEX_BIN is a test override and requires "
+            "HARNESS_E2E_ALLOW_CODEX_BIN_OVERRIDE=1"
+        )
+        scenarios = [
+            scenario_result(
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "blocked", "reason": reason},
+                category=mode,
+                mode=mode,
+            )
+        ]
+        return "", "", None, summarize(mode, scenarios, started, live_status="blocked")
     codex = live_codex_binary()
     if not codex:
         reason = "codex CLI is not available on PATH or HARNESS_E2E_CODEX_BIN"
         scenarios = [
-            scenario_result(name, started, False, {"capability_status": "blocked", "reason": reason}, category="live-codex", mode="live-codex")
-            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+            scenario_result(
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "blocked", "reason": reason},
+                category=mode,
+                mode=mode,
+            )
         ]
-        return summarize("live-codex", scenarios, started, live_status="blocked")
+        return "", "", None, summarize(mode, scenarios, started, live_status="blocked")
+    native_host = live_codex_binary_metadata(codex)
     try:
-        codex_version = run_live_preflight(codex)
-        details = execute_live_codex_profile(codex, codex_version)
+        with tempfile.TemporaryDirectory(prefix="kafa-live-preflight-") as live_home:
+            preflight_env = isolated_live_codex_environment(Path(live_home))
+            version = run_live_preflight(codex, preflight_env)
     except LiveCapabilityBlocked as exc:
         scenarios = [
             scenario_result(
-                name,
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "blocked", "reason": str(exc)},
+                category=mode,
+                mode=mode,
+            )
+        ]
+        return "", "", native_host, summarize(
+            mode,
+            scenarios,
+            started,
+            live_status="blocked",
+            native_host=native_host,
+        )
+    return codex, version, native_host, None
+
+
+def _run_live_codex_unpinned() -> dict[str, Any]:
+    started = time.perf_counter()
+    mode = "live-codex"
+    scenario_name = "native_codex_edit_and_controller_verify"
+    codex, codex_version, native_host, unavailable = prepare_live_profile(
+        mode=mode,
+        scenario_name=scenario_name,
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX",
+        started=started,
+    )
+    if unavailable is not None:
+        return unavailable
+
+    try:
+        timeout = int(os.environ.get("HARNESS_E2E_LIVE_TIMEOUT", "600"))
+    except ValueError:
+        timeout = 600
+    with (
+        tempfile.TemporaryDirectory(prefix="kafa-live-controller-") as temp,
+        tempfile.TemporaryDirectory(prefix="kafa-live-producer-") as producer_temp,
+        tempfile.TemporaryDirectory(prefix="kafa-live-codex-home-") as live_home,
+    ):
+        root = Path(temp)
+        producer_root = Path(producer_temp)
+        try:
+            native_env = isolated_live_codex_environment(Path(live_home))
+        except LiveCapabilityBlocked as exc:
+            scenario = scenario_result(
+                scenario_name,
                 started,
                 False,
                 {"capability_status": "blocked", "reason": str(exc)},
                 category="live-codex",
                 mode="live-codex",
             )
-            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+            return summarize(
+                "live-codex",
+                [scenario],
+                started,
+                live_status="blocked",
+                native_host=native_host,
+            )
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Kafa Live Eval"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "kafa-live@example.invalid"], cwd=root, check=True)
+        (root / "candidate.py").write_text('VALUE = "before"\n', encoding="utf-8")
+        (root / "test_candidate.py").write_text(
+            "import unittest\n"
+            "import candidate\n\n"
+            "class CandidateTest(unittest.TestCase):\n"
+            "    def test_native_edit(self):\n"
+            "        self.assertEqual(candidate.VALUE, 'after')\n",
+            encoding="utf-8",
+        )
+        _require_ok(run_harness(root, "init", check=False))
+        subprocess.run(
+            ["git", "add", ".gitignore", "candidate.py", "test_candidate.py"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "red live candidate"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _initialize_producer_workspace(
+            producer_root,
+            {
+                "candidate.py": 'VALUE = "before"\n',
+                "test_candidate.py": (
+                    "import unittest\n"
+                    "import candidate\n\n"
+                    "class CandidateTest(unittest.TestCase):\n"
+                    "    def test_native_edit(self):\n"
+                    "        self.assertEqual(candidate.VALUE, 'after')\n"
+                ),
+            },
+            name="Kafa Single Producer Eval",
+        )
+        for args in (
+            ("acceptance", "add", "--id", "LIVE-AC1", "--criterion", "candidate value is after"),
+            ("task", "add", "--id", "LIVE-T1", "--task", "edit candidate", "--acceptance", "LIVE-AC1"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "LIVE-UNIT",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -B -m unittest test_candidate.py",
+            ),
+            ("test-target", "link", "--task", "LIVE-T1", "--target", "LIVE-UNIT"),
+            ("task", "start", "LIVE-T1"),
+        ):
+            _require_ok(run_harness(root, *args, check=False))
+
+        pre_edit = subprocess.run(
+            [sys.executable, "-B", "-m", "unittest", "test_candidate.py"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        controller_test_digest = _sha256(root / "test_candidate.py")
+        controller_state_digest = _sha256(root / ".ai-team/state/harness.db")
+        output_dir = Path(live_home) / "messages"
+        output_dir.mkdir(parents=True)
+        producer_result = _run_native_eval_producer(
+            codex=codex,
+            root=producer_root,
+            native_env=native_env,
+            timeout=timeout,
+            output_dir=output_dir,
+            producer={
+                "task": "LIVE-T1",
+                "marker": "SINGLE-PRODUCER",
+                "exclusive_files": ["candidate.py"],
+                "test_file": "test_candidate.py",
+                "test_command": "python3 -B -m unittest test_candidate.py",
+                "context_id": "native-codex-task",
+                "capability_hint": "fast",
+            },
+        )
+        controller_state_unchanged = (
+            _sha256(root / ".ai-team/state/harness.db") == controller_state_digest
+        )
+        producer_scope_valid = bool(producer_result["scope_valid"])
+        integrated_files: list[str] = []
+        if (
+            producer_result["returncode"] == 0
+            and producer_scope_valid
+            and controller_state_unchanged
+        ):
+            shutil.copy2(producer_root / "candidate.py", root / "candidate.py")
+            integrated_files.append("candidate.py")
+        controller_test_unchanged = _sha256(root / "test_candidate.py") == controller_test_digest
+        if integrated_files == ["candidate.py"] and controller_test_unchanged:
+            controller = run_harness(
+                root,
+                "verify",
+                "run",
+                "--target",
+                "LIVE-UNIT",
+                "--acceptance",
+                "LIVE-AC1",
+                check=False,
+                timeout=120,
+            )
+            controller_verify_status = "passed" if controller.returncode == 0 else "failed"
+        else:
+            controller = subprocess.CompletedProcess([], 1, "", "producer scope rejected before verification")
+            controller_verify_status = "not-run"
+        if controller.returncode == 0:
+            submit = run_harness(
+                root,
+                "task",
+                "submit",
+                "LIVE-T1",
+                "--context-id",
+                "native-codex-task",
+                "--evidence",
+                "controller verification passed after Native Codex returned",
+                check=False,
+            )
+        else:
+            submit = subprocess.CompletedProcess([], 1, "", "controller verification failed")
+        execution_count = int(_scalar(root, "select count(*) from executions"))
+        validation_count = int(_scalar(root, "select count(*) from validations"))
+        task_status = str(_scalar(root, "select status from tasks where id='LIVE-T1'"))
+        retired_host_tables, provider_surface_absent = active_table_contract(root)
+        passed = (
+            pre_edit.returncode != 0
+            and producer_result["returncode"] == 0
+            and producer_scope_valid
+            and producer_result["changed_files"] == ["candidate.py"]
+            and producer_result["test_file_unchanged"]
+            and controller_state_unchanged
+            and controller_test_unchanged
+            and integrated_files == ["candidate.py"]
+            and producer_result["native_usage"] is not None
+            and controller.returncode == 0
+            and submit.returncode == 0
+            and execution_count == 1
+            and validation_count == 1
+            and task_status == "submitted"
+            and provider_surface_absent
+        )
+        scenario = scenario_result(
+            scenario_name,
+            started,
+            passed,
+            {
+                "capability_status": "passed" if passed else "failed",
+                "codex_version": codex_version,
+                "pre_edit_returncode": pre_edit.returncode,
+                "native_returncode": producer_result["returncode"],
+                "native_runtime_seconds": producer_result["runtime_seconds"],
+                "native_runtime_source": "controller-wall-clock",
+                "native_usage": producer_result["native_usage"],
+                "native_token_count": producer_result["token_count"],
+                "native_token_source": producer_result["token_source"],
+                "native_token_scope": NATIVE_TOKEN_SCOPE,
+                "workload_family": LIVE_WORKLOAD_FAMILY,
+                "workload_unit_sha256": LIVE_WORKLOAD_UNIT_SHA256,
+                "workload_units": 1,
+                "native_stdout_tail": producer_result["stdout_tail"],
+                "native_stderr_tail": producer_result["stderr_tail"],
+                "exclusive_files": producer_result["exclusive_files"],
+                "changed_files": producer_result["changed_files"],
+                "producer_changed_files": producer_result["changed_files"],
+                "integrated_files": integrated_files,
+                "producer_scope_valid": producer_scope_valid,
+                "producer_workspace_isolated": True,
+                "test_file_unchanged": bool(producer_result["test_file_unchanged"]),
+                "controller_test_unchanged": controller_test_unchanged,
+                "controller_state_unchanged_during_native": controller_state_unchanged,
+                "controller_verify_returncode": controller.returncode,
+                "controller_verify_status": controller_verify_status,
+                "controller_verify_output": (controller.stdout + controller.stderr)[-2000:],
+                "task_submit_returncode": submit.returncode,
+                "execution_count": execution_count,
+                "validation_count": validation_count,
+                "task_status": task_status,
+                "provider_surface_absent": provider_surface_absent,
+                "retired_host_tables": retired_host_tables,
+                "last_message_recorded": producer_result["last_message_recorded"],
+                "human_intervention_count": 0,
+                "false_pass_count": int(
+                    producer_result["returncode"] == 0
+                    and controller_verify_status == "failed"
+                ),
+            },
+            category="live-codex",
+            mode="live-codex",
+        )
+        return summarize(
+            "live-codex",
+            [scenario],
+            started,
+            live_status="passed" if passed else "failed",
+            native_host=native_host,
+        )
+
+
+def _initialize_producer_workspace(root: Path, files: dict[str, str], *, name: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", name], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "kafa-native-eval@example.invalid"], cwd=root, check=True)
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "red Native Host producer candidate"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _git_changed_files(root: Path) -> list[str]:
+    lines = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+    return sorted(line[3:] for line in lines if len(line) > 3)
+
+
+def _run_native_eval_producer(
+    *,
+    codex: str,
+    root: Path,
+    native_env: dict[str, str],
+    timeout: int,
+    output_dir: Path,
+    producer: dict[str, Any],
+) -> dict[str, Any]:
+    task = str(producer["task"])
+    relative = normalize_live_eval_path(producer["exclusive_files"][0])
+    test_command = str(producer["test_command"])
+    marker = str(producer["marker"])
+    test_file = normalize_live_eval_path(producer["test_file"])
+    test_digest_before = _sha256(root / test_file)
+    last_message = output_dir / f"{task}.txt"
+    prompt = (
+        f"{marker}. Capability hint: fast; actual model selection remains Host-owned. "
+        f"In this isolated local repository, edit only {relative} so `{test_command}` passes. "
+        "Do not edit tests, .gitignore, .ai-team, .codex, or docs/harness. "
+        f"Run {test_command}. Do not commit, create branches, or use network services. "
+        "Stop after the bounded local edit and test."
+    )
+    command = codex_cli_command(
+        codex,
+        "exec",
+        "--ignore-user-config",
+        "--cd",
+        str(root),
+        "--sandbox",
+        "workspace-write",
+        "--ephemeral",
+        "--json",
+        "--color",
+        "never",
+        "--output-last-message",
+        str(last_message),
+        prompt,
+    )
+    launched = time.perf_counter()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            env=native_env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=max(timeout, 1),
+        )
+        error = ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = subprocess.CompletedProcess(command, 124, "", str(exc))
+        error = str(exc)
+    finished = time.perf_counter()
+    usage = parse_native_usage_jsonl(result.stdout)
+    changed_files = _git_changed_files(root)
+    test_file_unchanged = _sha256(root / test_file) == test_digest_before
+    exclusive_files = sorted(normalize_live_eval_path(path) for path in producer["exclusive_files"])
+    scope_valid = changed_files == exclusive_files and test_file_unchanged
+    return {
+        "task": task,
+        "exclusive_files": exclusive_files,
+        "changed_files": changed_files,
+        "scope_valid": scope_valid,
+        "test_file_unchanged": test_file_unchanged,
+        "capability_hint": str(producer["capability_hint"]),
+        "context_id": str(producer["context_id"]),
+        "target": str(producer.get("target") or ""),
+        "acceptance": str(producer.get("acceptance") or ""),
+        "returncode": result.returncode,
+        "started_at": launched,
+        "finished_at": finished,
+        "runtime_seconds": round(finished - launched, 6),
+        "native_usage": usage,
+        "token_count": usage["token_count"] if usage is not None else None,
+        "token_source": "codex-json-turn.completed" if usage is not None else "unavailable",
+        "stdout_tail": result.stdout[-2000:],
+        "stderr_tail": result.stderr[-2000:],
+        "last_message_recorded": last_message.is_file(),
+        "error": error,
+    }
+
+
+def _run_live_codex_parallel_unpinned() -> dict[str, Any]:
+    """Run two disjoint Native Host producers and root-owned integration verification."""
+
+    started = time.perf_counter()
+    mode = "live-codex-parallel"
+    scenario_name = "native_codex_two_producer_integration"
+    codex, codex_version, native_host, unavailable = prepare_live_profile(
+        mode=mode,
+        scenario_name=scenario_name,
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL",
+        started=started,
+    )
+    if unavailable is not None:
+        return unavailable
+    try:
+        timeout = int(os.environ.get("HARNESS_E2E_LIVE_TIMEOUT", "600"))
+    except ValueError:
+        timeout = 600
+
+    with (
+        tempfile.TemporaryDirectory(prefix="kafa-live-parallel-controller-") as temp,
+        tempfile.TemporaryDirectory(prefix="kafa-live-alpha-producer-") as alpha_temp,
+        tempfile.TemporaryDirectory(prefix="kafa-live-beta-producer-") as beta_temp,
+        tempfile.TemporaryDirectory(prefix="kafa-live-parallel-home-") as live_home,
+    ):
+        root = Path(temp)
+        producer_roots = [Path(alpha_temp), Path(beta_temp)]
+        output_dir = Path(live_home) / "messages"
+        output_dir.mkdir(parents=True)
+        producers = [
+            {
+                "task": "LIVE-P1",
+                "marker": "ALPHA-PRODUCER",
+                "exclusive_files": ["alpha.py"],
+                "test_file": "test_alpha.py",
+                "test_command": "python3 -B -m unittest test_alpha.py",
+                "target": "LIVE-ALPHA",
+                "acceptance": "LIVE-AC-A",
+                "context_id": "native-alpha-producer",
+                "capability_hint": "fast",
+            },
+            {
+                "task": "LIVE-P2",
+                "marker": "BETA-PRODUCER",
+                "exclusive_files": ["beta.py"],
+                "test_file": "test_beta.py",
+                "test_command": "python3 -B -m unittest test_beta.py",
+                "target": "LIVE-BETA",
+                "acceptance": "LIVE-AC-B",
+                "context_id": "native-beta-producer",
+                "capability_hint": "fast",
+            },
         ]
-        return summarize("live-codex", scenarios, started, live_status="blocked")
-    except Exception as exc:  # noqa: BLE001 - live report must preserve the failing boundary.
-        scenarios = [
-            scenario_result(
-                name,
+        scope_conflicts = live_eval_scope_conflicts(producers)
+        if scope_conflicts:
+            scenario = scenario_result(
+                scenario_name,
                 started,
                 False,
-                {"capability_status": "failed", "error": str(exc)},
-                category="live-codex",
-                mode="live-codex",
+                {
+                    "capability_status": "blocked",
+                    "reason": "parallel live eval write scopes overlap",
+                    "scope_conflicts": scope_conflicts,
+                    "overlap_policy": "block-parallel-on-declared-overlap",
+                },
+                category=mode,
+                mode=mode,
             )
-            for name in ["live_codex_app_server_e2e", "live_codex_native_receipt_e2e"]
+            return summarize(
+                mode,
+                [scenario],
+                started,
+                live_status="blocked",
+                native_host=native_host,
+            )
+        try:
+            native_envs = [
+                isolated_live_codex_environment(Path(live_home) / f"producer-{index}")
+                for index in range(len(producers))
+            ]
+        except LiveCapabilityBlocked as exc:
+            scenario = scenario_result(
+                scenario_name,
+                started,
+                False,
+                {"capability_status": "blocked", "reason": str(exc)},
+                category=mode,
+                mode=mode,
+            )
+            return summarize(
+                mode,
+                [scenario],
+                started,
+                live_status="blocked",
+                native_host=native_host,
+            )
+
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Kafa Parallel Eval"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "kafa-parallel@example.invalid"], cwd=root, check=True)
+        (root / "alpha.py").write_text('VALUE = "before"\n', encoding="utf-8")
+        (root / "beta.py").write_text('VALUE = "before"\n', encoding="utf-8")
+        (root / "test_alpha.py").write_text(
+            "import unittest\nimport alpha\n\n"
+            "class AlphaTest(unittest.TestCase):\n"
+            "    def test_alpha(self):\n"
+            "        self.assertEqual(alpha.VALUE, 'after')\n",
+            encoding="utf-8",
+        )
+        (root / "test_beta.py").write_text(
+            "import unittest\nimport beta\n\n"
+            "class BetaTest(unittest.TestCase):\n"
+            "    def test_beta(self):\n"
+            "        self.assertEqual(beta.VALUE, 'after')\n",
+            encoding="utf-8",
+        )
+        (root / "test_integration.py").write_text(
+            "import unittest\nimport alpha\nimport beta\n\n"
+            "class IntegrationTest(unittest.TestCase):\n"
+            "    def test_both(self):\n"
+            "        self.assertEqual((alpha.VALUE, beta.VALUE), ('after', 'after'))\n",
+            encoding="utf-8",
+        )
+        _require_ok(run_harness(root, "init", check=False))
+        subprocess.run(
+            [
+                "git",
+                "add",
+                ".gitignore",
+                "alpha.py",
+                "beta.py",
+                "test_alpha.py",
+                "test_beta.py",
+                "test_integration.py",
+            ],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "red parallel candidate"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _initialize_producer_workspace(
+            producer_roots[0],
+            {
+                "alpha.py": (root / "alpha.py").read_text(encoding="utf-8"),
+                "test_alpha.py": (root / "test_alpha.py").read_text(encoding="utf-8"),
+            },
+            name="Kafa Alpha Producer Eval",
+        )
+        _initialize_producer_workspace(
+            producer_roots[1],
+            {
+                "beta.py": (root / "beta.py").read_text(encoding="utf-8"),
+                "test_beta.py": (root / "test_beta.py").read_text(encoding="utf-8"),
+            },
+            name="Kafa Beta Producer Eval",
+        )
+        test_digests_before = {
+            name: _sha256(root / name)
+            for name in ("test_alpha.py", "test_beta.py", "test_integration.py")
+        }
+        pre_edit = subprocess.run(
+            [sys.executable, "-B", "-m", "unittest", "test_integration.py"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        setup_commands = [
+            ("acceptance", "add", "--id", "LIVE-AC-A", "--criterion", "alpha value is after"),
+            ("acceptance", "add", "--id", "LIVE-AC-B", "--criterion", "beta value is after"),
+            ("acceptance", "add", "--id", "LIVE-AC-I", "--criterion", "alpha and beta are after together"),
+            ("task", "add", "--id", "LIVE-P1", "--task", "edit alpha", "--acceptance", "LIVE-AC-A"),
+            ("task", "add", "--id", "LIVE-P2", "--task", "edit beta", "--acceptance", "LIVE-AC-B"),
+            (
+                "task",
+                "add",
+                "--id",
+                "LIVE-INTEGRATE",
+                "--task",
+                "verify combined candidate",
+                "--acceptance",
+                "LIVE-AC-I",
+                "--depends-on",
+                "LIVE-P1,LIVE-P2",
+            ),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "LIVE-ALPHA",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -B -m unittest test_alpha.py",
+            ),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "LIVE-BETA",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -B -m unittest test_beta.py",
+            ),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "LIVE-COMBINED",
+                "--kind",
+                "integration",
+                "--command-template",
+                "python3 -B -m unittest test_integration.py",
+            ),
+            ("test-target", "link", "--task", "LIVE-P1", "--target", "LIVE-ALPHA"),
+            ("test-target", "link", "--task", "LIVE-P2", "--target", "LIVE-BETA"),
+            ("test-target", "link", "--task", "LIVE-INTEGRATE", "--target", "LIVE-COMBINED"),
+            ("task", "start", "LIVE-P1"),
+            ("task", "start", "LIVE-P2"),
         ]
-        return summarize("live-codex", scenarios, started)
-    scenarios = [
-        scenario_result(
-            "live_codex_app_server_e2e",
+        for args in setup_commands:
+            _require_ok(run_harness(root, *args, check=False))
+        integration_blocked = run_harness(root, "task", "start", "LIVE-INTEGRATE", check=False)
+        controller_state_digest = _sha256(root / ".ai-team/state/harness.db")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    _run_native_eval_producer,
+                    codex=codex,
+                    root=producer_roots[index],
+                    native_env=native_envs[index],
+                    timeout=timeout,
+                    output_dir=output_dir,
+                    producer=producer,
+                )
+                for index, producer in enumerate(producers)
+            ]
+            producer_results = [future.result() for future in futures]
+
+        producer_overlap_seconds = round(
+            max(
+                0.0,
+                min(float(result["finished_at"]) for result in producer_results)
+                - max(float(result["started_at"]) for result in producer_results),
+            ),
+            6,
+        )
+        native_runtime_seconds = round(
+            max(float(result["finished_at"]) for result in producer_results)
+            - min(float(result["started_at"]) for result in producer_results),
+            6,
+        )
+        usage_values = [result["native_usage"] for result in producer_results]
+        native_usage = (
+            {
+                field: sum(int(usage[field]) for usage in usage_values)
+                for field in (*NATIVE_USAGE_FIELDS, "token_count")
+            }
+            if all(isinstance(usage, dict) for usage in usage_values)
+            else None
+        )
+        native_token_count = native_usage["token_count"] if native_usage is not None else None
+        producer_attribution_valid = all(
+            result["returncode"] == 0 and result["scope_valid"]
+            for result in producer_results
+        )
+        controller_state_unchanged = (
+            _sha256(root / ".ai-team/state/harness.db") == controller_state_digest
+        )
+        integrated_files: list[str] = []
+        if producer_attribution_valid and controller_state_unchanged:
+            for producer_root, producer in zip(producer_roots, producers, strict=True):
+                for relative in sorted(
+                    normalize_live_eval_path(path) for path in producer["exclusive_files"]
+                ):
+                    shutil.copy2(producer_root / relative, root / relative)
+                    integrated_files.append(relative)
+        integrated_files.sort()
+        changed_files = [
+            relative
+            for relative in _git_changed_files(root)
+            if relative != ".gitignore"
+            and not relative.startswith((".ai-team/", ".codex/agents/", "docs/harness/"))
+        ]
+        test_files_unchanged = all(
+            _sha256(root / name) == digest for name, digest in test_digests_before.items()
+        )
+        expected_integrated_files = sorted(
+            normalize_live_eval_path(path)
+            for producer in producers
+            for path in producer["exclusive_files"]
+        )
+        if (
+            producer_attribution_valid
+            and controller_state_unchanged
+            and test_files_unchanged
+            and integrated_files == expected_integrated_files
+        ):
+            targeted_results = {
+                str(producer["target"]): run_harness(
+                    root,
+                    "verify",
+                    "run",
+                    "--target",
+                    str(producer["target"]),
+                    "--acceptance",
+                    str(producer["acceptance"]),
+                    check=False,
+                )
+                for producer in producers
+            }
+        else:
+            targeted_results = {
+                str(producer["target"]): subprocess.CompletedProcess(
+                    [], 1, "", "producer scope rejected before verification"
+                )
+                for producer in producers
+            }
+        producer_state_results: list[subprocess.CompletedProcess[str]] = []
+        if all(result.returncode == 0 for result in targeted_results.values()):
+            for producer in producers:
+                submitted = run_harness(
+                    root,
+                    "task",
+                    "submit",
+                    str(producer["task"]),
+                    "--context-id",
+                    str(producer["context_id"]),
+                    "--evidence",
+                    "root verified bounded Native Host producer output",
+                    check=False,
+                )
+                accepted = run_harness(
+                    root,
+                    "task",
+                    "accept",
+                    str(producer["task"]),
+                    "--evidence",
+                    "root inspected exclusive file diff and targeted verification",
+                    check=False,
+                )
+                producer_state_results.extend([submitted, accepted])
+        integration_started = run_harness(root, "task", "start", "LIVE-INTEGRATE", check=False)
+        if integration_started.returncode == 0:
+            combined = run_harness(
+                root,
+                "verify",
+                "run",
+                "--target",
+                "LIVE-COMBINED",
+                "--acceptance",
+                "LIVE-AC-I",
+                check=False,
+            )
+            combined_verify_status = "passed" if combined.returncode == 0 else "failed"
+        else:
+            combined = subprocess.CompletedProcess([], 1, "", "integration prerequisites not accepted")
+            combined_verify_status = "not-run"
+        if combined.returncode == 0:
+            integration_submitted = run_harness(
+                root,
+                "task",
+                "submit",
+                "LIVE-INTEGRATE",
+                "--context-id",
+                "native-root-integrator",
+                "--evidence",
+                "combined candidate passed root controller integration verification",
+                check=False,
+            )
+        else:
+            integration_submitted = subprocess.CompletedProcess([], 1, "", "combined verification failed")
+        task_statuses = {
+            str(row[0]): str(row[1])
+            for row in db_rows(
+                root,
+                "select id, status from tasks where id in ('LIVE-P1', 'LIVE-P2', 'LIVE-INTEGRATE') order by id",
+            )
+        }
+        execution_count = int(_scalar(root, "select count(*) from executions"))
+        validation_count = int(_scalar(root, "select count(*) from validations"))
+        retired_host_tables, provider_surface_absent = active_table_contract(root)
+        targeted_returncodes = {
+            target: result.returncode for target, result in targeted_results.items()
+        }
+        producer_window_start = min(float(result["started_at"]) for result in producer_results)
+        producer_summaries = []
+        for result in producer_results:
+            summary = {
+                key: value
+                for key, value in result.items()
+                if key not in {"started_at", "finished_at"}
+            }
+            summary["started_offset_seconds"] = round(
+                float(result["started_at"]) - producer_window_start,
+                6,
+            )
+            summary["finished_offset_seconds"] = round(
+                float(result["finished_at"]) - producer_window_start,
+                6,
+            )
+            summary["runtime_seconds"] = round(
+                float(summary["finished_offset_seconds"])
+                - float(summary["started_offset_seconds"]),
+                6,
+            )
+            producer_summaries.append(summary)
+        producer_overlap_seconds = round(
+            max(
+                0.0,
+                min(float(item["finished_offset_seconds"]) for item in producer_summaries)
+                - max(float(item["started_offset_seconds"]) for item in producer_summaries),
+            ),
+            6,
+        )
+        native_runtime_seconds = round(
+            max(float(item["finished_offset_seconds"]) for item in producer_summaries)
+            - min(float(item["started_offset_seconds"]) for item in producer_summaries),
+            6,
+        )
+        passed = (
+            pre_edit.returncode != 0
+            and integration_blocked.returncode != 0
+            and not scope_conflicts
+            and all(result["returncode"] == 0 for result in producer_results)
+            and producer_attribution_valid
+            and controller_state_unchanged
+            and producer_overlap_seconds > 0
+            and integrated_files == ["alpha.py", "beta.py"]
+            and changed_files == ["alpha.py", "beta.py"]
+            and test_files_unchanged
+            and all(code == 0 for code in targeted_returncodes.values())
+            and len(producer_state_results) == 4
+            and all(result.returncode == 0 for result in producer_state_results)
+            and integration_started.returncode == 0
+            and combined.returncode == 0
+            and integration_submitted.returncode == 0
+            and task_statuses
+            == {"LIVE-INTEGRATE": "submitted", "LIVE-P1": "accepted", "LIVE-P2": "accepted"}
+            and execution_count == 3
+            and validation_count == 3
+            and provider_surface_absent
+            and native_usage is not None
+            and all(result["last_message_recorded"] for result in producer_results)
+        )
+        scenario = scenario_result(
+            scenario_name,
             started,
-            True,
-            {"capability_status": "passed", **details["discovery"]},
-            category="live-codex",
-            mode="live-codex",
-        ),
-        scenario_result(
-            "live_codex_native_receipt_e2e",
+            passed,
+            {
+                "capability_status": "passed" if passed else "failed",
+                "codex_version": codex_version,
+                "pre_edit_returncode": pre_edit.returncode,
+                "producer_count": len(producer_results),
+                "producers": producer_summaries,
+                "producer_overlap_seconds": producer_overlap_seconds,
+                "native_runtime_seconds": native_runtime_seconds,
+                "native_runtime_source": "controller-parallel-wall-clock",
+                "native_usage": native_usage,
+                "native_token_count": native_token_count,
+                "native_token_source": "codex-json-turn.completed" if native_usage is not None else "unavailable",
+                "native_token_scope": NATIVE_TOKEN_SCOPE,
+                "workload_family": LIVE_WORKLOAD_FAMILY,
+                "workload_unit_sha256": LIVE_WORKLOAD_UNIT_SHA256,
+                "workload_units": len(producer_results),
+                "changed_files": changed_files,
+                "integrated_files": integrated_files,
+                "producer_attribution_valid": producer_attribution_valid,
+                "controller_state_unchanged_during_native": controller_state_unchanged,
+                "scope_enforcement": "isolated-producer-workspaces-plus-exact-diff-integration",
+                "test_files_unchanged": test_files_unchanged,
+                "targeted_verify_returncodes": targeted_returncodes,
+                "producer_state_returncodes": [
+                    result.returncode for result in producer_state_results
+                ],
+                "integration_start_returncode": integration_started.returncode,
+                "combined_verify_returncode": combined.returncode,
+                "combined_verify_status": combined_verify_status,
+                "integration_submit_returncode": integration_submitted.returncode,
+                "integration_dependency_blocked_before_producers": integration_blocked.returncode != 0,
+                "task_statuses": task_statuses,
+                "execution_count": execution_count,
+                "validation_count": validation_count,
+                "scope_conflicts": scope_conflicts,
+                "overlap_policy": "block-parallel-on-declared-overlap",
+                "retired_host_tables": retired_host_tables,
+                "provider_surface_absent": provider_surface_absent,
+                "human_intervention_count": 0,
+                "false_pass_count": int(
+                    all(result["returncode"] == 0 for result in producer_results)
+                    and combined_verify_status == "failed"
+                ),
+            },
+            category=mode,
+            mode=mode,
+        )
+        return summarize(
+            mode,
+            [scenario],
             started,
-            True,
-            {"capability_status": "passed", **details["delivery"]},
-            category="live-codex",
-            mode="live-codex",
-        ),
-    ]
-    return summarize("live-codex", scenarios, started)
+            live_status="passed" if passed else "failed",
+            native_host=native_host,
+        )
+
+
+def run_live_codex() -> dict[str, Any]:
+    return _run_pinned_live_profile(
+        mode="live-codex",
+        scenario_name="native_codex_edit_and_controller_verify",
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX",
+        runner=_run_live_codex_unpinned,
+    )
+
+
+def run_live_codex_parallel() -> dict[str, Any]:
+    return _run_pinned_live_profile(
+        mode="live-codex-parallel",
+        scenario_name="native_codex_parallel_overlap_and_controller_verify",
+        enable_env="HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL",
+        runner=_run_live_codex_parallel_unpinned,
+    )
+
+
+def _valid_nonzero_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def _valid_aware_iso8601(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _matches_exact_json_contract(actual: object, expected: object) -> bool:
+    """Compare closed-report values without Python bool/int or int/float coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _matches_exact_json_contract(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _matches_exact_json_contract(item, contract)
+            for item, contract in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _usage_errors(prefix: str, usage: object) -> list[str]:
+    if not isinstance(usage, dict):
+        return [f"{prefix} usage is not an object"]
+    errors = _unexpected_key_errors(f"{prefix} usage", usage, USAGE_KEYS)
+    for field in (*NATIVE_USAGE_FIELDS, "token_count"):
+        value = usage.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(f"{prefix} {field} is not a non-negative integer")
+    if errors:
+        return errors
+    if usage["cached_input_tokens"] > usage["input_tokens"]:
+        errors.append(f"{prefix} cached_input_tokens exceeds input_tokens")
+    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
+        errors.append(f"{prefix} reasoning_output_tokens exceeds output_tokens")
+    if usage["token_count"] != usage["input_tokens"] + usage["output_tokens"]:
+        errors.append(f"{prefix} token_count does not equal input_tokens + output_tokens")
+    if usage["token_count"] <= 0:
+        errors.append(f"{prefix} token_count is not positive")
+    return errors
+
+
+def _aggregate_usages(usages: list[dict[str, Any]]) -> dict[str, int] | None:
+    if not usages:
+        return None
+    return {
+        field: sum(int(usage[field]) for usage in usages)
+        for field in (*NATIVE_USAGE_FIELDS, "token_count")
+    }
+
+
+def _passing_live_scenario_errors(
+    mode: str,
+    scenario: dict[str, Any],
+) -> list[str]:
+    """Validate every persisted fact required by a passing Native profile."""
+
+    name = str(scenario.get("name", "<unknown>"))
+    details = scenario.get("details")
+    if not isinstance(details, dict):
+        return [f"scenario {name} details is not an object"]
+    expected_detail_keys = (
+        SINGLE_PASSING_DETAIL_KEYS
+        if mode == "live-codex"
+        else PARALLEL_PASSING_DETAIL_KEYS
+        if mode == "live-codex-parallel"
+        else frozenset()
+    )
+    errors = _unexpected_key_errors(
+        f"scenario {name} details",
+        details,
+        expected_detail_keys,
+    )
+
+    def require(field: str, expected: object) -> None:
+        if not _matches_exact_json_contract(details.get(field), expected):
+            errors.append(f"scenario {name} {field} is inconsistent with passing contract")
+
+    if scenario.get("category") != mode:
+        errors.append(f"scenario {name} category is inconsistent with live profile")
+    if scenario.get("mode") != mode:
+        errors.append(f"scenario {name} mode is inconsistent with live profile")
+    require("capability_status", "passed")
+    pre_edit_returncode = details.get("pre_edit_returncode")
+    if (
+        not isinstance(pre_edit_returncode, int)
+        or isinstance(pre_edit_returncode, bool)
+        or pre_edit_returncode == 0
+    ):
+        errors.append(f"scenario {name} pre_edit_returncode did not prove the red state")
+    if not isinstance(details.get("native_usage"), dict):
+        errors.append(f"scenario {name} native_usage is required for a passing live profile")
+    token_count = details.get("native_token_count")
+    if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count <= 0:
+        errors.append(f"scenario {name} native_token_count is required")
+    runtime = details.get("native_runtime_seconds")
+    if (
+        not isinstance(runtime, (int, float))
+        or isinstance(runtime, bool)
+        or not math.isfinite(float(runtime))
+        or runtime <= 0
+    ):
+        errors.append(f"scenario {name} native_runtime_seconds is required")
+    duration = scenario.get("duration_seconds")
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(float(duration))
+        or duration <= 0
+    ):
+        errors.append(f"scenario {name} duration_seconds is not positive and finite")
+    elif isinstance(runtime, (int, float)) and math.isfinite(float(runtime)) and duration < runtime:
+        errors.append(f"scenario {name} duration_seconds is shorter than Native runtime")
+    require("native_token_scope", NATIVE_TOKEN_SCOPE)
+    require("codex_version", EXPECTED_CODEX_CLI_VERSION)
+    require("human_intervention_count", 0)
+    require("false_pass_count", 0)
+
+    if mode == "live-codex":
+        if name != "native_codex_edit_and_controller_verify":
+            errors.append("passing single Native profile has an unexpected scenario")
+            return errors
+        exact = {
+            "native_returncode": 0,
+            "native_runtime_source": "controller-wall-clock",
+            "exclusive_files": ["candidate.py"],
+            "changed_files": ["candidate.py"],
+            "producer_changed_files": ["candidate.py"],
+            "integrated_files": ["candidate.py"],
+            "producer_scope_valid": True,
+            "producer_workspace_isolated": True,
+            "test_file_unchanged": True,
+            "controller_test_unchanged": True,
+            "controller_state_unchanged_during_native": True,
+            "controller_verify_returncode": 0,
+            "controller_verify_status": "passed",
+            "task_submit_returncode": 0,
+            "execution_count": 1,
+            "validation_count": 1,
+            "workload_units": 1,
+            "task_status": "submitted",
+            "provider_surface_absent": True,
+            "retired_host_tables": [],
+            "last_message_recorded": True,
+        }
+        for field, expected in exact.items():
+            require(field, expected)
+        return errors
+
+    if mode == "live-codex-parallel":
+        if name != "native_codex_two_producer_integration":
+            errors.append("passing parallel Native profile has an unexpected scenario")
+            return errors
+        exact = {
+            "producer_count": 2,
+            "native_runtime_source": "controller-parallel-wall-clock",
+            "changed_files": ["alpha.py", "beta.py"],
+            "integrated_files": ["alpha.py", "beta.py"],
+            "producer_attribution_valid": True,
+            "controller_state_unchanged_during_native": True,
+            "scope_enforcement": "isolated-producer-workspaces-plus-exact-diff-integration",
+            "test_files_unchanged": True,
+            "targeted_verify_returncodes": {"LIVE-ALPHA": 0, "LIVE-BETA": 0},
+            "producer_state_returncodes": [0, 0, 0, 0],
+            "integration_start_returncode": 0,
+            "combined_verify_returncode": 0,
+            "combined_verify_status": "passed",
+            "integration_submit_returncode": 0,
+            "integration_dependency_blocked_before_producers": True,
+            "task_statuses": {
+                "LIVE-INTEGRATE": "submitted",
+                "LIVE-P1": "accepted",
+                "LIVE-P2": "accepted",
+            },
+            "execution_count": 3,
+            "validation_count": 3,
+            "workload_units": 2,
+            "scope_conflicts": {},
+            "overlap_policy": "block-parallel-on-declared-overlap",
+            "retired_host_tables": [],
+            "provider_surface_absent": True,
+        }
+        for field, expected in exact.items():
+            require(field, expected)
+        overlap = details.get("producer_overlap_seconds")
+        if not isinstance(overlap, (int, float)) or isinstance(overlap, bool) or overlap <= 0:
+            errors.append(f"scenario {name} producer_overlap_seconds is not positive")
+        producers = details.get("producers")
+        if not isinstance(producers, list) or len(producers) != len(
+            PARALLEL_PRODUCER_CONTRACT
+        ):
+            errors.append(f"scenario {name} producer task set is inconsistent")
+        else:
+            by_task = {
+                str(producer.get("task")): producer
+                for producer in producers
+                if isinstance(producer, dict)
+            }
+            if set(by_task) != set(PARALLEL_PRODUCER_CONTRACT):
+                errors.append(f"scenario {name} producer task set is inconsistent")
+            else:
+                for task, contract in PARALLEL_PRODUCER_CONTRACT.items():
+                    producer = by_task[task]
+                    errors.extend(
+                        _unexpected_key_errors(
+                            f"scenario {name} producer {task}",
+                            producer,
+                            PARALLEL_PRODUCER_KEYS,
+                        )
+                    )
+                    for field, expected in contract.items():
+                        if not _matches_exact_json_contract(
+                            producer.get(field),
+                            expected,
+                        ):
+                            errors.append(
+                                f"scenario {name} producer {task} {field} is inconsistent"
+                            )
+        return errors
+
+    return [f"scenario {name} uses unsupported passing live mode: {mode}"]
+
+
+def report_consistency_errors(
+    report: dict[str, Any],
+    *,
+    require_current_binary: bool = True,
+    require_current_git_state: bool = True,
+    require_current_matrix: bool = True,
+) -> list[str]:
+    """Recompute evidence facts instead of trusting report summary fields.
+
+    Persisted reports retain the Git metadata from their execution.  A later
+    commit necessarily changes HEAD and status without changing executable
+    bytes, so callers reading committed evidence may disable only the current
+    Git-state comparison.  The executable digest and source scope always have
+    to match the current checkout.
+    """
+
+    errors = _unexpected_key_errors("report", report, REPORT_KEYS)
+    scenarios = report.get("scenarios")
+    if not isinstance(scenarios, list):
+        return ["scenarios is not a list"]
+    if any(not isinstance(scenario, dict) for scenario in scenarios):
+        return ["scenario entry is not an object"]
+    for scenario in scenarios:
+        errors.extend(_unexpected_key_errors("scenario", scenario, SCENARIO_KEYS))
+
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        return ["summary is not an object"]
+    errors.extend(_unexpected_key_errors("summary", summary, SUMMARY_KEYS))
+    mode = report.get("mode")
+    if (
+        type(report.get("report_version")) is not int
+        or report.get("report_version") != REPORT_VERSION
+    ):
+        errors.append("report_version is unsupported")
+    if mode not in REPORT_MODES:
+        errors.append(f"report mode is unsupported: {mode!r}")
+    expected_evidence_scope = (
+        "deterministic-local-runtime"
+        if mode in {"fixture", "stability"}
+        else mode
+    )
+    if report.get("evidence_scope") != expected_evidence_scope:
+        errors.append("evidence_scope is inconsistent with report mode")
+    if not isinstance(report.get("live_skipped"), bool):
+        errors.append("live_skipped is not a boolean")
+    matrix = report.get("matrix")
+    if not isinstance(matrix, dict):
+        errors.append("matrix is not an object")
+    else:
+        errors.extend(_unexpected_key_errors("matrix", matrix, MATRIX_KEYS))
+        if matrix.get("profile") != mode:
+            errors.append("matrix profile is inconsistent with report mode")
+        for field in ("platform", "python_version", "git_version"):
+            value = matrix.get(field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"matrix {field} is not a non-empty string")
+        for field in ("codex_available", "container_available", "sqlite_stress"):
+            if not isinstance(matrix.get(field), bool):
+                errors.append(f"matrix {field} is not a boolean")
+        if matrix.get("sqlite_stress") is not (mode == "stability"):
+            errors.append("matrix sqlite_stress is inconsistent with report mode")
+        skipped_reasons = matrix.get("live_skipped_reasons")
+        if not isinstance(skipped_reasons, list):
+            errors.append("matrix live_skipped_reasons is not a list")
+        elif any(not isinstance(reason, str) or not reason.strip() for reason in skipped_reasons):
+            errors.append("matrix live_skipped_reasons contains an invalid reason")
+        if require_current_matrix:
+            current_matrix = {
+                "platform": platform.platform(),
+                "python_version": platform.python_version(),
+                "git_version": command_version(["git", "--version"]),
+                "container_available": shutil.which("docker") is not None
+                or shutil.which("podman") is not None,
+            }
+            for field, expected in current_matrix.items():
+                if matrix.get(field) != expected:
+                    errors.append(f"matrix {field} does not match current generation environment")
+
+    summary_duration = summary.get("duration_seconds")
+    if (
+        not isinstance(summary_duration, (int, float))
+        or isinstance(summary_duration, bool)
+        or not math.isfinite(float(summary_duration))
+        or summary_duration < 0
+    ):
+        errors.append("summary duration_seconds is not non-negative and finite")
+    scenario_durations: list[float] = []
+    for scenario in scenarios:
+        duration = scenario.get("duration_seconds")
+        if (
+            not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or not math.isfinite(float(duration))
+            or duration < 0
+        ):
+            errors.append(
+                f"scenario {scenario.get('name', '<unknown>')} duration_seconds is not non-negative and finite"
+            )
+        else:
+            scenario_durations.append(float(duration))
+    if (
+        isinstance(summary_duration, (int, float))
+        and not isinstance(summary_duration, bool)
+        and math.isfinite(float(summary_duration))
+        and scenario_durations
+        and float(summary_duration) < max(scenario_durations)
+    ):
+        errors.append("summary duration_seconds is shorter than a scenario duration")
+    skipped = sum(1 for scenario in scenarios if scenario.get("skip_reason"))
+    passed = sum(
+        1
+        for scenario in scenarios
+        if scenario.get("pass") is True and not scenario.get("skip_reason")
+    )
+    failed = sum(
+        1
+        for scenario in scenarios
+        if scenario.get("pass") is not True and not scenario.get("skip_reason")
+    )
+    detail_counters = {
+        "false_pass_count": "false_pass_count",
+        "forged_evidence_block_count": "forged_evidence_block_count",
+        "expected_human_review_required_count": "expected_human_review_required_count",
+        "sqlite_lock_error_count": "sqlite_lock_error_count",
+        "human_intervention_count": "human_intervention_count",
+    }
+    expected_summary: dict[str, int | float] = {
+        "scenario_count": len(scenarios),
+        "passed_count": passed,
+        "failed_count": failed,
+        "skipped_count": skipped,
+        "scenario_pass_rate": round(passed / max(len(scenarios), 1), 4),
+    }
+    for summary_field, detail_field in detail_counters.items():
+        values: list[int] = []
+        for scenario in scenarios:
+            details = scenario.get("details")
+            value = details.get(detail_field, 0) if isinstance(details, dict) else 0
+            if type(value) is not int or value < 0:
+                errors.append(
+                    f"scenario {scenario.get('name', '<unknown>')} {detail_field} "
+                    "is not a non-negative integer"
+                )
+                value = 0
+            values.append(value)
+        expected_summary[summary_field] = sum(values)
+    for field, expected in expected_summary.items():
+        actual = summary.get(field)
+        if field in SUMMARY_INTEGER_FIELDS and type(actual) is not int:
+            errors.append(f"summary {field} is not an exact integer")
+        elif field == "scenario_pass_rate" and (
+            not isinstance(actual, (int, float))
+            or isinstance(actual, bool)
+            or not math.isfinite(float(actual))
+        ):
+            errors.append("summary scenario_pass_rate is not numeric and finite")
+        if actual != expected:
+            errors.append(f"summary {field} is inconsistent")
+
+    if mode in {"live-codex", "live-codex-parallel"}:
+        if report.get("live_skipped") is True:
+            expected_live_status = "not-run"
+        elif failed and all(
+            isinstance(scenario.get("details"), dict)
+            and scenario["details"].get("capability_status") == "blocked"
+            for scenario in scenarios
+            if not scenario.get("skip_reason")
+        ):
+            expected_live_status = "blocked"
+        elif failed:
+            expected_live_status = "failed"
+        elif scenarios and passed == len(scenarios):
+            expected_live_status = "passed"
+        else:
+            expected_live_status = "failed"
+    else:
+        expected_live_status = "not-applicable"
+    if report.get("live_status") != expected_live_status:
+        errors.append("live_status is inconsistent with scenarios")
+    expected_scenario_inventory = {
+        "fixture": [
+            scenario.__name__.removeprefix("scenario_")
+            for scenario in FIXTURE_SCENARIOS
+        ],
+        "stability": [
+            scenario.__name__.removeprefix("scenario_")
+            for scenario in (*FIXTURE_SCENARIOS, *STABILITY_SCENARIOS)
+        ],
+        "live-codex": ["native_codex_edit_and_controller_verify"],
+        "live-codex-parallel": ["native_codex_two_producer_integration"],
+    }
+    if mode in expected_scenario_inventory and [
+        scenario.get("name") for scenario in scenarios
+    ] != expected_scenario_inventory[mode]:
+        errors.append("profile scenario inventory is inconsistent")
+    if mode in {"fixture", "stability"}:
+        for scenario in scenarios:
+            name = str(scenario.get("name", ""))
+            expected_local_contract = LOCAL_SCENARIO_CONTRACT.get(name)
+            if expected_local_contract is None:
+                continue
+            expected_category, expected_mode = expected_local_contract
+            if scenario.get("category") != expected_category:
+                errors.append(
+                    f"scenario {name} category is inconsistent with local profile"
+                )
+            if scenario.get("mode") != expected_mode:
+                errors.append(
+                    f"scenario {name} mode is inconsistent with local profile"
+                )
+    if expected_live_status == "passed":
+        if not isinstance(summary_duration, (int, float)) or isinstance(
+            summary_duration, bool
+        ) or not math.isfinite(float(summary_duration)) or summary_duration <= 0:
+            errors.append("passing live summary duration_seconds is not positive and finite")
+        if isinstance(matrix, dict):
+            if matrix.get("codex_available") is not True:
+                errors.append("passing live matrix does not report Codex available")
+            if matrix.get("live_skipped_reasons") != []:
+                errors.append("passing live matrix contains skip reasons")
+
+    identity = report.get("evaluation_source")
+    if not isinstance(identity, dict):
+        errors.append("evaluation_source is not an object")
+    else:
+        errors.extend(
+            _unexpected_key_errors(
+                "evaluation_source",
+                identity,
+                EVALUATION_SOURCE_KEYS,
+            )
+        )
+        if not _valid_aware_iso8601(identity.get("generated_at")):
+            errors.append("evaluation_source generated_at is not timezone-aware ISO-8601")
+        for field in ("workspace_sha256", "status_sha256"):
+            if not _valid_nonzero_sha256(identity.get(field)):
+                errors.append(f"evaluation_source {field} is not a nonzero SHA-256")
+        git_head = identity.get("git_head")
+        if (
+            not isinstance(git_head, str)
+            or len(git_head) not in {40, 64}
+            or git_head == "0" * len(git_head)
+            or any(character not in "0123456789abcdef" for character in git_head)
+        ):
+            errors.append("evaluation_source git_head is not a nonzero Git object ID")
+        if not isinstance(identity.get("git_dirty"), bool):
+            errors.append("evaluation_source git_dirty is not a boolean")
+        status_entry_count = identity.get("status_entry_count")
+        if (
+            not isinstance(status_entry_count, int)
+            or isinstance(status_entry_count, bool)
+            or status_entry_count < 0
+        ):
+            errors.append("evaluation_source status_entry_count is not non-negative")
+        git_dirty = identity.get("git_dirty")
+        empty_status_sha256 = hashlib.sha256(b"").hexdigest()
+        if isinstance(git_dirty, bool) and isinstance(status_entry_count, int) and not isinstance(
+            status_entry_count, bool
+        ) and status_entry_count >= 0:
+            if git_dirty != (status_entry_count > 0):
+                errors.append(
+                    "evaluation_source git_dirty is inconsistent with status_entry_count"
+                )
+            if status_entry_count == 0 and identity.get("status_sha256") != empty_status_sha256:
+                errors.append(
+                    "evaluation_source clean status_sha256 is inconsistent"
+                )
+            if status_entry_count > 0 and identity.get("status_sha256") == empty_status_sha256:
+                errors.append(
+                    "evaluation_source dirty status_sha256 is inconsistent"
+                )
+        source_scope = identity.get("source_scope")
+        if (
+            not isinstance(source_scope, list)
+            or not source_scope
+            or any(not isinstance(entry, str) or not entry for entry in source_scope)
+        ):
+            errors.append("evaluation_source source_scope is invalid")
+        current_identity = evaluation_source_identity()
+        for field in ("workspace_sha256", "source_scope"):
+            if identity.get(field) != current_identity.get(field):
+                errors.append(
+                    f"evaluation_source {field} does not match current executable source"
+                )
+        if require_current_git_state:
+            for field in (
+                "git_head",
+                "git_dirty",
+                "status_sha256",
+                "status_entry_count",
+            ):
+                if identity.get(field) != current_identity.get(field):
+                    errors.append(
+                        f"evaluation_source {field} does not match current checkout"
+                    )
+
+    native_host = report.get("native_host")
+    if expected_live_status == "passed" and not isinstance(native_host, dict):
+        errors.append("passing live report has no Native Host binary metadata")
+    if isinstance(native_host, dict):
+        errors.extend(
+            _unexpected_key_errors("Native Host", native_host, NATIVE_HOST_KEYS)
+        )
+        resolved_path = native_host.get("resolved_path")
+        path_flavor = (
+            _absolute_path_flavor(resolved_path)
+            if isinstance(resolved_path, str)
+            else None
+        )
+        if path_flavor is None:
+            errors.append("Native Host resolved_path is not absolute")
+        if not _valid_nonzero_sha256(native_host.get("sha256")):
+            errors.append("Native Host sha256 is not a nonzero SHA-256")
+        if native_host.get("source") not in {"explicit-test-override", "path-discovery"}:
+            errors.append("Native Host source is invalid")
+        if native_host.get("trust") != "local-capability-only-not-delivery-provenance":
+            errors.append("Native Host trust label is invalid")
+        if (
+            require_current_binary
+            and expected_live_status == "passed"
+            and isinstance(resolved_path, str)
+            and path_flavor is not None
+        ):
+            current_flavor = "windows" if os.name == "nt" else "posix"
+            if path_flavor != current_flavor:
+                errors.append("Native Host resolved_path is for a different operating system")
+                binary_path = None
+            else:
+                binary_path = Path(resolved_path)
+            if binary_path is None:
+                pass
+            elif not binary_path.is_file():
+                errors.append("Native Host resolved binary is unavailable")
+            elif native_host.get("sha256") != _sha256(binary_path):
+                errors.append("Native Host sha256 does not match resolved binary")
+            expected_binary = live_codex_binary()
+            if not expected_binary:
+                errors.append("current Native Codex binary is unavailable")
+            elif binary_path is not None and binary_path.is_file():
+                expected_path = Path(expected_binary).expanduser().resolve()
+                if binary_path.expanduser().resolve() != expected_path:
+                    errors.append(
+                        "Native Host resolved binary does not match current Native Codex binary"
+                    )
+                expected_source = (
+                    "explicit-test-override"
+                    if os.environ.get("HARNESS_E2E_CODEX_BIN", "").strip()
+                    else "path-discovery"
+                )
+                if native_host.get("source") != expected_source:
+                    errors.append(
+                        "Native Host source does not match current binary discovery"
+                    )
+
+    scenario_usages: list[dict[str, Any]] = []
+    scenario_token_counts: list[int] = []
+    scenario_runtimes: list[float] = []
+    for scenario in scenarios:
+        name = str(scenario.get("name", "<unknown>"))
+        details = scenario.get("details")
+        if not isinstance(details, dict):
+            continue
+        usage = details.get("native_usage")
+        token_count = details.get("native_token_count")
+        if usage is not None:
+            usage_errors = _usage_errors(f"scenario {name}", usage)
+            errors.extend(usage_errors)
+            if not usage_errors:
+                scenario_usages.append(usage)
+                if token_count != usage["token_count"]:
+                    errors.append(f"scenario {name} native_token_count is inconsistent")
+                if details.get("native_token_source") != "codex-json-turn.completed":
+                    errors.append(f"scenario {name} native_token_source is invalid")
+        if isinstance(token_count, int) and not isinstance(token_count, bool):
+            scenario_token_counts.append(token_count)
+        runtime = details.get("native_runtime_seconds")
+        if isinstance(runtime, (int, float)) and not isinstance(runtime, bool):
+            if not math.isfinite(float(runtime)) or runtime < 0:
+                errors.append(
+                    f"scenario {name} native_runtime_seconds is not non-negative and finite"
+                )
+            else:
+                scenario_runtimes.append(float(runtime))
+        elif runtime is not None:
+            errors.append(f"scenario {name} native_runtime_seconds is not numeric")
+
+        if mode in {"live-codex", "live-codex-parallel"} and scenario.get("pass") is True:
+            if details.get("native_token_scope") != NATIVE_TOKEN_SCOPE:
+                errors.append(f"scenario {name} native_token_scope is invalid")
+            if details.get("workload_family") != LIVE_WORKLOAD_FAMILY:
+                errors.append(f"scenario {name} workload_family is invalid")
+            if details.get("workload_unit_sha256") != LIVE_WORKLOAD_UNIT_SHA256:
+                errors.append(f"scenario {name} workload_unit_sha256 is invalid")
+            errors.extend(_passing_live_scenario_errors(mode, scenario))
+
+        producers = details.get("producers")
+        if not isinstance(producers, list):
+            if "producer_scope_valid" in details:
+                exclusive: list[str] = []
+                try:
+                    exclusive = sorted(
+                        normalize_live_eval_path(path)
+                        for path in details.get("exclusive_files", [])
+                    )
+                    changed = sorted(
+                        normalize_live_eval_path(path)
+                        for path in details.get("producer_changed_files", [])
+                    )
+                    expected_scope_valid = changed == exclusive and bool(
+                        details.get("test_file_unchanged")
+                    )
+                except (TypeError, ValueError):
+                    expected_scope_valid = False
+                if details.get("producer_scope_valid") is not expected_scope_valid:
+                    errors.append(f"scenario {name} producer_scope_valid is inconsistent")
+                if scenario.get("pass") is True:
+                    if not exclusive:
+                        errors.append(f"scenario {name} exclusive_files is empty")
+                    if type(details.get("native_returncode")) is not int or details.get(
+                        "native_returncode"
+                    ) != 0:
+                        errors.append(f"scenario {name} native_returncode is inconsistent")
+                    if details.get("integrated_files") != exclusive:
+                        errors.append(f"scenario {name} integrated_files is inconsistent with scope")
+            if (
+                isinstance(mode, str)
+                and mode.startswith("live-codex")
+                and scenario.get("pass") is True
+                and (
+                    type(details.get("workload_units")) is not int
+                    or details.get("workload_units") != 1
+                )
+            ):
+                errors.append(f"scenario {name} workload_units is inconsistent")
+            continue
+        if type(details.get("producer_count")) is not int or details.get(
+            "producer_count"
+        ) != len(producers):
+            errors.append(f"scenario {name} producer_count is inconsistent")
+        try:
+            expected_conflicts = live_eval_scope_conflicts(producers)
+        except (KeyError, TypeError, ValueError):
+            expected_conflicts = {"<invalid-producer>": [name]}
+        if details.get("scope_conflicts") != expected_conflicts:
+            errors.append(f"scenario {name} scope_conflicts is inconsistent")
+        expected_attribution = True
+        producer_usages: list[dict[str, Any]] = []
+        producer_changed_files: set[str] = set()
+        for producer in producers:
+            if not isinstance(producer, dict):
+                expected_attribution = False
+                continue
+            try:
+                exclusive = sorted(
+                    normalize_live_eval_path(path)
+                    for path in producer.get("exclusive_files", [])
+                )
+                changed = sorted(
+                    normalize_live_eval_path(path)
+                    for path in producer.get("changed_files", [])
+                )
+            except (TypeError, ValueError):
+                expected_attribution = False
+                continue
+            producer_changed_files.update(changed)
+            if (
+                type(producer.get("returncode")) is not int
+                or producer.get("returncode") != 0
+                or producer.get("scope_valid") is not True
+                or producer.get("test_file_unchanged") is not True
+                or changed != exclusive
+            ):
+                expected_attribution = False
+            producer_usage = producer.get("native_usage")
+            producer_usage_errors = _usage_errors(
+                f"scenario {name} producer {producer.get('task', '<unknown>')}",
+                producer_usage,
+            )
+            errors.extend(producer_usage_errors)
+            if not producer_usage_errors:
+                producer_usages.append(producer_usage)
+                if (
+                    type(producer.get("token_count")) is not int
+                    or producer.get("token_count") != producer_usage["token_count"]
+                ):
+                    errors.append(
+                        f"scenario {name} producer {producer.get('task', '<unknown>')} token_count is inconsistent"
+                    )
+                if producer.get("token_source") != "codex-json-turn.completed":
+                    errors.append(
+                        f"scenario {name} producer {producer.get('task', '<unknown>')} token_source is invalid"
+                    )
+            producer_start = producer.get("started_offset_seconds")
+            producer_finish = producer.get("finished_offset_seconds")
+            if (
+                isinstance(producer_start, (int, float))
+                and not isinstance(producer_start, bool)
+                and math.isfinite(float(producer_start))
+                and isinstance(producer_finish, (int, float))
+                and not isinstance(producer_finish, bool)
+                and math.isfinite(float(producer_finish))
+                and producer_finish > producer_start
+            ):
+                expected_producer_runtime = round(
+                    float(producer_finish) - float(producer_start),
+                    6,
+                )
+                producer_runtime = producer.get("runtime_seconds")
+                if (
+                    not isinstance(producer_runtime, (int, float))
+                    or isinstance(producer_runtime, bool)
+                    or not math.isfinite(float(producer_runtime))
+                    or producer_runtime <= 0
+                    or producer_runtime != expected_producer_runtime
+                ):
+                    errors.append(
+                        f"scenario {name} producer {producer.get('task', '<unknown>')} runtime_seconds is inconsistent"
+                    )
+            else:
+                errors.append(
+                    f"scenario {name} producer {producer.get('task', '<unknown>')} timing is not positive and finite"
+                )
+        if details.get("producer_attribution_valid") is not expected_attribution:
+            errors.append(f"scenario {name} producer_attribution_valid is inconsistent")
+        if producer_usages and details.get("native_usage") != _aggregate_usages(producer_usages):
+            errors.append(f"scenario {name} producer usage aggregate is inconsistent")
+        if scenario.get("pass") is True:
+            if type(details.get("workload_units")) is not int or details.get(
+                "workload_units"
+            ) != len(producers):
+                errors.append(f"scenario {name} workload_units is inconsistent")
+            expected_files = sorted(producer_changed_files)
+            if details.get("changed_files") != expected_files:
+                errors.append(f"scenario {name} changed_files is inconsistent with producers")
+            if details.get("integrated_files") != expected_files:
+                errors.append(f"scenario {name} integrated_files is inconsistent with producers")
+        starts = [producer.get("started_offset_seconds") for producer in producers if isinstance(producer, dict)]
+        finishes = [producer.get("finished_offset_seconds") for producer in producers if isinstance(producer, dict)]
+        if (
+            len(starts) == len(producers)
+            and len(finishes) == len(producers)
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in starts + finishes
+            )
+        ):
+            expected_overlap = round(
+                max(0.0, min(float(value) for value in finishes) - max(float(value) for value in starts)),
+                6,
+            )
+            expected_runtime = round(
+                max(float(value) for value in finishes) - min(float(value) for value in starts),
+                6,
+            )
+            if details.get("producer_overlap_seconds") != expected_overlap:
+                errors.append(f"scenario {name} producer_overlap_seconds is inconsistent")
+            if details.get("native_runtime_seconds") != expected_runtime:
+                errors.append(f"scenario {name} native_runtime_seconds is inconsistent with producers")
+        else:
+            errors.append(f"scenario {name} producer timing window is incomplete")
+
+    expected_usage = _aggregate_usages(scenario_usages)
+    if expected_usage is not None:
+        errors.extend(_usage_errors("top-level", report.get("token_usage")))
+    if not _matches_exact_json_contract(report.get("token_usage"), expected_usage):
+        errors.append("top-level token_usage is inconsistent")
+    expected_token_count = sum(scenario_token_counts) if scenario_token_counts else None
+    if not _matches_exact_json_contract(report.get("token_count"), expected_token_count):
+        errors.append("top-level token_count is inconsistent")
+    if expected_usage is not None and expected_token_count != expected_usage["token_count"]:
+        errors.append("scenario token totals disagree with structured usage")
+    expected_runtime = round(sum(scenario_runtimes), 6) if scenario_runtimes else None
+    actual_runtime = report.get("agent_runtime_seconds")
+    if expected_runtime is None:
+        runtime_matches = actual_runtime is None
+    else:
+        runtime_matches = (
+            isinstance(actual_runtime, (int, float))
+            and not isinstance(actual_runtime, bool)
+            and math.isfinite(float(actual_runtime))
+            and actual_runtime == expected_runtime
+        )
+    if not runtime_matches:
+        errors.append("top-level agent_runtime_seconds is inconsistent")
+    if expected_live_status == "passed" and (
+        expected_runtime is None or not math.isfinite(expected_runtime) or expected_runtime <= 0
+    ):
+        errors.append("passing live agent_runtime_seconds is not positive and finite")
+    if report.get("estimated_cost") is not None:
+        errors.append("estimated_cost must remain null because cost is not exposed")
+    return errors
+
+
+def persistent_report_consistency_errors(
+    report: dict[str, Any],
+    *,
+    require_current_binary: bool = False,
+    require_current_git_state: bool = False,
+    require_current_matrix: bool = False,
+) -> list[str]:
+    """Validate persisted evidence while rejecting explicit test binaries."""
+
+    errors = report_consistency_errors(
+        report,
+        require_current_binary=require_current_binary,
+        require_current_git_state=require_current_git_state,
+        require_current_matrix=require_current_matrix,
+    )
+    native_host = report.get("native_host")
+    if (
+        report.get("mode") in {"live-codex", "live-codex-parallel"}
+        and report.get("live_status") == "passed"
+        and (
+            not isinstance(native_host, dict)
+            or native_host.get("source") != "path-discovery"
+        )
+    ):
+        errors.append(
+            "persisted passing Native evidence requires a path-discovered binary"
+        )
+    return errors
 
 
 def should_fail(report: dict[str, Any]) -> bool:
-    if report["mode"] == "live-codex" and report["live_skipped"]:
+    if report_consistency_errors(report):
         return True
-    if report["mode"] == "live-command" and report["live_skipped"]:
-        return False
     summary = report["summary"]
+    if report["mode"].startswith("live-codex"):
+        if report["live_skipped"] or report.get("live_status") != "passed":
+            return True
+        if (
+            summary.get("scenario_count") != 1
+            or summary.get("passed_count") != 1
+            or summary.get("failed_count") != 0
+            or summary.get("skipped_count") != 0
+            or summary.get("false_pass_count") != 0
+            or summary.get("human_intervention_count") != 0
+        ):
+            return True
     if summary["failed_count"] != 0:
         return True
-    if report["mode"] == "fixture" and summary["scenario_count"] != 5:
+    if report["mode"] == "fixture" and summary["scenario_count"] != len(FIXTURE_SCENARIOS):
         return True
-    if report["mode"] == "stability" and summary["scenario_count"] < 10:
+    if report["mode"] == "stability" and summary["scenario_count"] != len(FIXTURE_SCENARIOS) + len(STABILITY_SCENARIOS):
         return True
     if report["mode"] in {"fixture", "stability"}:
         if summary["false_pass_count"] != 0:
             return True
-        if summary["forged_evidence_block_count"] < 1:
-            return True
         if summary["human_intervention_count"] != 0:
             return True
         if summary.get("sqlite_lock_error_count", 0) != 0:
+            return True
+        if summary.get("skipped_count", 0) != 0:
+            return True
+        if summary.get("forged_evidence_block_count", 0) != 1:
+            return True
+        if summary.get("expected_human_review_required_count", 0) != 1:
             return True
     return False
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run agent E2E evaluation scenarios")
-    parser.add_argument("--mode", choices=["fixture", "stability", "live-codex", "live-command"], default="fixture")
-    parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--mode",
+        choices=["fixture", "stability", "live-codex", "live-codex-parallel"],
+        default="fixture",
+    )
+    parser.add_argument("--out", default="", help="Write the compact evidence report")
+    parser.add_argument(
+        "--evidence-out",
+        default="",
+        help="Write a compact report with verbose Native Host output removed",
+    )
+    parser.add_argument(
+        "--debug-out",
+        default="",
+        help="Explicitly write the full local debug report including Native output tails",
+    )
     args = parser.parse_args()
 
     runners = {
         "fixture": run_fixture,
         "stability": run_stability,
         "live-codex": run_live_codex,
-        "live-command": run_live_command,
+        "live-codex-parallel": run_live_codex_parallel,
     }
     report = runners[args.mode]()
-    text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    evidence_report = compact_evidence_report(report)
+    persistent_errors = (
+        persistent_report_consistency_errors(
+            evidence_report,
+            require_current_binary=True,
+            require_current_git_state=True,
+            require_current_matrix=True,
+        )
+        if args.evidence_out
+        else []
+    )
+    text = json.dumps(evidence_report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
+    if args.evidence_out:
+        if persistent_errors:
+            print(
+                "ERROR: refusing persistent evidence: " + "; ".join(persistent_errors),
+                file=sys.stderr,
+            )
+        else:
+            evidence_out = Path(args.evidence_out)
+            evidence_out.parent.mkdir(parents=True, exist_ok=True)
+            evidence_out.write_text(text, encoding="utf-8")
+    if args.debug_out:
+        debug_out = Path(args.debug_out)
+        debug_out.parent.mkdir(parents=True, exist_ok=True)
+        debug_text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        debug_out.write_text(debug_text, encoding="utf-8")
     print(text, end="")
-    return 1 if should_fail(report) else 0
+    return 1 if should_fail(report) or persistent_errors else 0
 
 
 if __name__ == "__main__":

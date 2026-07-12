@@ -63,10 +63,10 @@ jobs:
         run: |
           ${{ matrix.python }} -m kafa.release --require-tag
           ${{ matrix.python }} plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
-          ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-runtime/scripts/harness.py tests/test_*.py tests/run_isolated_install_smoke.py
+          ${{ matrix.python }} -m py_compile kafa/*.py plugins/codex-project-harness/scripts/*.py plugins/codex-project-harness/core/*.py plugins/codex-project-harness/hooks/*.py plugins/codex-project-harness/skills/project-harness/scripts/harness.py tests/test_*.py tests/run_isolated_install_smoke.py
 
       - name: Run unit regression gate
-        run: ${{ matrix.python }} -m unittest discover -s tests -p 'test_*.py'
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 
       - name: Run real isolated install smoke
         run: ${{ matrix.python }} tests/run_isolated_install_smoke.py --repo .
@@ -75,7 +75,6 @@ jobs:
         if: matrix.extended
         run: |
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_runtime_smoke.py
-          ${{ matrix.python }} plugins/codex-project-harness/scripts/run_forward_eval.py
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_skill_eval.py
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode fixture
           ${{ matrix.python }} plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stability
@@ -118,7 +117,7 @@ jobs:
       - name: Run real Codex host compatibility profile
         env:
           HARNESS_E2E_ENABLE_LIVE_CODEX: "1"
-          HARNESS_E2E_LIVE_TIMEOUT_SECONDS: "900"
+          HARNESS_E2E_LIVE_TIMEOUT: "900"
         run: python plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode live-codex --out "$RUNNER_TEMP/kafa-live-codex-report.json"
 
       - name: Preserve real-host compatibility evidence

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kafa"
-version = "1.25.0b1"
+version = "2.0.0b1"
 description = "Local installer and release helper for Codex Project Harness"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,11 +14,6 @@ authors = [
 ]
 keywords = ["codex", "plugins", "harness", "installer"]
 dependencies = []
-
-[project.optional-dependencies]
-host-codex = [
-  "openai-codex>=0.1.0b3"
-]
 
 [project.scripts]
 kafa = "kafa.cli:main"

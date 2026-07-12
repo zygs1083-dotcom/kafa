@@ -1,83 +1,90 @@
 ---
 name: "project-harness"
-description: "Use when the user wants to develop, create, build, implement, or fully deliver code for a software/data/automation project with Codex, including Chinese requests like 我要开发, 帮我做一个, 实现一个功能, 搭建一个系统, 从0到代码交付. Orchestrates executable project runtime updates, project bootstrap, git/workspace checks, Codex-selected GitHub/Linear/Notion/Figma/Slack collaboration mapping, requirement clarification, confirmed scope, team architecture, implementation, tests, independent QA, and code delivery handoff. This skill stops at delivery of verified code and does not perform deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation."
+description: "Use when the user wants to develop, create, build, implement, or fully deliver code for a software, data, or automation project with Codex, including 我要开发, 帮我做一个, 实现一个功能, 搭建一个系统, and 从0到代码交付. This is the single Kafa entrypoint for workspace bootstrap, OpenSpec routing, local delivery facts, implementation, controller verification, independent QA, and verified code handoff. It stops before deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation."
 ---
 
 # Project Harness
 
-You are the project manager and orchestrator for code delivery.
+Act as the project manager and root controller for verified code delivery.
 
-## Trigger
+## Authority And Boundary
 
-Use this skill for requests like:
+Use existing project instructions and mature local tooling first.
 
-- 我要开发/创建/搭建一个项目
-- 帮我做一个功能/系统
-- 实现一个功能
-- 从零交付可验收代码
-- 帮我完整实现这个系统
-- 组建 Agent 小队完成项目
-- Build and deliver this project end to end
+- OpenSpec is the specification authority for unclear requirements, medium or large features, architecture or cross-module changes, and long-lived behavior. Follow its proposal, design, specs, tasks, and archive. Do not copy those documents into Kafa as a competing source of truth.
+- Kafa SQLite is the delivery authority for local requirements when OpenSpec is not needed, acceptance links, failure modes, tasks, immutable controller executions, validation judgments, findings, quality gates, delivery decisions, and audit events.
+- Generated Markdown is a human-readable projection, not a fact source.
+- Local Git identity, or content identity for a no-Git project, identifies the candidate under review.
+- Native Codex/ChatGPT owns task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle. Kafa never starts a second host lifecycle.
+- Only the root controller writes Kafa delivery facts. Workers and reviewers return changed files, commands, findings, and risks through the host.
 
-Do not use this skill to deploy, release to production, provision paid/cloud resources, rotate secrets, or run irreversible production operations. If the user asks for those actions, stop at a delivery handoff and state that deployment is outside this harness.
+This workflow ends at verified code handoff. It does not deploy, release to production, provision infrastructure, run production data migrations, change secrets, create paid resources, or perform post-release operations.
 
-## Delivery Boundary
+## Route The Request
 
-The harness owns:
+| Work | Route |
+| --- | --- |
+| Explanation, translation, or summary only | Answer directly; do not initialize Kafa |
+| Small clear patch | `minimal-safe-change` |
+| Reproducible bug or failing behavior | `bug-fix-loop` |
+| New contract-sensitive behavior | `test-first-delivery` |
+| Broad, vague, architectural, cross-module, or long-lived change | OpenSpec first, then this delivery workflow |
+| Finished implementation needing a fresh review | `independent-quality-gate` |
+| Harness state or generated-view drift | `harness-audit` |
+| Completed milestone needing lessons captured | `project-retrospective` |
 
-- requirement baseline and acceptance criteria,
-- project bootstrap, git/workspace checks, and collaboration tool mapping,
-- executable runtime state, tasks, validation records, and delivery records,
-- implementation plan and task routing,
-- code changes and local/project tests,
-- independent QA and integration coherence review,
-- delivery package with evidence, residual risks, and next-step notes.
+## Bootstrap The Workspace
 
-The harness does not own:
+Before substantial work:
 
-- production deployment or release approval,
-- infrastructure provisioning,
-- production database migrations,
-- secret or credential changes,
-- paid-resource creation,
-- post-release monitoring operations.
+1. Read applicable `AGENTS.md` and project entry documents.
+2. Inspect the real workspace, repository root, branch, remotes, candidate revision, and dirty state.
+3. Preserve user changes. Do not initialize Git, create a branch, or mutate unrelated files unless that is within the request.
+4. Inspect the applicable OpenSpec change and validate it when OpenSpec owns the work.
+5. Initialize the local Kernel when appropriate:
 
-## Phase State Machine
-
-Move through these phases explicitly:
-
-```text
-intake -> project_bootstrap -> requirement_baseline -> confirmation -> team_architecture -> planning -> implementation -> qa -> delivery_readiness -> retrospective
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . init
+python3 plugins/codex-project-harness/scripts/harness.py --root . status
 ```
 
-Rules:
+When the Plugin is installed outside the project, use the retained proxy:
 
-- Run `project_bootstrap` before requirement baselining for new projects, substantial features, or any request that mentions GitHub, Linear, Notion, Figma, Slack, issues, PRs, design, or team coordination.
-- Use `project-runtime` scripts whenever a phase, task, decision, validation record, or delivery record changes.
-- Do not enter `implementation` before a requirement baseline exists unless the request is a narrow, already-clear change.
-- Ask for confirmation before freezing the baseline when scope, data model, user workflow, or acceptance criteria are ambiguous.
-- Skip `team_architecture` only for small changes where one producer and one review pass are enough.
-- Always run `qa` before claiming delivery.
-- Stop at `delivery_readiness`; do not continue into deployment.
+```bash
+python3 <project-harness-skill-dir>/scripts/harness.py --root . status
+python3 <project-harness-skill-dir>/scripts/harness.py --root . validate --delivery
+```
 
-## Intake Classification
+`kafa doctor --repo .` checks a Kafa or Plugin source repository. In an ordinary project, use `kafa project doctor --repo .` or the Plugin runtime status command.
 
-Classify the request before choosing the full path:
+## Specification And Requirement Baseline
 
-| Class | Route |
-| --- | --- |
-| Explanation, translation, or summary only | Answer directly; do not enter harness |
-| Small clear code change | `minimal-safe-change`, with bootstrap only if git/tooling state matters |
-| Bug or failing behavior | `bug-fix-loop`, with bootstrap only if issue/branch/PR context matters |
-| Clear feature | Lightweight `project-bootstrap` + `requirement-baseline` + implementation + QA |
-| Broad or vague project | Full phase state machine |
-| Deployment or production operation | Stop at code delivery boundary; do not execute deployment |
+For work that meets the OpenSpec boundary:
 
-## Communication Gates
+1. Read and follow the selected OpenSpec proposal, design, specs, and tasks in dependency order.
+2. Treat the OpenSpec task list as implementation authority when the change says it is the unique checklist.
+3. Record only the local facts needed to verify delivery; reference stable OpenSpec IDs or paths without duplicating the spec.
 
-Ask concise, high-leverage questions when the answer materially changes scope, data shape, permissions, irreversible behavior, or acceptance.
+For narrow work that does not need OpenSpec:
 
-Use this baseline confirmation shape before implementation on broad work:
+1. Identify the goal, users, observable scenarios, constraints, non-goals, and success criteria.
+2. Turn vague statements into acceptance criteria.
+3. Ask only questions whose answers materially change scope, permissions, data shape, irreversible behavior, or acceptance.
+4. State conservative assumptions when safe to continue.
+
+For risky work, record failure modes before implementation. Data writes, permissions, concurrency, migrations, billing, destructive behavior, sandbox/no-network requirements, and external effects require explicit failure-mode analysis. High or critical accepted/exempt risks require actor, reason, scope, revision, and unexpired expiry.
+
+Use stable local IDs and links:
+
+```bash
+harness.py --root . requirement add --id R1 --kind functional --body "..." --priority must
+harness.py --root . acceptance add --id AC1 --criterion "..." --priority must
+harness.py --root . requirement link --requirement R1 --acceptance AC1
+harness.py --root . failure-mode add --id FM1 --feature "..." --scenario "..." \
+  --trigger "..." --expected "..." --risk high --acceptance AC1
+```
+
+For broad or ambiguous work, confirm this baseline before implementation:
 
 ```text
 我理解本阶段要交付的是：
@@ -88,155 +95,141 @@ Use this baseline confirmation shape before implementation on broad work:
 - 验收标准：
 - 风险和待确认：
 
-请确认或修正以上范围。确认后我会按这个基线拆任务并开始实现。
+请确认或修正以上范围。确认后我会按这个基线开始实现。
 ```
 
-## Work Method Discipline
+Every implementation task must map to acceptance or an explicit documented exception.
 
-Before implementation:
+## Delivery Sequence
 
-- Restate the root problem the task is meant to solve.
-- Split the work into the smallest units that can be independently verified.
-- Explain why key decisions are being made, not only how to implement them.
+Use this reasoning sequence when it fits the work:
 
-Before delivery:
+```text
+intake -> specification/baseline -> planning -> implementation
+       -> controller verification -> independent QA -> verified handoff
+       -> retrospective
+```
 
-- Run an adversarial review against logic gaps, incorrect facts, simpler alternatives, and verification evidence.
-- List the most likely remaining failure points when risk remains.
-- Do not claim the work is complete based on "looks good"; provide verification evidence or explicit residual risk.
+These are workflow stages, not public CLI state and not separate Skills. Do not
+enter implementation before the spec or confirmed local baseline is ready.
+Always perform QA before claiming handoff readiness.
 
-## Workflow
+## Team And Delegation
 
-1. Inspect the workspace and current repository state.
-2. Run `project-bootstrap` when the work is new, substantial, or tool-coordinated.
-3. Use `project-runtime` to update the current phase and local control plane.
-4. Clarify only missing information that materially changes scope, risk, or acceptance.
-5. Build a requirement baseline with acceptance criteria and non-goals.
-6. Identify failure modes for risky behavior and map them to acceptance criteria or explicit exemptions.
-7. Ask for confirmation before treating the baseline as execution scope when the project is ambiguous or high impact.
-8. Initialize the control plane with `scripts/init_project_harness.py` when appropriate.
-9. Use `team-architecture` logic to choose the smallest effective agent team.
-10. Add tasks through `project-runtime` with owners, acceptance mapping, failure-mode mapping, tool mapping, dependencies, and evidence fields.
-11. Before dispatching native subagent work, run `dispatch route-advice` for capability/risk hints; the host owns the concrete model, reasoning, sandbox, approval, and task/thread/worktree lifecycle.
-12. Use `dispatch native-export` to produce immutable packages, create visible native host tasks/subagents, and return real host task/thread/worktree IDs through `dispatch native-import`. Provider reports remain raw until controller verification.
-13. Keep producer and reviewer roles separate.
-14. Use a maximum of two producer-reviewer retry loops before escalating.
-15. Run integration coherence QA before declaring completion.
-16. Record QA, quality-gate, and delivery evidence through `project-runtime`.
-17. Use `delivery-readiness` to package verified code, tests, changed files, residual risks, tool handoff links, and notes.
-18. Finish with a concise delivery report and update the evolution log when useful.
+Default to one root controller, bounded producers, and a distinct reviewer. Add parallelism only when tasks are independent and the merge/review cost is justified.
 
-## Skill Routing
+Before delegating, read
+[`references/delegation-matrix.md`](../../references/delegation-matrix.md) and
+fill its bounded Host-side matrix. Do not load that reference for work that stays
+inside the root-controller context. Capability hints are advisory; the Native
+Host owns actual model selection and Kafa stores no model lifecycle.
 
-Route work through the smallest useful path:
+- The root controller retains schema, migration, trust, delivery-gate, and cross-module integration decisions.
+- Use subagents for bounded implementation or review; give them explicit files, acceptance, and tests.
+- Every worker returns concrete changed files, commands run, results, remaining risks, and blockers.
+- Workers never mutate Kafa task, validation, gate, or delivery state.
+- Keep producer and reviewer contexts distinct. A same-context review is `same-context-degraded`, never `fresh`.
+- Use at most two producer-review loops before escalating a persistent failure or design conflict.
 
-| Situation | Skill |
+## Local Runtime Commands
+
+The installed or vendored `harness.py` is the executable interface:
+
+| Need | Command |
 | --- | --- |
-| New/substantial project, repo setup, branch setup, GitHub/Linear/Notion/Figma/Slack coordination | `project-bootstrap` |
-| Phase/task/decision/validation/delivery state changes | `project-runtime` |
-| Broad or vague new project / feature | `requirement-baseline` first |
-| Agent roles or parallel work are useful | `team-architecture` |
-| Small focused patch | `minimal-safe-change` |
-| New behavior or contract-sensitive change | `test-first-delivery` |
-| Reported defect or failing behavior | `bug-fix-loop` |
-| Finished implementation needs review | `independent-quality-gate` |
-| Code is ready to hand off | `delivery-readiness` |
-| Harness files or team state drift | `harness-audit` |
-| Milestone completed or process needs improvement | `project-retrospective` |
+| Status and health | `status`, `doctor`, `validate`, `validate --delivery` |
+| Guided start | `quickstart status`, `quickstart minimal ... --execute` |
+| Delivery cycle | `cycle status`, `cycle close`, `cycle start` |
+| Baseline | `baseline freeze/diff/validate` |
+| Requirements | `requirement add/link`, `acceptance add`, `failure-mode add`, `trace show/validate` |
+| Root-owned task state | `task add/list/start/submit/accept/block/cancel` |
+| Verification | `test-target add/list/link`, `verify run` |
+| Audit judgments | `validation record`, `finding record`, `decision record` |
+| Delivery decision | `gate record`, `delivery record` |
+| Recovery | `migrate`, `repair`, `projection rebuild`; `doctor` validates invariants |
 
-## Collaboration Tools
+Events are compact append-only audit facts, not a replay source. Migration and administrator recovery use verified SQLite backups. There is no Connector, adapter, provider, dispatch, host receipt, checkpoint, or event export runtime.
 
-Use `references/collaboration-tools.md` when the project uses or requests GitHub, Linear, Notion, Figma, Slack, issues, PRs, design files, or status notifications.
-Use `references/tool-adapters.md` when deciding whether and how to sync local harness records to GitHub, Linear, Notion, Figma, or Slack.
+## Root-Owned Task Lifecycle
 
-Default source-of-truth policy:
-
-- Local fallback: `.ai-team/` and `docs/harness/`.
-- Git/GitHub: code state, branches, PRs, review, checks, and issue links.
-- Linear: task/project tracking when useful or already used by the project.
-- Notion: PRD, decisions, architecture notes, QA notes, and delivery records when useful.
-- Figma: design context, prototypes, component references, and visual acceptance when relevant.
-- Slack: progress updates, review requests, and delivery handoff only after confirmation.
-
-Codex should decide whether each tool is needed. Ask only before high-impact external actions such as Slack messages, public/shared artifact creation, permission or secret changes, paid resources, destructive edits, or production-related changes. Reading external context and low-risk project-management writes can proceed when the target and purpose are clear.
-
-## Session And Subagent Model
-
-- Layer 0 Project Manager is the controlling conversation and single source of truth.
-- Layer 1 Domain Sessions are role-based contexts such as Product, Architecture, Development, QA, Security, and Delivery. Use separate sessions when the runtime supports them; otherwise emulate them with clearly labeled role outputs in the same conversation.
-- Layer 2 Subagents are short-lived task execution units. They may be spawned inside a domain session for independent checks such as QA-A API contract, QA-B UI behavior, and QA-C data/schema safety. They do not need independent user-visible sessions unless the runtime provides them.
-- Every subagent returns a verifiable artifact, not just an opinion.
-- Treat `native-host-small-verified` as a capability hint for a small, low-risk, controller-verifiable developer task; the native host owns the concrete model and reasoning policy.
-- Require stronger host policy or main-model/manual review for architecture, QA judgment, high/critical failure modes, sandbox/no-network targets, missing-target work, broad refactors, or ambiguous tasks.
-- If no native candidate exists, state that clearly and keep the work with the controlling model or manual flow.
-
-## Control Files
-
-Create or maintain these when the project is substantial:
+Task state is single-writer:
 
 ```text
-.ai-team/control/project-charter.md
-.ai-team/control/project-state.yaml
-.ai-team/control/agent-registry.md
-.ai-team/control/capability-report.md
-.ai-team/control/tooling-map.md
-.ai-team/control/decision-log.md
-.ai-team/requirements/requirements.md
-.ai-team/requirements/acceptance.md
-.ai-team/requirements/failure-modes.md
-.ai-team/requirements/traceability.md
-.ai-team/planning/task-board.md
-docs/harness/bootstrap.md
-docs/harness/team-architecture.md
-docs/harness/validation.md
-docs/harness/quality-gates.md
-docs/harness/delivery.md
-docs/harness/evolution-log.md
+planned -> active -> submitted -> accepted
+                    |           -> blocked
+                    -> blocked
+planned/active/submitted -> cancelled
 ```
 
-Do not preserve noisy raw run logs unless they are needed for debugging or audit.
-
-## Output Protocol
-
-Use this shape for role or subagent returns:
-
-```text
-Role:
-Task:
-Input:
-Decision:
-Output:
-Evidence:
-Risks:
-Next:
-```
-
-## Output Contract
-
-Every major phase should leave:
-
-- decision made,
-- current scope,
-- owner,
-- evidence,
-- remaining risk,
-- next action.
-
-Final delivery must include:
-
-- delivered behavior mapped to acceptance criteria,
-- changed files or modules,
-- tests/checks run and results,
-- independent QA findings,
-- failure-mode coverage or exemption reason,
-- quality-gate result, reviewed commit/revision, and reviewer context,
-- GitHub/Linear/Notion/Figma/Slack links or fallback local artifacts used,
-- known gaps or residual risks,
-- explicit note that deployment is not included.
-
-Before final delivery, run:
+Example:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . status
-python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
+harness.py --root . task add --id T1 --task "Implement profile CRUD" \
+  --owner developer --acceptance AC1 --failure-mode FM1
+harness.py --root . task start T1
+harness.py --root . task submit T1 --context-id producer-context \
+  --evidence "implementation returned to root controller"
+harness.py --root . task accept T1 --evidence "independent review accepted"
 ```
+
+There are no leases, heartbeat, fence, claim/release, stale recovery, review lease, retry budget, global request-id command log, or worker database writes. SQLite transactions, natural keys, and explicit state preconditions prevent duplicate mutation.
+
+## Immutable Verification
+
+Register an exact target, then let the root controller execute it:
+
+```bash
+harness.py --root . test-target add --id UNIT --kind unit \
+  --command-template "python3 -m unittest" --result-format regex
+harness.py --root . test-target link --task T1 --target UNIT
+harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
+```
+
+`verify run` executes outside the write transaction, then atomically records one immutable current-candidate execution, validation, links, artifact digest, structured count/semantic result, runner, sandbox/no-network status, policy status, and compact audit event. A free-form `validation record` is judgment-only and cannot create gate-eligible execution evidence.
+
+Container verification must really run with no network when the target requires it. Unavailable container capability fails closed; do not call it sandbox verification.
+
+High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata. Never fabricate Host, CI, HMAC, Connector, or receipt provenance.
+If any prerequisite is missing, the result is `human-review-required`.
+
+## Quality Review And Delivery Handoff
+
+Before a passing gate:
+
+1. Confirm the candidate identity and worktree state under review.
+2. Map delivered behavior to acceptance criteria and active failure modes.
+3. Confirm exact tests/checks actually run on the current candidate; `skipped`, `blocked`, `not-run`, and fixture-only are not passes.
+4. Resolve or explicitly record independent QA findings and residual risk.
+5. Confirm immutable executions are current, structured, positive-count where required, artifact-consistent, and policy-compliant.
+6. Confirm same-context review is labeled degraded and high/critical work follows `human-review-required` semantics.
+7. Run adversarial review for logic gaps, false facts, simpler alternatives, data loss, stale candidate, forged evidence, and missing verification.
+
+Record review and delivery only after those checks:
+
+```bash
+harness.py --root . gate record --reviewer-context fresh \
+  --reviewer-context-id reviewer-context --result pass
+harness.py --root . validate --delivery
+harness.py --root . delivery record --scope "..." --acceptance AC1 \
+  --changed-files "..." --validation "..." --qa "..." \
+  --failure-mode-coverage "..." --quality-gate "pass" \
+  --known-gaps "..." --handoff "..."
+```
+
+The final handoff must report:
+
+- delivered behavior and acceptance mapping;
+- changed files/modules and current candidate;
+- exact tests/checks with counts and outcomes;
+- independent QA and quality-gate result;
+- failure-mode coverage or accepted/exempt risk metadata;
+- migration/data/config implications;
+- local artifact paths;
+- known gaps, not-run checks, and residual risk;
+- explicit statement that deployment is not included.
+
+## Work Discipline
+
+Before implementation, restate the root problem, split it into the smallest verifiable units, and explain why key decisions are made. Preserve unrelated user work.
+
+Before handoff, challenge the result from four angles: logic gaps, incorrect facts, simpler alternatives, and verification evidence. Do not claim completion because the code merely looks correct.

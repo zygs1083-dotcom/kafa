@@ -11,21 +11,16 @@
     "owner": { "type": "string" },
     "status": {
       "type": "string",
-      "enum": ["ready", "claimed", "in_progress", "submitted", "review", "blocked", "accepted", "failed", "cancelled", "skipped"]
+      "enum": ["planned", "active", "submitted", "accepted", "blocked", "cancelled"]
     },
     "acceptance_ids": { "type": "array", "items": { "type": "string" } },
     "failure_mode_ids": { "type": "array", "items": { "type": "string" } },
     "dependencies": { "type": "array", "items": { "type": "string" } },
-    "tool_link": { "type": "string" },
     "evidence": { "type": "string" },
-    "lease_agent": { "type": ["string", "null"] },
-    "lease_token": { "type": ["string", "null"] },
-    "lease_heartbeat_at": { "type": ["string", "null"] },
-    "lease_expires_at": { "type": ["string", "null"] },
-    "retry_count": { "type": "integer" },
-    "retry_budget": { "type": "integer" },
-    "fence": { "type": "integer" },
-    "revision": { "type": "integer" }
+    "submitted_context_id": { "type": "string" },
+    "accepted_by": { "type": "string" },
+    "revision": { "type": "integer" },
+    "updated_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

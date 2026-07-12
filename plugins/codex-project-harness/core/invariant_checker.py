@@ -7,9 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .event_bus import validate_replay_compatible_events
-from .lock_manager import is_expired
-from .schema_guard import FAILURE_MODE_STATUSES, TASK_STATUSES, adapter_action_payload_hash
+from .event_bus import validate_audit_events
+from .schema_guard import FAILURE_MODE_STATUSES, TASK_STATUSES
 
 
 @dataclass(frozen=True)
@@ -79,15 +78,6 @@ def check_runtime_invariants(
 
     for row in query_scoped(
         conn,
-        "select id, lease_agent, lease_expires_at from tasks where lease_agent is not null and lease_expires_at is not null order by id",
-        "select id, lease_agent, lease_expires_at from tasks where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) and lease_agent is not null and lease_expires_at is not null order by id",
-        task_ids,
-    ):
-        if is_expired(row["lease_expires_at"]):
-            issues.append(issue("expired-lease", "task", row["id"], f"invariant failed: expired lease remains active {row['id']} agent={row['lease_agent']}"))
-
-    for row in query_scoped(
-        conn,
         "select cycle_id, id, evidence, owner, accepted_by from tasks where status = 'accepted' order by id",
         "select cycle_id, id, evidence, owner, accepted_by from tasks where cycle_id = (select current_cycle_id from project where id = 1) and id in ({placeholders}) and status = 'accepted' order by id",
         task_ids,
@@ -98,17 +88,13 @@ def check_runtime_invariants(
         accept_event = conn.execute(
             """
             select 1 from events
-            where type = 'task_accepted' and json_extract(payload_json, '$.entity_id') = ?
-              and json_extract(payload_json, '$.after.cycle_id') = ?
+            where event_type = 'task_accepted' and entity_id = ?
             limit 1
             """,
-            (row["id"], row["cycle_id"]),
+            (row["id"],),
         ).fetchone()
         if not accepted_by and not accept_event:
             issues.append(issue("accepted-task-missing-actor", "task", row["id"], f"invariant failed: accepted task has no accept actor/event {row['id']}"))
-        if accepted_by and accepted_by == row["owner"]:
-            issues.append(issue("producer-self-accepted", "task", row["id"], f"invariant failed: producer accepted own task {row['id']} actor={accepted_by}"))
-
     for row in query_scoped(
         conn,
         "select id, status from failure_modes order by id",
@@ -131,39 +117,7 @@ def check_runtime_invariants(
             issues.append(issue("delivery-missing-acceptance-link", "delivery", row["id"], f"invariant failed: delivery has no linked acceptance {row['id']}"))
 
     if scope is None or full:
-        adapter_columns = {row[1] for row in conn.execute("pragma table_info(adapter_actions)")}
-        if "payload_hash" not in adapter_columns:
-            issues.append(
-                issue(
-                    "adapter-payload-hash-column",
-                    "adapter_action",
-                    "",
-                    "invariant failed: adapter_actions payload_hash column is missing",
-                )
-            )
-        else:
-            for row in conn.execute(
-                "select id, tool, mode, artifact, action, payload_json, payload_hash from adapter_actions order by id"
-            ):
-                expected_hash = adapter_action_payload_hash(
-                    str(row["tool"]),
-                    str(row["mode"]),
-                    str(row["artifact"]),
-                    str(row["action"]),
-                    str(row["payload_json"]),
-                )
-                if row["payload_hash"] != expected_hash:
-                    issues.append(
-                        issue(
-                            "adapter-payload-hash-mismatch",
-                            "adapter_action",
-                            row["id"],
-                            f"invariant failed: adapter action payload hash mismatch {row['id']}",
-                        )
-                    )
-
-    if scope is None or full:
-        issues.extend(issue("event-payload", "event", "", str(event_issue)) for event_issue in validate_replay_compatible_events(conn))
+        issues.extend(issue("event-payload", "event", "", str(event_issue)) for event_issue in validate_audit_events(conn))
     else:
         issues.extend(event_waterline_issues(conn))
     return issues

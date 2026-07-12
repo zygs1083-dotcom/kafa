@@ -1,3 +1,7 @@
-"""Codex Project Harness consistency kernel."""
+"""Canonical runtime identity for the Codex Project Harness Kernel."""
 
-KERNEL_VERSION = "4.18.0"
+RUNTIME_VERSION = "5.0.0"
+KERNEL_VERSION = RUNTIME_VERSION
+SCHEMA_VERSION = 30
+
+__all__ = ["KERNEL_VERSION", "RUNTIME_VERSION", "SCHEMA_VERSION"]

@@ -56,8 +56,12 @@ class KernelModuleArchitectureTest(unittest.TestCase):
         self.assertIn("__all__", api_text)
         self.assertTrue(cli_names.issubset(api_names), sorted(cli_names - api_names))
 
-    def test_delivery_decision_does_not_reverse_import_the_monolith(self) -> None:
-        self.assertNotIn("harness_db", imported_modules(CORE_ROOT / "gate_engine.py"))
+    def test_schema30_delivery_is_the_only_delivery_decision_module(self) -> None:
+        delivery = CORE_ROOT / "delivery.py"
+
+        self.assertTrue(delivery.is_file())
+        self.assertFalse((CORE_ROOT / "gate_engine.py").exists())
+        self.assertNotIn("harness_db", imported_modules(delivery))
 
     def test_schema_lifecycle_owns_database_ddl(self) -> None:
         lifecycle = CORE_ROOT / "schema_lifecycle.py"
@@ -80,7 +84,6 @@ class KernelModuleArchitectureTest(unittest.TestCase):
         for function in [
             "current_cycle_row",
             "baseline_issues",
-            "validation_has_test_or_evidence",
             "traceability_issues",
         ]:
             self.assertIn(f"def {function}", ledger_text)

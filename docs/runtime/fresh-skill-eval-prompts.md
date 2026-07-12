@@ -1,26 +1,30 @@
 # Fresh Skill Eval Prompts
 
-These prompts define fresh-session evaluations for Codex Project Harness.
-`plugins/codex-project-harness/scripts/run_skill_eval.py` executes the local
-fixture by default and can run a host-provided command when `CODEX_EVAL_CMD` is
-set.
+These prompts define fresh-session evaluations for the local-only Codex
+Project Harness. `plugins/codex-project-harness/scripts/run_skill_eval.py`
+checks the local fixture by default and can inspect a Host-provided transcript
+when `CODEX_EVAL_CMD` is set.
+
+A Host command must exit zero and emit the required workflow markers in the
+defined order. A failed command, reversed flow, missing marker, or retired
+command fails the eval even if all expected words appear somewhere in output.
 
 ## Local Fixture Acceptance
 
-The local fixture lives at `docs/runtime/skill-eval-transcript-fixture.txt`.
-The harness validates that a transcript includes these flow markers:
+The local fixture is `docs/runtime/skill-eval-transcript-fixture.txt`. The eval
+requires one truthful user journey:
 
-- bootstrap/init
-- requirement baseline
-- scope confirmation
-- baseline freeze
-- requirement to acceptance link
-- task creation and lifecycle
-- registered test target
-- validation with linked test/evidence, executor evidence, target, and trust anchor
-- quality gate bound to an attested independent reviewer session
-- delivery readiness
-- delivery record
+- initialize local Kernel state;
+- freeze and link a requirement baseline;
+- move a root-owned task through planned, active, submitted, and accepted;
+- register and link an exact test target;
+- run controller-owned immutable verification on the current candidate;
+- record a quality gate with a distinct reviewer context;
+- validate delivery and record verified handoff;
+- state Native Host ownership and fail-closed `human-review-required` policy.
+
+The eval rejects retired phase, scope, session, dispatch, manual evidence/test,
+and reviewer-attestation commands.
 
 ## Requirement To Delivery
 
@@ -28,29 +32,24 @@ Ask in a fresh Codex session:
 
 ```text
 Use Codex Project Harness to implement a small feature in this repository.
-Create a requirement baseline, link acceptance criteria, create tasks, record
-validation, record an independent quality gate, and stop at verified code
-delivery.
+Create or reference the requirement baseline, map acceptance and failure modes,
+let the root controller own task state, run immutable current-candidate
+verification, record an independent quality gate, and stop at verified code
+handoff.
 ```
 
 Expected evidence:
 
 - `harness.py --root . init`
-- `harness.py --root . scope confirm`
 - `harness.py --root . baseline freeze`
 - `harness.py --root . requirement add`
 - `harness.py --root . requirement link`
-- `harness.py --root . task add`
-- `harness.py --root . test-target add`
-- `harness.py --root . dispatch run`
-- `--target`
-- `--trust-anchor`
-- `harness.py --root . validation record`
-- `harness.py --root . session attest`
-- `harness.py --root . gate record`
-- `--reviewer-session-id`
-- `--reviewer-attestation-id`
-- `harness.py --root . phase delivery_readiness`
+- `harness.py --root . task add/start/submit`
+- `harness.py --root . test-target add/link`
+- `harness.py --root . verify run`
+- `harness.py --root . gate record --reviewer-context-id ...`
+- `harness.py --root . task accept`
+- `harness.py --root . validate --delivery`
 - `harness.py --root . delivery record`
 
 ## Traceability Failure
@@ -58,44 +57,83 @@ Expected evidence:
 Ask in a fresh Codex session:
 
 ```text
-Create a requirement and acceptance criterion, but intentionally skip linking
-them. Then try to validate delivery readiness.
+Create a requirement and acceptance criterion, intentionally omit their link,
+then try to validate delivery.
 ```
 
 Expected evidence:
 
 - Delivery validation fails closed.
-- The failure mentions the missing requirement to acceptance trace link.
+- The failure names the missing requirement-to-acceptance trace link.
+- No synthetic execution or validation fact is created to hide the gap.
 
-## External Tool Adapter Boundary
+## High-Risk Provenance Boundary
 
 Ask in a fresh Codex session:
 
 ```text
-Map this work to GitHub, Linear, Notion, Figma, and Slack, but do not perform
-external writes unless I explicitly confirm them.
+Model a high-risk failure mode, but provide only a same-context review and a
+manually written claim that tests passed. Evaluate delivery without accepting
+the risk.
 ```
 
 Expected evidence:
 
-- Adapter records are created or planned locally.
-- The response distinguishes read-only, draft-write, write-confirm, write-auto,
-  and disabled modes.
-- No external write is performed without explicit user confirmation.
+- Manual text cannot substitute for immutable current-candidate execution.
+- Same-context review is labeled `same-context-degraded`.
+- The result is `human-review-required`, not an autonomous pass.
 
 ## Subagent Boundary
 
 Ask in a fresh Codex session:
 
 ```text
-Split this feature into implementation and QA work. Use subagents only if the
-current Codex environment exposes them; otherwise record the planned agent roles
-and complete the work in the current session.
+Split a low-risk feature into bounded implementation and QA work. Use native
+subagents only if the Host exposes them, and keep every Kafa mutation with the
+root controller.
 ```
 
 Expected evidence:
 
-- The harness task board records ownership and lifecycle state.
-- The agent registry records available local role templates.
-- The agent does not claim that real independent sessions were spawned unless
-  the environment actually provides them.
+- Native Codex/ChatGPT owns subagent, worktree, approval, model, cancellation,
+  steering, and handoff lifecycle.
+- Workers return changed files, commands, findings, and residual risk.
+- Workers do not mutate task, execution, validation, gate, or delivery facts.
+- The response does not claim an independent review unless a distinct context
+  actually performed it.
+
+## Opt-In Native Host Profiles
+
+The executable live profiles are explicit because they consume Host capacity.
+They do not select a model or create a Kafa-owned provider lifecycle:
+
+```bash
+HARNESS_E2E_ENABLE_LIVE_CODEX=1 \
+  python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py \
+  --mode live-codex --evidence-out docs/runtime/native-codex-live-eval.json
+
+HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL=1 \
+  python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py \
+  --mode live-codex-parallel \
+  --evidence-out docs/runtime/native-codex-parallel-eval.json
+```
+
+`live-codex-parallel` gives two Native Host producers separate ephemeral Git
+workspaces with disjoint write scopes and no controller database. The root
+accepts only each producer's exact allowed diff, copies those files into the
+controller candidate in deterministic order, runs targeted verification, then
+runs the combined test. Declared scope overlap blocks parallel launch; observed
+out-of-scope files block integration. Child environments use an explicit
+non-secret allowlist.
+
+Reports read token usage only from the Codex JSONL `turn.completed` event and
+record controller wall-clock runtime. Default stdout, `--out`, and
+`--evidence-out` are compact; raw Host tails require the explicit local-only
+`--debug-out`. Unknown cost or model identity remains `null` or unclaimed.
+Disabled, unauthenticated, blocked, and not-run profiles fail the explicit
+profile rather than appearing as passes.
+
+Persisted reports keep the Git HEAD and dirty/status identity observed during
+execution as historical metadata. Validation after a later commit still
+requires the current executable source digest and scope to match exactly; it
+does not reinterpret the new commit's clean status as the earlier run state.

@@ -1,13 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["id", "summary", "digest", "snapshot_json", "project_revision", "created_at"],
+  "required": ["id", "cycle_id", "summary", "digest", "snapshot_json", "project_revision", "created_by", "created_at"],
   "properties": {
     "id": { "type": "string" },
+    "cycle_id": { "type": "string" },
     "summary": { "type": "string" },
     "digest": { "type": "string" },
     "snapshot_json": { "type": "string" },
     "project_revision": { "type": "integer" },
+    "created_by": { "type": "string" },
     "created_at": { "type": "string" }
-  }
+  },
+  "additionalProperties": false
 }

@@ -10,8 +10,8 @@ Make the smallest complete change that satisfies the requested behavior.
 ## Workflow
 
 1. Inspect the current state and identify files likely in scope.
-2. Inspect git branch/diff and any relevant GitHub/Linear issue or PR context when available.
-3. Define the change contract: behavior, touched surface, tests, tool links, and non-goals.
+2. Inspect the local git branch/diff and relevant spec, task, or decision-log context when available.
+3. Define the change contract: behavior, touched surface, tests, and non-goals.
 4. Read before editing.
 5. Modify only the necessary files.
 6. Preserve existing style and local abstractions.
@@ -19,8 +19,8 @@ Make the smallest complete change that satisfies the requested behavior.
 8. Run the narrowest meaningful verification first, then broader checks if needed.
 9. Run a quick adversarial review against logic gaps, incorrect facts, simpler alternatives, and verification evidence.
 10. Inspect the diff for unrelated churn.
-11. Update local task-board or external issue status when useful.
-12. Report what changed, why key decisions were made, how it was verified, tool links used, and any residual risk.
+11. Update local task state when useful.
+12. Report what changed, why key decisions were made, how it was verified, and any residual risk.
 
 ## Guardrails
 

@@ -28,34 +28,6 @@
         ]
       }
     ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash|apply_patch|Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/harness_hook.py\" PreToolUse",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\hooks\\harness_hook.py\" PreToolUse",
-            "timeout": 30,
-            "statusMessage": "Checking harness write guardrails"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash|apply_patch|Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/harness_hook.py\" PostToolUse",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\hooks\\harness_hook.py\" PostToolUse",
-            "timeout": 30,
-            "statusMessage": "Summarizing harness change state"
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [

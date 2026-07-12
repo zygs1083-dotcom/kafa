@@ -2,33 +2,38 @@ User:
 Use Codex Project Harness to implement a small feature in this repository.
 
 Assistant:
-I will run the local harness flow and stop at verified code delivery.
+I will use the local-only Kernel and stop at verified code handoff.
+Native Codex/ChatGPT owns task, subagent, worktree, approval, model, cancellation,
+steering, and handoff lifecycle; only the root controller writes Kafa facts.
 
 $ harness.py --root . init
-$ harness.py --root . phase project_bootstrap
-$ harness.py --root . phase requirement_baseline
 $ harness.py --root . requirement add --id R1 --kind functional --body "User can create a task"
-$ harness.py --root . acceptance add --id AC1 --criterion "Create tasks"
+$ harness.py --root . acceptance add --id AC1 --criterion "Create exactly one task"
 $ harness.py --root . requirement link --requirement R1 --acceptance AC1
-$ harness.py --root . phase confirmation
-$ harness.py --root . failure-mode add --id FM1 --feature "Task creation" --scenario "Duplicate submit" --trigger "same form twice" --expected "one task" --risk high --acceptance AC1
-$ harness.py --root . task add --id T1 --task "Implement task creation" --acceptance AC1 --failure-mode FM1
-$ harness.py --root . scope confirm --by project-manager --summary "Scope confirmed with user"
+$ harness.py --root . failure-mode add --id FM1 --feature "Task creation" --scenario "Duplicate submit" --trigger "same form twice" --expected "one task" --risk medium --acceptance AC1
 $ harness.py --root . baseline freeze --id B1 --summary "Confirmed task creation scope"
-$ harness.py --root . phase planning
-$ harness.py --root . phase implementation
-$ harness.py --root . session attest --session-id S-dev --agent developer --role developer --context-id ctx-dev
-$ harness.py --root . task claim T1 --agent developer --expected-revision 1
-$ harness.py --root . task start T1 --agent developer --lease-token TOKEN --expected-revision 2
-$ harness.py --root . task submit T1 --agent developer --lease-token TOKEN --expected-revision 3 --evidence "Code and tests updated" --session-id S-dev
-$ harness.py --root . phase qa
-$ harness.py --root . session attest --session-id S-qa --agent qa-reviewer --role qa-reviewer --context-id ctx-qa --origin connector --verification-token HOST-HMAC
-$ harness.py --root . task review T1 --agent qa-reviewer --expected-revision 4 --session-id S-qa
-$ harness.py --root . task accept T1 --agent qa-reviewer --lease-token REVIEW --expected-revision 5 --evidence "Reviewed" --session-id S-qa
-$ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m unittest" --description "Unit test suite"
-$ harness.py --root . dispatch run --agent developer --target UNIT --command "python3 -m unittest"
-$ harness.py --root . test record --id TEST1 --surface "Task creation" --command "unit test" --result pass --evidence EXEC-123
-$ harness.py --root . validation record --surface "Task creation" --acceptance AC1 --commands "unit test" --findings passed --result pass --failure-mode FM1 --test TEST1 --evidence EXEC-123 --target UNIT --trust-anchor external-session --trust-anchor-id fresh-session-1
-$ harness.py --root . gate record --reviewer-context fresh --reviewer-session-id S-qa --reviewer-attestation-id SESSION-ATTESTATION-ID --result pass --commands "review" --evidence "reviewed"
-$ harness.py --root . phase delivery_readiness
-$ harness.py --root . delivery record --scope "Task creation" --acceptance AC1 --validation "unit test passed" --qa "gate passed" --failure-mode-coverage "FM1 covered" --quality-gate pass
+$ harness.py --root . task add --id T1 --task "Implement task creation" --owner developer --acceptance AC1 --failure-mode FM1
+$ harness.py --root . task start T1
+
+Assistant:
+A Native Host producer returns the changed files and commands to the root
+controller. It does not write Kafa state.
+
+$ harness.py --root . task submit T1 --context-id producer-context --evidence "Implementation and tests returned to root controller"
+$ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m unittest" --description "Unit test suite" --result-format regex
+$ harness.py --root . test-target link --task T1 --target UNIT
+$ harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
+
+Assistant:
+A distinct Native Host reviewer inspects the current candidate and returns no
+blocking findings. The root controller records the review decision.
+
+$ harness.py --root . gate record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass
+$ harness.py --root . task accept T1 --evidence "Distinct reviewer accepted the current candidate"
+$ harness.py --root . validate --delivery
+$ harness.py --root . delivery record --scope "Task creation" --acceptance AC1 --changed-files "src/tasks.py tests/test_tasks.py" --validation "UNIT immutable execution passed" --qa "fresh reviewer context passed" --failure-mode-coverage "FM1 covered" --quality-gate pass --known-gaps "none" --handoff "verified code only; no deployment"
+
+Assistant:
+If this were high/critical work without verifiable current-candidate provenance
+and distinct producer/reviewer context, the delivery result would be
+human-review-required rather than an autonomous pass.

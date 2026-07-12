@@ -23,8 +23,16 @@ def run_harness(root: Path, *args: str, check: bool = True) -> subprocess.Comple
 
 
 class StructuredResultParserTest(unittest.TestCase):
+    def test_regex_parser_counts_common_runner_outputs(self) -> None:
+        from core.execution import parse_executed_count
+
+        self.assertEqual(parse_executed_count("3 passed, 1 skipped in 0.12s"), 3)
+        self.assertEqual(parse_executed_count("Ran 4 tests in 0.001s\n\nOK"), 4)
+        self.assertEqual(parse_executed_count("Tests:       5 passed, 5 total"), 5)
+        self.assertEqual(parse_executed_count("0 passing (4ms)"), 0)
+
     def test_parsers_accept_successful_structured_outputs(self) -> None:
-        from core.executor import parse_structured_result
+        from core.execution import parse_structured_result
 
         samples = {
             "junit": b'<testsuite tests="2" failures="0" errors="0"><testcase name="a"/><testcase name="b"/></testsuite>',
@@ -42,7 +50,7 @@ class StructuredResultParserTest(unittest.TestCase):
                 self.assertEqual(parsed.executed_count_source, "structured")
 
     def test_structured_targets_do_not_accept_regex_like_stdout(self) -> None:
-        from core.executor import parse_structured_result
+        from core.execution import parse_structured_result
 
         parsed = parse_structured_result("pytest-json", b"10 passed in 0.2s")
 
@@ -51,7 +59,7 @@ class StructuredResultParserTest(unittest.TestCase):
         self.assertIn("malformed", parsed.reason)
 
     def test_local_executor_records_structured_result_from_result_path(self) -> None:
-        from core.executor import LocalExecutor
+        from core.execution import LocalExecutor
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -84,7 +92,10 @@ class StructuredResultGateTest(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
             (root / "emit.py").write_text(
-                "from pathlib import Path\nPath('pytest.json').write_text('{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}')\n",
+                "from pathlib import Path\n"
+                "result = Path('.ai-team/runtime/pytest.json')\n"
+                "result.parent.mkdir(parents=True, exist_ok=True)\n"
+                "result.write_text('{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}')\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", "emit.py"], cwd=root, check=True)
@@ -104,43 +115,28 @@ class StructuredResultGateTest(unittest.TestCase):
                 "--result-format",
                 "pytest-json",
                 "--result-path",
-                "pytest.json",
+                ".ai-team/runtime/pytest.json",
             )
-            run_harness(root, "task", "add", "--id", "T1", "--task", "structured", "--acceptance", "AC1")
-            run_harness(root, "test-target", "link", "--task", "T1", "--target", "UNIT")
-            run_id = run_harness(root, "dispatch", "plan", "--scope", "structured").stdout.strip().split()[-1]
-            branch = f"agent/{run_id}/T1/developer"
-            subprocess.run(["git", "branch", branch, "HEAD"], cwd=root, check=True, capture_output=True)
-            head = subprocess.run(["git", "rev-parse", branch], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
-            tree = subprocess.run(["git", "rev-parse", f"{branch}^{{tree}}"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
-            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                conn.execute("update dispatch_assignments set agent_id = 'developer', status = 'reported' where run_id = ? and task_id = 'T1'", (run_id,))
-                conn.execute(
-                    """
-                    insert into task_attempts
-                    (id, run_id, task_id, agent_id, fence, base_commit_sha, head_commit_sha, tree_sha,
-                     branch_name, target_id, status, provider_session_id, agent_session_id, report_id, evidence_id, started_at, finished_at)
-                    values ('ATTEMPT1', ?, 'T1', 'developer', 0, ?, ?, ?, ?, 'UNIT', 'reported', '', '', '', '', 'now', '')
-                    """,
-                    (run_id, head, head, tree, branch),
-                )
-                conn.execute(
-                    """
-                    insert into dispatch_worktrees
-                    (id, run_id, task_id, agent_id, branch_name, worktree_path, status, created_at, cleaned_at)
-                    values ('WT1', ?, 'T1', 'developer', ?, '', 'active', 'now', '')
-                    """,
-                    (run_id, branch),
-                )
-                conn.commit()
-
-            run_harness(root, "dispatch", "verify-attempt", "--run-id", run_id, "--task", "T1")
+            run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
 
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
-                evidence = conn.execute("select result_format, result_path, semantic_status, executed_count_source from evidence").fetchone()
-                validation = conn.execute("select result_format, result_path, semantic_status, executed_count_source from validations").fetchone()
-            self.assertEqual(tuple(evidence), ("pytest-json", "pytest.json", "pass", "structured"))
-            self.assertEqual(tuple(validation), ("pytest-json", "pytest.json", "pass", "structured"))
+                recorded = conn.execute(
+                    """
+                    select e.result_format, e.semantic_status, e.executed_count, e.exit_code,
+                           e.artifact_path, e.policy_status, v.acceptance_id, v.surface,
+                           v.result, e.candidate_sha = v.candidate_sha
+                    from executions e
+                    join validation_executions ve on ve.execution_id = e.id
+                    join validations v on v.id = ve.validation_id
+                    """
+                ).fetchone()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("update executions set semantic_status = 'fail'")
+
+            self.assertEqual(recorded[:4], ("pytest-json", "pass", 1, 0))
+            self.assertTrue(recorded[4].endswith("stdout.txt"))
+            self.assertTrue((root / recorded[4]).is_file())
+            self.assertEqual(recorded[5:], ("allowed", "AC1", "test-target:UNIT", "pass", 1))
 
 
 if __name__ == "__main__":

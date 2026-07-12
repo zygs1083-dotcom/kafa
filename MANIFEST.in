@@ -1,0 +1,4 @@
+include VERSION
+include release.json
+recursive-include plugins/codex-project-harness *
+global-exclude *.py[cod]

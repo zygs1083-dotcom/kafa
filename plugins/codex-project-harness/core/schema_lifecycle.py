@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import hashlib
+import os
 import sqlite3
+from contextlib import closing
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 from harness_lib import now_iso
+from . import RUNTIME_VERSION, SCHEMA_VERSION
 from .errors import HarnessError
-from .schema_guard import adapter_action_payload_hash
+from .store import project_db_operation
 
 
 class SchemaLifecycleError(HarnessError):
@@ -28,6 +35,677 @@ DEFAULT_EXECUTOR_PREFIXES = [
     "cargo test",
     "dotnet test",
 ]
+
+
+SCHEMA30_VERSION = SCHEMA_VERSION
+SCHEMA30_RUNTIME_VERSION = RUNTIME_VERSION
+SCHEMA30_TABLES = frozenset(
+    {
+        "project",
+        "delivery_cycles",
+        "requirements",
+        "acceptance",
+        "requirement_acceptance",
+        "failure_modes",
+        "failure_mode_acceptance",
+        "baselines",
+        "tasks",
+        "task_acceptance",
+        "task_failure_modes",
+        "task_dependencies",
+        "test_targets",
+        "task_test_targets",
+        "executions",
+        "validations",
+        "validation_executions",
+        "validation_failure_modes",
+        "findings",
+        "quality_gates",
+        "quality_gate_findings",
+        "deliveries",
+        "delivery_acceptance",
+        "decisions",
+        "invalidations",
+        "migrations",
+        "events",
+    }
+)
+SCHEMA30_SQLITE_INTERNAL_TABLES = frozenset({"sqlite_sequence"})
+SCHEMA30_CATALOG_TABLES = SCHEMA30_TABLES | SCHEMA30_SQLITE_INTERNAL_TABLES
+SCHEMA30_JSON_SCHEMAS = frozenset(
+    {
+        "project-state.schema.json",
+        "delivery-cycle.schema.json",
+        "requirement.schema.json",
+        "acceptance.schema.json",
+        "failure-mode.schema.json",
+        "baseline.schema.json",
+        "task.schema.json",
+        "task-test-target.schema.json",
+        "test-target.schema.json",
+        "execution.schema.json",
+        "validation.schema.json",
+        "finding.schema.json",
+        "quality-gate.schema.json",
+        "delivery.schema.json",
+        "invalidation.schema.json",
+        "event.schema.json",
+    }
+)
+
+
+SCHEMA30_DDL = """
+create table project (
+    id integer primary key check (id = 1),
+    project_id text not null,
+    schema_version integer not null check (schema_version = __SCHEMA_VERSION__),
+    runtime_version text not null,
+    phase text not null,
+    current_cycle_id text not null default '',
+    status text not null,
+    scope_status text not null,
+    current_owner text not null,
+    revision integer not null check (revision > 0),
+    updated_at text not null
+);
+create table delivery_cycles (
+    id text primary key,
+    name text not null,
+    goal text not null,
+    status text not null,
+    phase text not null,
+    base_ref text not null default '',
+    candidate_sha text not null default '',
+    started_at text not null,
+    closed_at text not null default '',
+    created_at text not null,
+    updated_at text not null
+);
+create table requirements (
+    uid text primary key default (lower(hex(randomblob(16)))),
+    id text not null,
+    cycle_id text not null,
+    kind text not null,
+    body text not null,
+    priority text not null default '',
+    status text not null default 'active',
+    revision integer not null default 1 check (revision > 0),
+    updated_at text not null,
+    unique(cycle_id, id),
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table acceptance (
+    uid text primary key default (lower(hex(randomblob(16)))),
+    id text not null,
+    cycle_id text not null,
+    criterion text not null,
+    priority text not null default '',
+    status text not null default 'active',
+    revision integer not null default 1 check (revision > 0),
+    unique(cycle_id, id),
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table requirement_acceptance (
+    cycle_id text not null,
+    requirement_id text not null,
+    acceptance_id text not null,
+    primary key (cycle_id, requirement_id, acceptance_id),
+    foreign key (cycle_id, requirement_id) references requirements(cycle_id, id) on delete cascade,
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
+);
+create table failure_modes (
+    uid text primary key default (lower(hex(randomblob(16)))),
+    id text not null,
+    cycle_id text not null,
+    feature text not null,
+    scenario text not null,
+    trigger text not null,
+    expected_behavior text not null,
+    recovery text not null default '',
+    data_safety text not null default '',
+    risk text not null check (risk in ('low', 'medium', 'high', 'critical')),
+    status text not null default 'active',
+    accepted_by text not null default '',
+    acceptance_reason text not null default '',
+    acceptance_scope text not null default '',
+    accepted_revision integer,
+    expires_at text not null default '',
+    revision integer not null default 1 check (revision > 0),
+    unique(cycle_id, id),
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table failure_mode_acceptance (
+    cycle_id text not null,
+    failure_mode_id text not null,
+    acceptance_id text not null,
+    primary key (cycle_id, failure_mode_id, acceptance_id),
+    foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade,
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
+);
+create table baselines (
+    id text primary key,
+    cycle_id text not null,
+    summary text not null,
+    snapshot_json text not null,
+    digest text not null,
+    project_revision integer not null,
+    created_by text not null default '',
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table tasks (
+    uid text primary key default (lower(hex(randomblob(16)))),
+    id text not null,
+    cycle_id text not null,
+    task text not null,
+    owner text not null default '',
+    status text not null default 'planned'
+        check (status in ('planned', 'active', 'submitted', 'accepted', 'blocked', 'cancelled')),
+    evidence text not null default '',
+    submitted_context_id text not null default '',
+    accepted_by text not null default '',
+    revision integer not null default 1 check (revision > 0),
+    updated_at text not null,
+    unique(cycle_id, id),
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table task_acceptance (
+    cycle_id text not null,
+    task_id text not null,
+    acceptance_id text not null,
+    primary key (cycle_id, task_id, acceptance_id),
+    foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete cascade
+);
+create table task_failure_modes (
+    cycle_id text not null,
+    task_id text not null,
+    failure_mode_id text not null,
+    primary key (cycle_id, task_id, failure_mode_id),
+    foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+    foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade
+);
+create table task_dependencies (
+    cycle_id text not null,
+    task_id text not null,
+    depends_on text not null,
+    primary key (cycle_id, task_id, depends_on),
+    foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+    foreign key (cycle_id, depends_on) references tasks(cycle_id, id) on delete restrict,
+    check (task_id != depends_on)
+);
+create table test_targets (
+    id text primary key,
+    kind text not null,
+    command_template text not null,
+    description text not null default '',
+    gateable integer not null default 1 check (gateable in (0, 1)),
+    gate_block_reason text not null default '',
+    stack_profile text not null default 'python',
+    container_image text not null default '',
+    requires_sandbox integer not null default 0 check (requires_sandbox in (0, 1)),
+    requires_no_network integer not null default 0 check (requires_no_network in (0, 1)),
+    result_format text not null default 'regex',
+    result_path text not null default '',
+    created_at text not null,
+    updated_at text not null
+);
+create table task_test_targets (
+    cycle_id text not null,
+    task_id text not null,
+    target_id text not null,
+    primary key (cycle_id, task_id, target_id),
+    foreign key (cycle_id, task_id) references tasks(cycle_id, id) on delete cascade,
+    foreign key (target_id) references test_targets(id) on delete cascade
+);
+create table executions (
+    id text primary key,
+    cycle_id text not null,
+    candidate_sha text not null,
+    target_id text,
+    command text not null,
+    exit_code integer not null,
+    stdout_sha256 text not null,
+    artifact_path text not null default '',
+    executed_count integer not null check (executed_count >= 0),
+    result_format text not null,
+    semantic_status text not null,
+    runner text not null check (runner in ('local', 'container')),
+    sandbox_status text not null,
+    no_network integer not null default 0 check (no_network in (0, 1)),
+    policy_status text not null,
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade,
+    foreign key (target_id) references test_targets(id) on delete restrict,
+    unique (id, cycle_id, candidate_sha)
+);
+create trigger executions_no_update
+before update on executions
+begin
+    select raise(abort, 'executions are immutable');
+end;
+create trigger executions_no_delete
+before delete on executions
+begin
+    select raise(abort, 'executions are immutable');
+end;
+create table validations (
+    id text primary key,
+    cycle_id text not null,
+    candidate_sha text not null,
+    acceptance_id text,
+    surface text not null,
+    result text not null,
+    validation_status text not null default 'active',
+    superseded_by text,
+    findings text not null default '',
+    residual_risk text not null default '',
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade,
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete restrict,
+    foreign key (superseded_by) references validations(id) on delete set null,
+    unique (id, cycle_id, candidate_sha)
+);
+create table validation_executions (
+    validation_id text not null,
+    execution_id text not null,
+    cycle_id text not null,
+    candidate_sha text not null,
+    primary key (validation_id, execution_id),
+    foreign key (validation_id, cycle_id, candidate_sha)
+        references validations(id, cycle_id, candidate_sha) on delete cascade,
+    foreign key (execution_id, cycle_id, candidate_sha)
+        references executions(id, cycle_id, candidate_sha) on delete restrict
+);
+create table validation_failure_modes (
+    validation_id text not null,
+    cycle_id text not null,
+    failure_mode_id text not null,
+    primary key (validation_id, cycle_id, failure_mode_id),
+    foreign key (validation_id) references validations(id) on delete cascade,
+    foreign key (cycle_id, failure_mode_id) references failure_modes(cycle_id, id) on delete cascade
+);
+create table findings (
+    id text primary key,
+    cycle_id text not null,
+    candidate_sha text not null default '',
+    surface text not null,
+    severity text not null check (severity in ('low', 'medium', 'high', 'critical')),
+    status text not null,
+    summary text not null,
+    waived_by text not null default '',
+    waiver_reason text not null default '',
+    waiver_scope text not null default '',
+    waived_revision integer,
+    waiver_expires_at text not null default '',
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table quality_gates (
+    id text primary key,
+    sequence integer not null unique,
+    cycle_id text not null,
+    candidate_sha text not null,
+    gate_status text not null default 'active',
+    superseded_by text,
+    gate text not null,
+    producer_context_id text not null default '',
+    reviewer_context_id text not null default '',
+    review_status text not null default 'same-context-degraded',
+    result text not null,
+    blocking_findings text not null default '',
+    residual_risk text not null default '',
+    reviewed_revision integer not null default 0,
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade,
+    foreign key (superseded_by) references quality_gates(id) on delete set null
+);
+create table quality_gate_findings (
+    gate_id text not null,
+    finding_id text not null,
+    primary key (gate_id, finding_id),
+    foreign key (gate_id) references quality_gates(id) on delete cascade,
+    foreign key (finding_id) references findings(id) on delete cascade
+);
+create table deliveries (
+    id text primary key,
+    cycle_id text not null,
+    candidate_sha text not null,
+    scope text not null,
+    acceptance text not null default '',
+    changed_files text not null default '',
+    validation text not null default '',
+    qa text not null default '',
+    failure_mode_coverage text not null default '',
+    quality_gate text not null default '',
+    data_config_notes text not null default '',
+    known_gaps text not null default '',
+    handoff text not null default '',
+    decision_status text not null default 'delivered',
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table delivery_acceptance (
+    delivery_id text not null,
+    cycle_id text not null,
+    acceptance_id text not null,
+    primary key (delivery_id, cycle_id, acceptance_id),
+    foreign key (delivery_id) references deliveries(id) on delete cascade,
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete restrict
+);
+create table decisions (
+    id text primary key,
+    cycle_id text not null default '',
+    candidate_sha text not null default '',
+    decision text not null,
+    reason text not null,
+    created_at text not null
+);
+create table invalidations (
+    id text primary key,
+    cycle_id text not null,
+    source_type text not null,
+    source_id text not null,
+    target_type text not null,
+    target_id text not null,
+    reason text not null,
+    resolved_at text,
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade
+);
+create table migrations (
+    id integer primary key autoincrement,
+    from_version integer not null,
+    to_version integer not null,
+    source_sha256 text not null default '',
+    backup_path text not null default '',
+    manifest_path text not null default '',
+    row_counts_json text not null default '{}',
+    dropped_table_count integer not null default 0,
+    status text not null,
+    applied_at text not null
+);
+create table events (
+    sequence integer primary key autoincrement,
+    id text not null unique,
+    schema_version integer not null check (schema_version = __SCHEMA_VERSION__),
+    event_type text not null,
+    entity_type text not null default '',
+    entity_id text not null default '',
+    actor text not null default '',
+    command text not null default '',
+    before_json text not null default '{}',
+    after_json text not null default '{}',
+    correlation_id text not null default '',
+    created_at text not null
+);
+create trigger events_no_update
+before update on events
+begin
+    select raise(abort, 'events are append-only');
+end;
+create trigger events_no_delete
+before delete on events
+begin
+    select raise(abort, 'events are append-only');
+end;
+create index requirements_cycle_status on requirements(cycle_id, status);
+create index acceptance_cycle_status on acceptance(cycle_id, status);
+create index failure_modes_cycle_risk_status on failure_modes(cycle_id, risk, status);
+create index tasks_cycle_status on tasks(cycle_id, status);
+create index executions_cycle_candidate on executions(cycle_id, candidate_sha, created_at);
+create index validations_cycle_candidate on validations(cycle_id, candidate_sha, validation_status);
+create index findings_cycle_candidate_status on findings(cycle_id, candidate_sha, status, severity);
+create index quality_gates_cycle_candidate_sequence on quality_gates(cycle_id, candidate_sha, sequence desc);
+create index deliveries_cycle_candidate on deliveries(cycle_id, candidate_sha);
+create index invalidations_cycle_target on invalidations(cycle_id, target_type, target_id);
+create index events_entity on events(entity_type, entity_id, sequence);
+""".replace("__SCHEMA_VERSION__", str(SCHEMA30_VERSION))
+
+
+def create_schema30(conn: sqlite3.Connection) -> None:
+    """Create only the schema 30 local delivery Kernel in an empty staging DB."""
+
+    existing = {
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table'"
+        )
+    }
+    if existing:
+        raise SchemaLifecycleError(
+            "schema 30 creation requires an empty staging database; found: "
+            + ", ".join(sorted(existing))
+        )
+    execute_transactional_script(conn, SCHEMA30_DDL)
+    actual = {
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table'"
+        )
+    }
+    if actual != SCHEMA30_CATALOG_TABLES:
+        missing = sorted(SCHEMA30_CATALOG_TABLES - actual)
+        extra = sorted(actual - SCHEMA30_CATALOG_TABLES)
+        raise SchemaLifecycleError(f"schema 30 table inventory mismatch: missing={missing} extra={extra}")
+
+
+@dataclass(frozen=True)
+class SQLiteBackupManifest:
+    source_version: int
+    target_version: int
+    created_at: str
+    backup_path: str
+    sha256: str
+    row_counts: dict[str, int]
+    source_integrity_check: tuple[str, ...]
+    source_foreign_key_issue_count: int
+    backup_integrity_check: tuple[str, ...]
+    backup_foreign_key_issue_count: int
+    manifest_path: str
+
+    def safe_payload(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["source_integrity_check"] = list(self.source_integrity_check)
+        payload["backup_integrity_check"] = list(self.backup_integrity_check)
+        return payload
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _user_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name"
+        )
+    )
+
+
+def _database_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    return {
+        table: int(conn.execute(f"select count(*) from {_quote_identifier(table)}").fetchone()[0])
+        for table in _user_tables(conn)
+    }
+
+
+def _database_integrity(conn: sqlite3.Connection) -> tuple[tuple[str, ...], int]:
+    integrity = tuple(str(row[0]) for row in conn.execute("pragma integrity_check"))
+    foreign_key_issue_count = sum(1 for _ in conn.execute("pragma foreign_key_check"))
+    return integrity, foreign_key_issue_count
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    project_exists = conn.execute(
+        "select 1 from sqlite_master where type='table' and name='project'"
+    ).fetchone()
+    if project_exists is None:
+        raise SchemaLifecycleError("cannot back up database without project schema metadata")
+    row = conn.execute("select schema_version from project where id = 1").fetchone()
+    if row is None:
+        raise SchemaLifecycleError("cannot back up database without project row")
+    return int(row[0])
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_file(path: Path) -> None:
+    # Windows' CRT rejects os.fsync/_commit on a read-only descriptor.
+    with path.open("rb+") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def _unique_backup_directory(backups_root: Path, source_version: int, timestamp: str) -> Path:
+    stem = f"schema-{source_version}-before-local-core-{timestamp}"
+    candidate = backups_root / stem
+    suffix = 0
+    while candidate.exists():
+        suffix += 1
+        candidate = backups_root / f"{stem}-{suffix}"
+    candidate.mkdir(parents=True, mode=0o700)
+    return candidate
+
+
+def backup_sqlite_database(
+    root: Path,
+    *,
+    source_path: Path | None = None,
+    expected_source_version: int | None = None,
+    created_at: str | None = None,
+) -> SQLiteBackupManifest:
+    """Create a consistent, digested recovery backup without exporting row payloads."""
+
+    with project_db_operation(root):
+        return _backup_sqlite_database_locked(
+            root,
+            source_path=source_path,
+            expected_source_version=expected_source_version,
+            created_at=created_at,
+        )
+
+
+def _backup_sqlite_database_locked(
+    root: Path,
+    *,
+    source_path: Path | None = None,
+    expected_source_version: int | None = None,
+    created_at: str | None = None,
+) -> SQLiteBackupManifest:
+    """Implement backup while the caller owns the project operation lock."""
+
+    root = root.resolve()
+    source = (source_path or (root / ".ai-team/state/harness.db")).resolve()
+    if not source.is_file():
+        raise SchemaLifecycleError(f"runtime database is missing: {source}")
+
+    created_at_value = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = (
+        created_at_value.replace("-", "")
+        .replace(":", "")
+        .replace("T", "T")
+        .removesuffix("Z")
+        + "Z"
+    )
+    backups_root = root / ".ai-team/backups"
+    backups_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup_dir: Path | None = None
+    partial_path: Path | None = None
+    try:
+        source_uri = f"file:{source.as_posix()}?mode=ro"
+        with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source_conn:
+            source_conn.execute("pragma query_only = on")
+            source_version = _schema_version(source_conn)
+            if expected_source_version is not None and source_version != expected_source_version:
+                raise SchemaLifecycleError(
+                    f"source schema changed before backup: expected {expected_source_version}, actual {source_version}"
+                )
+            source_integrity, source_fk_issues = _database_integrity(source_conn)
+            if source_integrity != ("ok",) or source_fk_issues:
+                raise SchemaLifecycleError(
+                    "source database failed pre-backup validation: "
+                    f"integrity={list(source_integrity)} foreign_key_issues={source_fk_issues}"
+                )
+            source_counts = _database_row_counts(source_conn)
+            backup_dir = _unique_backup_directory(backups_root, source_version, timestamp)
+            partial_path = backup_dir / "harness.db.partial"
+            with closing(sqlite3.connect(partial_path)) as destination_conn:
+                source_conn.backup(destination_conn)
+                destination_conn.execute("pragma journal_mode = delete")
+                destination_conn.commit()
+
+        final_path = backup_dir / "harness.db"
+        os.replace(partial_path, final_path)
+        partial_path = None
+        os.chmod(final_path, 0o600)
+        _fsync_file(final_path)
+
+        backup_uri = f"file:{final_path.as_posix()}?mode=ro"
+        with closing(sqlite3.connect(backup_uri, uri=True, timeout=5.0)) as backup_conn:
+            backup_integrity, backup_fk_issues = _database_integrity(backup_conn)
+            backup_counts = _database_row_counts(backup_conn)
+            backup_version = _schema_version(backup_conn)
+        if backup_integrity != ("ok",) or backup_fk_issues:
+            raise SchemaLifecycleError(
+                "backup database failed validation: "
+                f"integrity={list(backup_integrity)} foreign_key_issues={backup_fk_issues}"
+            )
+        if backup_version != source_version or backup_counts != source_counts:
+            raise SchemaLifecycleError(
+                "backup database does not match source metadata: "
+                f"version={backup_version}/{source_version} rows_equal={backup_counts == source_counts}"
+            )
+
+        manifest_path = backup_dir / "backup-manifest.json"
+        manifest = SQLiteBackupManifest(
+            source_version=source_version,
+            target_version=SCHEMA30_VERSION,
+            created_at=created_at_value,
+            backup_path=str(final_path),
+            sha256=_sha256_file(final_path),
+            row_counts=source_counts,
+            source_integrity_check=source_integrity,
+            source_foreign_key_issue_count=source_fk_issues,
+            backup_integrity_check=backup_integrity,
+            backup_foreign_key_issue_count=backup_fk_issues,
+            manifest_path=str(manifest_path),
+        )
+        manifest_path.write_text(
+            json.dumps(manifest.safe_payload(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(manifest_path, 0o600)
+        _fsync_file(manifest_path)
+        _fsync_directory(backup_dir)
+        _fsync_directory(backups_root)
+        return manifest
+    except Exception:
+        if partial_path is not None:
+            partial_path.unlink(missing_ok=True)
+        if backup_dir is not None and backup_dir.exists() and not any(backup_dir.iterdir()):
+            backup_dir.rmdir()
+        raise
 
 
 def execute_transactional_script(conn: sqlite3.Connection, script: str) -> None:
@@ -52,26 +730,6 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
-def backfill_adapter_action_payload_hashes(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        "select id, tool, mode, artifact, action, payload_json from adapter_actions where payload_hash = ''"
-    ).fetchall()
-    for row in rows:
-        conn.execute(
-            "update adapter_actions set payload_hash = ? where id = ? and payload_hash = ''",
-            (
-                adapter_action_payload_hash(
-                    str(row["tool"]),
-                    str(row["mode"]),
-                    str(row["artifact"]),
-                    str(row["action"]),
-                    str(row["payload_json"]),
-                ),
-                row["id"],
-            ),
-        )
-
-
 def ensure_default_executor_allowlist(conn: sqlite3.Connection) -> None:
     for prefix in DEFAULT_EXECUTOR_PREFIXES:
         conn.execute(
@@ -85,9 +743,6 @@ def ensure_default_executor_allowlist(conn: sqlite3.Connection) -> None:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    adapter_action_columns_before = {
-        str(row[1]) for row in conn.execute("pragma table_info(adapter_actions)").fetchall()
-    }
     execute_transactional_script(
         conn,
         """
@@ -98,7 +753,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             runtime_version text not null,
             phase text not null,
             current_cycle_id text not null default '',
-            connector_project_key text not null default '',
             status text not null,
             scope_status text not null,
             current_owner text not null,
@@ -124,7 +778,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             cycle_id text not null default '',
             criterion text not null,
             priority text not null default '',
-            tool_link text not null default '',
             status text not null default 'active',
             revision integer not null default 1,
             unique(cycle_id, id)
@@ -137,7 +790,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             body text not null,
             priority text not null default '',
             status text not null default 'active',
-            tool_link text not null default '',
             revision integer not null default 1,
             updated_at text not null,
             unique(cycle_id, id)
@@ -192,22 +844,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
             id text not null,
             cycle_id text not null default '',
             task text not null,
-            owner text not null,
-            status text not null,
+            owner text not null default '',
+            status text not null default 'planned'
+                check (status in ('planned', 'active', 'submitted', 'accepted', 'blocked', 'cancelled')),
             evidence text not null default '',
-            tool_link text not null default '',
-            submitted_by text not null default '',
-            submitted_session_id text not null default '',
+            submitted_context_id text not null default '',
             accepted_by text not null default '',
-            accepted_session_id text not null default '',
-            lease_agent text,
-            lease_token text,
-            lease_heartbeat_at text,
-            lease_expires_at text,
-            retry_count integer not null default 0,
-            retry_budget integer not null default 2,
-            fence integer not null default 0,
-            revision integer not null default 1,
+            revision integer not null default 1 check (revision > 0),
             updated_at text not null,
             unique(cycle_id, id)
         );
@@ -291,8 +934,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             sandbox_engine text not null default '',
             container_image text not null default '',
             allow_unlisted_reason text not null default '',
-            trust_anchor text not null default 'local-only',
-            trust_anchor_id text not null default '',
             policy_status text not null default '',
             policy_reason text not null default '',
             findings text not null,
@@ -363,8 +1004,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             evidence text not null default '',
             residual_risk text not null default '',
             reviewer_session_id text not null default '',
-            reviewer_attestation_id text not null default '',
-            review_trust_level text not null default 'local-only',
             created_at text not null
         );
         create table if not exists quality_gate_findings (
@@ -384,7 +1023,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             failure_mode_coverage text not null default '',
             quality_gate text not null default '',
             data_config_notes text not null default '',
-            collaboration_links text not null default '',
             known_gaps text not null default '',
             handoff text not null default '',
             created_at text not null
@@ -421,8 +1059,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             sandbox_engine text not null default '',
             container_image text not null default '',
             allow_unlisted_reason text not null default '',
-            trust_anchor text not null default 'local-only',
-            trust_anchor_id text not null default '',
             policy_status text not null default '',
             policy_reason text not null default '',
             attempt_id text not null default '',
@@ -461,88 +1097,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             reason text not null,
             created_at text not null
         );
-        create table if not exists adapters (
-            id text primary key,
-            tool text not null,
-            mode text not null,
-            artifact text not null,
-            external_id text not null default '',
-            external_link text not null default '',
-            idempotency_key text not null,
-            evidence text not null default '',
-            fallback text not null default '',
-            confirmation_needed text not null default 'no',
-            updated_at text not null,
-            unique(tool, idempotency_key)
-        );
-        create table if not exists adapter_actions (
-            id text primary key,
-            tool text not null,
-            mode text not null,
-            artifact text not null,
-            action text not null,
-            payload_json text not null default '{}',
-            payload_hash text not null default '',
-            status text not null,
-            confirmation text not null default '',
-            external_id text not null default '',
-            external_link text not null default '',
-            idempotency_key text not null,
-            attempt_count integer not null default 0,
-            next_retry_at text not null default '',
-            connector_status text not null default 'available',
-            blocked_reason text not null default '',
-            execution_fence integer not null default 0,
-            claimed_at text not null default '',
-            claim_expires_at text not null default '',
-            last_recovery_at text not null default '',
-            remote_recovery_count integer not null default 0,
-            created_at text not null,
-            updated_at text not null,
-            unique(tool, idempotency_key)
-        );
-        create table if not exists connector_budgets (
-            id text primary key,
-            tool text not null,
-            operation text not null,
-            scope_key text not null default '',
-            status text not null,
-            retry_after_at text not null default '',
-            rate_limit_remaining integer,
-            rate_limit_reset_at text not null default '',
-            last_status_code integer,
-            last_error text not null default '',
-            free_plan_risk text not null default '',
-            updated_at text not null,
-            unique(tool, operation, scope_key)
-        );
-        create table if not exists connector_profiles (
-            id text primary key,
-            tool text not null,
-            project_key text not null,
-            status text not null,
-            scope_json text not null default '{}',
-            created_at text not null,
-            updated_at text not null,
-            unique(tool)
-        );
-        create table if not exists advisory_fallbacks (
-            id text primary key,
-            action_id text not null,
-            tool text not null,
-            operation text not null,
-            scope_key text not null default '',
-            source_status text not null default '',
-            fallback_kind text not null,
-            official_capability text not null,
-            artifact_path text not null,
-            summary text not null,
-            status text not null,
-            delivery_eligible integer not null default 0,
-            generated_at text not null,
-            updated_at text not null,
-            unique(action_id)
-        );
         create table if not exists invalidations (
             id text primary key,
             cycle_id text not null default '',
@@ -577,54 +1131,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             status text not null default 'active',
             started_at text not null,
             ended_at text not null default ''
-        );
-        create table if not exists session_attestations (
-            id text primary key,
-            session_id text not null,
-            agent_id text not null,
-            role text not null,
-            context_id text not null,
-            provider_session_id text not null default '',
-            origin text not null default 'manual',
-            verification_token text not null default '',
-            token_status text not null default 'unchecked',
-            token_reason text not null default '',
-            trust_level text not null default 'local-only',
-            effective_trust text not null default 'local-only',
-            receipt_provenance text not null default '',
-            created_at text not null
-        );
-        create table if not exists ci_verifications (
-            id text primary key,
-            provider text not null,
-            run_id text not null,
-            conclusion text not null,
-            commit_sha text not null,
-            origin text not null default 'manual',
-            verification_token text not null default '',
-            token_status text not null default 'unchecked',
-            token_reason text not null default '',
-            effective_trust text not null default 'local-only',
-            receipt_provenance text not null default '',
-            external_link text not null default '',
-            created_at text not null,
-            unique(provider, run_id)
-        );
-        create table if not exists external_session_verifications (
-            id text primary key,
-            session_id text not null,
-            verifier text not null,
-            conclusion text not null,
-            commit_sha text not null,
-            origin text not null default 'manual',
-            verification_token text not null default '',
-            token_status text not null default 'unchecked',
-            token_reason text not null default '',
-            effective_trust text not null default 'local-only',
-            receipt_provenance text not null default '',
-            external_link text not null default '',
-            created_at text not null,
-            unique(session_id, verifier)
         );
         create table if not exists agent_capabilities (
             agent_id text not null references agents(id) on delete cascade,
@@ -834,13 +1340,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "dispatch_runs", "cycle_id", "text not null default ''")
     ensure_column(conn, "failure_modes", "acceptance_scope", "text not null default ''")
     ensure_column(conn, "failure_modes", "accepted_revision", "integer")
-    ensure_column(conn, "tasks", "submitted_by", "text not null default ''")
-    ensure_column(conn, "tasks", "submitted_session_id", "text not null default ''")
+    ensure_column(conn, "tasks", "submitted_context_id", "text not null default ''")
     ensure_column(conn, "tasks", "accepted_by", "text not null default ''")
-    ensure_column(conn, "tasks", "accepted_session_id", "text not null default ''")
-    ensure_column(conn, "tasks", "lease_heartbeat_at", "text")
-    ensure_column(conn, "tasks", "lease_expires_at", "text")
-    ensure_column(conn, "tasks", "fence", "integer not null default 0")
     ensure_column(conn, "quality_gates", "base_commit", "text not null default ''")
     ensure_column(conn, "quality_gates", "cycle_id", "text not null default ''")
     ensure_column(conn, "quality_gates", "candidate_sha", "text not null default ''")
@@ -851,8 +1352,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "quality_gates", "tracked_diff_hash", "text not null default ''")
     ensure_column(conn, "quality_gates", "project_revision", "integer not null default 0")
     ensure_column(conn, "quality_gates", "reviewer_session_id", "text not null default ''")
-    ensure_column(conn, "quality_gates", "reviewer_attestation_id", "text not null default ''")
-    ensure_column(conn, "quality_gates", "review_trust_level", "text not null default 'local-only'")
     ensure_column(conn, "findings", "cycle_id", "text not null default ''")
     ensure_column(conn, "findings", "candidate_sha", "text not null default ''")
     ensure_column(conn, "findings", "waived_by", "text not null default ''")
@@ -890,8 +1389,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "validations", "sandbox_engine", "text not null default ''")
     ensure_column(conn, "validations", "container_image", "text not null default ''")
     ensure_column(conn, "validations", "allow_unlisted_reason", "text not null default ''")
-    ensure_column(conn, "validations", "trust_anchor", "text not null default 'local-only'")
-    ensure_column(conn, "validations", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "validations", "policy_status", "text not null default ''")
     ensure_column(conn, "validations", "policy_reason", "text not null default ''")
     ensure_column(conn, "test_targets", "gateable", "integer not null default 1")
@@ -925,29 +1422,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "evidence", "sandbox_engine", "text not null default ''")
     ensure_column(conn, "evidence", "container_image", "text not null default ''")
     ensure_column(conn, "evidence", "allow_unlisted_reason", "text not null default ''")
-    ensure_column(conn, "evidence", "trust_anchor", "text not null default 'local-only'")
-    ensure_column(conn, "evidence", "trust_anchor_id", "text not null default ''")
     ensure_column(conn, "evidence", "policy_status", "text not null default ''")
     ensure_column(conn, "evidence", "policy_reason", "text not null default ''")
     ensure_column(conn, "deliveries", "cycle_id", "text not null default ''")
     ensure_column(conn, "deliveries", "candidate_sha", "text not null default ''")
-    ensure_column(conn, "project", "connector_project_key", "text not null default ''")
-    ensure_column(conn, "ci_verifications", "origin", "text not null default 'manual'")
-    ensure_column(conn, "ci_verifications", "verification_token", "text not null default ''")
-    ensure_column(conn, "ci_verifications", "token_status", "text not null default 'unchecked'")
-    ensure_column(conn, "ci_verifications", "token_reason", "text not null default ''")
-    ensure_column(conn, "ci_verifications", "effective_trust", "text not null default 'local-only'")
-    ensure_column(conn, "ci_verifications", "receipt_provenance", "text not null default ''")
-    ensure_column(conn, "external_session_verifications", "origin", "text not null default 'manual'")
-    ensure_column(conn, "external_session_verifications", "verification_token", "text not null default ''")
-    ensure_column(conn, "external_session_verifications", "token_status", "text not null default 'unchecked'")
-    ensure_column(conn, "external_session_verifications", "token_reason", "text not null default ''")
-    ensure_column(conn, "external_session_verifications", "effective_trust", "text not null default 'local-only'")
-    ensure_column(conn, "external_session_verifications", "receipt_provenance", "text not null default ''")
     ensure_column(conn, "agent_sessions", "effective_trust", "text not null default 'local-only'")
     ensure_column(conn, "agent_sessions", "receipt_provenance", "text not null default ''")
-    ensure_column(conn, "session_attestations", "effective_trust", "text not null default 'local-only'")
-    ensure_column(conn, "session_attestations", "receipt_provenance", "text not null default ''")
     ensure_column(conn, "dispatch_assignments", "heartbeat_at", "text")
     ensure_column(conn, "dispatch_assignments", "lease_expires_at", "text")
     ensure_column(conn, "dispatch_assignments", "provider_session_id", "text not null default ''")
@@ -955,16 +1435,4 @@ def create_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "task_attempts", "agent_session_id", "text not null default ''")
     ensure_column(conn, "agent_reports", "provider_session_id", "text not null default ''")
     ensure_column(conn, "agent_provider_sessions", "agent_session_id", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "attempt_count", "integer not null default 0")
-    ensure_column(conn, "adapter_actions", "payload_hash", "text not null default ''")
-    if adapter_action_columns_before and "payload_hash" not in adapter_action_columns_before:
-        backfill_adapter_action_payload_hashes(conn)
-    ensure_column(conn, "adapter_actions", "next_retry_at", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "connector_status", "text not null default 'available'")
-    ensure_column(conn, "adapter_actions", "blocked_reason", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "execution_fence", "integer not null default 0")
-    ensure_column(conn, "adapter_actions", "claimed_at", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "claim_expires_at", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "last_recovery_at", "text not null default ''")
-    ensure_column(conn, "adapter_actions", "remote_recovery_count", "integer not null default 0")
     ensure_default_executor_allowlist(conn)

@@ -1,5 +1,9 @@
 # Harness Operating System Implementation Plan
 
+> **Status: Historical / Superseded.** This v1 plan was replaced by OpenSpec
+> change `local-core-slimming`; do not execute its lease, adapter, legacy Host,
+> or compatibility instructions against the local-only v2 Kernel.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Complete the remaining runtime-system gaps identified in `# 总体判断.md`.

@@ -67,28 +67,63 @@ def release_report(repo: Path, *, require_tag: bool = False) -> dict[str, Any]:
     package = package if isinstance(package, dict) else {}
     add_check(checks, "package version alignment", package.get("version") == pep440, f"package={package.get('version', '')} manifest={pep440}")
     add_check(checks, "package name alignment", package.get("name") == manifest.get("package"), str(package.get("name", "")))
-    module_version = read_python_constant(repo / "kafa" / "__init__.py", "__version__")
-    add_check(checks, "module version alignment", module_version == version, f"module={module_version} manifest={version}")
+    module_source = read_text(repo / "kafa" / "__init__.py")
+    version_source = read_text(repo / "kafa" / "version.py")
+    derived_module_version = (
+        "from .version import release_version" in module_source
+        and "__version__ = release_version()" in module_source
+        and ' / "VERSION"' in version_source
+        and 'distribution_version("kafa")' in version_source
+    )
+    module_literals = re.findall(
+        r"\b\d+\.\d+\.\d+(?:-beta\.\d+|b\d+)?\b",
+        module_source,
+    )
+    add_check(
+        checks,
+        "module version derivation",
+        derived_module_version and not module_literals,
+        f"derived={derived_module_version} literals={module_literals}",
+    )
 
-    runtime = repo / "plugins" / "codex-project-harness" / "scripts" / "harness_db.py"
-    kernel = repo / "plugins" / "codex-project-harness" / "core" / "__init__.py"
+    runtime_identity = repo / "plugins" / "codex-project-harness" / "core" / "__init__.py"
+    runtime_version = read_python_constant(runtime_identity, "RUNTIME_VERSION")
+    kernel_version = read_python_constant(runtime_identity, "KERNEL_VERSION")
+    schema_version = read_python_constant(runtime_identity, "SCHEMA_VERSION")
     add_check(
         checks,
         "runtime version alignment",
-        read_python_constant(runtime, "RUNTIME_VERSION") == manifest.get("runtime_version"),
-        f"runtime={read_python_constant(runtime, 'RUNTIME_VERSION')} manifest={manifest.get('runtime_version')}",
+        runtime_version == manifest.get("runtime_version"),
+        f"runtime={runtime_version} manifest={manifest.get('runtime_version')}",
     )
     add_check(
         checks,
         "kernel version alignment",
-        read_python_constant(kernel, "KERNEL_VERSION") == manifest.get("kernel_version"),
-        f"kernel={read_python_constant(kernel, 'KERNEL_VERSION')} manifest={manifest.get('kernel_version')}",
+        kernel_version == manifest.get("kernel_version"),
+        f"kernel={kernel_version} manifest={manifest.get('kernel_version')}",
     )
     add_check(
         checks,
         "schema version alignment",
-        read_python_constant(runtime, "SCHEMA_VERSION") == manifest.get("schema_version_runtime"),
-        f"runtime={read_python_constant(runtime, 'SCHEMA_VERSION')} manifest={manifest.get('schema_version_runtime')}",
+        schema_version == manifest.get("schema_version_runtime"),
+        f"runtime={schema_version} manifest={manifest.get('schema_version_runtime')}",
+    )
+
+    readme = read_text(repo / "README.md")
+    current_intro = readme.split("\n## ", 1)[0]
+    docs_aligned = (
+        f"v{version}" in current_intro
+        and f"Kernel v{manifest.get('kernel_version')}" in current_intro
+        and f"schema {manifest.get('schema_version_runtime')}" in readme
+    )
+    add_check(
+        checks,
+        "current documentation runtime facts",
+        docs_aligned,
+        (
+            f"version=v{version} kernel={manifest.get('kernel_version')} "
+            f"schema={manifest.get('schema_version_runtime')}"
+        ),
     )
 
     changelog = read_text(repo / "CHANGELOG.md")
@@ -143,15 +178,18 @@ def read_python_constant(path: Path, name: str) -> Any:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, SyntaxError):
         return None
+    resolved: dict[str, Any] = {}
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(target, ast.Name) and target.id == name for target in targets):
-                try:
-                    return ast.literal_eval(node.value)
-                except (ValueError, TypeError):
-                    return None
-    return None
+            target_names = [target.id for target in targets if isinstance(target, ast.Name)]
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                value = resolved.get(node.value.id) if isinstance(node.value, ast.Name) else None
+            for target_name in target_names:
+                resolved[target_name] = value
+    return resolved.get(name)
 
 
 def read_json(path: Path) -> dict[str, Any]:

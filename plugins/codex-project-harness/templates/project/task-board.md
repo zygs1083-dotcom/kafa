@@ -1,4 +1,4 @@
 # Task Board
 
-| ID | Task | Owner | Status | Acceptance | Depends On | Tool Link | Evidence |
-| --- | --- | --- | --- | --- | --- | --- | --- |
+| ID | Task | Owner | Status | Acceptance | Failure Modes | Depends On | Evidence | Producer Context | Revision |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

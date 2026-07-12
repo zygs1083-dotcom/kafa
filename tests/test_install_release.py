@@ -10,13 +10,26 @@ import unittest
 import zipfile
 from email.parser import Parser
 from pathlib import Path
+from unittest.mock import patch
 
-from kafa.codex_app_server import AppServerClient, validate_app_server_discovery
+from kafa import cli as kafa_cli
+from kafa.codex_app_server import (
+    APPROVED_AGENT_TEMPLATES,
+    APPROVED_APP_SERVER_HOOK_EVENTS,
+    APPROVED_RUNTIME_SCRIPTS,
+    APPROVED_SCHEMA_FILES,
+    APPROVED_SKILLS,
+    AppServerClient,
+    validate_app_server_discovery,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
 VALIDATE = PLUGIN_ROOT / "scripts" / "validate_structure.py"
+RELEASE = json.loads((REPO_ROOT / "release.json").read_text(encoding="utf-8"))
+RELEASE_VERSION = str(RELEASE["version"])
+RELEASE_PEP440_VERSION = str(RELEASE["pep440_version"])
 
 
 def run_kafa(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -32,6 +45,7 @@ def run_kafa(*args: str, env: dict[str, str] | None = None, cwd: Path | None = N
 def copy_release_repo(target: Path) -> Path:
     shutil.copytree(PLUGIN_ROOT, target / "plugins" / "codex-project-harness", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copyfile(REPO_ROOT / "VERSION", target / "VERSION")
+    shutil.copyfile(REPO_ROOT / "release.json", target / "release.json")
     shutil.copyfile(REPO_ROOT / "pyproject.toml", target / "pyproject.toml")
     return target
 
@@ -45,7 +59,7 @@ def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-
                 "pluginId": f"codex-project-harness@{marketplace_name}",
                 "name": "codex-project-harness",
                 "marketplaceName": marketplace_name,
-                "version": "1.25.0-beta.1",
+                "version": RELEASE_VERSION,
                 "installed": True,
                 "enabled": True,
                 "source": {"source": "local", "path": str(plugin_root)},
@@ -74,6 +88,75 @@ def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-
     return {"PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", "")}
 
 
+def app_server_discovery(cache_root: Path) -> dict[str, object]:
+    event_names = {
+        "sessionStart": "SessionStart",
+        "subagentStart": "SubagentStart",
+        "stop": "Stop",
+    }
+    expected_skills = {
+        f"codex-project-harness:{name}" for name in APPROVED_SKILLS
+    }
+    return {
+        "plugin": {
+            "marketplaces": [
+                {
+                    "name": "kafa-local",
+                    "plugins": [
+                        {
+                            "id": "codex-project-harness@kafa-local",
+                            "localVersion": RELEASE_VERSION,
+                            "installed": True,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            ],
+            "marketplaceLoadErrors": [],
+        },
+        "skills": {
+            "data": [
+                {
+                    "cwd": "/tmp/business",
+                    "errors": [],
+                    "skills": [
+                        {
+                            "name": name,
+                            "enabled": True,
+                            "scope": "user",
+                            "path": str(cache_root / "skills" / name.split(":", 1)[1] / "SKILL.md"),
+                        }
+                        for name in sorted(expected_skills)
+                    ],
+                }
+            ]
+        },
+        "hooks": {
+            "data": [
+                {
+                    "cwd": "/tmp/business",
+                    "errors": [],
+                    "warnings": [],
+                    "hooks": [
+                        {
+                            "eventName": event,
+                            "enabled": True,
+                            "source": "plugin",
+                            "pluginId": "codex-project-harness@kafa-local",
+                            "sourcePath": str(cache_root / "hooks/hooks.json"),
+                            "command": (
+                                f'python "${{PLUGIN_ROOT}}/hooks/harness_hook.py" '
+                                f"{event_names[event]}"
+                            ),
+                        }
+                        for event in sorted(APPROVED_APP_SERVER_HOOK_EVENTS)
+                    ],
+                }
+            ]
+        },
+    }
+
+
 class InstallReleaseTest(unittest.TestCase):
     def test_app_server_client_uses_utf8_for_stdio(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -97,118 +180,74 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertEqual(result, {"message": "\u008d"})
 
     def test_app_server_discovery_requires_exact_plugin_skills_and_hooks(self) -> None:
-        cache_root = Path("/tmp/codex-home/plugins/cache/kafa-local/codex-project-harness/1.25.0-beta.1")
-        expected_skills = {
-            f"codex-project-harness:{path.parent.name}"
-            for path in PLUGIN_ROOT.glob("skills/*/SKILL.md")
-        }
-        expected_events = {"sessionStart", "subagentStart", "preToolUse", "postToolUse", "stop"}
-        discovery = {
-            "plugin": {
-                "marketplaces": [
-                    {
-                        "name": "kafa-local",
-                        "plugins": [
-                            {
-                                "id": "codex-project-harness@kafa-local",
-                                "localVersion": "1.25.0-beta.1",
-                                "installed": True,
-                                "enabled": True,
-                            }
-                        ],
-                    }
-                ],
-                "marketplaceLoadErrors": [],
-            },
-            "skills": {
-                "data": [
-                    {
-                        "cwd": "/tmp/business",
-                        "errors": [],
-                        "skills": [
-                            {
-                                "name": name,
-                                "enabled": True,
-                                "scope": "user",
-                                "path": str(cache_root / "skills" / name.split(":", 1)[1] / "SKILL.md"),
-                            }
-                            for name in sorted(expected_skills)
-                        ],
-                    }
-                ]
-            },
-            "hooks": {
-                "data": [
-                    {
-                        "cwd": "/tmp/business",
-                        "errors": [],
-                        "warnings": [],
-                        "hooks": [
-                            {
-                                "eventName": event,
-                                "enabled": True,
-                                "source": "plugin",
-                                "pluginId": "codex-project-harness@kafa-local",
-                                "sourcePath": str(cache_root / "hooks" / "hooks.json"),
-                                "command": f'python "%PLUGIN_ROOT%\\hooks\\harness_hook.py" {event}',
-                            }
-                            for event in sorted(expected_events)
-                        ],
-                    }
-                ]
-            },
-        }
-
-        report = validate_app_server_discovery(
-            discovery,
-            cache_root=cache_root,
-            plugin_id="codex-project-harness@kafa-local",
-            version="1.25.0-beta.1",
-            expected_skills=expected_skills,
-            expected_hook_events=expected_events,
-        )
-
-        self.assertEqual(report["skill_count"], 12)
-        self.assertEqual(set(report["skill_names"]), expected_skills)
-        self.assertEqual(set(report["hook_events"]), expected_events)
-        self.assertEqual(report["plugin_local_version"], "1.25.0-beta.1")
-
-    def test_app_server_discovery_rejects_missing_skill_or_hook(self) -> None:
-        cache_root = Path("/tmp/cache")
-        discovery = {
-            "plugin": {
-                "marketplaces": [
-                    {
-                        "name": "kafa-local",
-                        "plugins": [
-                            {
-                                "id": "codex-project-harness@kafa-local",
-                                "localVersion": "1.25.0-beta.1",
-                                "installed": True,
-                                "enabled": True,
-                            }
-                        ],
-                    }
-                ],
-                "marketplaceLoadErrors": [],
-            },
-            "skills": {"data": [{"cwd": "/tmp/business", "errors": [], "skills": []}]},
-            "hooks": {"data": [{"cwd": "/tmp/business", "errors": [], "warnings": [], "hooks": []}]},
-        }
-
-        with self.assertRaisesRegex(RuntimeError, "skill discovery mismatch"):
-            validate_app_server_discovery(
-                discovery,
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache/codex-project-harness" / RELEASE_VERSION
+            shutil.copytree(PLUGIN_ROOT, cache_root, ignore=shutil.ignore_patterns("__pycache__"))
+            report = validate_app_server_discovery(
+                app_server_discovery(cache_root),
                 cache_root=cache_root,
                 plugin_id="codex-project-harness@kafa-local",
-                version="1.25.0-beta.1",
-                expected_skills={"codex-project-harness:project-harness"},
-                expected_hook_events={"sessionStart"},
+                version=RELEASE_VERSION,
             )
+
+        self.assertEqual(report["skill_count"], 7)
+        self.assertEqual(
+            set(report["skill_names"]),
+            {f"codex-project-harness:{name}" for name in APPROVED_SKILLS},
+        )
+        self.assertEqual(set(report["hook_events"]), APPROVED_APP_SERVER_HOOK_EVENTS)
+        self.assertEqual(report["template_count"], 3)
+        self.assertEqual(set(report["template_names"]), APPROVED_AGENT_TEMPLATES)
+        self.assertEqual(set(report["runtime_script_names"]), APPROVED_RUNTIME_SCRIPTS)
+        self.assertEqual(set(report["schema_names"]), APPROVED_SCHEMA_FILES)
+        self.assertTrue(report["retired_runtime_absent"])
+        self.assertEqual(report["plugin_local_version"], RELEASE_VERSION)
+
+    def test_app_server_discovery_rejects_missing_skill_or_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(PLUGIN_ROOT, cache_root, ignore=shutil.ignore_patterns("__pycache__"))
+            discovery = app_server_discovery(cache_root)
+            discovery["skills"] = {"data": [{"cwd": "/tmp/business", "errors": [], "skills": []}]}
+
+            with self.assertRaisesRegex(RuntimeError, "skill discovery mismatch"):
+                validate_app_server_discovery(
+                    discovery,
+                    cache_root=cache_root,
+                    plugin_id="codex-project-harness@kafa-local",
+                    version=RELEASE_VERSION,
+                )
+
+    def test_app_server_discovery_rejects_extra_template_and_retired_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(PLUGIN_ROOT, cache_root, ignore=shutil.ignore_patterns("__pycache__"))
+            extra = cache_root / "templates/agents/bootstrap-coordinator.toml"
+            extra.write_text('name = "bootstrap-coordinator"\n', encoding="utf-8")
+            discovery = app_server_discovery(cache_root)
+
+            with self.assertRaisesRegex(RuntimeError, "template inventory mismatch"):
+                validate_app_server_discovery(
+                    discovery,
+                    cache_root=cache_root,
+                    plugin_id="codex-project-harness@kafa-local",
+                    version=RELEASE_VERSION,
+                )
+
+            extra.unlink()
+            retired = cache_root / "core/agent_provider.py"
+            retired.write_text("class HostCodexProvider: pass\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "retired runtime files"):
+                validate_app_server_discovery(
+                    discovery,
+                    cache_root=cache_root,
+                    plugin_id="codex-project-harness@kafa-local",
+                    version=RELEASE_VERSION,
+                )
 
     def test_kafa_version_reports_repository_version(self) -> None:
         result = run_kafa("--version")
-        self.assertEqual(result.stdout.strip(), "1.25.0-beta.1")
+        self.assertEqual(result.stdout.strip(), RELEASE_VERSION)
 
     def test_doctor_reports_repo_health_as_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -265,7 +304,6 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
             (root / "plugins" / "codex-project-harness" / "core" / "store.py").unlink()
-            run_kafa("plugin", "install", "--repo", str(root))
 
             result = run_kafa("doctor", "--repo", str(root), "--json", check=False)
             report = json.loads(result.stdout)
@@ -275,15 +313,17 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertFalse(checks["plugin structure"]["ok"])
         self.assertIn("missing local Python import: core.store", checks["plugin structure"]["details"])
 
-    def test_doctor_static_structure_requires_host_codex_optional_extra(self) -> None:
+    def test_doctor_static_structure_rejects_host_codex_optional_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
             pyproject = root / "pyproject.toml"
             pyproject.write_text(
-                pyproject.read_text(encoding="utf-8").replace('  "openai-codex>=0.1.0b3"\n', ""),
+                pyproject.read_text(encoding="utf-8").replace(
+                    "[project.scripts]",
+                    '[project.optional-dependencies]\nhost-codex = ["openai-codex>=0.1.0b3"]\n\n[project.scripts]',
+                ),
                 encoding="utf-8",
             )
-            run_kafa("plugin", "install", "--repo", str(root))
 
             result = run_kafa("doctor", "--repo", str(root), "--json", check=False)
             report = json.loads(result.stdout)
@@ -291,9 +331,32 @@ class InstallReleaseTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(checks["plugin structure"]["ok"])
-        self.assertIn("optional dependency host-codex", checks["plugin structure"]["details"])
+        self.assertIn("must not declare the retired Host Codex SDK dependency", checks["plugin structure"]["details"])
 
-    def test_base_wheel_keeps_host_codex_sdk_optional(self) -> None:
+    def test_plugin_install_rejects_retired_runtime_before_copy_or_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            retired = root / "plugins/codex-project-harness/core/agent_provider.py"
+            retired.write_text("class HostCodexProvider:\n    pass\n", encoding="utf-8")
+
+            result = run_kafa(
+                "plugin",
+                "install",
+                "--scope",
+                "user",
+                "--repo",
+                str(root),
+                env={"HOME": str(home)},
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("retired core file exists", result.stderr)
+        self.assertFalse((home / ".agents/plugins/codex-project-harness").exists())
+        self.assertFalse((home / ".agents/plugins/marketplace.json").exists())
+
+    def test_base_wheel_has_no_host_codex_sdk_dependency_or_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             release = Path(temp) / "release"
             release.mkdir()
@@ -316,9 +379,54 @@ class InstallReleaseTest(unittest.TestCase):
 
         requirements = metadata.get_all("Requires-Dist") or []
         sdk_requirements = [item for item in requirements if item.startswith("openai-codex")]
-        self.assertEqual(metadata.get_all("Provides-Extra"), ["host-codex"])
-        self.assertEqual(len(sdk_requirements), 1, requirements)
-        self.assertIn('extra == "host-codex"', sdk_requirements[0])
+        self.assertEqual(metadata.get_all("Provides-Extra"), None)
+        self.assertEqual(sdk_requirements, [], requirements)
+
+    def test_source_distribution_manifest_contains_installable_release_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            release = Path(temp) / "release"
+            release.mkdir()
+            for name in ["VERSION", "README.md", "pyproject.toml", "release.json"]:
+                shutil.copyfile(REPO_ROOT / name, release / name)
+            manifest = REPO_ROOT / "MANIFEST.in"
+            if manifest.is_file():
+                shutil.copyfile(manifest, release / manifest.name)
+            shutil.copytree(
+                REPO_ROOT / "kafa",
+                release / "kafa",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            shutil.copytree(
+                PLUGIN_ROOT,
+                release / "plugins/codex-project-harness",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    ".",
+                    "--wheel-dir",
+                    str(Path(temp) / "dist"),
+                ],
+                cwd=release,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            sources = set(
+                (release / "kafa.egg-info/SOURCES.txt").read_text(encoding="utf-8").splitlines()
+            )
+
+        self.assertIn("release.json", sources)
+        self.assertIn("VERSION", sources)
+        self.assertIn("plugins/codex-project-harness/.codex-plugin/plugin.json", sources)
+        self.assertIn("plugins/codex-project-harness/scripts/harness.py", sources)
+        self.assertFalse(any("__pycache__" in name or name.endswith(".pyc") for name in sources))
 
     def test_user_doctor_validates_installed_copy_and_hook_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -327,7 +435,7 @@ class InstallReleaseTest(unittest.TestCase):
             installed = home / ".agents" / "plugins" / "codex-project-harness"
             env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
             run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
-            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / "1.25.0-beta.1"
+            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / RELEASE_VERSION
             shutil.copytree(installed, cache)
             env.update(fake_codex_env(Path(temp), installed))
             result = run_kafa("doctor", "--scope", "user", "--repo", str(root), "--json", env=env)
@@ -347,6 +455,24 @@ class InstallReleaseTest(unittest.TestCase):
             "codex plugin cache",
         ]:
             self.assertTrue(checks[name]["ok"], checks[name])
+
+    def test_plugin_install_preserves_on_demand_delegation_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = copy_release_repo(Path(temp) / "repo")
+            home = Path(temp) / "home"
+            env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
+            run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
+            installed = home / ".agents/plugins/codex-project-harness"
+            source_reference = root / "plugins/codex-project-harness/references/delegation-matrix.md"
+            installed_reference = installed / "references/delegation-matrix.md"
+            installed_skill = (installed / "skills/project-harness/SKILL.md").read_text(encoding="utf-8")
+            installed_exists = installed_reference.is_file()
+            source_bytes = source_reference.read_bytes()
+            installed_bytes = installed_reference.read_bytes()
+
+        self.assertTrue(installed_exists)
+        self.assertEqual(installed_bytes, source_bytes)
+        self.assertIn("references/delegation-matrix.md", installed_skill)
 
     def test_user_doctor_detects_same_version_installed_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -411,7 +537,7 @@ class InstallReleaseTest(unittest.TestCase):
             installed = home / ".agents" / "plugins" / "codex-project-harness"
             env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}
             run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
-            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / "1.25.0-beta.1"
+            cache = Path(env["CODEX_HOME"]) / "plugins" / "cache" / "kafa-local" / "codex-project-harness" / RELEASE_VERSION
             shutil.copytree(installed, cache)
             cached_hook = cache / "hooks" / "hooks.json"
             cached_hook.write_text(cached_hook.read_text(encoding="utf-8") + "\n", encoding="utf-8")
@@ -474,6 +600,66 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertIn("harness initialized", {check["name"] for check in report["checks"]})
         self.assertNotIn("plugin structure", {check["name"] for check in report["checks"]})
         self.assertTrue(report["next_commands"][0].startswith("kafa project init --repo "))
+
+    def test_project_doctor_fails_closed_on_migration_sentinel_without_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps({"pid": 999999, "created_at": "2026-07-12T00:00:00Z"}) + "\n",
+                encoding="utf-8",
+            )
+            (sentinel.parent / "harness.db").touch()
+
+            with patch("sqlite3.connect", side_effect=AssertionError("SQLite must stay closed")):
+                report = kafa_cli.project_doctor_report(root)
+
+        initialized = next(check for check in report["checks"] if check["name"] == "harness initialized")
+        self.assertFalse(report["ok"])
+        self.assertFalse(initialized["ok"])
+        self.assertIn("migration-in-progress", initialized["details"])
+        self.assertIn(str(sentinel.resolve()), initialized["details"])
+        self.assertIn("pid=999999", initialized["details"])
+        self.assertIn(
+            "confirm no migration is active, and verify database/projection authority before considering sentinel removal",
+            initialized["details"],
+        )
+        self.assertEqual(report["next_commands"], [])
+
+    def test_project_doctor_reports_recovery_required_manifest_without_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            manifest = root / ".ai-team/backups/schema-29/migration-manifest.json"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "created_at": "2026-07-12T00:00:00Z",
+                        "target_schema": 30,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(manifest.resolve()),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("sqlite3.connect", side_effect=AssertionError("SQLite must stay closed")):
+                report = kafa_cli.project_doctor_report(root)
+
+        initialized = next(
+            check for check in report["checks"] if check["name"] == "harness initialized"
+        )
+        self.assertFalse(report["ok"])
+        self.assertFalse(initialized["ok"])
+        self.assertIn("rollback-incomplete", initialized["details"])
+        self.assertIn(str(manifest.resolve()), initialized["details"])
+        self.assertIn("recover and verify", initialized["details"])
+        self.assertIn("do not remove", initialized["details"])
+        self.assertEqual(report["next_commands"], [])
 
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -568,12 +754,18 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('version = "1.25.0b1"', 'version = "1.15.0b2"'), encoding="utf-8")
+            pyproject.write_text(
+                pyproject.read_text(encoding="utf-8").replace(
+                    f'version = "{RELEASE_PEP440_VERSION}"',
+                    'version = "1.15.0b2"',
+                ),
+                encoding="utf-8",
+            )
 
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pyproject version must match root VERSION", result.stdout)
+        self.assertIn("pyproject version must match release.json", result.stdout)
 
     def test_validate_structure_rejects_missing_pyproject(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -607,16 +799,22 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pyproject requires-python must be >=3.11", result.stdout)
 
-    def test_validate_structure_requires_host_codex_optional_dependency(self) -> None:
+    def test_validate_structure_rejects_host_codex_optional_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp))
             pyproject = root / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('  "openai-codex>=0.1.0b3"\n', ""), encoding="utf-8")
+            pyproject.write_text(
+                pyproject.read_text(encoding="utf-8").replace(
+                    "[project.scripts]",
+                    '[project.optional-dependencies]\nhost-codex = ["openai-codex>=0.1.0b3"]\n\n[project.scripts]',
+                ),
+                encoding="utf-8",
+            )
 
             result = subprocess.run([sys.executable, str(VALIDATE), str(root / "plugins" / "codex-project-harness")], text=True, capture_output=True, check=False)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pyproject optional dependency host-codex must include openai-codex>=0.1.0b3", result.stdout)
+        self.assertIn("pyproject must not declare the retired Host Codex SDK dependency", result.stdout)
 
 
 if __name__ == "__main__":

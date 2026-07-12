@@ -1,228 +1,308 @@
-# Full Project Flow Example
+# Full Local Project Flow
 
-This example shows how `project-harness` should behave when a user asks Codex to build a new feature or project. The flow stops at verified code delivery.
+This example shows one end-to-end local-only path from a substantial feature
+request to a verified local code handoff. OpenSpec owns the specification, Native
+Codex/ChatGPT owns the work lifecycle, and Kafa records only local delivery
+facts. The flow stops before deployment or release.
 
-## User Request
+## Example Request
 
 ```text
 我要开发一个微信小程序，用于管理亲友关系、生日提醒和关系图谱。
 ```
 
-## 1. Intake
+## 1. Inspect the Real Workspace
 
-Codex should inspect the workspace, identify whether this is a new project or an existing codebase, and summarize the initial understanding.
+The root controller first reads applicable `AGENTS.md` files and project entry
+documents, then inspects the repository root, current branch/revision, remotes,
+and dirty state. Existing user changes are preserved.
 
-Expected output:
-
-```text
-我理解你想交付一个亲友关系管理小程序，核心包括亲友档案、生日提醒、关系图谱。
-我会先形成需求基线，确认范围后再拆任务和实现。
-```
-
-## 2. Project Bootstrap
-
-Codex should decide whether Git, GitHub, Linear, Notion, Figma, or Slack is useful from context. Local harness files remain the fallback.
-
-Expected output:
+Expected summary:
 
 ```text
-# Project Bootstrap
-
-## Workspace
-- Existing project or new project:
-- Existing instructions:
-
-## Git
-- Repository:
-- Branch:
-- Remote:
-- Recommended branch:
-
-## Harness Files
-- .ai-team:
-- docs/harness:
-
-## Collaboration Tools
-- GitHub:
-- Linear:
-- Notion:
-- Figma:
-- Slack:
-
-## Source Of Truth
-- Requirements:
-- Tasks:
-- Design:
-- Validation:
-- Delivery:
-
-## Next Step
-- Build and confirm requirement baseline.
+目标是交付一个可运行的亲友关系管理小程序代码候选，包含亲友档案、生日提醒和
+基础关系图。该范围跨多个模块并具有长期行为约束，因此先由 OpenSpec 固定规格，
+再由 Kafa 对本地候选执行可验证交付。部署和发布不在本次范围内。
 ```
 
-For example, if a GitHub remote exists and the task is large, Codex may use GitHub issues or a draft PR. If no Linear/Notion/Figma/Slack context is present, Codex should continue with local harness files instead of stopping.
+The root controller does not initialize Git, create a branch, commit, or push
+unless the user authorized that action.
 
-External tools should be selected by adapter mode:
+## 2. Make OpenSpec the Specification Authority
 
-```text
-off | read-only | draft-write | write-confirm | write-auto
-```
+Because the request is broad and cross-module, create or select an OpenSpec
+change such as `family-mini-program`. The change owns:
 
-Public, destructive, paid, permission-changing, or production-affecting actions require confirmation and are outside normal code delivery.
+- `proposal.md`: problem, goals, non-goals, and impact;
+- `design.md`: architecture and locked decisions;
+- `specs/**/spec.md`: observable requirements and scenarios; and
+- `tasks.md`: dependency-ordered implementation checklist.
 
-## 3. Requirement Baseline
-
-Codex should produce a baseline and ask for confirmation when scope is broad.
-
-```text
-我理解本阶段要交付的是：
-- 目标：交付一个可运行的小程序基础版本。
-- 用户/场景：个人用户维护亲友信息，查看生日提醒和关系图。
-- 必须实现：亲友档案 CRUD、生日字段、近期生日列表、基础关系图展示。
-- 暂不实现：云端同步、社交邀请、复杂权限、部署上线。
-- 验收标准：能新增/编辑/删除亲友；能看到 30 天内生日；能查看基础关系图；关键流程有测试或可执行验证。
-- 失败模式：重复提交、无效日期、关系数据循环、存储失败、空数据状态。
-- 工具映射：本地 `.ai-team` 作为默认事实源；如检测到 GitHub/Linear/Notion/Figma 上下文则自动映射。
-- 风险和待确认：数据存储方式、提醒方式、关系图复杂度。
-
-请确认或修正以上范围。确认后我会按这个基线拆任务并开始实现。
-```
-
-## 4. Team Architecture
-
-Use the smallest effective team.
-
-```text
-Selected Patterns:
-- Supervisor
-- Producer-Reviewer
-- Pipeline
-
-Agents:
-- Bootstrap Coordinator: inspect workspace, git, harness files, and useful collaboration tools.
-- Product Analyst: clarify scenarios and acceptance criteria.
-- Architect: define data model and module boundaries.
-- Developer: implement scoped code changes.
-- QA Reviewer: independently validate behavior and integration consistency.
-- Delivery Coordinator: package delivery evidence.
-```
-
-## 5. Planning
-
-Codex should break confirmed scope into implementation tasks tied to acceptance criteria and failure-mode IDs.
-
-```text
-Acceptance:
-- AC1 Relative profile CRUD
-- AC2 30-day birthday reminder list
-- AC3 Basic relationship graph
-
-Failure Modes:
-- FM1 Duplicate profile submit creates duplicated records
-- FM2 Invalid birthday causes broken reminder sorting
-- FM3 Relationship loop crashes graph rendering
-- FM4 Local storage write fails mid-operation
-
-Task Board:
-- T1 Data model and local storage | Acceptance: AC1 | Failure: FM4 | Tool link: local or Linear/GitHub
-- T2 Relative profile CRUD | Acceptance: AC1 | Failure: FM1 | Tool link: local or Linear/GitHub
-- T3 Birthday reminder list | Acceptance: AC2 | Failure: FM2 | Tool link: local or Linear/GitHub
-- T4 Relationship graph view | Acceptance: AC3 | Failure: FM3 | Tool link: local or Linear/GitHub/Figma
-- T5 Tests and validation | Acceptance: AC1, AC2, AC3 | Failure: FM1-FM4 | Tool link: local or GitHub checks
-- T6 Independent QA | Tool link: local or GitHub review/Notion note
-- T7 Delivery readiness | Tool link: local or GitHub PR/Notion handoff
-```
-
-Codex should record these tasks through the unified `project-runtime` CLI, for example:
+Before implementation, read those files in order and validate the change:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . failure-mode add --id FM1 --feature "Relative profile CRUD" --scenario "Duplicate submit" --trigger "same form submitted twice" --expected "only one record is created" --risk high --acceptance AC1
-python3 plugins/codex-project-harness/scripts/harness.py --root . task add --id T1 --task "Data model and local storage" --owner architect --acceptance AC1 --failure-mode FM1
+openspec status --change family-mini-program
+openspec validate family-mini-program
 ```
 
-## 6. Implementation
+Do not copy the OpenSpec documents into Kafa as a second specification. Record
+only stable IDs and local acceptance/task facts needed for verification. When
+`tasks.md` is the unique implementation checklist, follow its dependency order
+and update each checkbox immediately after its evidence is verified.
 
-Implementation should follow local project conventions and keep changes scoped.
+## 3. Initialize the Local Runtime
 
-Each producer output should include:
-
-```text
-Role:
-Task:
-Input:
-Decision:
-Output:
-Evidence:
-Tool Links:
-Risks:
-Next:
-```
-
-Codex should update task state with `scripts/harness.py --root . task ...` as work progresses.
-
-## 7. Independent QA
-
-For broad changes, split QA into short-lived subagents:
-
-```text
-QA-A: API/data contract and validation
-QA-B: UI flows and empty/loading/error states
-QA-C: data persistence and failure modes
-QA-D: permission/security review when relevant
-```
-
-Each QA subagent must return findings, evidence, and residual risk.
-Codex should record material QA results with `scripts/harness.py --root . validation record ...` and the final gate with `scripts/harness.py --root . gate record ...`.
-
-The quality gate must include the reviewed commit or revision and reviewer context:
+For an ordinary project, first verify that the installed Plugin is discoverable:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
+kafa project doctor --repo .
+```
+
+The remaining examples use the runtime resolved by the installed
+`project-harness` Skill. In a source checkout, a convenient shell helper is:
+
+```bash
+KAFA_PLUGIN_ROOT=/absolute/path/to/kafa/plugins/codex-project-harness
+harness() {
+  python3 "$KAFA_PLUGIN_ROOT/scripts/harness.py" --root . "$@"
+}
+```
+
+Initialize and inspect the project-local facts:
+
+```bash
+harness init
+harness status
+harness quickstart status
+```
+
+Initialization creates `.ai-team/state/harness.db` and local projections. It
+does not request external credentials, create a remote project, or start a
+worker process.
+
+## 4. Record the Minimal Delivery Baseline
+
+Suppose OpenSpec defines:
+
+```text
+REQ1  A user can create and edit a relative profile.
+AC1   A saved profile can be reopened with the same name and birthday.
+T1    Implement the profile model, storage, and tests.
+```
+
+The root controller records those local verification facts:
+
+```bash
+harness requirement add \
+  --id REQ1 \
+  --kind functional \
+  --body "A user can create and edit a relative profile" \
+  --priority must
+
+harness acceptance add \
+  --id AC1 \
+  --criterion "A saved profile reopens with the same name and birthday" \
+  --priority must
+
+harness requirement link --requirement REQ1 --acceptance AC1
+harness baseline freeze --id BASE-1 --summary "OpenSpec family-mini-program baseline"
+
+harness task add \
+  --id T1 \
+  --task "Implement the profile model, storage, and tests" \
+  --owner developer \
+  --acceptance AC1
+```
+
+These rows support traceability and delivery checks. OpenSpec still owns the
+full product language, design, and task checklist.
+
+For data loss, permissions, concurrency, migrations, destructive behavior, or
+other meaningful risk, record explicit failure modes before implementation.
+High/critical work follows the stricter review rule described below.
+
+## 5. Let the Native Host Own Implementation
+
+The root controller starts the local task intent:
+
+```bash
+harness task start T1
+```
+
+Native Codex/ChatGPT then creates any visible task, subagent, or worktree needed
+for implementation. Kafa does not create or merge that worktree, choose the
+model, manage approval, cancel the worker, or collect hidden worker output.
+
+A bounded developer returns:
+
+```text
+Changed files:
+- src/profile.py
+- tests/test_profile.py
+
+Checks run:
+- focused unit test during implementation
+
+Remaining risk:
+- persistence failure path still needs root-controller verification
+```
+
+The worker does not mutate `.ai-team/state/harness.db`. The root controller
+reviews the returned change in the target workspace.
+
+## 6. Establish the Current Candidate
+
+Before trusted verification, make the candidate stable and inspectable:
+
+- In Git, use an existing clean revision or a user-authorized commit.
+- Without Git, Kafa uses local content identity.
+- Never create a passing quality gate on a dirty Git worktree.
+- Never commit merely to satisfy Kafa unless the user authorized committing.
+
+If the candidate changes after verification, run verification again. Historical
+results remain auditable but do not satisfy the new candidate.
+
+## 7. Run Controller Verification
+
+Register the exact test target and link it to the task:
+
+```bash
+harness test-target add \
+  --id PROFILE-UNIT \
+  --kind unit \
+  --command-template "python3 -B -m unittest discover -s tests -p 'test_*.py'" \
+  --result-format regex
+
+harness test-target link --task T1 --target PROFILE-UNIT
+```
+
+The root controller, not the implementation worker, executes it:
+
+```bash
+harness verify run --target PROFILE-UNIT --acceptance AC1
+```
+
+A passing run records one immutable execution with the current candidate,
+command, exit code, positive test count, semantic result, stdout artifact and
+digest, runner policy, and validation link. A manual statement such as "tests
+passed" cannot replace this execution.
+
+Missing or malformed structured output, zero executed tests, a stale candidate,
+artifact digest mismatch, or an unsatisfied sandbox/no-network policy fails
+closed.
+
+After implementation evidence has returned to the root controller:
+
+```bash
+harness task submit T1 \
+  --context-id native-producer-context \
+  --evidence "candidate and controller verification ready for independent review"
+```
+
+The context identifier is procedural audit metadata, not proof of host identity.
+
+## 8. Perform Independent Review
+
+The native host starts a short-lived `qa-reviewer` context distinct from the
+producer. The reviewer checks:
+
+- behavior against OpenSpec scenarios and `AC1`;
+- logic errors and simpler alternatives;
+- data-loss and error paths;
+- current-candidate test evidence;
+- dirty-tree and stale-candidate hazards; and
+- any open finding or unverified claim.
+
+The reviewer returns concrete findings and the checks actually inspected. The
+root controller records any material finding, resolves blockers, and accepts the
+task only after review:
+
+```bash
+harness task accept T1 --evidence "independent QA accepted AC1 on the current candidate"
+
+harness gate record \
   --reviewer-context fresh \
-  --result pass \
-  --commands "npm test" \
-  --evidence "QA-A/QA-B/QA-C reviewed acceptance and failure modes"
+  --reviewer-context-id native-reviewer-context \
+  --result pass
 ```
 
-## 8. Delivery Readiness
+For low/medium work, a same-context review must be labeled
+`same-context-degraded`; it must not be called fresh.
 
-Final output should package the code delivery:
+For high/critical work, current structured execution and distinct context
+metadata are necessary but not sufficient for autonomous delivery. Without
+verifiable provenance, Kafa returns `human-review-required`. Delivery may
+continue only if the user explicitly accepts or exempts every remaining risk
+with actor, reason, scope, current revision, and unexpired expiry. That path is
+reported as procedural accepted risk, never cryptographic proof.
 
-```text
-# Delivery Readiness
+## 9. Record Verified Handoff
 
-## Scope
-## Acceptance Mapping
-## Changed Files
-## Validation
-## Independent QA
-## Collaboration Links
-## Failure Mode Coverage
-## Quality Gate
-## Data / Config Notes
-## Known Gaps
-## Handoff Notes
-## Out Of Scope
-- Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation.
-```
-
-Before final handoff, Codex should run:
+After the gate passes and all delivery prerequisites are current, record the
+local handoff:
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . status
-python3 plugins/codex-project-harness/scripts/harness.py --root . validate --delivery
+harness delivery record \
+  --scope "Relative profile slice from family-mini-program" \
+  --acceptance AC1 \
+  --changed-files "src/profile.py,tests/test_profile.py" \
+  --validation "PROFILE-UNIT passed with a positive executed-test count" \
+  --qa "independent qa-reviewer context accepted AC1" \
+  --quality-gate pass \
+  --known-gaps "birthday reminders and relationship graph remain in later tasks" \
+  --handoff "verified local code candidate; no deployment performed"
+
+harness validate --delivery
+harness status
 ```
 
-## 9. Retrospective
+The final user-facing handoff reports:
 
-After delivery, Codex may summarize what should improve in the harness:
+- delivered behavior and OpenSpec acceptance mapping;
+- current candidate identity and changed files;
+- exact checks run, test counts, and outcomes;
+- independent review and quality-gate result;
+- failure-mode coverage or complete accepted-risk metadata;
+- data/config/migration implications;
+- local artifact paths;
+- known gaps, not-run checks, and residual risk; and
+- an explicit statement that deployment and release were not performed.
+
+`skipped`, `blocked`, `not-run`, unavailable, and fixture-only checks remain
+listed as such. They are not converted into passes.
+
+## 10. Recovery and Audit
+
+Normal changes update only affected local projections. If a generated view is
+missing or damaged:
+
+```bash
+harness projection rebuild
+harness doctor
+```
+
+Compact audit events explain local mutations but are not a replay source.
+Migration and administrator repair use verified SQLite backups. Inspect a repair
+plan before applying it:
+
+```bash
+harness repair --dry-run
+```
+
+Schema migration creates and verifies a backup before activating schema 30. If
+activation validation fails, Kafa restores that backup rather than rebuilding
+state from events.
+
+## Ownership Summary
 
 ```text
-Wins:
-Problems:
-Root Causes:
-Process Changes:
-Skill / Agent Changes:
-Tooling Changes:
-Follow-Up Tasks:
+OpenSpec                 Kafa local runtime              Native host
+----------------------   -----------------------------   ----------------------
+proposal/design/specs    acceptance links               task/thread/subagent
+tasks and archive        root-owned task status          worktree and approval
+behavioral authority     immutable verification          model/cancel/handoff
+                         findings/gate/delivery
 ```
+
+This separation is the product contract: one specification authority, one
+native lifecycle owner, and one local verified-delivery fact source.
