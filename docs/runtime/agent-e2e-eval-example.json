@@ -2,9 +2,9 @@
   "agent_runtime_seconds": null,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-12T17:02:40+00:00",
+    "generated_at": "2026-07-12T17:25:23+00:00",
     "git_dirty": true,
-    "git_head": "586929ca8eae394f8a7b22eb478aaac584d52a34",
+    "git_head": "b8d325f339824bf5903dbf52b29cddb3928cd880",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -17,9 +17,9 @@
       "pyproject.toml",
       "release.json"
     ],
-    "status_entry_count": 1,
-    "status_sha256": "a31636ab32114ac4cc511121e00badad33512ca2e6ead646dfa43617d2d1ae57",
-    "workspace_sha256": "a74c924029266b9295ddbe1ca7b327c201dd2df3ac74224f0157610c72120324"
+    "status_entry_count": 3,
+    "status_sha256": "2793a33d0f29c83dd1b29cceab727ca6e2966c688a3bd70fe7c06217fb15fb93",
+    "workspace_sha256": "afce24b9c482cac40f61939feb033602c9b6f4e2c385c06814ddb611fd7879b1"
   },
   "evidence_scope": "deterministic-local-runtime",
   "live_skipped": false,
@@ -51,7 +51,7 @@
           "qa-reviewer.toml"
         ]
       },
-      "duration_seconds": 0.165578,
+      "duration_seconds": 0.163548,
       "mode": "local",
       "name": "fresh_local_install_and_init",
       "pass": true,
@@ -68,7 +68,7 @@
         "task_status": "submitted",
         "validations": 1
       },
-      "duration_seconds": 0.334116,
+      "duration_seconds": 0.343358,
       "mode": "local",
       "name": "quickstart_stops_before_independent_review",
       "pass": true,
@@ -79,11 +79,11 @@
       "details": {
         "candidate_count": 2,
         "validation_statuses": [
-          "active",
-          "superseded"
+          "superseded",
+          "active"
         ]
       },
-      "duration_seconds": 0.540592,
+      "duration_seconds": 0.542648,
       "mode": "local",
       "name": "current_candidate_supersedes_stale_validation",
       "pass": true,
@@ -98,7 +98,7 @@
         "false_pass_count": 0,
         "forged_evidence_block_count": 1
       },
-      "duration_seconds": 0.963087,
+      "duration_seconds": 0.981052,
       "mode": "local",
       "name": "manual_evidence_cannot_satisfy_delivery",
       "pass": true,
@@ -111,7 +111,7 @@
         "false_pass_count": 0,
         "finding_block_count": 1
       },
-      "duration_seconds": 0.557003,
+      "duration_seconds": 0.57619,
       "mode": "local",
       "name": "open_high_finding_blocks_delivery",
       "pass": true,
@@ -125,7 +125,7 @@
         "false_pass_count": 0,
         "human_intervention_count": 0
       },
-      "duration_seconds": 1.229006,
+      "duration_seconds": 1.227334,
       "mode": "local",
       "name": "high_risk_requires_human_review",
       "pass": true,
@@ -139,7 +139,7 @@
         "policy_block_count": 2,
         "structured_zero_blocked": true
       },
-      "duration_seconds": 0.684336,
+      "duration_seconds": 0.681255,
       "mode": "local",
       "name": "structured_and_no_network_policy_fail_closed",
       "pass": true,
@@ -154,7 +154,7 @@
           "CYCLE-next"
         ]
       },
-      "duration_seconds": 0.415638,
+      "duration_seconds": 0.401687,
       "mode": "local",
       "name": "cycle_isolation",
       "pass": true,
@@ -170,7 +170,7 @@
         "sqlite_lock_error_count": 0,
         "thread_leak_count": 0
       },
-      "duration_seconds": 0.607767,
+      "duration_seconds": 0.496651,
       "mode": "local",
       "name": "sqlite_contention_stress",
       "pass": true,
@@ -195,7 +195,7 @@
         "schema27_success_version": 30,
         "schema27_target_version": 30
       },
-      "duration_seconds": 0.299275,
+      "duration_seconds": 0.245797,
       "mode": "local",
       "name": "schema27_29_migration_and_rollback",
       "pass": true,
@@ -212,7 +212,7 @@
         "skill_count": 7,
         "template_count": 3
       },
-      "duration_seconds": 0.482113,
+      "duration_seconds": 0.468,
       "mode": "local",
       "name": "installed_plugin_surface",
       "pass": true,
@@ -220,7 +220,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 6.307572,
+    "duration_seconds": 6.155027,
     "expected_human_review_required_count": 1,
     "failed_count": 0,
     "false_pass_count": 0,

@@ -37,14 +37,18 @@ def run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def create_candidate(root: Path) -> None:
-    (root / "test_harness_dummy.py").write_text(
-        "import unittest\n\n"
-        "class HarnessSmokeTest(unittest.TestCase):\n"
-        "    def test_smoke(self):\n"
-        "        self.assertTrue(True)\n",
-        encoding="utf-8",
+    (root / "test_harness_dummy.py").write_bytes(
+        b"import unittest\n\n"
+        b"class HarnessSmokeTest(unittest.TestCase):\n"
+        b"    def test_smoke(self):\n"
+        b"        self.assertTrue(True)\n"
     )
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=root,
+        check=True,
+    )
     subprocess.run(["git", "config", "user.email", "smoke@example.invalid"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "Smoke Runner"], cwd=root, check=True)
     subprocess.run(["git", "add", "test_harness_dummy.py"], cwd=root, check=True)

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL = REPO_ROOT / "plugins/codex-project-harness/scripts/run_agent_e2e_eval.py"
 sys.path.insert(0, str(EVAL.parent))
 import run_agent_e2e_eval  # noqa: E402
+
+
+def configure_repo_lf(root: Path) -> None:
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=root,
+        check=True,
+    )
+
+
+def unlink_git_object(path: Path) -> None:
+    try:
+        path.unlink()
+    except PermissionError:
+        os.chmod(path, path.stat().st_mode | stat.S_IWUSR)
+        path.unlink()
 
 
 def run_eval(*args: str, env: dict[str, str] | None = None) -> dict[str, object]:
@@ -191,9 +208,10 @@ class AgentE2EEvalTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            configure_repo_lf(root)
             harness = root / "plugins/codex-project-harness/scripts/harness.py"
             harness.parent.mkdir(parents=True)
-            harness.write_text("print('trusted-controller')\n", encoding="utf-8")
+            harness.write_bytes(b"print('trusted-controller')\n")
             subprocess.run(
                 ["git", "add", "plugins/codex-project-harness/scripts/harness.py"],
                 cwd=root,
@@ -320,6 +338,7 @@ class AgentE2EEvalTest(unittest.TestCase):
             subprocess.run(
                 ["git", "init"], cwd=root, check=True, capture_output=True, text=True
             )
+            configure_repo_lf(root)
             subprocess.run(
                 ["git", "config", "user.email", "eval@example.invalid"],
                 cwd=root,
@@ -333,8 +352,8 @@ class AgentE2EEvalTest(unittest.TestCase):
             attributes = root / ".gitattributes"
             source = root / "tests/source.py"
             source.parent.mkdir(parents=True)
-            attributes.write_text("* text=auto eol=lf\n", encoding="utf-8")
-            source.write_text("VALUE = 1\n", encoding="utf-8")
+            attributes.write_bytes(b"* text=auto eol=lf\n")
+            source.write_bytes(b"VALUE = 1\n")
 
             before_commit = run_agent_e2e_eval.evaluation_source_identity(root)
             subprocess.run(
@@ -884,7 +903,7 @@ class AgentE2EEvalTest(unittest.TestCase):
             ).stdout.strip()
             loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
             self.assertTrue(loose_object.is_file())
-            loose_object.unlink()
+            unlink_git_object(loose_object)
 
             identity = run_agent_e2e_eval.evaluation_source_identity(root)
 
@@ -1769,7 +1788,11 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertTrue(run_agent_e2e_eval.should_fail(empty_scope))
 
         missing_binary = json.loads(json.dumps(report))
-        missing_binary["native_host"]["resolved_path"] = "/definitely/missing/kafa-codex"
+        missing_binary["native_host"]["resolved_path"] = (
+            r"C:\definitely\missing\kafa-codex.exe"
+            if os.name == "nt"
+            else "/definitely/missing/kafa-codex"
+        )
         missing_binary_errors = run_agent_e2e_eval.report_consistency_errors(missing_binary)
         self.assertTrue(any("resolved binary is unavailable" in error for error in missing_binary_errors))
         self.assertTrue(run_agent_e2e_eval.should_fail(missing_binary))

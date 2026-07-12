@@ -51,14 +51,18 @@ def cli_surface(parser: argparse.ArgumentParser) -> set[str]:
 
 def create_candidate(root: Path) -> None:
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=root,
+        check=True,
+    )
     subprocess.run(["git", "config", "user.name", "Kafa Test"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "kafa@example.invalid"], cwd=root, check=True)
-    (root / "test_candidate.py").write_text(
-        "import unittest\n\n"
-        "class CandidateTest(unittest.TestCase):\n"
-        "    def test_candidate(self):\n"
-        "        self.assertTrue(True)\n",
-        encoding="utf-8",
+    (root / "test_candidate.py").write_bytes(
+        b"import unittest\n\n"
+        b"class CandidateTest(unittest.TestCase):\n"
+        b"    def test_candidate(self):\n"
+        b"        self.assertTrue(True)\n"
     )
     subprocess.run(["git", "add", "test_candidate.py"], cwd=root, check=True)
     subprocess.run(["git", "commit", "-m", "candidate"], cwd=root, check=True, capture_output=True, text=True)

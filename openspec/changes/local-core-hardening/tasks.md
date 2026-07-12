@@ -345,3 +345,9 @@
 - [x] 55.1 Main model: preserve the first new-HEAD Windows matrix failures proving projection text-mode writes produce CRLF bytes, a post-commit fixture rewrite fabricates a dirty candidate, and read-only loose Git objects cannot be removed by the missing-object tests.
 - [x] 55.2 Main model: publish projection and project-state content as explicit UTF-8 LF bytes, make the delivery fixture a self-contained `core.autocrlf=false` repository with exact tracked LF bytes, and restore the user-write bit only when a Windows loose-object deletion reports `PermissionError`.
 - [ ] 55.3 Checkpoint: rerun projection determinism, delivery identity, missing/replace-object tests, complete strict regression, artifacts, both OpenSpec validations, fresh QA, and both complete new-HEAD three-platform matrices before merge.
+
+## 56. Complete Windows evaluation-fixture portability follow-up
+
+- [x] 56.1 Main model: preserve the first full-runtime Windows failures for remaining Native missing-object permissions, temp-repo autocrlf drift, cross-platform missing-binary paths, immutable-execution E2E, and runtime-smoke candidate cleanliness.
+- [x] 56.2 Main model: make affected Native, execution, and runtime-smoke repositories self-contained with local `core.autocrlf=false`, exact LF tracked bytes, PermissionError-only loose-object cleanup, and an OS-native missing binary path without changing production identity or delivery policy.
+- [ ] 56.3 Checkpoint: rerun all six Windows reproductions, Native identity/report tests, runtime smoke, immutable execution, complete strict regression, artifacts, both OpenSpec validations, fresh QA, and both complete new-HEAD three-platform matrices before merge.
