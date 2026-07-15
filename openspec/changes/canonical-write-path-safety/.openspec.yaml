@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-07-15
+goal: Route every canonical project read/write through one cross-platform
+  handle-backed safe filesystem seam without changing schema 30 or public
+  lifecycle.
