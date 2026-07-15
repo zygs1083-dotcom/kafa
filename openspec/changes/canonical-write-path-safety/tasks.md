@@ -6,13 +6,13 @@
 
 ## 2. Deterministic Red Tests
 
-- [ ] 2.1 Add lexical, unsafe-ancestor, final symlink, hard-link, non-regular, root-alias, and identity-change red tests in a dedicated project-filesystem safety suite; use Events/Barriers for races and no correctness sleeps.
-- [ ] 2.2 Add real POSIX symlink/hardlink/FIFO/socket tests and Windows junction/hardlink/reparse tests; unsupported platform primitives must produce explicit per-case capability results, never skip the whole safety group.
-- [ ] 2.3 Add Store red tests covering DB, WAL/SHM/journal, operation lock, migration sentinel, normal connection/transaction/backup, BaseException cleanup, and unchanged `InMemoryStore` behavior.
-- [ ] 2.4 Add projection/init red tests covering all 13 generated paths, retired evidence, `.gitignore`, and three agent-template destinations; prove external sentinel bytes/hash/mode/inode remain unchanged.
-- [ ] 2.5 Add execution red tests for stdout, structured-result, and container artifact source/destination links and path replacement races; prove no passing execution or validation is recorded.
-- [ ] 2.6 Add migration/recovery red tests for unsafe backup, staging, manifest, projection-backup, failed-DB, sidecar, restore, and sentinel paths before and after activation.
-- [ ] 2.7 Run the new targeted suites against unchanged production, confirm each defect class fails for the expected reason, and record the exact red evidence without describing unsupported cases as passes.
+- [x] 2.1 Add lexical, unsafe-ancestor, final symlink, hard-link, non-regular, root-alias, and identity-change red tests in a dedicated project-filesystem safety suite; use Events/Barriers for races and no correctness sleeps.
+- [x] 2.2 Add real POSIX symlink/hardlink/FIFO/socket tests and Windows junction/hardlink/reparse tests; unsupported platform primitives must produce explicit per-case capability results, never skip the whole safety group.
+- [x] 2.3 Add Store red tests covering DB, WAL/SHM/journal, operation lock, migration sentinel, normal connection/transaction/backup, BaseException cleanup, and unchanged `InMemoryStore` behavior.
+- [x] 2.4 Add projection/init red tests covering all 13 generated paths, retired evidence, `.gitignore`, and three agent-template destinations; prove external sentinel bytes/hash/mode/inode remain unchanged.
+- [x] 2.5 Add execution red tests for stdout, structured-result, and container artifact source/destination links and path replacement races; prove no passing execution or validation is recorded.
+- [x] 2.6 Add migration/recovery red tests for unsafe backup, staging, manifest, projection-backup, failed-DB, sidecar, restore, and sentinel paths before and after activation.
+- [x] 2.7 Run the new targeted suites against unchanged production, confirm each defect class fails for the expected reason, and record the exact red evidence without describing unsupported cases as passes.
 
 ## 3. ProjectFS Foundation
 
