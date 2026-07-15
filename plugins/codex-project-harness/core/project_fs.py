@@ -33,6 +33,10 @@ _WINDOWS_RESERVED = {
     *(f"LPT{value}" for value in "¹²³"),
 }
 _WINDOWS_INVALID = frozenset('<>:"|?*')
+_POSIX_DIR_FD_AVAILABLE = all(
+    function in os.supports_dir_fd
+    for function in (os.open, os.stat, os.mkdir, os.unlink)
+)
 
 
 def _before_atomic_replace(_fs: "ProjectFS", _relative: Path) -> None:
@@ -123,10 +127,7 @@ class _PosixBackend:
     def __init__(self, root: Path) -> None:
         required = (
             hasattr(os, "O_NOFOLLOW"),
-            os.open in os.supports_dir_fd,
-            os.stat in os.supports_dir_fd,
-            os.mkdir in os.supports_dir_fd,
-            os.unlink in os.supports_dir_fd,
+            _POSIX_DIR_FD_AVAILABLE,
         )
         if not all(required):
             raise ProjectPathSafetyError(Path("."), "platform-safety-unavailable")
@@ -982,15 +983,27 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
 class ProjectFS:
     """Operation-scoped facade for safe project-relative filesystem access."""
 
-    def __init__(self, root: Path, backend: _PosixBackend | _WindowsBackend) -> None:
+    def __init__(
+        self,
+        root: Path,
+        backend: _PosixBackend | _WindowsBackend,
+        *,
+        root_alias: Path,
+    ) -> None:
         self._root = root
+        self._root_alias = root_alias
         self._backend = backend
         self._closed = False
 
     @classmethod
     def open(cls, root: Path) -> "ProjectFS":
+        expanded = Path(root).expanduser()
         try:
-            resolved = Path(root).expanduser().resolve(strict=True)
+            if not expanded.exists():
+                if expanded.is_symlink():
+                    raise OSError("project root is a dangling link")
+                expanded.mkdir(parents=True, exist_ok=True)
+            resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise ProjectPathSafetyError(Path("."), "unsafe-ancestor") from exc
         if not resolved.is_dir():
@@ -1000,7 +1013,11 @@ class ProjectFS:
             backend = _WindowsBackend(resolved)
         else:
             backend = _PosixBackend(resolved)
-        return cls(resolved, backend)
+        return cls(
+            resolved,
+            backend,
+            root_alias=Path(os.path.abspath(expanded)),
+        )
 
     @property
     def root(self) -> Path:
@@ -1032,11 +1049,13 @@ class ProjectFS:
         path = Path(value)
         if not path.is_absolute():
             return self._relative(path)
-        try:
-            relative = Path(os.path.abspath(path)).relative_to(self._root)
-        except ValueError as exc:
-            raise ProjectPathSafetyError(path, "invalid-relative-path") from exc
-        return self._relative(relative)
+        absolute = Path(os.path.abspath(path))
+        for root in (self._root_alias, self._root):
+            try:
+                return self._relative(absolute.relative_to(root))
+            except ValueError:
+                continue
+        raise ProjectPathSafetyError(path, "invalid-relative-path")
 
     def absolute(self, relative: Path | str) -> Path:
         return self._root / self._relative(relative)

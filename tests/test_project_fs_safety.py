@@ -147,6 +147,26 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             after = (external.read_bytes(), sha256(external), stat.S_IMODE(external.stat().st_mode))
             self.assertEqual(after, before)
 
+    def test_operation_lock_rejects_hard_linked_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            lock = root / ".ai-team/state/harness.db.operation.lock"
+            lock.parent.mkdir(parents=True)
+            external = base / "outside-hardlink.lock"
+            external.write_bytes(b"outside-lock")
+            before = external_identity(external)
+            os.link(external, lock)
+
+            with self.assertRaisesRegex(
+                Exception,
+                "unsafe-project-path: .ai-team/state/harness.db.operation.lock: hard-linked-target",
+            ):
+                with project_db_operation(root):
+                    self.fail("hard-linked operation lock was acquired")
+
+            self.assertEqual(external_identity(external), before)
+
     def test_store_rejects_symlinked_database_before_sqlite_open(self) -> None:
         if not hasattr(os, "symlink"):
             self.skipTest("symlink primitive unavailable")
@@ -226,6 +246,28 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     Exception,
                     rf"unsafe-project-path: \.ai-team/state/harness\.db{suffix}",
+                ):
+                    with SqliteStore(root).connection() as conn:
+                        conn.execute("select count(*) from project").fetchone()
+
+                self.assertEqual(external_identity(external), before)
+
+    def test_store_rejects_hard_linked_database_sidecars_before_sqlite_open(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp)
+                root = base / "project"
+                harness_db.init_runtime(root)
+                external = base / f"outside-hardlink{suffix}"
+                external.write_bytes(b"outside-hardlinked-sidecar\n")
+                before = external_identity(external)
+                sidecar = Path(str(root / ".ai-team/state/harness.db") + suffix)
+                sidecar.unlink(missing_ok=True)
+                os.link(external, sidecar)
+
+                with self.assertRaisesRegex(
+                    Exception,
+                    rf"unsafe-project-path: \.ai-team/state/harness\.db{suffix}: hard-linked-target",
                 ):
                     with SqliteStore(root).connection() as conn:
                         conn.execute("select count(*) from project").fetchone()

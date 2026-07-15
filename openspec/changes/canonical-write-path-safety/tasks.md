@@ -24,10 +24,10 @@
 
 ## 4. Store, Operation Lock, And SQLite
 
-- [ ] 4.1 Key reentrant operation locks by pinned root filesystem identity plus the fixed relative lock path, and route lock/sentinel open/read through one `ProjectFS` held for the entire operation.
-- [ ] 4.2 Safely precreate or validate the main DB and DB-family paths, connect only with SQLite URI `mode=ro|rw`, and recheck identity after connect, after journal setup, and before close.
-- [ ] 4.3 Route file-backed connection, transaction, and backup destination publication through the safe seam without changing timeout, WAL, foreign-key, nesting, or `InMemoryStore` semantics.
-- [ ] 4.4 Run Store/path targeted tests with `ResourceWarning` as error, including process/thread reentrancy, fork cleanup, active migration, and all DB-family attacks.
+- [x] 4.1 Key reentrant operation locks by pinned root filesystem identity plus the fixed relative lock path, and route lock/sentinel open/read through one `ProjectFS` held for the entire operation.
+- [x] 4.2 Safely precreate or validate the main DB and DB-family paths, connect only with SQLite URI `mode=ro|rw`, and recheck identity after connect, after journal setup, and before close.
+- [x] 4.3 Route file-backed connection, transaction, and backup destination publication through the safe seam without changing timeout, WAL, foreign-key, nesting, or `InMemoryStore` semantics.
+- [x] 4.4 Run Store/path targeted tests with `ResourceWarning` as error, including process/thread reentrancy, fork cleanup, active migration, and all DB-family attacks.
 
 ## 5. Projections And Initialization
 

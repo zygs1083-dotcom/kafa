@@ -15,10 +15,11 @@ import threading
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Hashable, Iterator, Protocol
 
 from harness_lib import ensure_parent
 from .errors import HarnessError
+from .project_fs import ProjectFS, ProjectPathSafetyError, _PathSnapshot
 
 if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
     import msvcrt
@@ -38,7 +39,7 @@ class ProjectOperationLockError(HarnessError):
 
 
 _REGISTRY_GUARD = threading.Lock()
-_LOCAL_LOCKS: dict[str, threading.RLock] = {}
+_LOCAL_LOCKS: dict[Hashable, threading.RLock] = {}
 _HELD_FDS: set[int] = set()
 _THREAD_STATE = threading.local()
 
@@ -72,15 +73,11 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def _operation_paths(root: Path) -> tuple[Path, Path, str]:
-    resolved_root = Path(root).expanduser().resolve()
-    lock_path = resolved_root / OPERATION_LOCK_PATH
-    sentinel_path = resolved_root / MIGRATION_SENTINEL_PATH
-    key = os.path.normcase(os.path.realpath(os.fspath(lock_path)))
-    return lock_path, sentinel_path, key
+def _operation_key(project_fs: ProjectFS) -> tuple[object, ...]:
+    return (*project_fs.root_identity_key, OPERATION_LOCK_PATH.as_posix())
 
 
-def _thread_operations() -> dict[str, dict[str, object]]:
+def _thread_operations() -> dict[Hashable, dict[str, object]]:
     held = getattr(_THREAD_STATE, "held", None)
     if held is None:
         held = {}
@@ -88,7 +85,7 @@ def _thread_operations() -> dict[str, dict[str, object]]:
     return held
 
 
-def _local_lock(key: str) -> threading.RLock:
+def _local_lock(key: Hashable) -> threading.RLock:
     with _REGISTRY_GUARD:
         lock = _LOCAL_LOCKS.get(key)
         if lock is None:
@@ -97,12 +94,21 @@ def _local_lock(key: str) -> threading.RLock:
         return lock
 
 
-def _sentinel_error(sentinel_path: Path) -> ProjectOperationLockError | None:
-    try:
-        with sentinel_path.open("r", encoding="utf-8") as handle:
-            raw = handle.read(4096)
-    except FileNotFoundError:
+def _sentinel_error(project_fs: ProjectFS) -> ProjectOperationLockError | None:
+    snapshot = project_fs._snapshot(
+        MIGRATION_SENTINEL_PATH,
+        allow_missing=True,
+    )
+    if not snapshot.exists:
         return None
+    sentinel_path = project_fs.absolute(MIGRATION_SENTINEL_PATH)
+    try:
+        raw = project_fs.read_bytes(
+            MIGRATION_SENTINEL_PATH,
+            max_bytes=4096,
+        ).decode("utf-8", errors="replace")
+    except ProjectPathSafetyError:
+        raise
     except OSError as exc:
         return ProjectOperationLockError(
             "migration-in-progress: local-core migration sentinel exists at "
@@ -140,8 +146,8 @@ def _sentinel_error(sentinel_path: Path) -> ProjectOperationLockError | None:
     )
 
 
-def _raise_if_migration_announced(sentinel_path: Path) -> None:
-    error = _sentinel_error(sentinel_path)
+def _raise_if_migration_announced(project_fs: ProjectFS) -> None:
+    error = _sentinel_error(project_fs)
     if error is not None:
         raise error
 
@@ -149,25 +155,41 @@ def _raise_if_migration_announced(sentinel_path: Path) -> None:
 def raise_if_project_migration_announced(root: Path) -> None:
     """Fail closed on a migration sentinel without opening or creating SQLite."""
 
-    _, sentinel_path, _ = _operation_paths(root)
-    _raise_if_migration_announced(sentinel_path)
+    with ProjectFS.open(root) as project_fs:
+        _raise_if_migration_announced(project_fs)
 
 
-def _open_operation_lock(path: Path) -> int:
-    ensure_parent(path)
+def _open_operation_lock(path_or_fs: Path | ProjectFS) -> int:
+    owns_fs = not isinstance(path_or_fs, ProjectFS)
+    if owns_fs:
+        path = Path(path_or_fs)
+        try:
+            root = path.parents[2]
+        except IndexError as exc:
+            raise ProjectOperationLockError(
+                f"project-db-operation-lock-error: invalid operation lock path {path}"
+            ) from exc
+        project_fs = ProjectFS.open(root)
+        relative = project_fs.relative_to_root(path)
+    else:
+        project_fs = path_or_fs
+        relative = OPERATION_LOCK_PATH
     with _REGISTRY_GUARD:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = project_fs.open_lock_fd(relative, mode=0o600)
         try:
             os.set_inheritable(descriptor, False)
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
                 os.fsync(descriptor)
-            os.chmod(path, 0o600)
+            os.fchmod(descriptor, 0o600)
             _HELD_FDS.add(descriptor)
             return descriptor
         except BaseException:
             os.close(descriptor)
             raise
+        finally:
+            if owns_fs:
+                project_fs.close()
 
 
 def _close_operation_lock(descriptor: int) -> None:
@@ -222,7 +244,7 @@ def project_db_operation(
     *,
     purpose: str = "normal",
     timeout: float = DEFAULT_OPERATION_LOCK_TIMEOUT,
-) -> Iterator[None]:
+) -> Iterator[ProjectFS]:
     """Serialize a complete file-backed DB operation or local-core migration."""
 
     if purpose not in {"normal", "migration"}:
@@ -230,10 +252,13 @@ def project_db_operation(
     if timeout <= 0:
         raise ValueError("project DB operation timeout must be positive")
 
-    lock_path, sentinel_path, key = _operation_paths(root)
+    project_fs = ProjectFS.open(root)
+    lock_path = project_fs.absolute(OPERATION_LOCK_PATH)
+    key = _operation_key(project_fs)
     held = _thread_operations()
     current = held.get(key)
     if current is not None:
+        project_fs.close()
         current_purpose = str(current["purpose"])
         if current_purpose == "normal" and purpose == "migration":
             raise ProjectOperationLockError(
@@ -241,17 +266,22 @@ def project_db_operation(
             )
         current["depth"] = int(current["depth"]) + 1
         try:
-            yield
+            yield current["fs"]  # type: ignore[misc]
         finally:
             current["depth"] = int(current["depth"]) - 1
         return
 
     if purpose == "normal":
-        _raise_if_migration_announced(sentinel_path)
+        try:
+            _raise_if_migration_announced(project_fs)
+        except BaseException:
+            project_fs.close()
+            raise
 
     deadline = time.monotonic() + timeout
     local_lock = _local_lock(key)
     if not local_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        project_fs.close()
         raise ProjectOperationLockError(
             "project-db-operation-timeout: could not enter the process-local operation lock "
             f"for {lock_path} within {timeout:.1f} seconds"
@@ -260,20 +290,21 @@ def project_db_operation(
     descriptor: int | None = None
     os_locked = False
     try:
-        descriptor = _open_operation_lock(lock_path)
+        descriptor = _open_operation_lock(project_fs)
         _acquire_os_lock(descriptor, lock_path, deadline, timeout)
         os_locked = True
         if purpose == "normal":
-            _raise_if_migration_announced(sentinel_path)
+            _raise_if_migration_announced(project_fs)
         held[key] = {
             "pid": os.getpid(),
             "thread_id": threading.get_ident(),
             "purpose": purpose,
             "depth": 1,
             "fd": descriptor,
+            "fs": project_fs,
         }
         try:
-            yield
+            yield project_fs
         finally:
             held.pop(key, None)
     finally:
@@ -288,7 +319,10 @@ def project_db_operation(
                 if descriptor is not None:
                     _close_operation_lock(descriptor)
             finally:
-                local_lock.release()
+                try:
+                    local_lock.release()
+                finally:
+                    project_fs.close()
 
 
 class Store(Protocol):
@@ -320,19 +354,31 @@ class SqliteStore:
     def root(self) -> Path:
         return self._root
 
-    def _db_file(self) -> Path:
-        return self._root / DB_PATH
+    @staticmethod
+    def _db_family() -> tuple[Path, ...]:
+        return (
+            DB_PATH,
+            Path(f"{DB_PATH.as_posix()}-wal"),
+            Path(f"{DB_PATH.as_posix()}-shm"),
+            Path(f"{DB_PATH.as_posix()}-journal"),
+        )
 
-    def _connect(self) -> sqlite3.Connection:
-        path = self._db_file()
-        ensure_parent(path)
+    def _connect(
+        self,
+        project_fs: ProjectFS,
+    ) -> tuple[sqlite3.Connection, _PathSnapshot, dict[Path, _PathSnapshot]]:
+        project_fs.audit(self._db_family(), allow_missing=True)
+        path = project_fs.sqlite_path(DB_PATH, access="rw", create=True)
+        database_identity = project_fs._snapshot(DB_PATH, allow_missing=False)
         deadline = time.monotonic() + 5.0
         last_error: sqlite3.OperationalError | None = None
         while True:
             remaining = max(0.1, deadline - time.monotonic())
-            conn = sqlite3.connect(path, timeout=remaining)
+            uri = f"{path.as_uri()}?mode=rw"
+            conn = sqlite3.connect(uri, uri=True, timeout=remaining)
             conn.row_factory = sqlite3.Row
             conn.execute(f"pragma busy_timeout = {int(remaining * 1000)}")
+            project_fs._assert_unchanged(DB_PATH, database_identity)
             try:
                 conn.execute("pragma journal_mode = wal")
             except sqlite3.OperationalError as exc:
@@ -345,23 +391,99 @@ class SqliteStore:
                 time.sleep(0.05)
                 continue
             conn.execute("pragma foreign_keys = on")
-            return conn
+            project_fs._assert_unchanged(DB_PATH, database_identity)
+            family_identity = {
+                relative: project_fs._snapshot(relative, allow_missing=True)
+                for relative in self._db_family()[1:]
+            }
+            return conn, database_identity, family_identity
         raise last_error or sqlite3.OperationalError("database is locked")
+
+    @staticmethod
+    def _verify_connection_authority(
+        project_fs: ProjectFS,
+        database_identity: _PathSnapshot,
+        family_identity: dict[Path, _PathSnapshot],
+    ) -> None:
+        project_fs._assert_unchanged(DB_PATH, database_identity)
+        for relative, expected in family_identity.items():
+            actual = project_fs._snapshot(relative, allow_missing=True)
+            # SQLite may create or remove a WAL/SHM/journal while the same
+            # pinned connection is active.  Every observed object must still
+            # be safe, and an object that survives the lifecycle must retain
+            # its identity.
+            if expected.exists and actual.exists and actual != expected:
+                raise ProjectPathSafetyError(relative, "path-identity-changed")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        with project_db_operation(self._root):
-            conn = self._connect()
+        with project_db_operation(self._root) as project_fs:
+            conn, database_identity, family_identity = self._connect(project_fs)
             try:
                 yield conn
             finally:
-                conn.close()
+                try:
+                    self._verify_connection_authority(
+                        project_fs,
+                        database_identity,
+                        family_identity,
+                    )
+                finally:
+                    conn.close()
 
     def backup_to(self, target: Path) -> None:
-        with project_db_operation(self._root):
-            ensure_parent(target)
-            with self.connection() as source, closing(sqlite3.connect(target)) as destination:
-                source.backup(destination)
+        target = Path(target).expanduser().absolute()
+        with project_db_operation(self._root) as project_fs:
+            source, database_identity, family_identity = self._connect(project_fs)
+            destination_fs: ProjectFS | None = None
+            try:
+                try:
+                    relative = project_fs.relative_to_root(target)
+                    active_destination_fs = project_fs
+                except ProjectPathSafetyError:
+                    destination_fs = ProjectFS.open(target.parent)
+                    active_destination_fs = destination_fs
+                    relative = Path(target.name)
+                destination_snapshot = active_destination_fs._snapshot(
+                    relative,
+                    allow_missing=True,
+                )
+                if not destination_snapshot.exists:
+                    active_destination_fs.create_exclusive(
+                        relative,
+                        b"",
+                        mode=0o600,
+                    )
+                    destination_snapshot = active_destination_fs._snapshot(
+                        relative,
+                        allow_missing=False,
+                    )
+                destination_path = active_destination_fs.absolute(relative)
+                destination_uri = f"{destination_path.as_uri()}?mode=rw"
+                with closing(
+                    sqlite3.connect(destination_uri, uri=True, timeout=5.0)
+                ) as destination:
+                    source.backup(destination)
+                    destination.commit()
+                    active_destination_fs._assert_unchanged(
+                        relative,
+                        destination_snapshot,
+                    )
+                self._verify_connection_authority(
+                    project_fs,
+                    database_identity,
+                    family_identity,
+                )
+                active_destination_fs._assert_unchanged(
+                    relative,
+                    destination_snapshot,
+                )
+            finally:
+                try:
+                    source.close()
+                finally:
+                    if destination_fs is not None:
+                        destination_fs.close()
 
     @contextmanager
     def transaction(
@@ -371,19 +493,26 @@ class SqliteStore:
         request_id: str | None = None,
     ) -> Iterator[sqlite3.Connection]:
         _ = request_id
-        with project_db_operation(self._root):
-            conn = self._connect()
+        with project_db_operation(self._root) as project_fs:
+            conn, database_identity, family_identity = self._connect(project_fs)
             try:
                 conn.execute("begin immediate")
                 yield conn
                 if before_commit is not None:
                     before_commit(conn)
                 conn.commit()
-            except Exception:
+            except BaseException:
                 conn.rollback()
                 raise
             finally:
-                conn.close()
+                try:
+                    self._verify_connection_authority(
+                        project_fs,
+                        database_identity,
+                        family_identity,
+                    )
+                finally:
+                    conn.close()
 
 
 class InMemoryStore:
