@@ -21,8 +21,8 @@ risks through the Host and never write Kafa state themselves.
 
 The authoritative decision and scenarios are:
 
-- `openspec/changes/local-core-slimming/design.md`
-- `openspec/changes/local-core-slimming/specs/local-delivery-kernel/spec.md`
+- `openspec/changes/archive/2026-07-15-local-core-slimming/design.md`
+- `openspec/specs/local-delivery-kernel/spec.md`
 - `docs/runtime/CONTROL_PLANE.md`
 
 This short record is retained only to explain why older audits link to this

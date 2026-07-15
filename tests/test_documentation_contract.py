@@ -44,6 +44,11 @@ RETAINED_SKILLS = {
     "project-retrospective",
 }
 
+CANONICAL_KERNEL_SPEC = "openspec/specs/local-delivery-kernel/spec.md"
+HARDENING_ARCHIVE = (
+    "openspec/changes/archive/2026-07-15-local-core-hardening"
+)
+
 
 def shell_command(argv: list[str]) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
@@ -356,9 +361,7 @@ class DocumentationContractTest(unittest.TestCase):
     def test_migration_recovery_guidance_distinguishes_safe_and_incomplete_cleanup(
         self,
     ) -> None:
-        spec = self.read(
-            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
-        )
+        spec = self.read(CANONICAL_KERNEL_SPEC)
         public_guidance = "\n".join(
             [
                 self.read("README.md"),
@@ -378,10 +381,8 @@ class DocumentationContractTest(unittest.TestCase):
         )
 
     def test_project_state_projection_is_database_deterministic(self) -> None:
-        design = self.read("openspec/changes/local-core-hardening/design.md")
-        spec = self.read(
-            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
-        )
+        design = self.read(f"{HARDENING_ARCHIVE}/design.md")
+        spec = self.read(CANONICAL_KERNEL_SPEC)
         public_guidance = "\n".join(
             [
                 self.read("README.md"),
@@ -396,10 +397,8 @@ class DocumentationContractTest(unittest.TestCase):
     def test_final_hardening_followups_are_explicitly_fail_closed(self) -> None:
         contract = "\n".join(
             [
-                self.read("openspec/changes/local-core-hardening/design.md"),
-                self.read(
-                    "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
-                ),
+                self.read(f"{HARDENING_ARCHIVE}/design.md"),
+                self.read(CANONICAL_KERNEL_SPEC),
                 self.read("README.md"),
                 self.read("INSTALL.md"),
             ]
@@ -416,10 +415,8 @@ class DocumentationContractTest(unittest.TestCase):
     def test_candidate_identity_distinguishes_source_from_dependency_environments(
         self,
     ) -> None:
-        design = self.read("openspec/changes/local-core-hardening/design.md")
-        spec = self.read(
-            "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
-        )
+        design = self.read(f"{HARDENING_ARCHIVE}/design.md")
+        spec = self.read(CANONICAL_KERNEL_SPEC)
         public_guidance = "\n".join(
             [
                 self.read("README.md"),
@@ -441,10 +438,8 @@ class DocumentationContractTest(unittest.TestCase):
     ) -> None:
         contract = "\n".join(
             [
-                self.read("openspec/changes/local-core-hardening/design.md"),
-                self.read(
-                    "openspec/changes/local-core-hardening/specs/local-delivery-kernel/spec.md"
-                ),
+                self.read(f"{HARDENING_ARCHIVE}/design.md"),
+                self.read(CANONICAL_KERNEL_SPEC),
             ]
         )
         for marker in (
