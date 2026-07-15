@@ -1185,6 +1185,55 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 "schema_version: 29\n",
             )
 
+    def test_migration_root_replacement_fails_closed_without_writing_new_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            active = self._prepare_source(root)
+            source_digest = sha256(active)
+            detached = base / "detached-project"
+            replacement_marker = b"replacement-root-must-remain-untouched\n"
+            original_checkpoint = local_core_migration._checkpoint_active_database
+
+            def replace_root_then_checkpoint(
+                active_path: Path,
+                *,
+                pinned_fs=None,
+            ) -> None:
+                root.rename(detached)
+                root.mkdir()
+                (root / "replacement-marker.txt").write_bytes(replacement_marker)
+                original_checkpoint(active_path, pinned_fs=pinned_fs)
+
+            with patch.object(
+                local_core_migration,
+                "_checkpoint_active_database",
+                side_effect=replace_root_then_checkpoint,
+            ):
+                with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                    migrate_project_to_schema30(root)
+
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["replacement-marker.txt"],
+            )
+            self.assertEqual(
+                (root / "replacement-marker.txt").read_bytes(),
+                replacement_marker,
+            )
+            detached_active = detached / ".ai-team/state/harness.db"
+            self.assertEqual(sha256(detached_active), source_digest)
+            with closing(sqlite3.connect(detached_active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+            self.assertTrue(
+                (detached / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
     def test_failure_injection_preserves_or_restores_active_database(self) -> None:
         points = (
             "before_copy",
@@ -1337,26 +1386,28 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             projection = root / ".ai-team/control/project-state.yaml"
             projection.parent.mkdir(parents=True, exist_ok=True)
             projection.write_bytes(b"schema_version: 29\nstate: before-replace\n")
-            original_replace = local_core_migration.os.replace
+            original_activate = (
+                local_core_migration._activate_staging_database
+            )
             interrupted = False
 
-            def interrupt_after_replace(source: Path, destination: Path) -> None:
+            def interrupt_after_replace(
+                project_fs,
+                source: Path,
+                destination: Path,
+            ) -> None:
                 nonlocal interrupted
-                if (
-                    not interrupted
-                    and Path(source).name == "harness.schema30.new.db"
-                    and Path(destination).resolve() == active.resolve()
-                ):
-                    original_replace(source, destination)
+                if not interrupted:
+                    original_activate(project_fs, source, destination)
                     interrupted = True
                     raise KeyboardInterrupt(
                         "interrupt-between-replace-and-activated-flag"
                     )
-                original_replace(source, destination)
+                original_activate(project_fs, source, destination)
 
             with patch.object(
-                local_core_migration.os,
-                "replace",
+                local_core_migration,
+                "_activate_staging_database",
                 side_effect=interrupt_after_replace,
             ):
                 with self.assertRaisesRegex(
@@ -1514,13 +1565,17 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             active = self._prepare_source(root)
             original_write_json = local_core_migration._write_json_atomic
 
-            def fail_terminal_manifest(path: Path, payload: dict[str, object]) -> None:
+            def fail_terminal_manifest(
+                path: Path,
+                payload: dict[str, object],
+                **kwargs: object,
+            ) -> None:
                 if (
                     Path(path).name == "migration-manifest.json"
                     and payload.get("status") == "rollback-incomplete"
                 ):
                     raise OSError("manifest-write-failed-during-rollback")
-                original_write_json(path, payload)
+                original_write_json(path, payload, **kwargs)
 
             with (
                 patch.object(
@@ -1563,8 +1618,9 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             def preserve_then_interrupt(
                 active_path: Path,
                 failed_path: Path,
+                **kwargs: object,
             ) -> tuple[str, str]:
-                original_preserve(active_path, failed_path)
+                original_preserve(active_path, failed_path, **kwargs)
                 raise KeyboardInterrupt("cancel-after-schema30-preservation")
 
             with patch.object(
@@ -1748,16 +1804,18 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
             with patch.object(
-                local_core_migration.os,
-                "replace",
+                local_core_migration,
+                "_move_failed_schema30",
                 side_effect=reject_failed_database_move,
             ):
                 with self.assertRaises(InjectedLocalCoreMigrationFailure):
@@ -1785,28 +1843,33 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-            original_copyfile = local_core_migration.shutil.copyfile
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
-
-            def reject_failed_database_copy(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 copy denial")
-                original_copyfile(source, destination)
+            def reject_failed_database_copy(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 copy denial"
+                )
 
             with (
                 patch.object(
-                    local_core_migration.os,
-                    "replace",
+                    local_core_migration,
+                    "_move_failed_schema30",
                     side_effect=reject_failed_database_move,
                 ),
                 patch.object(
-                    local_core_migration.shutil,
-                    "copyfile",
+                    local_core_migration,
+                    "_copy_failed_schema30",
                     side_effect=reject_failed_database_copy,
                 ),
             ):
@@ -1834,11 +1897,16 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_sha256 = local_core_migration._sha256_file
+            original_digest = (
+                local_core_migration._diagnostic_database_digest
+            )
 
-            def reject_failed_active_digest(path: Path) -> str:
-                resolved = Path(path)
-                if resolved.resolve() == active.resolve():
+            def reject_failed_active_digest(
+                project_fs,
+                relative: Path,
+            ) -> str:
+                resolved = project_fs.absolute(relative)
+                if resolved == active.resolve():
                     with closing(sqlite3.connect(resolved)) as conn:
                         version = int(
                             conn.execute(
@@ -1847,11 +1915,11 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                         )
                     if version == 30:
                         raise PermissionError("injected active-schema30 read denial")
-                return original_sha256(resolved)
+                return original_digest(project_fs, relative)
 
             with patch.object(
                 local_core_migration,
-                "_sha256_file",
+                "_diagnostic_database_digest",
                 side_effect=reject_failed_active_digest,
             ):
                 with self.assertRaisesRegex(
@@ -1886,11 +1954,16 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_sha256 = local_core_migration._sha256_file
+            original_digest = (
+                local_core_migration._diagnostic_database_digest
+            )
 
-            def interrupt_failed_active_digest(path: Path) -> str:
-                resolved = Path(path)
-                if resolved.resolve() == active.resolve() and resolved.is_file():
+            def interrupt_failed_active_digest(
+                project_fs,
+                relative: Path,
+            ) -> str:
+                resolved = project_fs.absolute(relative)
+                if resolved == active.resolve() and resolved.is_file():
                     with closing(sqlite3.connect(resolved)) as conn:
                         version = int(
                             conn.execute(
@@ -1899,11 +1972,11 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                         )
                     if version == 30:
                         raise KeyboardInterrupt()
-                return original_sha256(resolved)
+                return original_digest(project_fs, relative)
 
             with patch.object(
                 local_core_migration,
-                "_sha256_file",
+                "_diagnostic_database_digest",
                 side_effect=interrupt_failed_active_digest,
             ):
                 with self.assertRaisesRegex(
@@ -1948,38 +2021,48 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-            original_copyfile = local_core_migration.shutil.copyfile
-            path_type = type(active)
-            original_unlink = path_type.unlink
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
+            def reject_failed_database_copy(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 copy denial"
+                )
 
-            def reject_failed_database_copy(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 copy denial")
-                original_copyfile(source, destination)
-
-            def reject_failed_database_cleanup(path: Path, *args: object, **kwargs: object) -> None:
-                if Path(path).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 cleanup denial")
-                original_unlink(path, *args, **kwargs)
+            def reject_failed_database_cleanup(
+                _project_fs,
+                _relative: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 cleanup denial"
+                )
 
             with (
                 patch.object(
-                    local_core_migration.os,
-                    "replace",
+                    local_core_migration,
+                    "_move_failed_schema30",
                     side_effect=reject_failed_database_move,
                 ),
                 patch.object(
-                    local_core_migration.shutil,
-                    "copyfile",
+                    local_core_migration,
+                    "_copy_failed_schema30",
                     side_effect=reject_failed_database_copy,
                 ),
-                patch.object(path_type, "unlink", new=reject_failed_database_cleanup),
+                patch.object(
+                    local_core_migration,
+                    "_cleanup_failed_schema30",
+                    side_effect=reject_failed_database_cleanup,
+                ),
             ):
                 with self.assertRaisesRegex(
                     LocalCoreMigrationError,

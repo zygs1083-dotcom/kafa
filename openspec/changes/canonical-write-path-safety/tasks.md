@@ -45,11 +45,11 @@
 
 ## 7. Migration, Backup, And Rollback
 
-- [ ] 7.1 Create/update the migration sentinel and manifest with safe exclusive/atomic operations and acquire the safe operation lock before reading source authority.
-- [ ] 7.2 Route backup, staging, projection-backup directory, failed DB, sidecar quarantine, restore, and cleanup operations through pinned safe paths with verified mode/digest/existence metadata unchanged.
-- [ ] 7.3 Audit every activation and rollback target before replacement; on any post-activation unsafe path, retain sentinel/manifest and record `rollback-incomplete` with original and restore errors.
-- [ ] 7.4 Preserve schema 27/28/29 conversion, active DB fingerprinting, mandatory projection validator, hard-exit recovery, and exact projection rollback semantics.
-- [ ] 7.5 Run migration/rollback/hard-exit targeted suites plus new path attacks; inspect manifests and prove original external objects and source DB remain unchanged.
+- [x] 7.1 Create/update the migration sentinel and manifest with safe exclusive/atomic operations and acquire the safe operation lock before reading source authority.
+- [x] 7.2 Route backup, staging, projection-backup directory, failed DB, sidecar quarantine, restore, and cleanup operations through pinned safe paths with verified mode/digest/existence metadata unchanged.
+- [x] 7.3 Audit every activation and rollback target before replacement; on any post-activation unsafe path, retain sentinel/manifest and record `rollback-incomplete` with original and restore errors.
+- [x] 7.4 Preserve schema 27/28/29 conversion, active DB fingerprinting, mandatory projection validator, hard-exit recovery, and exact projection rollback semantics.
+- [x] 7.5 Run migration/rollback/hard-exit targeted suites plus new path attacks; inspect manifests and prove original external objects and source DB remain unchanged.
 
 ## 8. Doctor And CLI Integration
 

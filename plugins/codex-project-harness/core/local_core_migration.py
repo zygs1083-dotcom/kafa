@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -18,6 +17,7 @@ from typing import Callable, Iterator
 
 from .execution import command_matches_template
 from .errors import HarnessError
+from .project_fs import ProjectFS, ProjectPathSafetyError
 from .projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS
 from .schema_lifecycle import (
     SCHEMA30_RUNTIME_VERSION,
@@ -42,6 +42,7 @@ class InjectedLocalCoreMigrationFailure(LocalCoreMigrationError):
 @dataclass
 class _MigrationGuard:
     lock_path: Path
+    project_fs: ProjectFS
     recovery_required: bool = False
     manifest_path: Path | None = None
     clear_allowed: bool = False
@@ -57,7 +58,11 @@ class _MigrationGuard:
             "status": "recovery-required",
             "manifest_path": str(manifest_path),
         }
-        _write_json_atomic(self.lock_path, payload)
+        _write_json_atomic(
+            self.lock_path,
+            payload,
+            project_fs=self.project_fs,
+        )
         self.recovery_required = True
         self.manifest_path = manifest_path
         self.clear_allowed = False
@@ -142,6 +147,90 @@ def _exception_text(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _project_root_for_internal_path(path: Path) -> Path:
+    absolute = Path(path).expanduser().absolute()
+    for parent in absolute.parents:
+        if parent.name == ".ai-team":
+            return parent.parent
+    raise LocalCoreMigrationError(
+        f"migration path is outside project-owned authority: {path}"
+    )
+
+
+def _project_relative(root: Path, path: Path) -> Path:
+    with ProjectFS.open(root) as project_fs:
+        return project_fs.relative_to_root(path)
+
+
+@contextmanager
+def _project_fs_scope(
+    root: Path,
+    project_fs: ProjectFS | None = None,
+) -> Iterator[ProjectFS]:
+    if project_fs is not None:
+        yield project_fs
+        return
+    with ProjectFS.open(root) as opened:
+        yield opened
+
+
+def _safe_file_sha256(project_fs: ProjectFS, relative: Path) -> str:
+    return hashlib.sha256(project_fs.read_bytes(relative)).hexdigest()
+
+
+def _safe_file_mode(project_fs: ProjectFS, relative: Path) -> int:
+    snapshot = project_fs._snapshot(relative, allow_missing=False)
+    assert snapshot.identity is not None
+    if os.name == "nt":
+        return stat.S_IMODE(project_fs.absolute(relative).stat().st_mode)
+    return stat.S_IMODE(snapshot.identity.mode_or_attributes)
+
+
+def _database_family(relative: Path) -> tuple[Path, Path, Path, Path]:
+    value = relative.as_posix()
+    return (
+        relative,
+        Path(f"{value}-wal"),
+        Path(f"{value}-shm"),
+        Path(f"{value}-journal"),
+    )
+
+
+def _safe_database_fingerprint(
+    project_fs: ProjectFS,
+    relative: Path,
+) -> dict[str, str]:
+    """Hash committed authority and a non-empty WAL without following links."""
+
+    family = _database_family(relative)
+    project_fs.audit(family, allow_missing=True)
+    fingerprint: dict[str, str] = {}
+    for candidate in family[:2]:
+        snapshot = project_fs._snapshot(candidate, allow_missing=True)
+        if not snapshot.exists:
+            continue
+        payload = project_fs.read_bytes(candidate)
+        if candidate == relative or payload:
+            fingerprint[candidate.name] = hashlib.sha256(payload).hexdigest()
+    return fingerprint
+
+
+def _safe_database_digest(project_fs: ProjectFS, relative: Path) -> str:
+    return hashlib.sha256(project_fs.read_bytes(relative)).hexdigest()
+
+
+def _cleanup_database_family(
+    project_fs: ProjectFS,
+    relative: Path,
+    *,
+    include_database: bool,
+) -> None:
+    family = _database_family(relative)
+    candidates = family if include_database else family[1:]
+    for candidate in reversed(candidates):
+        project_fs.unlink_regular(candidate, missing_ok=True)
+
+
 TASK_STATUS_MAP = {
     "ready": "planned",
     "planned": "planned",
@@ -220,22 +309,6 @@ RETIRED_METADATA_KEYS = {
 
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _database_fingerprint(path: Path) -> dict[str, str]:
-    fingerprint: dict[str, str] = {}
-    for candidate in (path, Path(str(path) + "-wal")):
-        if candidate.exists() and (candidate == path or candidate.stat().st_size > 0):
-            fingerprint[candidate.name] = _sha256_file(candidate)
-    return fingerprint
 
 
 def _table_names(conn: sqlite3.Connection) -> tuple[str, ...]:
@@ -563,23 +636,38 @@ def _copy_quality_gates(
 
 
 def _project_root_for_database(source_path: Path) -> Path:
-    if source_path.parent.name == "state" and source_path.parent.parent.name == ".ai-team":
-        return source_path.parent.parent.parent
-    return source_path.parent
+    try:
+        return _project_root_for_internal_path(source_path)
+    except LocalCoreMigrationError:
+        return Path(source_path).expanduser().absolute().parent
 
 
-def _artifact_matches(project_root: Path, artifact_path: object, expected_sha256: object) -> bool:
+def _artifact_matches(
+    project_root: Path,
+    artifact_path: object,
+    expected_sha256: object,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> bool:
     relative = str(artifact_path or "").strip()
     expected = str(expected_sha256 or "").strip().lower()
     if not relative or len(expected) != 64:
         return False
     candidate = Path(relative)
-    resolved = candidate.resolve() if candidate.is_absolute() else (project_root / candidate).resolve()
     try:
-        resolved.relative_to(project_root.resolve())
-    except ValueError:
+        with _project_fs_scope(project_root, pinned_fs) as project_fs:
+            artifact_relative = project_fs.relative_to_root(candidate)
+            snapshot = project_fs._snapshot(
+                artifact_relative,
+                allow_missing=True,
+            )
+            return (
+                snapshot.exists
+                and _safe_file_sha256(project_fs, artifact_relative)
+                == expected
+            )
+    except ProjectPathSafetyError:
         return False
-    return resolved.is_file() and _sha256_file(resolved) == expected
 
 
 def _execution_id(evidence_id: str) -> str:
@@ -596,6 +684,7 @@ def _eligible_execution(
     *,
     project_root: Path,
     candidate_sha: str,
+    pinned_fs: ProjectFS | None = None,
 ) -> tuple[bool, str]:
     if str(evidence.get("kind") or "") != "command":
         return False, "evidence is not a command execution"
@@ -625,7 +714,12 @@ def _eligible_execution(
         return False, "structured execution did not report semantic pass"
     if str(evidence.get("source_tree_hash") or "") != candidate_sha or not candidate_sha:
         return False, "evidence candidate does not match validation candidate"
-    if not _artifact_matches(project_root, evidence.get("artifact_path"), evidence.get("stdout_sha256")):
+    if not _artifact_matches(
+        project_root,
+        evidence.get("artifact_path"),
+        evidence.get("stdout_sha256"),
+        pinned_fs=pinned_fs,
+    ):
         return False, "evidence artifact is missing or has a digest mismatch"
     requires_sandbox = _sqlite_integer(target.get("requires_sandbox"))
     requires_no_network = _sqlite_integer(target.get("requires_no_network"))
@@ -647,6 +741,7 @@ def _copy_execution_validation_facts(
     destination: sqlite3.Connection,
     current_cycle_id: str,
     project_root: Path,
+    pinned_fs: ProjectFS | None = None,
 ) -> tuple[int, int, int]:
     evidence_rows = {str(row["id"]): row for row in _rows(source, "evidence")}
     target_rows = {str(row["id"]): row for row in _rows(source, "test_targets")}
@@ -695,6 +790,7 @@ def _copy_execution_validation_facts(
                 target,
                 project_root=project_root,
                 candidate_sha=candidate_sha,
+                pinned_fs=pinned_fs,
             )
             if not eligible:
                 rejection_reasons.append(f"{evidence_id}: {reason}")
@@ -872,6 +968,7 @@ def _copy_schema29_local_facts(
     staging_path: Path,
     project_root: Path,
     fail_at: str | None,
+    pinned_fs: ProjectFS | None = None,
 ) -> tuple[int, int, int, int]:
     project = _source_project(source)
     current_cycle_id = _copy_delivery_cycles(source, destination, project)
@@ -924,6 +1021,7 @@ def _copy_schema29_local_facts(
         destination,
         current_cycle_id,
         project_root,
+        pinned_fs,
     )
 
     def normalize_finding(values: dict[str, object]) -> dict[str, object]:
@@ -1044,141 +1142,348 @@ def stage_schema29_to_schema30(
     *,
     project_root: Path | None = None,
     fail_at: str | None = None,
+    source_fs: ProjectFS | None = None,
+    destination_fs: ProjectFS | None = None,
 ) -> LocalCoreStagingReport:
     """Create a validated schema 30 staging DB without modifying the schema 29 source."""
 
-    source_path = source_path.resolve()
-    staging_path = staging_path.resolve()
-    if not source_path.is_file():
-        raise LocalCoreMigrationError(f"schema 29 source database is missing: {source_path}")
-    if source_path == staging_path:
-        raise LocalCoreMigrationError("staging database must not replace the active source")
-    if staging_path.exists():
-        raise LocalCoreMigrationError(f"staging database already exists: {staging_path}")
-    staging_path.parent.mkdir(parents=True, exist_ok=True)
-
-    source_fingerprint = _database_fingerprint(source_path)
-    source_sha256 = _sha256_file(source_path)
-    source_uri = f"file:{source_path.as_posix()}?mode=ro"
-    try:
-        with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source:
-            source.row_factory = sqlite3.Row
-            source.execute("pragma query_only = on")
-            integrity = [str(row[0]) for row in source.execute("pragma integrity_check")]
-            foreign_keys = source.execute("pragma foreign_key_check").fetchall()
-            if integrity != ["ok"] or foreign_keys:
-                raise LocalCoreMigrationError(
-                    f"schema 29 source failed validation: integrity={integrity} foreign_keys={len(foreign_keys)}"
-                )
-            project = _source_project(source)
-            source_counts = _row_counts(source)
-            source_tables = set(source_counts)
-            with closing(sqlite3.connect(staging_path, timeout=5.0)) as destination:
-                destination.row_factory = sqlite3.Row
-                destination.execute("pragma foreign_keys = on")
-                destination.execute("begin immediate")
-                create_schema30(destination)
-                (
-                    dropped_event_count,
-                    converted_execution_count,
-                    converted_validation_count,
-                    invalidated_validation_count,
-                ) = _copy_schema29_local_facts(
-                    source,
-                    destination,
-                    source_sha256,
-                    staging_path,
-                    (project_root or _project_root_for_database(source_path)).resolve(),
-                    fail_at,
-                )
-                destination.commit()
-                destination.execute("pragma journal_mode = delete")
-                _validate_staging_database(destination, fail_at=fail_at)
-                staging_counts = _row_counts(destination)
-            if int(project["schema_version"]) != 29:
-                raise LocalCoreMigrationError("schema version changed during staging conversion")
-
-        if _database_fingerprint(source_path) != source_fingerprint:
-            raise LocalCoreMigrationError("active schema 29 database changed during staging conversion")
-        retired_counts = {
-            table: count
-            for table, count in source_counts.items()
-            if table not in SCHEMA30_TABLES
-        }
-        _fsync_path(staging_path)
-        return LocalCoreStagingReport(
-            source_version=29,
-            target_version=SCHEMA30_VERSION,
-            source_path=str(source_path),
-            staging_path=str(staging_path),
-            source_sha256=source_sha256,
-            staging_sha256=_sha256_file(staging_path),
-            source_row_counts=source_counts,
-            staging_row_counts=staging_counts,
-            retired_row_counts=retired_counts,
-            dropped_event_count=dropped_event_count,
-            converted_execution_count=converted_execution_count,
-            converted_validation_count=converted_validation_count,
-            invalidated_validation_count=invalidated_validation_count,
+    source_root = _project_root_for_database(source_path)
+    destination_root = project_root or _project_root_for_internal_path(staging_path)
+    created_staging = False
+    with _project_fs_scope(
+        source_root,
+        source_fs,
+    ) as active_source_fs, _project_fs_scope(
+        destination_root,
+        destination_fs,
+    ) as active_destination_fs:
+        source_relative = active_source_fs.relative_to_root(source_path)
+        staging_relative = active_destination_fs.relative_to_root(staging_path)
+        source_snapshot = active_source_fs._snapshot(
+            source_relative,
+            allow_missing=True,
         )
-    except Exception:
-        staging_path.unlink(missing_ok=True)
-        Path(str(staging_path) + "-wal").unlink(missing_ok=True)
-        Path(str(staging_path) + "-shm").unlink(missing_ok=True)
-        raise
+        if not source_snapshot.exists:
+            raise LocalCoreMigrationError(
+                "schema 29 source database is missing: "
+                f"{active_source_fs.absolute(source_relative)}"
+            )
+        if (
+            active_source_fs.root_identity_key
+            == active_destination_fs.root_identity_key
+            and source_relative == staging_relative
+        ):
+            raise LocalCoreMigrationError(
+                "staging database must not replace the active source"
+            )
+        staging_snapshot = active_destination_fs._snapshot(
+            staging_relative,
+            allow_missing=True,
+        )
+        if staging_snapshot.exists:
+            raise LocalCoreMigrationError(
+                "staging database already exists: "
+                f"{active_destination_fs.absolute(staging_relative)}"
+            )
+        active_source_fs.audit(
+            _database_family(source_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.audit(
+            _database_family(staging_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.create_exclusive(
+            staging_relative,
+            b"",
+            mode=0o600,
+        )
+        created_staging = True
+        staging_snapshot = active_destination_fs._snapshot(
+            staging_relative,
+            allow_missing=False,
+        )
+        source_fingerprint = _safe_database_fingerprint(
+            active_source_fs,
+            source_relative,
+        )
+        source_sha256 = _safe_database_digest(
+            active_source_fs,
+            source_relative,
+        )
+        source_absolute = active_source_fs.absolute(source_relative)
+        staging_absolute = active_destination_fs.absolute(staging_relative)
+        source_uri = f"{source_absolute.as_uri()}?mode=ro"
+        staging_uri = f"{staging_absolute.as_uri()}?mode=rw"
+        try:
+            with closing(
+                sqlite3.connect(source_uri, uri=True, timeout=5.0)
+            ) as source:
+                source.row_factory = sqlite3.Row
+                source.execute("pragma query_only = on")
+                active_source_fs._assert_unchanged(
+                    source_relative,
+                    source_snapshot,
+                )
+                integrity = [
+                    str(row[0])
+                    for row in source.execute("pragma integrity_check")
+                ]
+                foreign_keys = source.execute(
+                    "pragma foreign_key_check"
+                ).fetchall()
+                if integrity != ["ok"] or foreign_keys:
+                    raise LocalCoreMigrationError(
+                        "schema 29 source failed validation: "
+                        f"integrity={integrity} "
+                        f"foreign_keys={len(foreign_keys)}"
+                    )
+                project = _source_project(source)
+                source_counts = _row_counts(source)
+                with closing(
+                    sqlite3.connect(staging_uri, uri=True, timeout=5.0)
+                ) as destination:
+                    destination.row_factory = sqlite3.Row
+                    destination.execute("pragma foreign_keys = on")
+                    destination.execute("begin immediate")
+                    create_schema30(destination)
+                    (
+                        dropped_event_count,
+                        converted_execution_count,
+                        converted_validation_count,
+                        invalidated_validation_count,
+                    ) = _copy_schema29_local_facts(
+                        source,
+                        destination,
+                        source_sha256,
+                        staging_absolute,
+                        Path(destination_root).expanduser().absolute(),
+                        fail_at,
+                        active_destination_fs,
+                    )
+                    destination.commit()
+                    destination.execute("pragma journal_mode = delete")
+                    _validate_staging_database(
+                        destination,
+                        fail_at=fail_at,
+                    )
+                    staging_counts = _row_counts(destination)
+                    active_destination_fs._assert_unchanged(
+                        staging_relative,
+                        staging_snapshot,
+                    )
+                active_source_fs._assert_unchanged(
+                    source_relative,
+                    source_snapshot,
+                )
+                if int(project["schema_version"]) != 29:
+                    raise LocalCoreMigrationError(
+                        "schema version changed during staging conversion"
+                    )
+
+            active_destination_fs.audit(
+                _database_family(staging_relative),
+                allow_missing=True,
+            )
+            if (
+                _safe_database_fingerprint(
+                    active_source_fs,
+                    source_relative,
+                )
+                != source_fingerprint
+            ):
+                raise LocalCoreMigrationError(
+                    "active schema 29 database changed during staging conversion"
+                )
+            retired_counts = {
+                table: count
+                for table, count in source_counts.items()
+                if table not in SCHEMA30_TABLES
+            }
+            return LocalCoreStagingReport(
+                source_version=29,
+                target_version=SCHEMA30_VERSION,
+                source_path=str(source_absolute),
+                staging_path=str(staging_absolute),
+                source_sha256=source_sha256,
+                staging_sha256=_safe_database_digest(
+                    active_destination_fs,
+                    staging_relative,
+                ),
+                source_row_counts=source_counts,
+                staging_row_counts=staging_counts,
+                retired_row_counts=retired_counts,
+                dropped_event_count=dropped_event_count,
+                converted_execution_count=converted_execution_count,
+                converted_validation_count=converted_validation_count,
+                invalidated_validation_count=invalidated_validation_count,
+            )
+        except BaseException:
+            if created_staging:
+                _cleanup_database_family(
+                    active_destination_fs,
+                    staging_relative,
+                    include_database=True,
+                )
+            raise
 
 
-def _read_source_version(path: Path) -> int:
-    uri = f"file:{path.as_posix()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
-        row = conn.execute("select schema_version from project where id=1").fetchone()
+def _read_source_version(
+    path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> int:
+    with _project_fs_scope(
+        _project_root_for_database(path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            row = conn.execute(
+                "select schema_version from project where id=1"
+            ).fetchone()
+            project_fs._assert_unchanged(relative, snapshot)
     if row is None:
         raise LocalCoreMigrationError("legacy source is missing project schema metadata")
     return int(row[0])
 
 
-def _sqlite_backup_copy(source_path: Path, destination_path: Path) -> None:
-    source_uri = f"file:{source_path.as_posix()}?mode=ro"
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source:
-        source.execute("pragma query_only = on")
-        with closing(sqlite3.connect(destination_path, timeout=5.0)) as destination:
-            source.backup(destination)
-            destination.execute("pragma journal_mode = delete")
-            destination.commit()
+def _sqlite_backup_copy(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    source_fs: ProjectFS | None = None,
+    destination_fs: ProjectFS | None = None,
+) -> None:
+    with _project_fs_scope(
+        _project_root_for_database(source_path),
+        source_fs,
+    ) as active_source_fs, _project_fs_scope(
+        _project_root_for_database(destination_path),
+        destination_fs,
+    ) as active_destination_fs:
+        source_relative = active_source_fs.relative_to_root(source_path)
+        destination_relative = active_destination_fs.relative_to_root(
+            destination_path
+        )
+        source_snapshot = active_source_fs._snapshot(
+            source_relative,
+            allow_missing=False,
+        )
+        destination_snapshot = active_destination_fs._snapshot(
+            destination_relative,
+            allow_missing=True,
+        )
+        if destination_snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"isolated backup destination already exists: {destination_path}"
+            )
+        active_source_fs.audit(
+            _database_family(source_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.audit(
+            _database_family(destination_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.create_exclusive(
+            destination_relative,
+            b"",
+            mode=0o600,
+        )
+        destination_snapshot = active_destination_fs._snapshot(
+            destination_relative,
+            allow_missing=False,
+        )
+        source_uri = (
+            f"{active_source_fs.absolute(source_relative).as_uri()}?mode=ro"
+        )
+        destination_uri = (
+            f"{active_destination_fs.absolute(destination_relative).as_uri()}?mode=rw"
+        )
+        try:
+            with closing(
+                sqlite3.connect(source_uri, uri=True, timeout=5.0)
+            ) as source:
+                source.execute("pragma query_only = on")
+                active_source_fs._assert_unchanged(
+                    source_relative,
+                    source_snapshot,
+                )
+                with closing(
+                    sqlite3.connect(destination_uri, uri=True, timeout=5.0)
+                ) as destination:
+                    source.backup(destination)
+                    destination.execute("pragma journal_mode = delete")
+                    destination.commit()
+                    active_destination_fs._assert_unchanged(
+                        destination_relative,
+                        destination_snapshot,
+                    )
+                active_source_fs._assert_unchanged(
+                    source_relative,
+                    source_snapshot,
+                )
+        except BaseException:
+            _cleanup_database_family(
+                active_destination_fs,
+                destination_relative,
+                include_database=True,
+            )
+            raise
 
 
-def _validate_legacy_trust_revisions(source_path: Path, source_version: int) -> None:
+def _validate_legacy_trust_revisions(
+    source_path: Path,
+    source_version: int,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
     """Reject malformed trust revisions before legacy SQLite arithmetic can coerce them."""
 
-    source_uri = f"file:{source_path.as_posix()}?mode=ro"
-    with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source:
-        project = source.execute(
-            "select revision from project where id=1"
-        ).fetchone()
-        if project is None:
-            raise LocalCoreMigrationError(
-                f"schema {source_version} source is missing project revision metadata"
-            )
-        _positive_sqlite_integer(
-            project[0],
-            field="project.revision",
-            source_schema=source_version,
-        )
-
-        if (
-            "quality_gates" not in _table_names(source)
-            or "project_revision" not in _columns(source, "quality_gates")
-        ):
-            return
-        for gate_id, revision in source.execute(
-            "select id, project_revision from quality_gates order by rowid"
-        ):
+    with _project_fs_scope(
+        _project_root_for_database(source_path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(source_path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        source_uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(source_uri, uri=True, timeout=5.0)
+        ) as source:
+            project = source.execute(
+                "select revision from project where id=1"
+            ).fetchone()
+            if project is None:
+                raise LocalCoreMigrationError(
+                    f"schema {source_version} source is missing project revision metadata"
+                )
             _positive_sqlite_integer(
-                revision,
-                field=f"quality gate {gate_id}.project_revision",
+                project[0],
+                field="project.revision",
                 source_schema=source_version,
             )
+
+            if (
+                "quality_gates" in _table_names(source)
+                and "project_revision"
+                in _columns(source, "quality_gates")
+            ):
+                for gate_id, revision in source.execute(
+                    "select id, project_revision from quality_gates order by rowid"
+                ):
+                    _positive_sqlite_integer(
+                        revision,
+                        field=(
+                            f"quality gate {gate_id}.project_revision"
+                        ),
+                        source_schema=source_version,
+                    )
+            project_fs._assert_unchanged(relative, snapshot)
 
 
 def stage_supported_schema_to_schema30(
@@ -1187,18 +1492,21 @@ def stage_supported_schema_to_schema30(
     *,
     project_root: Path | None = None,
     fail_at: str | None = None,
+    pinned_fs: ProjectFS | None = None,
 ) -> LocalCoreStagingReport:
     """Stage schema 27/28 through an isolated schema 29 copy, or convert schema 29 directly."""
-
-    source_path = source_path.resolve()
-    staging_path = staging_path.resolve()
-    source_version = _read_source_version(source_path)
+    source_version = _read_source_version(
+        source_path,
+        pinned_fs=pinned_fs,
+    )
     if source_version == 29:
         return stage_schema29_to_schema30(
             source_path,
             staging_path,
             project_root=project_root,
             fail_at=fail_at,
+            source_fs=pinned_fs,
+            destination_fs=pinned_fs,
         )
     if source_version not in {27, 28}:
         raise LocalCoreMigrationError(
@@ -1206,18 +1514,43 @@ def stage_supported_schema_to_schema30(
             "install the last v1 release and migrate to schema 27, 28, or 29 first"
         )
 
-    _validate_legacy_trust_revisions(source_path, source_version)
-    staging_path.parent.mkdir(parents=True, exist_ok=True)
-    source_fingerprint = _database_fingerprint(source_path)
-    source_sha256 = _sha256_file(source_path)
-    source_uri = f"file:{source_path.as_posix()}?mode=ro"
-    with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as original:
-        original_counts = _row_counts(original)
+    _validate_legacy_trust_revisions(
+        source_path,
+        source_version,
+        pinned_fs=pinned_fs,
+    )
+    source_root = _project_root_for_database(source_path)
+    with _project_fs_scope(source_root, pinned_fs) as source_fs:
+        source_relative = source_fs.relative_to_root(source_path)
+        source_snapshot = source_fs._snapshot(
+            source_relative,
+            allow_missing=False,
+        )
+        source_fingerprint = _safe_database_fingerprint(
+            source_fs,
+            source_relative,
+        )
+        source_sha256 = _safe_database_digest(source_fs, source_relative)
+        source_uri = f"{source_fs.absolute(source_relative).as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(source_uri, uri=True, timeout=5.0)
+        ) as original:
+            original_counts = _row_counts(original)
+            source_fs._assert_unchanged(
+                source_relative,
+                source_snapshot,
+            )
 
-    with tempfile.TemporaryDirectory(prefix=f"schema{source_version}-legacy-stage-", dir=staging_path.parent) as temp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"schema{source_version}-legacy-stage-"
+    ) as temp:
         legacy_root = Path(temp)
         legacy_db = legacy_root / ".ai-team/state/harness.db"
-        _sqlite_backup_copy(source_path, legacy_db)
+        _sqlite_backup_copy(
+            source_path,
+            legacy_db,
+            source_fs=pinned_fs,
+        )
         try:
             import harness_db as legacy_runtime
         except ImportError as exc:
@@ -1237,17 +1570,35 @@ def stage_supported_schema_to_schema30(
             staging_path,
             project_root=project_root or _project_root_for_database(source_path),
             fail_at=fail_at,
+            destination_fs=pinned_fs,
         )
 
-    if _database_fingerprint(source_path) != source_fingerprint:
-        staging_path.unlink(missing_ok=True)
-        raise LocalCoreMigrationError(
-            f"active schema {source_version} database changed during isolated legacy conversion"
-        )
+    with _project_fs_scope(
+        source_root,
+        pinned_fs,
+    ) as source_fs, _project_fs_scope(
+        project_root or _project_root_for_internal_path(staging_path),
+        pinned_fs,
+    ) as destination_fs:
+        source_relative = source_fs.relative_to_root(source_path)
+        staging_relative = destination_fs.relative_to_root(staging_path)
+        source_absolute = source_fs.absolute(source_relative)
+        if (
+            _safe_database_fingerprint(source_fs, source_relative)
+            != source_fingerprint
+        ):
+            _cleanup_database_family(
+                destination_fs,
+                staging_relative,
+                include_database=True,
+            )
+            raise LocalCoreMigrationError(
+                f"active schema {source_version} database changed during isolated legacy conversion"
+            )
     return replace(
         report,
         source_version=source_version,
-        source_path=str(source_path),
+        source_path=str(source_absolute),
         source_sha256=source_sha256,
         source_row_counts=original_counts,
     )
@@ -1257,124 +1608,111 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _fsync_path(path: Path) -> None:
-    # Windows' CRT rejects os.fsync/_commit on a read-only descriptor.
-    with path.open("rb+") as handle:
-        os.fsync(handle.fileno())
+def _write_json_atomic(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    project_fs: ProjectFS | None = None,
+) -> None:
+    root = _project_root_for_internal_path(path)
+    with _project_fs_scope(root, project_fs) as active_project_fs:
+        relative = active_project_fs.relative_to_root(path)
+        legacy_temporary = relative.with_name(relative.name + ".tmp")
+        active_project_fs.audit(
+            (relative, legacy_temporary),
+            allow_missing=True,
+        )
+        active_project_fs.atomic_write(
+            relative,
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+            mode=0o600,
+        )
 
 
-def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            pass
-    finally:
-        os.close(descriptor)
+def _create_projection_backup(
+    root: Path,
+    backup_dir: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> dict[str, object]:
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        backup_relative = project_fs.relative_to_root(backup_dir)
+        projection_dir = backup_relative / "projections"
+        project_fs.create_directory_exclusive(projection_dir, mode=0o700)
+        entries: list[dict[str, object]] = []
+        for index, relative_path in enumerate(PROJECTION_ROLLBACK_PATHS):
+            snapshot = project_fs._snapshot(
+                relative_path,
+                allow_missing=True,
+            )
+            if not snapshot.exists:
+                entries.append(
+                    {
+                        "path": relative_path.as_posix(),
+                        "existed": False,
+                        "mode": None,
+                        "sha256": "",
+                        "backup_path": "",
+                    }
+                )
+                continue
 
-
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(temporary, 0o600)
-    _fsync_path(temporary)
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
-
-
-def _projection_target(root: Path, relative_path: Path) -> Path:
-    if relative_path.is_absolute() or ".." in relative_path.parts:
-        raise LocalCoreMigrationError(f"unsafe projection path in rollback inventory: {relative_path}")
-    resolved_root = root.resolve()
-    target = resolved_root / relative_path
-    if not target.parent.resolve().is_relative_to(resolved_root):
-        raise LocalCoreMigrationError(f"projection parent escapes project root: {relative_path}")
-    return target
-
-
-def _create_projection_backup(root: Path, backup_dir: Path) -> dict[str, object]:
-    projection_dir = backup_dir / "projections"
-    projection_dir.mkdir(mode=0o700)
-    entries: list[dict[str, object]] = []
-    for index, relative_path in enumerate(PROJECTION_ROLLBACK_PATHS):
-        source = _projection_target(root, relative_path)
-        if source.is_symlink():
-            raise LocalCoreMigrationError(f"refusing to back up symlinked projection: {relative_path}")
-        if not source.exists():
+            mode = _safe_file_mode(project_fs, relative_path)
+            content = project_fs.read_bytes(relative_path)
+            digest = hashlib.sha256(content).hexdigest()
+            projection_copy = (
+                projection_dir / f"{index:02d}-{relative_path.name}.bin"
+            )
+            project_fs.create_exclusive(
+                projection_copy,
+                content,
+                mode=0o600,
+            )
+            if _safe_file_sha256(project_fs, projection_copy) != digest:
+                raise LocalCoreMigrationError(
+                    f"projection backup digest mismatch: {relative_path}"
+                )
+            project_fs._assert_unchanged(relative_path, snapshot)
+            if (
+                _safe_file_sha256(project_fs, relative_path) != digest
+                or _safe_file_mode(project_fs, relative_path) != mode
+            ):
+                raise LocalCoreMigrationError(
+                    "projection changed while its rollback backup was created: "
+                    f"{relative_path}"
+                )
             entries.append(
                 {
                     "path": relative_path.as_posix(),
-                    "existed": False,
-                    "mode": None,
-                    "sha256": "",
-                    "backup_path": "",
+                    "existed": True,
+                    "mode": mode,
+                    "sha256": digest,
+                    "backup_path": str(project_fs.absolute(projection_copy)),
                 }
             )
-            continue
-        if not source.is_file():
-            raise LocalCoreMigrationError(f"projection rollback path is not a regular file: {relative_path}")
 
-        mode = stat.S_IMODE(source.stat().st_mode)
-        content = source.read_bytes()
-        digest = hashlib.sha256(content).hexdigest()
-        projection_copy = projection_dir / f"{index:02d}-{relative_path.name}.bin"
-        with projection_copy.open("xb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(projection_copy, 0o600)
-        if _sha256_file(projection_copy) != digest:
-            raise LocalCoreMigrationError(f"projection backup digest mismatch: {relative_path}")
-        if (
-            not source.is_file()
-            or source.is_symlink()
-            or _sha256_file(source) != digest
-            or stat.S_IMODE(source.stat().st_mode) != mode
-        ):
-            raise LocalCoreMigrationError(f"projection changed while its rollback backup was created: {relative_path}")
-        entries.append(
-            {
-                "path": relative_path.as_posix(),
-                "existed": True,
-                "mode": mode,
-                "sha256": digest,
-                "backup_path": str(projection_copy),
-            }
-        )
-
-    _fsync_directory(projection_dir)
-    return {
-        "directory": str(projection_dir),
-        "live_projection_count": len(PROJECTION_PATHS),
-        "rollback_path_count": len(PROJECTION_ROLLBACK_PATHS),
-        "entries": entries,
-    }
+        return {
+            "directory": str(project_fs.absolute(projection_dir)),
+            "live_projection_count": len(PROJECTION_PATHS),
+            "rollback_path_count": len(PROJECTION_ROLLBACK_PATHS),
+            "entries": entries,
+        }
 
 
-def _make_projection_writable(path: Path) -> None:
-    if path.is_symlink() or not path.is_file():
-        return
-    os.chmod(path, stat.S_IMODE(path.stat().st_mode) | stat.S_IWUSR)
-
-
-def _unlink_projection_file(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except PermissionError:
-        if path.is_symlink() or not path.is_file():
-            raise
-        _make_projection_writable(path)
-        path.unlink()
-
-
-def _restore_projection_backup(root: Path, projection_backup: dict[str, object]) -> None:
+def _restore_projection_backup(
+    root: Path,
+    projection_backup: dict[str, object],
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
     entries = projection_backup.get("entries")
     if not isinstance(entries, list):
         raise LocalCoreMigrationError("projection rollback metadata is missing its entries")
@@ -1391,173 +1729,213 @@ def _restore_projection_backup(root: Path, projection_backup: dict[str, object])
     backup_directory_value = projection_backup.get("directory")
     if not isinstance(backup_directory_value, str) or not backup_directory_value:
         raise LocalCoreMigrationError("projection rollback metadata is missing its backup directory")
-    backup_directory = Path(backup_directory_value).resolve()
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        backup_directory = project_fs.relative_to_root(
+            Path(backup_directory_value)
+        )
+        project_fs.audit_directory(backup_directory, allow_missing=False)
 
-    for relative_path, entry in zip(PROJECTION_ROLLBACK_PATHS, entries, strict=True):
-        if not isinstance(entry, dict):
-            raise LocalCoreMigrationError(f"invalid projection rollback entry: {relative_path}")
-        target = _projection_target(root, relative_path)
-        existed = entry.get("existed")
-        if existed is False:
-            if target.exists() or target.is_symlink():
-                if target.is_dir() and not target.is_symlink():
+        for relative_path, entry in zip(
+            PROJECTION_ROLLBACK_PATHS,
+            entries,
+            strict=True,
+        ):
+            if not isinstance(entry, dict):
+                raise LocalCoreMigrationError(
+                    f"invalid projection rollback entry: {relative_path}"
+                )
+            existed = entry.get("existed")
+            if existed is False:
+                snapshot = project_fs._snapshot(
+                    relative_path,
+                    allow_missing=True,
+                )
+                if snapshot.exists:
+                    project_fs.unlink_regular(relative_path)
+                continue
+            if existed is not True:
+                raise LocalCoreMigrationError(
+                    f"invalid projection existence metadata: {relative_path}"
+                )
+
+            mode = entry.get("mode")
+            digest = entry.get("sha256")
+            backup_path_value = entry.get("backup_path")
+            if (
+                not isinstance(mode, int)
+                or not 0 <= mode <= 0o7777
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or not isinstance(backup_path_value, str)
+                or not backup_path_value
+            ):
+                raise LocalCoreMigrationError(
+                    f"invalid projection restore metadata: {relative_path}"
+                )
+            backup_path = project_fs.relative_to_root(Path(backup_path_value))
+            if not backup_path.is_relative_to(backup_directory):
+                raise LocalCoreMigrationError(
+                    f"projection recovery copy is missing or invalid: {relative_path}"
+                )
+            backup_content = project_fs.read_bytes(backup_path)
+            if hashlib.sha256(backup_content).hexdigest() != digest:
+                raise LocalCoreMigrationError(
+                    f"projection recovery copy is missing or invalid: {relative_path}"
+                )
+
+            current = project_fs._snapshot(
+                relative_path,
+                allow_missing=True,
+            )
+            if (
+                current.exists
+                and _safe_file_sha256(project_fs, relative_path) == digest
+                and _safe_file_mode(project_fs, relative_path) == mode
+            ):
+                continue
+            project_fs.atomic_write(
+                relative_path,
+                backup_content,
+                mode=mode,
+            )
+            if (
+                _safe_file_sha256(project_fs, relative_path) != digest
+                or _safe_file_mode(project_fs, relative_path) != mode
+            ):
+                raise LocalCoreMigrationError(
+                    f"restored projection failed verification: {relative_path}"
+                )
+
+        for relative_path, entry in zip(
+            PROJECTION_ROLLBACK_PATHS,
+            entries,
+            strict=True,
+        ):
+            snapshot = project_fs._snapshot(
+                relative_path,
+                allow_missing=True,
+            )
+            if entry["existed"] is False:
+                if snapshot.exists:
                     raise LocalCoreMigrationError(
-                        f"cannot remove projection path created during failed migration because it is a directory: {relative_path}"
+                        f"projection should be absent after rollback: {relative_path}"
                     )
-                _unlink_projection_file(target)
-                _fsync_directory(target.parent)
-            continue
-        if existed is not True:
-            raise LocalCoreMigrationError(f"invalid projection existence metadata: {relative_path}")
-
-        mode = entry.get("mode")
-        digest = entry.get("sha256")
-        backup_path_value = entry.get("backup_path")
-        if (
-            not isinstance(mode, int)
-            or not 0 <= mode <= 0o7777
-            or not isinstance(digest, str)
-            or len(digest) != 64
-            or not isinstance(backup_path_value, str)
-            or not backup_path_value
-        ):
-            raise LocalCoreMigrationError(f"invalid projection restore metadata: {relative_path}")
-        backup_path = Path(backup_path_value)
-        resolved_backup_path = backup_path.resolve()
-        if (
-            backup_path.is_symlink()
-            or not backup_path.is_file()
-            or not resolved_backup_path.is_relative_to(backup_directory)
-            or _sha256_file(backup_path) != digest
-        ):
-            raise LocalCoreMigrationError(f"projection recovery copy is missing or invalid: {relative_path}")
-
-        if (
-            not target.is_symlink()
-            and target.is_file()
-            and _sha256_file(target) == digest
-            and stat.S_IMODE(target.stat().st_mode) == mode
-        ):
-            continue
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
-        try:
-            shutil.copyfile(backup_path, temporary)
-            # Open while writable, then restore a possibly read-only mode and
-            # flush through the already-write-capable descriptor.  Reopening
-            # with rb+ after chmod fails for valid 0444 projections.
-            with temporary.open("rb+") as handle:
-                os.chmod(temporary, mode)
-                os.fsync(handle.fileno())
-            if target.exists() or target.is_symlink():
-                if target.is_dir() and not target.is_symlink():
-                    raise LocalCoreMigrationError(
-                        f"cannot replace projection rollback target because it is a directory: {relative_path}"
-                    )
-                _make_projection_writable(target)
-            os.replace(temporary, target)
-            _fsync_directory(target.parent)
-        finally:
-            _unlink_projection_file(temporary)
-        if (
-            target.is_symlink()
-            or not target.is_file()
-            or _sha256_file(target) != digest
-            or stat.S_IMODE(target.stat().st_mode) != mode
-        ):
-            raise LocalCoreMigrationError(f"restored projection failed verification: {relative_path}")
-
-    for relative_path, entry in zip(PROJECTION_ROLLBACK_PATHS, entries, strict=True):
-        target = _projection_target(root, relative_path)
-        if entry["existed"] is False:
-            if target.exists() or target.is_symlink():
-                raise LocalCoreMigrationError(f"projection should be absent after rollback: {relative_path}")
-            continue
-        if (
-            target.is_symlink()
-            or not target.is_file()
-            or _sha256_file(target) != entry["sha256"]
-            or stat.S_IMODE(target.stat().st_mode) != entry["mode"]
-        ):
-            raise LocalCoreMigrationError(f"projection rollback bundle failed final verification: {relative_path}")
+                continue
+            if (
+                not snapshot.exists
+                or _safe_file_sha256(project_fs, relative_path)
+                != entry["sha256"]
+                or _safe_file_mode(project_fs, relative_path) != entry["mode"]
+            ):
+                raise LocalCoreMigrationError(
+                    "projection rollback bundle failed final verification: "
+                    f"{relative_path}"
+                )
 
 
 @contextmanager
-def _project_migration_lock(root: Path) -> Iterator[_MigrationGuard]:
-    state_dir = root / ".ai-team/state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "local-core-migration.lock"
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise LocalCoreMigrationError(
-            f"local-core migration lock already exists: {lock_path}; inspect the active migration before retrying"
-        ) from exc
-    try:
+def _project_migration_lock(
+    root: Path,
+) -> Iterator[tuple[_MigrationGuard, ProjectFS]]:
+    relative_lock = Path(".ai-team/state/local-core-migration.lock")
+    with ProjectFS.open(root) as project_fs:
+        root = project_fs.root
+        lock_path = project_fs.absolute(relative_lock)
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "created_at": _timestamp(),
+                "target_schema": SCHEMA30_VERSION,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
         try:
-            payload = json.dumps(
-                {"pid": os.getpid(), "created_at": _timestamp(), "target_schema": SCHEMA30_VERSION},
-                sort_keys=True,
-            ).encode("utf-8")
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
+            project_fs.create_exclusive(
+                relative_lock,
+                payload,
+                mode=0o600,
+            )
+        except FileExistsError as exc:
+            raise LocalCoreMigrationError(
+                f"local-core migration lock already exists: {lock_path}; inspect the active migration before retrying"
+            ) from exc
+        guard = _MigrationGuard(
+            lock_path=lock_path,
+            project_fs=project_fs,
+        )
+        completed = False
+        try:
+            with project_db_operation(
+                root,
+                purpose="migration",
+                project_fs=project_fs,
+            ) as locked_project_fs:
+                yield guard, locked_project_fs
+                completed = True
         finally:
-            os.close(descriptor)
-    except BaseException:
-        lock_path.unlink(missing_ok=True)
-        raise
-    guard = _MigrationGuard(lock_path=lock_path)
-    completed = False
-    try:
-        with project_db_operation(root, purpose="migration"):
-            yield guard
-            completed = True
-    finally:
-        if completed or guard.clear_allowed:
-            lock_path.unlink(missing_ok=True)
-        elif guard.recovery_required:
-            try:
-                payload: dict[str, object] = {
-                    "pid": os.getpid(),
-                    "created_at": _timestamp(),
-                    "target_schema": SCHEMA30_VERSION,
-                    "status": "rollback-incomplete",
-                }
-                if guard.manifest_path is not None:
-                    payload["manifest_path"] = str(guard.manifest_path)
-                _write_json_atomic(
-                    lock_path,
-                    payload,
-                )
-            except BaseException:
-                # The original sentinel is still the fail-closed authority if its
-                # recovery-required metadata cannot be refreshed.
-                pass
-        elif guard.manifest_path is not None:
-            try:
-                _write_json_atomic(
-                    lock_path,
-                    {
+            if completed or guard.clear_allowed:
+                project_fs.unlink_regular(relative_lock, missing_ok=True)
+            elif guard.recovery_required:
+                try:
+                    recovery_payload: dict[str, object] = {
                         "pid": os.getpid(),
                         "created_at": _timestamp(),
                         "target_schema": SCHEMA30_VERSION,
-                        "status": "migration-failed",
-                        "manifest_path": str(guard.manifest_path),
-                    },
-                )
-            except BaseException:
-                # Preserve the original diagnostic sentinel if the richer
-                # pre-activation failure metadata cannot be published.
-                pass
+                        "status": "rollback-incomplete",
+                    }
+                    if guard.manifest_path is not None:
+                        recovery_payload["manifest_path"] = str(
+                            guard.manifest_path
+                        )
+                    _write_json_atomic(
+                        lock_path,
+                        recovery_payload,
+                        project_fs=project_fs,
+                    )
+                except BaseException:
+                    # The exclusive original sentinel remains fail-closed.
+                    pass
+            elif guard.manifest_path is not None:
+                try:
+                    _write_json_atomic(
+                        lock_path,
+                        {
+                            "pid": os.getpid(),
+                            "created_at": _timestamp(),
+                            "target_schema": SCHEMA30_VERSION,
+                            "status": "migration-failed",
+                            "manifest_path": str(guard.manifest_path),
+                        },
+                        project_fs=project_fs,
+                    )
+                except BaseException:
+                    # Preserve the original diagnostic sentinel.
+                    pass
 
 
-def _checkpoint_active_database(active_path: Path) -> None:
+def _checkpoint_active_database(
+    active_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
     """Merge committed WAL pages before source identity and backup are read."""
 
-    with closing(sqlite3.connect(active_path, timeout=5.0)) as conn:
-        conn.execute("pragma busy_timeout = 5000")
-        result = conn.execute("pragma wal_checkpoint(truncate)").fetchone()
+    with _project_fs_scope(
+        _project_root_for_database(active_path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(active_path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        uri = f"{project_fs.absolute(relative).as_uri()}?mode=rw"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            conn.execute("pragma busy_timeout = 5000")
+            project_fs._assert_unchanged(relative, snapshot)
+            result = conn.execute(
+                "pragma wal_checkpoint(truncate)"
+            ).fetchone()
+            project_fs._assert_unchanged(relative, snapshot)
+        project_fs.audit(_database_family(relative), allow_missing=True)
     if result is None or int(result[0]) != 0:
         raise LocalCoreMigrationError(
             f"active database WAL checkpoint did not complete before migration: {result}"
@@ -1569,208 +1947,440 @@ def _finalize_staging_metadata(
     report: LocalCoreStagingReport,
     backup: SQLiteBackupManifest,
     migration_manifest_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
 ) -> None:
-    with closing(sqlite3.connect(staging_path)) as conn:
-        conn.execute("pragma foreign_keys = on")
-        conn.execute("begin immediate")
-        updated = conn.execute(
-            """
-            update migrations
-            set backup_path=?, manifest_path=?, row_counts_json=?, dropped_table_count=?,
-                status='activated', applied_at=?
-            where id=(select max(id) from migrations where to_version=?)
-            """,
-            (
-                backup.backup_path,
-                str(migration_manifest_path),
-                _stable_json(report.staging_row_counts),
-                sum(report.retired_row_counts.values()),
-                _timestamp(),
-                SCHEMA30_VERSION,
-            ),
-        )
-        if updated.rowcount != 1:
-            conn.rollback()
-            raise LocalCoreMigrationError("schema 30 staging database is missing its migration record")
-        conn.execute(
-            """
-            insert into events
-            (id, schema_version, event_type, entity_type, entity_id, actor, command,
-            before_json, after_json, correlation_id, created_at)
-            values (?, ?, 'local_core_migration_activated', 'project', '1', 'root-controller',
-                    'migrate local-core', '{}', ?, lower(hex(randomblob(16))), ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                SCHEMA30_VERSION,
-                _stable_json(
-                    {
-                        "source_version": report.source_version,
-                        "target_version": report.target_version,
-                        "backup_sha256": backup.sha256,
-                    }
+    with _project_fs_scope(
+        _project_root_for_database(staging_path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(staging_path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        uri = f"{project_fs.absolute(relative).as_uri()}?mode=rw"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            project_fs._assert_unchanged(relative, snapshot)
+            conn.execute("pragma foreign_keys = on")
+            conn.execute("begin immediate")
+            updated = conn.execute(
+                """
+                update migrations
+                set backup_path=?, manifest_path=?, row_counts_json=?, dropped_table_count=?,
+                    status='activated', applied_at=?
+                where id=(select max(id) from migrations where to_version=?)
+                """,
+                (
+                    backup.backup_path,
+                    str(migration_manifest_path),
+                    _stable_json(report.staging_row_counts),
+                    sum(report.retired_row_counts.values()),
+                    _timestamp(),
+                    SCHEMA30_VERSION,
                 ),
-                _timestamp(),
-            ),
-        )
-        conn.commit()
-        conn.execute("pragma journal_mode = delete")
-        _validate_staging_database(conn)
-    _fsync_path(staging_path)
-
-
-def _schema30_doctor(path: Path) -> None:
-    uri = f"file:{path.as_posix()}?mode=ro&immutable=1"
-    with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
-        _validate_staging_database(conn)
-        triggers = {
-            str(row[0])
-            for row in conn.execute(
-                "select name from sqlite_master where type='trigger' order by name"
             )
-        }
-        if not {"executions_no_update", "executions_no_delete", "events_no_update", "events_no_delete"}.issubset(triggers):
-            raise LocalCoreMigrationError(f"schema 30 immutable trigger contract is incomplete: {sorted(triggers)}")
-        migration = conn.execute(
-            "select status from migrations where to_version=? order by id desc limit 1",
-            (SCHEMA30_VERSION,),
-        ).fetchone()
-        if migration is None or str(migration[0]) != "activated":
-            raise LocalCoreMigrationError("schema 30 activation record is missing or incomplete")
+            if updated.rowcount != 1:
+                conn.rollback()
+                raise LocalCoreMigrationError(
+                    "schema 30 staging database is missing its migration record"
+                )
+            conn.execute(
+                """
+                insert into events
+                (id, schema_version, event_type, entity_type, entity_id, actor, command,
+                before_json, after_json, correlation_id, created_at)
+                values (?, ?, 'local_core_migration_activated', 'project', '1', 'root-controller',
+                        'migrate local-core', '{}', ?, lower(hex(randomblob(16))), ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    SCHEMA30_VERSION,
+                    _stable_json(
+                        {
+                            "source_version": report.source_version,
+                            "target_version": report.target_version,
+                            "backup_sha256": backup.sha256,
+                        }
+                    ),
+                    _timestamp(),
+                ),
+            )
+            conn.commit()
+            conn.execute("pragma journal_mode = delete")
+            _validate_staging_database(conn)
+            project_fs._assert_unchanged(relative, snapshot)
+        project_fs.audit(_database_family(relative), allow_missing=True)
 
 
-def _database_sidecars(path: Path) -> tuple[Path, Path]:
-    return Path(str(path) + "-wal"), Path(str(path) + "-shm")
+def _schema30_doctor(
+    path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
+    with _project_fs_scope(
+        _project_root_for_database(path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            project_fs._assert_unchanged(relative, snapshot)
+            _validate_staging_database(conn)
+            triggers = {
+                str(row[0])
+                for row in conn.execute(
+                    "select name from sqlite_master where type='trigger' order by name"
+                )
+            }
+            required = {
+                "executions_no_update",
+                "executions_no_delete",
+                "events_no_update",
+                "events_no_delete",
+            }
+            if not required.issubset(triggers):
+                raise LocalCoreMigrationError(
+                    "schema 30 immutable trigger contract is incomplete: "
+                    f"{sorted(triggers)}"
+                )
+            migration = conn.execute(
+                "select status from migrations where to_version=? order by id desc limit 1",
+                (SCHEMA30_VERSION,),
+            ).fetchone()
+            if migration is None or str(migration[0]) != "activated":
+                raise LocalCoreMigrationError(
+                    "schema 30 activation record is missing or incomplete"
+                )
+            project_fs._assert_unchanged(relative, snapshot)
+
+
+def _database_sidecars(path: Path) -> tuple[Path, Path, Path]:
+    return (
+        Path(str(path) + "-wal"),
+        Path(str(path) + "-shm"),
+        Path(str(path) + "-journal"),
+    )
 
 
 def _quarantine_failed_database_sidecars(
     active_path: Path,
     failed_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
 ) -> tuple[Path, ...]:
-    quarantined: list[Path] = []
-    for source, destination in zip(
-        _database_sidecars(active_path),
-        _database_sidecars(failed_path),
-        strict=True,
-    ):
-        if not source.exists() and not source.is_symlink():
-            continue
-        if source.is_symlink() or not source.is_file():
-            raise LocalCoreMigrationError(
-                f"failed schema30 sidecar is not a regular file: {source}"
-            )
-        if destination.exists() or destination.is_symlink():
-            raise LocalCoreMigrationError(
-                f"failed schema30 sidecar quarantine target already exists: {destination}"
-            )
-        os.replace(source, destination)
-        _fsync_directory(destination.parent)
-        if source.exists() or source.is_symlink():
-            raise LocalCoreMigrationError(
-                f"failed schema30 sidecar remained active after quarantine: {source}"
-            )
-        if destination.is_symlink() or not destination.is_file():
-            raise LocalCoreMigrationError(
-                f"failed schema30 sidecar quarantine verification failed: {destination}"
-            )
-        quarantined.append(destination)
-    return tuple(quarantined)
-
-
-def _restore_verified_backup(active_path: Path, backup: SQLiteBackupManifest) -> None:
-    backup_path = Path(backup.backup_path)
-    if not backup_path.is_file() or _sha256_file(backup_path) != backup.sha256:
-        raise LocalCoreMigrationError("verified migration backup is missing or has a digest mismatch")
-    active_sidecars = _database_sidecars(active_path)
-    remaining_sidecars = [
-        str(path) for path in active_sidecars if path.exists() or path.is_symlink()
-    ]
-    if remaining_sidecars:
-        raise LocalCoreMigrationError(
-            "failed schema30 sidecars were not quarantined before authority restore: "
-            + ", ".join(remaining_sidecars)
+    root = _project_root_for_database(active_path)
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        sources = tuple(
+            project_fs.relative_to_root(path)
+            for path in _database_sidecars(active_path)
         )
-    restore_path = active_path.with_name(active_path.name + ".restore")
-    shutil.copyfile(backup_path, restore_path)
-    os.chmod(restore_path, 0o600)
-    _fsync_path(restore_path)
-    os.replace(restore_path, active_path)
-    _fsync_directory(active_path.parent)
-    if _sha256_file(active_path) != backup.sha256:
-        raise LocalCoreMigrationError("restored active database does not match the verified backup digest")
-    uri = f"file:{active_path.as_posix()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
-        integrity = [str(row[0]) for row in conn.execute("pragma integrity_check")]
-        foreign_keys = conn.execute("pragma foreign_key_check").fetchall()
-        version = conn.execute("select schema_version from project where id=1").fetchone()
-    for sidecar in active_sidecars:
-        sidecar.unlink(missing_ok=True)
-    _fsync_directory(active_path.parent)
-    if any(path.exists() or path.is_symlink() for path in active_sidecars):
-        raise LocalCoreMigrationError(
-            "restored database validation left an active WAL/SHM sidecar"
+        destinations = tuple(
+            project_fs.relative_to_root(path)
+            for path in _database_sidecars(failed_path)
         )
-    if integrity != ["ok"] or foreign_keys or version is None or int(version[0]) != backup.source_version:
-        raise LocalCoreMigrationError(
-            "automatic backup restore failed validation: "
-            f"integrity={integrity} foreign_keys={len(foreign_keys)} version={version}"
+        source_snapshots = tuple(
+            project_fs._snapshot(path, allow_missing=True)
+            for path in sources
         )
-
-
-def _preserve_failed_schema30(active_path: Path, failed_path: Path) -> tuple[str, str]:
-    """Best-effort diagnostic preservation that must never block authority restore."""
-
-    try:
-        active_digest = _sha256_file(active_path)
-    except BaseException as digest_exc:
-        return (
-            "failed",
-            f"failed schema30 digest unavailable: {_exception_text(digest_exc)}",
+        destination_snapshots = tuple(
+            project_fs._snapshot(path, allow_missing=True)
+            for path in destinations
         )
-
-    try:
-        os.replace(active_path, failed_path)
-    except BaseException as move_exc:
-        try:
-            shutil.copyfile(active_path, failed_path)
-            os.chmod(failed_path, 0o600)
-            _fsync_path(failed_path)
-            _fsync_directory(failed_path.parent)
-            if _sha256_file(failed_path) != active_digest:
-                raise LocalCoreMigrationError("fallback failed-schema30 copy digest mismatch")
-        except BaseException as copy_exc:
-            cleanup_error = ""
-            try:
-                failed_path.unlink(missing_ok=True)
-            except BaseException as cleanup_exc:
-                cleanup_error = (
-                    "; partial-copy cleanup failed: "
-                    f"{_exception_text(cleanup_exc)}"
+        for destination, snapshot in zip(
+            destinations,
+            destination_snapshots,
+            strict=True,
+        ):
+            if snapshot.exists:
+                raise LocalCoreMigrationError(
+                    "failed schema30 sidecar quarantine target already exists: "
+                    f"{project_fs.absolute(destination)}"
                 )
-            return (
-                "failed",
-                f"atomic move failed: {_exception_text(move_exc)}; "
-                f"fallback copy failed: {_exception_text(copy_exc)}"
-                f"{cleanup_error}",
+
+        quarantined: list[Path] = []
+        for source, destination, source_snapshot in zip(
+            sources,
+            destinations,
+            source_snapshots,
+            strict=True,
+        ):
+            if not source_snapshot.exists:
+                continue
+            project_fs._assert_unchanged(source, source_snapshot)
+            project_fs.replace_file(source, destination)
+            if project_fs._snapshot(source, allow_missing=True).exists:
+                raise LocalCoreMigrationError(
+                    "failed schema30 sidecar remained active after quarantine: "
+                    f"{project_fs.absolute(source)}"
+                )
+            project_fs._snapshot(destination, allow_missing=False)
+            quarantined.append(project_fs.absolute(destination))
+        return tuple(quarantined)
+
+
+def _restore_verified_backup(
+    active_path: Path,
+    backup: SQLiteBackupManifest,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
+    root = _project_root_for_database(active_path)
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        active_relative = project_fs.relative_to_root(active_path)
+        backup_relative = project_fs.relative_to_root(Path(backup.backup_path))
+        restore_relative = active_relative.with_name(
+            active_relative.name + ".restore"
+        )
+        sidecars = _database_family(active_relative)[1:]
+        project_fs._snapshot(backup_relative, allow_missing=False)
+        project_fs._snapshot(active_relative, allow_missing=True)
+        project_fs._snapshot(restore_relative, allow_missing=True)
+        sidecar_snapshots = tuple(
+            project_fs._snapshot(path, allow_missing=True)
+            for path in sidecars
+        )
+        remaining_sidecars = [
+            str(project_fs.absolute(path))
+            for path, snapshot in zip(
+                sidecars,
+                sidecar_snapshots,
+                strict=True,
             )
-        preservation_status = "copied-after-move-failure"
-        preservation_error = _exception_text(move_exc)
-    else:
+            if snapshot.exists
+        ]
+        if remaining_sidecars:
+            raise LocalCoreMigrationError(
+                "failed schema30 sidecars were not quarantined before authority restore: "
+                + ", ".join(remaining_sidecars)
+            )
+
+        backup_payload = project_fs.read_bytes(backup_relative)
+        if hashlib.sha256(backup_payload).hexdigest() != backup.sha256:
+            raise LocalCoreMigrationError(
+                "verified migration backup is missing or has a digest mismatch"
+            )
+        project_fs.atomic_write(
+            restore_relative,
+            backup_payload,
+            mode=0o600,
+        )
+        if _safe_database_digest(project_fs, restore_relative) != backup.sha256:
+            raise LocalCoreMigrationError(
+                "temporary restored database does not match the verified backup digest"
+            )
+        project_fs.replace_file(restore_relative, active_relative)
+        active_snapshot = project_fs._snapshot(
+            active_relative,
+            allow_missing=False,
+        )
+        if _safe_database_digest(project_fs, active_relative) != backup.sha256:
+            raise LocalCoreMigrationError(
+                "restored active database does not match the verified backup digest"
+            )
+        uri = f"{project_fs.absolute(active_relative).as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            integrity = [
+                str(row[0])
+                for row in conn.execute("pragma integrity_check")
+            ]
+            foreign_keys = conn.execute(
+                "pragma foreign_key_check"
+            ).fetchall()
+            version = conn.execute(
+                "select schema_version from project where id=1"
+            ).fetchone()
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
+        for sidecar in sidecars:
+            project_fs.unlink_regular(sidecar, missing_ok=True)
+        if any(
+            project_fs._snapshot(path, allow_missing=True).exists
+            for path in sidecars
+        ):
+            raise LocalCoreMigrationError(
+                "restored database validation left an active WAL/SHM/journal sidecar"
+            )
+        if (
+            integrity != ["ok"]
+            or foreign_keys
+            or version is None
+            or int(version[0]) != backup.source_version
+        ):
+            raise LocalCoreMigrationError(
+                "automatic backup restore failed validation: "
+                f"integrity={integrity} "
+                f"foreign_keys={len(foreign_keys)} version={version}"
+            )
+
+
+def _diagnostic_database_digest(
+    project_fs: ProjectFS,
+    relative: Path,
+) -> str:
+    return _safe_database_digest(project_fs, relative)
+
+
+def _move_failed_schema30(
+    project_fs: ProjectFS,
+    source: Path,
+    destination: Path,
+) -> None:
+    project_fs.replace_file(source, destination)
+
+
+def _copy_failed_schema30(
+    project_fs: ProjectFS,
+    source: Path,
+    destination: Path,
+) -> None:
+    project_fs.atomic_write(
+        destination,
+        project_fs.read_bytes(source),
+        mode=0o600,
+    )
+
+
+def _cleanup_failed_schema30(
+    project_fs: ProjectFS,
+    relative: Path,
+) -> None:
+    project_fs.unlink_regular(relative, missing_ok=True)
+
+
+def _preserve_failed_schema30(
+    active_path: Path,
+    failed_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> tuple[str, str]:
+    """Best-effort diagnostic preservation that must never block authority restore."""
+    root = _project_root_for_database(active_path)
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        active_relative = project_fs.relative_to_root(active_path)
+        failed_relative = project_fs.relative_to_root(failed_path)
+        active_snapshot = project_fs._snapshot(
+            active_relative,
+            allow_missing=False,
+        )
+        failed_snapshot = project_fs._snapshot(
+            failed_relative,
+            allow_missing=True,
+        )
+        if failed_snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"failed schema30 destination already exists: {failed_path}"
+            )
+        for source, destination in zip(
+            _database_family(active_relative)[1:],
+            _database_family(failed_relative)[1:],
+            strict=True,
+        ):
+            project_fs._snapshot(source, allow_missing=True)
+            destination_snapshot = project_fs._snapshot(
+                destination,
+                allow_missing=True,
+            )
+            if destination_snapshot.exists:
+                raise LocalCoreMigrationError(
+                    "failed schema30 sidecar quarantine target already exists: "
+                    f"{project_fs.absolute(destination)}"
+                )
+
         try:
-            _fsync_directory(failed_path.parent)
-            if _sha256_file(failed_path) != active_digest:
-                raise LocalCoreMigrationError("moved failed-schema30 digest mismatch")
-        except BaseException as verify_exc:
+            active_digest = _diagnostic_database_digest(
+                project_fs,
+                active_relative,
+            )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
+        except ProjectPathSafetyError:
+            raise
+        except BaseException as digest_exc:
             return (
                 "failed",
-                "atomic move completed but verification failed: "
-                f"{_exception_text(verify_exc)}",
+                "failed schema30 digest unavailable: "
+                f"{_exception_text(digest_exc)}",
             )
-        preservation_status = "moved"
-        preservation_error = ""
+
+        try:
+            _move_failed_schema30(
+                project_fs,
+                active_relative,
+                failed_relative,
+            )
+        except ProjectPathSafetyError:
+            raise
+        except BaseException as move_exc:
+            try:
+                _copy_failed_schema30(
+                    project_fs,
+                    active_relative,
+                    failed_relative,
+                )
+                if (
+                    _diagnostic_database_digest(
+                        project_fs,
+                        failed_relative,
+                    )
+                    != active_digest
+                ):
+                    raise LocalCoreMigrationError(
+                        "fallback failed-schema30 copy digest mismatch"
+                    )
+            except ProjectPathSafetyError:
+                raise
+            except BaseException as copy_exc:
+                cleanup_error = ""
+                try:
+                    _cleanup_failed_schema30(
+                        project_fs,
+                        failed_relative,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_error = (
+                        "; partial-copy cleanup failed: "
+                        f"{_exception_text(cleanup_exc)}"
+                    )
+                return (
+                    "failed",
+                    f"atomic move failed: {_exception_text(move_exc)}; "
+                    f"fallback copy failed: {_exception_text(copy_exc)}"
+                    f"{cleanup_error}",
+                )
+            preservation_status = "copied-after-move-failure"
+            preservation_error = _exception_text(move_exc)
+        else:
+            try:
+                if (
+                    _diagnostic_database_digest(
+                        project_fs,
+                        failed_relative,
+                    )
+                    != active_digest
+                ):
+                    raise LocalCoreMigrationError(
+                        "moved failed-schema30 digest mismatch"
+                    )
+            except BaseException as verify_exc:
+                return (
+                    "failed",
+                    "atomic move completed but verification failed: "
+                    f"{_exception_text(verify_exc)}",
+                )
+            preservation_status = "moved"
+            preservation_error = ""
 
     try:
-        _quarantine_failed_database_sidecars(active_path, failed_path)
+        _quarantine_failed_database_sidecars(
+            active_path,
+            failed_path,
+            pinned_fs=pinned_fs,
+        )
     except BaseException as sidecar_exc:
         return (
             "failed",
@@ -1781,14 +2391,41 @@ def _preserve_failed_schema30(active_path: Path, failed_path: Path) -> tuple[str
     return preservation_status, preservation_error
 
 
-def _remove_empty_active_sidecars(active_path: Path) -> None:
-    wal_path, shm_path = _database_sidecars(active_path)
-    if wal_path.exists() and wal_path.stat().st_size > 0:
-        raise LocalCoreMigrationError(
-            "active database has a non-empty WAL; stop project writers and checkpoint SQLite before activation"
-        )
-    wal_path.unlink(missing_ok=True)
-    shm_path.unlink(missing_ok=True)
+def _remove_empty_active_sidecars(
+    active_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
+    with _project_fs_scope(
+        _project_root_for_database(active_path),
+        pinned_fs,
+    ) as project_fs:
+        active_relative = project_fs.relative_to_root(active_path)
+        sidecars = _database_family(active_relative)[1:]
+        for index, sidecar in enumerate(sidecars):
+            snapshot = project_fs._snapshot(sidecar, allow_missing=True)
+            if not snapshot.exists:
+                continue
+            # A checkpointed WAL and rollback journal must be empty.  SQLite's
+            # shared-memory index is expected to remain non-empty after a
+            # successful checkpoint and is safe to remove once all handles
+            # are closed.
+            if index != 1 and project_fs.read_bytes(sidecar):
+                raise LocalCoreMigrationError(
+                    "active database has a non-empty SQLite sidecar; "
+                    "stop project writers and checkpoint SQLite before activation: "
+                    f"{project_fs.absolute(sidecar)}"
+                )
+        for sidecar in sidecars:
+            project_fs.unlink_regular(sidecar, missing_ok=True)
+
+
+def _activate_staging_database(
+    project_fs: ProjectFS,
+    staging_relative: Path,
+    active_relative: Path,
+) -> None:
+    project_fs.replace_file(staging_relative, active_relative)
 
 
 def migrate_project_to_schema30(
@@ -1808,27 +2445,67 @@ def migrate_project_to_schema30(
         raise LocalCoreMigrationError(
             f"unknown migration failure point {fail_at!r}; expected one of {sorted(MIGRATION_FAILURE_POINTS)}"
         )
-    root = root.resolve()
-    active_path = root / ".ai-team/state/harness.db"
-    if not active_path.is_file():
-        raise LocalCoreMigrationError(f"runtime database is missing: {active_path}")
-
-    with _project_migration_lock(root) as migration_guard:
-        _checkpoint_active_database(active_path)
-        source_version = _read_source_version(active_path)
+    active_relative = Path(".ai-team/state/harness.db")
+    with _project_migration_lock(root) as (
+        migration_guard,
+        project_fs,
+    ):
+        root = project_fs.root
+        active_path = project_fs.absolute(active_relative)
+        active_snapshot = project_fs._snapshot(
+            active_relative,
+            allow_missing=True,
+        )
+        if not active_snapshot.exists:
+            migration_guard.mark_safe()
+            raise LocalCoreMigrationError(
+                f"runtime database is missing: {active_path}"
+            )
+        project_fs.audit(
+            _database_family(active_relative),
+            allow_missing=True,
+        )
+        _checkpoint_active_database(
+            active_path,
+            pinned_fs=project_fs,
+        )
+        source_version = _read_source_version(
+            active_path,
+            pinned_fs=project_fs,
+        )
         if source_version not in {27, 28, 29}:
+            migration_guard.mark_safe()
             raise LocalCoreMigrationError(
                 f"unsupported local-core migration source schema {source_version}"
             )
-        source_fingerprint = _database_fingerprint(active_path)
+        source_fingerprint = _safe_database_fingerprint(
+            project_fs,
+            active_relative,
+        )
         backup = backup_sqlite_database(
             root,
             source_path=active_path,
             expected_source_version=source_version,
+            project_fs=project_fs,
         )
         backup_dir = Path(backup.backup_path).parent
         staging_path = backup_dir / "harness.schema30.new.db"
         migration_manifest_path = backup_dir / "migration-manifest.json"
+        backup_relative = project_fs.relative_to_root(backup_dir)
+        staging_relative = project_fs.relative_to_root(staging_path)
+        manifest_relative = project_fs.relative_to_root(
+            migration_manifest_path
+        )
+        project_fs.audit_directory(backup_relative, allow_missing=False)
+        project_fs.audit(
+            (
+                staging_relative,
+                *(_database_family(staging_relative)[1:]),
+                manifest_relative,
+                manifest_relative.with_name(manifest_relative.name + ".tmp"),
+            ),
+            allow_missing=True,
+        )
         manifest_payload: dict[str, object] = {
             "status": "backup-created",
             "source_version": source_version,
@@ -1838,18 +2515,34 @@ def migrate_project_to_schema30(
             "projection_restore_status": "not-needed",
             "failure_point": fail_at or "",
         }
-        _write_json_atomic(migration_manifest_path, manifest_payload)
+        _write_json_atomic(
+            migration_manifest_path,
+            manifest_payload,
+            project_fs=project_fs,
+        )
         migration_guard.record_manifest(migration_manifest_path)
         try:
-            projection_backup = _create_projection_backup(root, backup_dir)
-        except Exception as exc:
+            projection_backup = _create_projection_backup(
+                root,
+                backup_dir,
+                pinned_fs=project_fs,
+            )
+        except BaseException as exc:
             manifest_payload["status"] = "failed-before-activation"
-            manifest_payload["error"] = str(exc)
+            manifest_payload["error"] = _exception_text(exc)
             manifest_payload["projection_backup"] = {"status": "failed"}
-            _write_json_atomic(migration_manifest_path, manifest_payload)
+            _write_json_atomic(
+                migration_manifest_path,
+                manifest_payload,
+                project_fs=project_fs,
+            )
             raise
         manifest_payload["projection_backup"] = projection_backup
-        _write_json_atomic(migration_manifest_path, manifest_payload)
+        _write_json_atomic(
+            migration_manifest_path,
+            manifest_payload,
+            project_fs=project_fs,
+        )
         activated = False
         activation_attempted = False
         expected_active_sha256 = ""
@@ -1861,32 +2554,79 @@ def migrate_project_to_schema30(
                 staging_path,
                 project_root=root,
                 fail_at=fail_at,
+                pinned_fs=project_fs,
             )
             manifest_payload["staging"] = asdict(report)
             manifest_payload["status"] = "staged"
-            _write_json_atomic(migration_manifest_path, manifest_payload)
+            _write_json_atomic(
+                migration_manifest_path,
+                manifest_payload,
+                project_fs=project_fs,
+            )
             _finalize_staging_metadata(
                 staging_path,
                 report,
                 backup,
                 migration_manifest_path,
+                pinned_fs=project_fs,
             )
             if staging_validator:
                 staging_validator(staging_path)
-            if _database_fingerprint(active_path) != source_fingerprint:
-                raise LocalCoreMigrationError("active source changed after staging and before activation")
+            if (
+                _safe_database_fingerprint(project_fs, active_relative)
+                != source_fingerprint
+            ):
+                raise LocalCoreMigrationError(
+                    "active source changed after staging and before activation"
+                )
             _inject_failure(fail_at, "before_atomic_replace")
-            _remove_empty_active_sidecars(active_path)
-            expected_active_sha256 = _sha256_file(staging_path)
+            _remove_empty_active_sidecars(
+                active_path,
+                pinned_fs=project_fs,
+            )
+            staging_snapshot = project_fs._snapshot(
+                staging_relative,
+                allow_missing=False,
+            )
+            expected_active_sha256 = _safe_database_digest(
+                project_fs,
+                staging_relative,
+            )
+            project_fs._assert_unchanged(
+                staging_relative,
+                staging_snapshot,
+            )
             migration_guard.require_recovery(migration_manifest_path)
             activation_attempted = True
-            os.replace(staging_path, active_path)
+            _activate_staging_database(
+                project_fs,
+                staging_relative,
+                active_relative,
+            )
             activated = True
-            _fsync_directory(active_path.parent)
             _inject_failure(fail_at, "after_atomic_replace")
-            _schema30_doctor(active_path)
-            with closing(sqlite3.connect(active_path, timeout=5.0)) as callback_prep:
-                journal_mode = callback_prep.execute("pragma journal_mode=wal").fetchone()
+            _schema30_doctor(active_path, pinned_fs=project_fs)
+            active_snapshot = project_fs._snapshot(
+                active_relative,
+                allow_missing=False,
+            )
+            project_fs.audit(
+                _database_family(active_relative),
+                allow_missing=True,
+            )
+            active_uri = (
+                f"{project_fs.absolute(active_relative).as_uri()}?mode=rw"
+            )
+            with closing(
+                sqlite3.connect(active_uri, uri=True, timeout=5.0)
+            ) as callback_prep:
+                project_fs._assert_unchanged(
+                    active_relative,
+                    active_snapshot,
+                )
+                journal_mode = callback_prep.execute(
+                    "pragma journal_mode=wal"
+                ).fetchone()
                 if journal_mode is None or str(journal_mode[0]).lower() != "wal":
                     raise LocalCoreMigrationError(
                         f"cannot stabilize callback database journal mode: {journal_mode}"
@@ -1898,15 +2638,29 @@ def migrate_project_to_schema30(
                     raise LocalCoreMigrationError(
                         f"cannot stabilize callback database WAL: {checkpoint}"
                     )
-            pre_callback_fingerprint = _database_fingerprint(active_path)
+                project_fs._assert_unchanged(
+                    active_relative,
+                    active_snapshot,
+                )
+            project_fs.audit(
+                _database_family(active_relative),
+                allow_missing=True,
+            )
+            pre_callback_fingerprint = _safe_database_fingerprint(
+                project_fs,
+                active_relative,
+            )
             if active_validator:
                 active_validator(active_path)
-            post_callback_fingerprint = _database_fingerprint(active_path)
+            post_callback_fingerprint = _safe_database_fingerprint(
+                project_fs,
+                active_relative,
+            )
             if post_callback_fingerprint != pre_callback_fingerprint:
                 raise LocalCoreMigrationError(
                     "projection callback mutated the active database authority"
                 )
-            _schema30_doctor(active_path)
+            _schema30_doctor(active_path, pinned_fs=project_fs)
             from core.projections import projection_content_issues
 
             projection_issues = projection_content_issues(root)
@@ -1915,57 +2669,106 @@ def migrate_project_to_schema30(
                     "post-activation projection content verification failed: "
                     + "; ".join(projection_issues)
                 )
+            active_sha256 = _safe_database_digest(
+                project_fs,
+                active_relative,
+            )
             manifest_payload["status"] = "activated"
-            manifest_payload["active_sha256"] = _sha256_file(active_path)
-            _write_json_atomic(migration_manifest_path, manifest_payload)
+            manifest_payload["active_sha256"] = active_sha256
+            _write_json_atomic(
+                migration_manifest_path,
+                manifest_payload,
+                project_fs=project_fs,
+            )
+            assert report is not None
             return LocalCoreMigrationResult(
                 source_version=source_version,
                 target_version=SCHEMA30_VERSION,
                 active_path=str(active_path),
-                active_sha256=_sha256_file(active_path),
+                active_sha256=active_sha256,
                 backup=backup,
                 staging=report,
                 migration_manifest_path=str(migration_manifest_path),
             )
         except BaseException as exc:
             primary_error = _exception_text(exc)
-            if (
-                not activated
-                and activation_attempted
-                and active_path.is_file()
-                and not staging_path.exists()
-            ):
-                activated = True
+            if not activated and activation_attempted:
                 try:
-                    active_digest = _sha256_file(active_path)
+                    active_exists = project_fs._snapshot(
+                        active_relative,
+                        allow_missing=True,
+                    ).exists
+                    staging_exists = project_fs._snapshot(
+                        staging_relative,
+                        allow_missing=True,
+                    ).exists
                 except BaseException as detection_exc:
+                    activated = True
                     manifest_payload["activation_detection_status"] = (
-                        "staging-missing-active-digest-unavailable"
+                        "activation-state-unsafe-assume-replacement"
                     )
                     manifest_payload["activation_detection_error"] = _exception_text(
                         detection_exc
                     )
                 else:
-                    manifest_payload["activation_detection_status"] = (
-                        "matched-staging-digest"
-                        if active_digest == expected_active_sha256
-                        else "staging-missing-active-digest-mismatch"
-                    )
+                    activated = active_exists and not staging_exists
+                if activated and "activation_detection_status" not in manifest_payload:
+                    activated = True
+                    try:
+                        active_digest = _safe_database_digest(
+                            project_fs,
+                            active_relative,
+                        )
+                    except BaseException as detection_exc:
+                        manifest_payload["activation_detection_status"] = (
+                            "staging-missing-active-digest-unavailable"
+                        )
+                        manifest_payload["activation_detection_error"] = (
+                            _exception_text(detection_exc)
+                        )
+                    else:
+                        manifest_payload["activation_detection_status"] = (
+                            "matched-staging-digest"
+                            if active_digest == expected_active_sha256
+                            else "staging-missing-active-digest-mismatch"
+                        )
             if activated:
                 migration_guard.require_recovery(migration_manifest_path)
                 failed_path = backup_dir / "harness.schema30.failed-after-activation.db"
-                if failed_path.exists():
-                    failed_path = backup_dir / f"harness.schema30.failed-after-activation-{uuid.uuid4().hex[:8]}.db"
-                preservation_status, preservation_error = _preserve_failed_schema30(
-                    active_path,
-                    failed_path,
-                )
+                try:
+                    failed_relative = project_fs.relative_to_root(failed_path)
+                    while project_fs._snapshot(
+                        failed_relative,
+                        allow_missing=True,
+                    ).exists:
+                        failed_path = backup_dir / (
+                            "harness.schema30.failed-after-activation-"
+                            f"{uuid.uuid4().hex[:8]}.db"
+                        )
+                        failed_relative = project_fs.relative_to_root(
+                            failed_path
+                        )
+                    (
+                        preservation_status,
+                        preservation_error,
+                    ) = _preserve_failed_schema30(
+                        active_path,
+                        failed_path,
+                        pinned_fs=project_fs,
+                    )
+                except Exception as preserve_exc:
+                    preservation_status = "failed"
+                    preservation_error = _exception_text(preserve_exc)
                 manifest_payload["failed_schema30_preservation_status"] = preservation_status
                 manifest_payload["failed_schema30_path"] = str(failed_path)
                 if preservation_error:
                     manifest_payload["failed_schema30_preservation_error"] = preservation_error
                 try:
-                    _restore_verified_backup(active_path, backup)
+                    _restore_verified_backup(
+                        active_path,
+                        backup,
+                        pinned_fs=project_fs,
+                    )
                 except BaseException as restore_exc:
                     restore_error = _exception_text(restore_exc)
                     manifest_payload["status"] = "rollback-incomplete"
@@ -1976,21 +2779,33 @@ def migrate_project_to_schema30(
                         "not attempted because database restore failed"
                     )
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    _write_json_atomic(
+                        migration_manifest_path,
+                        manifest_payload,
+                        project_fs=project_fs,
+                    )
                     raise LocalCoreMigrationError(
                         f"migration failed after activation and database rollback failed: {restore_error}"
                         f"; recovery manifest: {migration_manifest_path}"
                     ) from restore_exc
                 manifest_payload["database_restore_status"] = "restored"
                 try:
-                    _restore_projection_backup(root, projection_backup)
+                    _restore_projection_backup(
+                        root,
+                        projection_backup,
+                        pinned_fs=project_fs,
+                    )
                 except BaseException as restore_exc:
                     restore_error = _exception_text(restore_exc)
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["projection_restore_status"] = "failed"
                     manifest_payload["projection_restore_error"] = restore_error
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    _write_json_atomic(
+                        migration_manifest_path,
+                        manifest_payload,
+                        project_fs=project_fs,
+                    )
                     raise LocalCoreMigrationError(
                         f"{primary_error}; database restored but projection restore failed: {restore_error}"
                         f"; recovery manifest: {migration_manifest_path}"
@@ -2000,27 +2815,80 @@ def migrate_project_to_schema30(
                 if preservation_status == "failed":
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    _write_json_atomic(
+                        migration_manifest_path,
+                        manifest_payload,
+                        project_fs=project_fs,
+                    )
                     raise LocalCoreMigrationError(
                         f"{primary_error}; database and projections restored but failed schema30 diagnostic "
                         f"preservation was incomplete: {preservation_error}; "
                         f"recovery manifest: {migration_manifest_path}"
                     ) from exc
             else:
-                if staging_path.exists():
-                    failed_path = backup_dir / "harness.schema30.failed-before-activation.db"
-                    os.replace(staging_path, failed_path)
-                    manifest_payload["failed_schema30_path"] = str(failed_path)
-                if _database_fingerprint(active_path) != source_fingerprint:
+                try:
+                    staging_exists = project_fs._snapshot(
+                        staging_relative,
+                        allow_missing=True,
+                    ).exists
+                    if staging_exists:
+                        failed_path = backup_dir / (
+                            "harness.schema30.failed-before-activation.db"
+                        )
+                        failed_relative = project_fs.relative_to_root(
+                            failed_path
+                        )
+                        if project_fs._snapshot(
+                            failed_relative,
+                            allow_missing=True,
+                        ).exists:
+                            failed_path = backup_dir / (
+                                "harness.schema30.failed-before-activation-"
+                                f"{uuid.uuid4().hex[:8]}.db"
+                            )
+                            failed_relative = project_fs.relative_to_root(
+                                failed_path
+                            )
+                        project_fs.replace_file(
+                            staging_relative,
+                            failed_relative,
+                        )
+                        _quarantine_failed_database_sidecars(
+                            staging_path,
+                            failed_path,
+                            pinned_fs=project_fs,
+                        )
+                        manifest_payload["failed_schema30_path"] = str(
+                            failed_path
+                        )
+                except BaseException as preservation_exc:
+                    manifest_payload[
+                        "failed_schema30_preservation_status"
+                    ] = "failed"
+                    manifest_payload[
+                        "failed_schema30_preservation_error"
+                    ] = _exception_text(preservation_exc)
+                if (
+                    _safe_database_fingerprint(project_fs, active_relative)
+                    != source_fingerprint
+                ):
                     manifest_payload["status"] = "source-changed-before-activation"
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    _write_json_atomic(
+                        migration_manifest_path,
+                        manifest_payload,
+                        project_fs=project_fs,
+                    )
                     raise LocalCoreMigrationError(
                         "active source changed before activation; refusing to overwrite concurrent facts"
                     ) from exc
                 manifest_payload["database_restore_status"] = "unchanged-verified"
                 try:
-                    _restore_projection_backup(root, projection_backup)
+                    _restore_projection_backup(
+                        root,
+                        projection_backup,
+                        pinned_fs=project_fs,
+                    )
                 except BaseException as restore_exc:
                     restore_error = _exception_text(restore_exc)
                     migration_guard.require_recovery(migration_manifest_path)
@@ -2028,7 +2896,11 @@ def migrate_project_to_schema30(
                     manifest_payload["projection_restore_status"] = "failed"
                     manifest_payload["projection_restore_error"] = restore_error
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(migration_manifest_path, manifest_payload)
+                    _write_json_atomic(
+                        migration_manifest_path,
+                        manifest_payload,
+                        project_fs=project_fs,
+                    )
                     raise LocalCoreMigrationError(
                         f"{primary_error}; pre-activation projection rollback failed: "
                         f"{restore_error}; recovery manifest: {migration_manifest_path}"
@@ -2036,7 +2908,11 @@ def migrate_project_to_schema30(
                 manifest_payload["projection_restore_status"] = "restored"
                 manifest_payload["status"] = "failed-before-activation"
             manifest_payload["error"] = primary_error
-            _write_json_atomic(migration_manifest_path, manifest_payload)
+            _write_json_atomic(
+                migration_manifest_path,
+                manifest_payload,
+                project_fs=project_fs,
+            )
             if manifest_payload["status"] in {"rolled-back", "failed-before-activation"}:
                 migration_guard.mark_safe()
             raise

@@ -19,7 +19,12 @@ from typing import Callable, Hashable, Iterator, Protocol
 
 from harness_lib import ensure_parent
 from .errors import HarnessError
-from .project_fs import ProjectFS, ProjectPathSafetyError, _PathSnapshot
+from .project_fs import (
+    ProjectFS,
+    ProjectPathSafetyError,
+    _PathSnapshot,
+    pin_project_filesystem,
+)
 
 if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
     import msvcrt
@@ -244,6 +249,7 @@ def project_db_operation(
     *,
     purpose: str = "normal",
     timeout: float = DEFAULT_OPERATION_LOCK_TIMEOUT,
+    project_fs: ProjectFS | None = None,
 ) -> Iterator[ProjectFS]:
     """Serialize a complete file-backed DB operation or local-core migration."""
 
@@ -252,13 +258,16 @@ def project_db_operation(
     if timeout <= 0:
         raise ValueError("project DB operation timeout must be positive")
 
-    project_fs = ProjectFS.open(root)
+    owns_project_fs = project_fs is None
+    if project_fs is None:
+        project_fs = ProjectFS.open(root)
     lock_path = project_fs.absolute(OPERATION_LOCK_PATH)
     key = _operation_key(project_fs)
     held = _thread_operations()
     current = held.get(key)
     if current is not None:
-        project_fs.close()
+        if owns_project_fs:
+            project_fs.close()
         current_purpose = str(current["purpose"])
         if current_purpose == "normal" and purpose == "migration":
             raise ProjectOperationLockError(
@@ -275,13 +284,15 @@ def project_db_operation(
         try:
             _raise_if_migration_announced(project_fs)
         except BaseException:
-            project_fs.close()
+            if owns_project_fs:
+                project_fs.close()
             raise
 
     deadline = time.monotonic() + timeout
     local_lock = _local_lock(key)
     if not local_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-        project_fs.close()
+        if owns_project_fs:
+            project_fs.close()
         raise ProjectOperationLockError(
             "project-db-operation-timeout: could not enter the process-local operation lock "
             f"for {lock_path} within {timeout:.1f} seconds"
@@ -304,7 +315,8 @@ def project_db_operation(
             "fs": project_fs,
         }
         try:
-            yield project_fs
+            with pin_project_filesystem(project_fs):
+                yield project_fs
         finally:
             held.pop(key, None)
     finally:
@@ -322,7 +334,8 @@ def project_db_operation(
                 try:
                     local_lock.release()
                 finally:
-                    project_fs.close()
+                    if owns_project_fs:
+                        project_fs.close()
 
 
 class Store(Protocol):

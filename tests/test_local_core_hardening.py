@@ -749,11 +749,14 @@ class MigrationOperationLockTests(unittest.TestCase):
             writer_result = self.context.Queue()
             original_remove_sidecars = local_core_migration._remove_empty_active_sidecars
 
-            def pause_after_fingerprint(active_path: Path) -> None:
+            def pause_after_fingerprint(
+                active_path: Path,
+                **kwargs: object,
+            ) -> None:
                 replace_window.set()
                 if not writer_finished.wait(10):
                     raise RuntimeError("writer did not finish inside replace-window probe")
-                original_remove_sidecars(active_path)
+                original_remove_sidecars(active_path, **kwargs)
 
             writer = self.context.Process(
                 target=_late_writer,

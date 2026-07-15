@@ -1172,6 +1172,215 @@ class ProjectFSContractRedTests(unittest.TestCase):
                 project_fs(root).atomic_write(Path("junction/result.txt"), b"unsafe")
             self.assertFalse((outside / "result.txt").exists())
 
+    @unittest.skipUnless(os.name == "nt", "Windows handle-publish contract")
+    def test_windows_replace_pins_exact_source_handle_through_publish(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "staging.db"
+            destination = root / "active.db"
+            parked = root / "parked.db"
+            source.write_bytes(b"verified-staging\n")
+            destination.write_bytes(b"previous-active\n")
+            original_hook = project_fs_module._before_windows_handle_rename
+            attacker_errors: list[BaseException] = []
+            attacker_done = threading.Event()
+
+            def attack_source_path() -> None:
+                try:
+                    os.replace(source, parked)
+                    source.write_bytes(b"substituted-staging\n")
+                except BaseException as exc:
+                    attacker_errors.append(exc)
+                finally:
+                    attacker_done.set()
+
+            def race_while_handle_is_pinned(_backend, relative: Path, _destination: Path) -> None:
+                if relative != Path("staging.db"):
+                    return
+                attacker = threading.Thread(target=attack_source_path)
+                attacker.start()
+                if not attacker_done.wait(5):
+                    raise AssertionError("Windows source-path attacker did not finish")
+                attacker.join(5)
+                if attacker.is_alive():
+                    raise AssertionError("Windows source-path attacker remained alive")
+
+            project_fs_module._before_windows_handle_rename = race_while_handle_is_pinned
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_handle_rename",
+                original_hook,
+            )
+
+            project_fs(root).replace_file(
+                Path("staging.db"),
+                Path("active.db"),
+            )
+
+            self.assertTrue(attacker_errors)
+            self.assertIsInstance(attacker_errors[0], OSError)
+            self.assertEqual(destination.read_bytes(), b"verified-staging\n")
+            self.assertFalse(source.exists())
+            self.assertFalse(parked.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-publish contract")
+    def test_windows_missing_target_race_fails_without_overwrite_or_temp(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "new-canonical.txt"
+            original_hook = project_fs_module._before_windows_handle_rename
+
+            def create_raced_target(
+                _backend,
+                _source: Path,
+                destination: Path,
+            ) -> None:
+                if destination == Path("new-canonical.txt"):
+                    target.write_bytes(b"raced-authority\n")
+
+            project_fs_module._before_windows_handle_rename = create_raced_target
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_handle_rename",
+                original_hook,
+            )
+
+            with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                project_fs(root).atomic_write(
+                    Path("new-canonical.txt"),
+                    b"must-not-overwrite\n",
+                )
+
+            self.assertEqual(target.read_bytes(), b"raced-authority\n")
+            self.assertEqual(
+                tuple(root.glob(".new-canonical.txt.kafa-*.tmp")),
+                (),
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-publish contract")
+    def test_windows_temp_hardlink_race_fails_before_publication(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "canonical.txt"
+            outside_alias = root.parent / f"{root.name}-temp-alias.txt"
+            target.write_bytes(b"previous-canonical\n")
+            original_hook = project_fs_module._before_windows_handle_rename
+
+            def hardlink_owned_temp(
+                _backend,
+                source: Path,
+                destination: Path,
+            ) -> None:
+                if destination == Path("canonical.txt"):
+                    os.link(root / source, outside_alias)
+
+            project_fs_module._before_windows_handle_rename = hardlink_owned_temp
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_handle_rename",
+                original_hook,
+            )
+            self.addCleanup(outside_alias.unlink, missing_ok=True)
+
+            with self.assertRaisesRegex(Exception, "hard-linked-target"):
+                project_fs(root).atomic_write(
+                    Path("canonical.txt"),
+                    b"must-not-publish\n",
+                )
+
+            self.assertEqual(target.read_bytes(), b"previous-canonical\n")
+            self.assertEqual(
+                tuple(root.glob(".canonical.txt.kafa-*.tmp")),
+                (),
+            )
+            self.assertEqual(outside_alias.read_bytes(), b"must-not-publish\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-delete contract")
+    def test_windows_unlink_hardlink_race_fails_before_delete(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            root.mkdir()
+            target = root / "retired.txt"
+            outside_alias = base / "outside-alias.txt"
+            target.write_bytes(b"must-remain-after-race\n")
+            original_hook = project_fs_module._before_windows_handle_delete
+
+            def hardlink_before_delete(_backend, relative: Path) -> None:
+                if relative == Path("retired.txt"):
+                    os.link(target, outside_alias)
+
+            project_fs_module._before_windows_handle_delete = hardlink_before_delete
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_handle_delete",
+                original_hook,
+            )
+
+            with self.assertRaisesRegex(Exception, "hard-linked-target"):
+                project_fs(root).unlink_regular(Path("retired.txt"))
+
+            self.assertEqual(target.read_bytes(), b"must-remain-after-race\n")
+            self.assertEqual(outside_alias.read_bytes(), b"must-remain-after-race\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows pinned-directory contract")
+    def test_windows_directory_create_holds_parent_against_replacement(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            parent = root / "backups"
+            parent.mkdir(parents=True)
+            parked = base / "parked-backups"
+            original_hook = project_fs_module._before_windows_directory_create
+            attacker_errors: list[BaseException] = []
+
+            def attempt_parent_replace() -> None:
+                try:
+                    os.replace(parent, parked)
+                except BaseException as exc:
+                    attacker_errors.append(exc)
+
+            def race_parent(_backend, relative: Path) -> None:
+                if relative.parent != Path("backups"):
+                    return
+                attacker = threading.Thread(target=attempt_parent_replace)
+                attacker.start()
+                attacker.join(5)
+                if attacker.is_alive():
+                    raise AssertionError("Windows parent attacker remained alive")
+
+            project_fs_module._before_windows_directory_create = race_parent
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_directory_create",
+                original_hook,
+            )
+
+            created = project_fs(root).create_unique_directory(
+                Path("backups"),
+                "schema-",
+            )
+
+            self.assertTrue(attacker_errors)
+            self.assertIsInstance(attacker_errors[0], OSError)
+            self.assertTrue((root / created).is_dir())
+            self.assertFalse(parked.exists())
+
 
 class ProjectFSFoundationTests(unittest.TestCase):
     def test_safe_read_write_copy_lock_unique_directory_and_unlink(self) -> None:
@@ -1197,6 +1406,17 @@ class ProjectFSFoundationTests(unittest.TestCase):
                     os.close(descriptor)
                 unique = fs.create_unique_directory(Path("backups"), "schema-")
                 fs.audit_directory(unique, allow_missing=False)
+                fs.create_directory_exclusive(Path("staging/exclusive-dir"))
+                fs.atomic_write(Path("staging/source.db"), b"database\n")
+                fs.replace_file(
+                    Path("staging/source.db"),
+                    Path("state/activated.db"),
+                )
+                self.assertEqual(
+                    fs.read_bytes(Path("state/activated.db")),
+                    b"database\n",
+                )
+                fs.remove_empty_directory(Path("staging/exclusive-dir"))
                 fs.unlink_regular(Path("state/copy.txt"))
                 fs.audit((Path("state/copy.txt"),), allow_missing=True)
 
@@ -1226,6 +1446,83 @@ class ProjectFSFoundationTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "platform-safety-unavailable"):
                 _WindowsBackend(root, api=UnavailableWindowsApi())
             self.assertEqual(tuple(root.iterdir()), before)
+
+    def test_windows_rename_error_mapping_distinguishes_capability_and_race(self) -> None:
+        from core.project_fs import _windows_rename_error_reason
+
+        for code in (1, 50, 87, 120, 124):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    _windows_rename_error_reason(OSError(code, "unsupported")),
+                    "platform-safety-unavailable",
+                )
+        for code in (5, 32, 80, 183):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    _windows_rename_error_reason(OSError(code, "race")),
+                    "path-identity-changed",
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows partial-write cleanup contract")
+    def test_windows_partial_write_preserves_primary_error_and_cleans_target(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            unrelated = root / "unrelated.txt"
+            unrelated.write_bytes(b"must-remain\n")
+            fs = project_fs(root)
+            backend = fs._backend
+            original_hook = project_fs_module._after_windows_write_chunk
+            original_delete = backend._delete_on_close
+            delete_calls = 0
+
+            def interrupt_after_first_chunk(
+                _backend,
+                relative: Path,
+                written_total: int,
+            ) -> None:
+                if relative == Path("partial.bin") and written_total > 0:
+                    raise KeyboardInterrupt("injected-partial-write")
+
+            def fail_first_delete(handle: int, relative: Path) -> None:
+                nonlocal delete_calls
+                delete_calls += 1
+                if delete_calls == 1:
+                    raise OSError("injected-delete-on-close-failure")
+                original_delete(handle, relative)
+
+            project_fs_module._after_windows_write_chunk = interrupt_after_first_chunk
+            backend._delete_on_close = fail_first_delete
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_after_windows_write_chunk",
+                original_hook,
+            )
+            self.addCleanup(setattr, backend, "_delete_on_close", original_delete)
+
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "injected-partial-write",
+            ) as caught:
+                fs.create_exclusive(
+                    Path("partial.bin"),
+                    b"x" * (2 * 1024 * 1024),
+                )
+
+            self.assertTrue(
+                any(
+                    "delete-on-close failed" in note
+                    for note in getattr(caught.exception, "__notes__", ())
+                )
+            )
+            self.assertFalse((root / "partial.bin").exists())
+            self.assertEqual(unrelated.read_bytes(), b"must-remain\n")
+            project_fs_module._after_windows_write_chunk = original_hook
+            backend._delete_on_close = original_delete
+            fs.create_exclusive(Path("partial.bin"), b"recreated\n")
+            self.assertEqual((root / "partial.bin").read_bytes(), b"recreated\n")
 
     def test_atomic_write_baseexception_closes_and_removes_owned_temporary(self) -> None:
         from core import project_fs as project_fs_module
