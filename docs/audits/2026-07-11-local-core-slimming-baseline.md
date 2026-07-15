@@ -7,8 +7,8 @@
 - Baseline: `main@adba3691d859c0ffc93d75cc148d8f916314cc49`
 - Baseline remote: `origin/main@adba3691d859c0ffc93d75cc148d8f916314cc49`
 - Release state at baseline: `development`
-- Scope authority: `openspec/changes/local-core-slimming/`
-- Implementation ledger: `openspec/changes/local-core-slimming/tasks.md`
+- Scope authority: `openspec/changes/archive/2026-07-15-local-core-slimming/`
+- Implementation ledger: `openspec/changes/archive/2026-07-15-local-core-slimming/tasks.md`
 - Workspace note: the untracked `openspec/` tree is the user-supplied change specification and was preserved when the branch was created.
 
 ## Scenario-to-test map

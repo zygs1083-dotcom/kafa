@@ -2,10 +2,10 @@ schema: spec-driven
 
 context: |
   Kafa is a Python 3.11+ stdlib-first Codex Plugin and local SQLite delivery
-  runtime. The current development baseline is VERSION 1.25.0-beta.1,
-  Runtime/Kernel 4.18.0, and schema 29. The latest published prerelease is
-  older, so every public CLI or schema removal must be treated as an explicit
-  breaking migration.
+  runtime. The current development baseline is VERSION 2.0.0-beta.1,
+  Runtime/Kernel 5.0.0, schema 30, and release_state=development. This source
+  candidate is not a published release, so every public CLI or schema change
+  must preserve the explicit v2 compatibility and migration contract.
 
   The target product is local-only. Native Codex/ChatGPT owns task, thread,
   subagent, worktree, approval, model, cancel, steer, and handoff lifecycle.
