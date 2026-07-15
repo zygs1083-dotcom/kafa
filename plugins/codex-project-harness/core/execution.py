@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Mapping
 from xml.etree import ElementTree
 
+from .project_fs import ProjectFS
+
 
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_STDOUT_BYTES = 1024 * 1024
@@ -237,6 +239,22 @@ class LocalExecutor:
     ) -> CommandResult:
         if not command.strip():
             raise ValueError("command is required")
+        normalized_result_path = _safe_result_path(result_path)
+        execution_id = uuid.uuid4().hex
+        artifact_relative = Path(
+            f".ai-team/runtime/executions/{execution_id}/stdout.txt"
+        )
+        structured_relative = artifact_relative.parent / "structured-result"
+        with ProjectFS.open(self.root) as project_fs:
+            project_fs.audit(
+                (artifact_relative, structured_relative),
+                allow_missing=True,
+            )
+            if normalized_result_path:
+                project_fs.audit(
+                    (Path(normalized_result_path),),
+                    allow_missing=True,
+                )
         profile = "no-network" if no_network else sandbox_profile
         sandbox_status = "unavailable" if profile == "no-network" else ""
         policy_status, policy_reason = self._policy(
@@ -264,8 +282,9 @@ class LocalExecutor:
                 policy_status=policy_status,
                 policy_reason=policy_reason,
                 result_format=result_format,
-                result_path=result_path,
+                result_path=normalized_result_path,
                 semantic_status="fail" if result_format != "regex" else "",
+                execution_id=execution_id,
             )
         args = shlex.split(command)
         if not args:
@@ -291,18 +310,21 @@ class LocalExecutor:
             stdout = str(exc).encode("utf-8", errors="replace")
         stdout = stdout[: self.max_stdout_bytes]
         semantic_status = ""
+        structured_payload_for_artifact: bytes | None = None
         if result_format != "regex":
             structured_payload = stdout
-            if result_path:
-                candidate = (self.root / result_path).resolve()
-                try:
-                    candidate.relative_to(self.root)
-                except ValueError:
-                    candidate = self.root / "__missing_structured_result__"
-                if candidate.exists() and candidate.is_file():
-                    structured_payload = candidate.read_bytes()
-                else:
-                    structured_payload = b""
+            if normalized_result_path:
+                with ProjectFS.open(self.root) as project_fs:
+                    source_relative = Path(normalized_result_path)
+                    snapshot = project_fs._snapshot(
+                        source_relative,
+                        allow_missing=True,
+                    )
+                    if snapshot.exists:
+                        structured_payload = project_fs.read_bytes(source_relative)
+                        structured_payload_for_artifact = structured_payload
+                    else:
+                        structured_payload = b""
             parsed = parse_structured_result(result_format, structured_payload)
             count = parsed.executed_count
             count_source = parsed.executed_count_source
@@ -327,9 +349,10 @@ class LocalExecutor:
             policy_status=policy_status,
             policy_reason=policy_reason,
             result_format=result_format,
-            result_path=result_path,
+            result_path=normalized_result_path,
             semantic_status=semantic_status,
-            structured_source_path=result_path,
+            structured_payload=structured_payload_for_artifact,
+            execution_id=execution_id,
         )
 
     def _policy(
@@ -376,28 +399,35 @@ class LocalExecutor:
         result_format: str = "regex",
         result_path: str = "",
         semantic_status: str = "",
-        structured_source_path: str = "",
+        structured_payload: bytes | None = None,
+        execution_id: str = "",
     ) -> CommandResult:
-        execution_id = uuid.uuid4().hex
-        artifact = self.root / ".ai-team" / "runtime" / "executions" / execution_id / "stdout.txt"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_bytes(stdout)
+        if not execution_id:
+            execution_id = uuid.uuid4().hex
+        artifact_relative = Path(
+            f".ai-team/runtime/executions/{execution_id}/stdout.txt"
+        )
+        structured_relative = artifact_relative.parent / "structured-result"
+        with ProjectFS.open(self.root) as project_fs:
+            project_fs.atomic_write(
+                artifact_relative,
+                stdout,
+                mode=0o600,
+            )
         stored_result_path = result_path
-        if result_format != "regex" and structured_source_path:
-            source = (self.root / structured_source_path).resolve()
-            try:
-                source.relative_to(self.root)
-            except ValueError:
-                source = self.root / "__missing_structured_result__"
-            if source.exists() and source.is_file():
-                structured_artifact = artifact.parent / "structured-result"
-                shutil.copyfile(source, structured_artifact)
-                stored_result_path = structured_artifact.relative_to(self.root).as_posix()
+        if result_format != "regex" and structured_payload is not None:
+            with ProjectFS.open(self.root) as project_fs:
+                project_fs.atomic_write(
+                    structured_relative,
+                    structured_payload,
+                    mode=0o600,
+                )
+            stored_result_path = structured_relative.as_posix()
         return CommandResult(
             command=command,
             exit_code=exit_code,
             stdout_sha256=hashlib.sha256(stdout).hexdigest(),
-            artifact_path=artifact.relative_to(self.root).as_posix(),
+            artifact_path=artifact_relative.as_posix(),
             timed_out=timed_out,
             target_id=target_id,
             executed_count=executed_count,
@@ -450,8 +480,18 @@ class ContainerExecutor:
             raise ExecutionPolicyError(f"command rejected by policy: {policy_reason}")
         normalized_result_path = _safe_result_path(result_path)
         execution_id = uuid.uuid4().hex
-        artifact = self.root / ".ai-team" / "runtime" / "executions" / execution_id / "stdout.txt"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact_relative = Path(
+            f".ai-team/runtime/executions/{execution_id}/stdout.txt"
+        )
+        structured_relative = artifact_relative.parent / "structured-result"
+        with ProjectFS.open(self.root) as project_fs:
+            project_fs.audit(
+                (artifact_relative, structured_relative),
+                allow_missing=True,
+            )
+            artifact_directory = project_fs.ensure_directory(
+                artifact_relative.parent
+            )
         container_name = f"kafa-verify-{execution_id[:12]}"
         result_copy = ""
         if normalized_result_path:
@@ -488,7 +528,7 @@ class ContainerExecutor:
             "-v",
             f"{self.root}:/src:ro",
             "-v",
-            f"{artifact.parent.resolve()}:/artifacts:rw",
+            f"{artifact_directory}:/artifacts:rw",
             "-w",
             "/workspace",
             container_image,
@@ -506,11 +546,18 @@ class ContainerExecutor:
                 timeout=timeout,
             )
             exit_code = completed.returncode
-            if not artifact.exists():
-                artifact.write_text(
-                    (completed.stdout or "") + (completed.stderr or ""),
-                    encoding="utf-8",
-                )
+            with ProjectFS.open(self.root) as project_fs:
+                if not project_fs._snapshot(
+                    artifact_relative,
+                    allow_missing=True,
+                ).exists:
+                    project_fs.atomic_write(
+                        artifact_relative,
+                        ((completed.stdout or "") + (completed.stderr or "")).encode(
+                            "utf-8"
+                        ),
+                        mode=0o600,
+                    )
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             exit_code = 124
@@ -524,20 +571,39 @@ class ContainerExecutor:
             stderr = exc.stderr or b""
             stdout_bytes = stdout if isinstance(stdout, bytes) else stdout.encode("utf-8")
             stderr_bytes = stderr if isinstance(stderr, bytes) else stderr.encode("utf-8")
-            artifact.write_bytes((stdout_bytes + stderr_bytes)[: self.max_stdout_bytes])
-        stdout_bytes = artifact.read_bytes()[: self.max_stdout_bytes]
-        if artifact.stat().st_size != len(stdout_bytes):
-            artifact.write_bytes(stdout_bytes)
-        structured_artifact = artifact.parent / "structured-result"
+            with ProjectFS.open(self.root) as project_fs:
+                project_fs.atomic_write(
+                    artifact_relative,
+                    (stdout_bytes + stderr_bytes)[: self.max_stdout_bytes],
+                    mode=0o600,
+                )
+        with ProjectFS.open(self.root) as project_fs:
+            complete_stdout = project_fs.read_bytes(artifact_relative)
+            stdout_bytes = complete_stdout[: self.max_stdout_bytes]
+            if len(complete_stdout) != len(stdout_bytes):
+                project_fs.atomic_write(
+                    artifact_relative,
+                    stdout_bytes,
+                    mode=0o600,
+                )
+            structured_snapshot = project_fs._snapshot(
+                structured_relative,
+                allow_missing=True,
+            )
+            structured_payload = (
+                project_fs.read_bytes(structured_relative)
+                if structured_snapshot.exists
+                else None
+            )
         if result_format == "regex":
             executed_count = parse_executed_count(stdout_bytes)
             executed_count_source = "parsed"
             semantic_status = "pass" if exit_code == 0 and executed_count > 0 else "fail"
         else:
-            structured_payload = (
-                structured_artifact.read_bytes() if structured_artifact.is_file() else b""
+            parsed = parse_structured_result(
+                result_format,
+                structured_payload or b"",
             )
-            parsed = parse_structured_result(result_format, structured_payload)
             executed_count = parsed.executed_count
             executed_count_source = parsed.executed_count_source
             semantic_status = parsed.semantic_status
@@ -545,15 +611,15 @@ class ContainerExecutor:
             command=command,
             exit_code=exit_code,
             stdout_sha256=hashlib.sha256(stdout_bytes).hexdigest(),
-            artifact_path=artifact.relative_to(self.root).as_posix(),
+            artifact_path=artifact_relative.as_posix(),
             timed_out=timed_out,
             target_id=target_id,
             executed_count=executed_count,
             executed_count_source=executed_count_source,
             result_format=result_format,
             result_path=(
-                structured_artifact.relative_to(self.root).as_posix()
-                if structured_artifact.is_file()
+                structured_relative.as_posix()
+                if structured_payload is not None
                 else normalized_result_path
             ),
             semantic_status=semantic_status,
@@ -624,15 +690,21 @@ def validate_execution_result(
         or not result.no_network
     ):
         issues.append("target requires an available no-network container sandbox")
-    artifact = (root.resolve() / result.artifact_path).resolve()
     try:
-        artifact.relative_to(root.resolve())
-    except ValueError:
+        artifact_relative = Path(_safe_result_path(result.artifact_path))
+    except ExecutionPolicyError:
         issues.append("artifact path escapes project root")
     else:
-        if not artifact.is_file():
-            issues.append("execution artifact is missing")
-        elif hashlib.sha256(artifact.read_bytes()).hexdigest() != result.stdout_sha256:
-            issues.append("execution artifact digest mismatch")
+        with ProjectFS.open(root) as project_fs:
+            snapshot = project_fs._snapshot(
+                artifact_relative,
+                allow_missing=True,
+            )
+            if not snapshot.exists:
+                issues.append("execution artifact is missing")
+            elif hashlib.sha256(
+                project_fs.read_bytes(artifact_relative)
+            ).hexdigest() != result.stdout_sha256:
+                issues.append("execution artifact digest mismatch")
     if issues:
         raise ExecutionPolicyError("verification failed: " + "; ".join(issues))

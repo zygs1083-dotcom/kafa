@@ -39,9 +39,9 @@
 
 ## 6. Execution And Artifact Evidence
 
-- [ ] 6.1 Route local stdout artifact creation/readback and structured-result read/copy through safe project-relative operations while preserving digest, truncation, count, and stale-candidate semantics.
-- [ ] 6.2 Route container stdout and structured-result destination handling through the same seam and fail before recording passing evidence when any identity is unsafe.
-- [ ] 6.3 Run execution, structured-result, sandbox-policy, and stop-ship targeted suites; confirm unsafe cases create no passing immutable execution or validation.
+- [x] 6.1 Route local stdout artifact creation/readback and structured-result read/copy through safe project-relative operations while preserving digest, truncation, count, and stale-candidate semantics.
+- [x] 6.2 Route container stdout and structured-result destination handling through the same seam and fail before recording passing evidence when any identity is unsafe.
+- [x] 6.3 Run execution, structured-result, sandbox-policy, and stop-ship targeted suites; confirm unsafe cases create no passing immutable execution or validation.
 
 ## 7. Migration, Backup, And Rollback
 
