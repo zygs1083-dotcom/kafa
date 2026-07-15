@@ -1070,5 +1070,80 @@ class ProjectFSContractRedTests(unittest.TestCase):
             self.assertFalse((outside / "result.txt").exists())
 
 
+class ProjectFSFoundationTests(unittest.TestCase):
+    def test_safe_read_write_copy_lock_unique_directory_and_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with project_fs(root) as fs:
+                fs.atomic_write(Path("state/source.txt"), b"source\n", mode=0o640)
+                self.assertEqual(fs.read_bytes(Path("state/source.txt")), b"source\n")
+                fs.copy_file(
+                    Path("state/source.txt"),
+                    Path("state/copy.txt"),
+                    mode=0o600,
+                )
+                self.assertEqual(fs.read_bytes(Path("state/copy.txt")), b"source\n")
+                fs.create_exclusive(Path("state/exclusive.txt"), b"exclusive\n")
+                with self.assertRaises(FileExistsError):
+                    fs.create_exclusive(Path("state/exclusive.txt"), b"replace\n")
+                descriptor = fs.open_lock_fd(Path("state/operation.lock"))
+                try:
+                    os.write(descriptor, b"\0")
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                unique = fs.create_unique_directory(Path("backups"), "schema-")
+                fs.audit_directory(unique, allow_missing=False)
+                fs.unlink_regular(Path("state/copy.txt"))
+                fs.audit((Path("state/copy.txt"),), allow_missing=True)
+
+            self.assertFalse((root / "state/copy.txt").exists())
+            self.assertEqual((root / "state/source.txt").read_bytes(), b"source\n")
+            self.assertEqual(stat.S_IMODE((root / "state/source.txt").stat().st_mode), 0o640)
+
+    def test_bounded_audit_rejects_unbounded_inventory(self) -> None:
+        from core.project_fs import MAX_AUDIT_PATHS
+
+        with tempfile.TemporaryDirectory() as temp:
+            fs = project_fs(Path(temp))
+            with self.assertRaisesRegex(Exception, "invalid-relative-path"):
+                fs.audit(
+                    tuple(Path(f"path-{index}") for index in range(MAX_AUDIT_PATHS + 1))
+                )
+
+    def test_windows_capability_fake_fails_closed_without_mutation(self) -> None:
+        from core.project_fs import _WindowsBackend
+
+        class UnavailableWindowsApi:
+            available = False
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = tuple(root.iterdir())
+            with self.assertRaisesRegex(Exception, "platform-safety-unavailable"):
+                _WindowsBackend(root, api=UnavailableWindowsApi())
+            self.assertEqual(tuple(root.iterdir()), before)
+
+    def test_atomic_write_baseexception_closes_and_removes_owned_temporary(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "state.txt"
+            target.write_bytes(b"before\n")
+            original_hook = project_fs_module._before_atomic_replace
+
+            def interrupt(_fs, _relative: Path) -> None:
+                raise KeyboardInterrupt("injected foundation interruption")
+
+            project_fs_module._before_atomic_replace = interrupt
+            self.addCleanup(setattr, project_fs_module, "_before_atomic_replace", original_hook)
+            with self.assertRaisesRegex(KeyboardInterrupt, "foundation interruption"):
+                project_fs(root).atomic_write(Path("state.txt"), b"after\n")
+
+            self.assertEqual(target.read_bytes(), b"before\n")
+            self.assertEqual(tuple(root.glob(".state.txt.kafa-*.tmp")), ())
+
+
 if __name__ == "__main__":
     unittest.main()

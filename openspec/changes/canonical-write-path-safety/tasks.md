@@ -16,11 +16,11 @@
 
 ## 3. ProjectFS Foundation
 
-- [ ] 3.1 Implement the closed relative-path grammar, stable `unsafe-project-path` reasons, one-time root-alias resolution, pinned root identity, and deterministic error rendering in internal `core/project_fs.py`.
-- [ ] 3.2 Implement POSIX descriptor-relative ancestor walking, safe directory creation, regular/single-link checks, atomic write/replace/unlink, fsync, and identity rechecks.
-- [ ] 3.3 Implement the Windows handle backend with `CreateFileW`, reparse/file-ID/volume/link-count checks, held ancestor handles without delete sharing, create-new, and fail-closed capability errors.
-- [ ] 3.4 Implement safe read, exclusive create, lock descriptor, unique directory, copy, and bounded audit operations; ensure every handle/descriptor closes on `BaseException`.
-- [ ] 3.5 Make the foundation tests green on the current platform, run deterministic backend fakes for the other platform, and run `py_compile` plus `git diff --check`.
+- [x] 3.1 Implement the closed relative-path grammar, stable `unsafe-project-path` reasons, one-time root-alias resolution, pinned root identity, and deterministic error rendering in internal `core/project_fs.py`.
+- [x] 3.2 Implement POSIX descriptor-relative ancestor walking, safe directory creation, regular/single-link checks, atomic write/replace/unlink, fsync, and identity rechecks.
+- [x] 3.3 Implement the Windows handle backend with `CreateFileW`, reparse/file-ID/volume/link-count checks, held ancestor handles without delete sharing, create-new, and fail-closed capability errors.
+- [x] 3.4 Implement safe read, exclusive create, lock descriptor, unique directory, copy, and bounded audit operations; ensure every handle/descriptor closes on `BaseException`.
+- [x] 3.5 Make the foundation tests green on the current platform, run deterministic backend fakes for the other platform, and run `py_compile` plus `git diff --check`.
 
 ## 4. Store, Operation Lock, And SQLite
 
