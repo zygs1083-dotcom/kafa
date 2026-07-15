@@ -10,14 +10,16 @@ Candidate: `v2-canonical-write-path-safety@0facd65` plus the uncommitted red-tes
 PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import sys,unittest,warnings; warnings.simplefilter("error", ResourceWarning); s=unittest.defaultTestLoader.loadTestsFromName("tests.test_project_fs_safety"); r=unittest.TestResult(); s.run(r); print(f"run={r.testsRun} failures={len(r.failures)} errors={len(r.errors)} skipped={len(r.skipped)}"); sys.exit(0 if r.wasSuccessful() else 1)'
 ```
 
-Result: `run=30 failures=40 errors=5 skipped=1`, exit 1. The five errors are the intentionally absent `core.project_fs` contract. The single skip is only the macOS-inapplicable Windows junction case; it is not reported as passing. POSIX symlink, hard-link, FIFO, socket and deterministic Event-coordinated exchange cases executed locally.
+Final pre-production result: `run=36 failures=47 errors=5 skipped=1`, exit 1. The five errors are the intentionally absent `core.project_fs` contract. The single skip is only the macOS-inapplicable Windows junction case; it is not reported as passing. POSIX symlink, hard-link, FIFO, socket and deterministic Event-coordinated exchange cases executed locally.
 
 The failures demonstrate these unchanged-production defects:
 
 - init follows or silently accepts unsafe `.gitignore`, all 13 projections, retired evidence and all three Native agent-template destinations after beginning runtime mutation;
 - Store opens linked or hard-linked DB authority, follows linked operation-lock and migration-sentinel authority, and reaches SQLite for unsafe WAL/SHM/journal and backup targets instead of returning the stable path error;
 - local and container executors accept linked stdout destinations, and local structured-result parsing follows an external source;
+- complete local/container verification can persist passing execution and validation facts through linked stdout or structured-result authority; a same-content symlink exchange between the two validation passes is also accepted;
 - migration and recovery do not uniformly reject linked backup roots, staging DBs, manifests, projection backup/restore paths, failed DBs, sidecar destinations, restore temporaries and sentinels;
+- a linked manifest temporary can permit activation, while a linked restore temporary after activation can be treated as a completed rollback instead of retaining `rollback-incomplete` recovery authority;
 - the closed relative grammar, root-alias pinning, non-regular rejection and identity-change seam do not exist yet.
 
 Every external referent assertion records bytes, SHA-256, mode and inode where applicable. Event-coordinated race tests use no correctness sleep.

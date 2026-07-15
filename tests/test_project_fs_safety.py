@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,9 +24,17 @@ for path in (PLUGIN_ROOT, SCRIPTS_ROOT):
 import harness_db  # noqa: E402
 from core import local_core_migration  # noqa: E402
 from core import schema_lifecycle  # noqa: E402
+from core import execution as execution_module  # noqa: E402
 from core.execution import ContainerExecutor, LocalExecutor  # noqa: E402
 from core.projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS  # noqa: E402
 from core.store import InMemoryStore, SqliteStore, project_db_operation  # noqa: E402
+from tests.test_execution_validation import (  # noqa: E402
+    create_candidate,
+    execution_fact_counts,
+    initialize_target,
+    run_harness,
+)
+from tests.test_local_core_hardening import _active_projection_validator  # noqa: E402
 from tests.test_schema30_migration import init_schema29_fixture  # noqa: E402
 
 
@@ -399,6 +408,197 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
 
             self.assertEqual(external_identity(external), before)
 
+    def test_verify_rejects_linked_stdout_without_persisting_facts(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_candidate(root)
+            initialize_target(root)
+            execution_id = "linked-verify-stdout"
+            artifact = root / ".ai-team/runtime/executions" / execution_id / "stdout.txt"
+            artifact.parent.mkdir(parents=True)
+            victim = root / ".ai-team/runtime/linked-victim.txt"
+            victim.parent.mkdir(parents=True, exist_ok=True)
+            victim.write_bytes(b"must-stay-unchanged\n")
+            before = external_identity(victim)
+            artifact.symlink_to(victim)
+            fake_uuid = types.SimpleNamespace(
+                uuid4=lambda: types.SimpleNamespace(hex=execution_id)
+            )
+
+            with patch("core.execution.uuid", fake_uuid):
+                with self.assertRaisesRegex(
+                    Exception,
+                    rf"unsafe-project-path: \.ai-team/runtime/executions/{execution_id}/stdout.txt",
+                ):
+                    harness_db.verify_run(root, "UNIT", acceptance="AC1")
+
+            self.assertEqual(external_identity(victim), before)
+            self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
+    def test_verify_rejects_linked_structured_source_and_destination(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        for attack in ("source", "destination"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                create_candidate(root)
+                command = "python3 -B -m unittest test_candidate.py"
+                result_path = ".ai-team/runtime/input/result.json"
+                for args in (
+                    ("init",),
+                    ("acceptance", "add", "--id", "AC1", "--criterion", "structured passes"),
+                    (
+                        "test-target",
+                        "add",
+                        "--id",
+                        "STRUCTURED",
+                        "--kind",
+                        "unit",
+                        "--command-template",
+                        command,
+                        "--result-format",
+                        "pytest-json",
+                        "--result-path",
+                        result_path,
+                    ),
+                ):
+                    result = run_harness(root, *args)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+                execution_id = f"linked-structured-{attack}"
+                artifact_dir = root / ".ai-team/runtime/executions" / execution_id
+                artifact_dir.mkdir(parents=True)
+                victim = root / ".ai-team/runtime" / f"structured-{attack}-victim.json"
+                victim.parent.mkdir(parents=True, exist_ok=True)
+                victim.write_text(
+                    '{"summary":{"total":1,"passed":1,"failed":0,"errors":0}}',
+                    encoding="utf-8",
+                )
+                before = external_identity(victim)
+                if attack == "source":
+                    source = root / result_path
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.symlink_to(victim)
+                else:
+                    source = root / result_path
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_bytes(victim.read_bytes())
+                    (artifact_dir / "structured-result").symlink_to(victim)
+                fake_uuid = types.SimpleNamespace(
+                    uuid4=lambda: types.SimpleNamespace(hex=execution_id)
+                )
+
+                with patch("core.execution.uuid", fake_uuid):
+                    with self.assertRaisesRegex(Exception, "unsafe-project-path"):
+                        harness_db.verify_run(
+                            root,
+                            "STRUCTURED",
+                            acceptance="AC1",
+                        )
+
+                self.assertEqual(external_identity(victim), before)
+                self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
+    def test_container_verify_rejects_linked_stdout_without_persisting_facts(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_candidate(root)
+            initialize_target(root)
+            execution_id = "linked-container-verify"
+            artifact = root / ".ai-team/runtime/executions" / execution_id / "stdout.txt"
+            artifact.parent.mkdir(parents=True)
+            victim = root / ".ai-team/runtime/container-victim.txt"
+            victim.parent.mkdir(parents=True, exist_ok=True)
+            victim.write_bytes(b"must-stay-container\n")
+            before = external_identity(victim)
+            artifact.symlink_to(victim)
+            fake_uuid = types.SimpleNamespace(
+                uuid4=lambda: types.SimpleNamespace(hex=execution_id)
+            )
+
+            original_subprocess_run = subprocess.run
+
+            def fake_container_run(argv, **kwargs):
+                mounts = [value for value in argv if str(value).endswith(":/artifacts:rw")]
+                if not mounts:
+                    return original_subprocess_run(argv, **kwargs)
+                mount = mounts[0]
+                artifact_dir = Path(mount.removesuffix(":/artifacts:rw"))
+                (artifact_dir / "stdout.txt").write_text(
+                    "Ran 1 test in 0.001s\nOK\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                patch("core.execution.uuid", fake_uuid),
+                patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                patch("core.execution.subprocess.run", side_effect=fake_container_run),
+            ):
+                with self.assertRaisesRegex(Exception, "unsafe-project-path"):
+                    harness_db.verify_run(
+                        root,
+                        "UNIT",
+                        acceptance="AC1",
+                        runner="container",
+                    )
+
+            self.assertEqual(external_identity(victim), before)
+            self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
+    def test_second_validation_rejects_artifact_exchange_without_facts(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_candidate(root)
+            initialize_target(root)
+            first_validation_complete = threading.Event()
+            exchange_complete = threading.Event()
+            artifact_ready: list[Path] = []
+            original_validate = execution_module.validate_execution_result
+            calls = 0
+
+            def validate_then_pause(*args, **kwargs):
+                nonlocal calls
+                original_validate(*args, **kwargs)
+                calls += 1
+                if calls == 1:
+                    result = args[2]
+                    artifact_ready.append(root / result.artifact_path)
+                    first_validation_complete.set()
+                    if not exchange_complete.wait(5):
+                        raise AssertionError("artifact exchange did not complete")
+
+            def exchange_artifact() -> None:
+                if not first_validation_complete.wait(5):
+                    return
+                artifact = artifact_ready[0]
+                victim = root / ".ai-team/runtime/same-content-artifact.txt"
+                victim.parent.mkdir(parents=True, exist_ok=True)
+                victim.write_bytes(artifact.read_bytes())
+                artifact.unlink()
+                artifact.symlink_to(victim)
+                exchange_complete.set()
+
+            attacker = threading.Thread(target=exchange_artifact)
+            attacker.start()
+            self.addCleanup(attacker.join, 5)
+            with patch.object(
+                execution_module,
+                "validate_execution_result",
+                side_effect=validate_then_pause,
+            ):
+                with self.assertRaisesRegex(Exception, "unsafe-project-path"):
+                    harness_db.verify_run(root, "UNIT", acceptance="AC1")
+            attacker.join(5)
+            self.assertFalse(attacker.is_alive())
+            self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
     def test_migration_rejects_symlinked_backup_root_before_copy(self) -> None:
         if not hasattr(os, "symlink"):
             self.skipTest("symlink primitive unavailable")
@@ -624,6 +824,87 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 local_core_migration._restore_verified_backup(active, backup)
 
             self.assertEqual(external_identity(external), before)
+
+    def test_migration_preactivation_manifest_temp_link_preserves_schema29(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            init_schema29_fixture(root)
+            active = root / ".ai-team/state/harness.db"
+            source_digest = sha256(active)
+            external = base / "outside-manifest-temp.json"
+            external.write_bytes(b'{"outside":true}\n')
+            before = external_identity(external)
+            original_backup = local_core_migration.backup_sqlite_database
+
+            def backup_then_attack(*args, **kwargs):
+                backup = original_backup(*args, **kwargs)
+                manifest_temp = Path(backup.backup_path).parent / "migration-manifest.json.tmp"
+                manifest_temp.symlink_to(external)
+                return backup
+
+            caught: BaseException | None = None
+            with patch.object(
+                local_core_migration,
+                "backup_sqlite_database",
+                side_effect=backup_then_attack,
+            ):
+                try:
+                    local_core_migration.migrate_project_to_schema30(
+                        root,
+                        active_validator=_active_projection_validator(root),
+                    )
+                except BaseException as exc:
+                    caught = exc
+
+            self.assertIsNotNone(caught)
+            self.assertIn("unsafe-project-path", str(caught))
+            self.assertEqual(external_identity(external), before)
+            self.assertFalse(active.is_symlink())
+            self.assertEqual(sha256(active), source_digest)
+
+    def test_migration_postactivation_restore_link_stays_recovery_required(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            init_schema29_fixture(root)
+            active = root / ".ai-team/state/harness.db"
+            external = base / "outside-restore-after-activation.db"
+            external.write_bytes(b"outside-restore-after-activation\n")
+            before = external_identity(external)
+
+            def attack_after_activation(_active: Path) -> None:
+                active.with_name(active.name + ".restore").symlink_to(external)
+                raise RuntimeError("injected activation failure")
+
+            caught: BaseException | None = None
+            try:
+                local_core_migration.migrate_project_to_schema30(
+                    root,
+                    active_validator=attack_after_activation,
+                )
+            except BaseException as exc:
+                caught = exc
+
+            self.assertIsNotNone(caught)
+            self.assertIn("unsafe-project-path", str(caught))
+            backup_dir = next(
+                (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
+            )
+            manifest = __import__("json").loads(
+                (backup_dir / "migration-manifest.json").read_text(encoding="utf-8")
+            )
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertIn("injected activation failure", manifest["error"])
+            self.assertIn("unsafe-project-path", manifest["database_restore_error"])
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(external_identity(external), before)
+            self.assertFalse(active.is_symlink())
 
 
 class ProjectFSContractRedTests(unittest.TestCase):
