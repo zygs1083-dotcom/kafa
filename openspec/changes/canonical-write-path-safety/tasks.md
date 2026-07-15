@@ -31,11 +31,11 @@
 
 ## 5. Projections And Initialization
 
-- [ ] 5.1 Make projection serialization publish through safe atomic writes and make retired projection removal use safe regular-file unlink; keep LF UTF-8 bytes and all 13 renderer outputs unchanged.
-- [ ] 5.2 Make projection verification use safe reads for live views and preserve independent snapshot rendering without trusting linked expected or actual files.
-- [ ] 5.3 Preflight the full projection set before any mutation commit, including normal mutation, rebuild, same-schema migration, and repair publication.
-- [ ] 5.4 Preflight DB family, lock/sentinel, `.gitignore`, projections, retired view, and three template destinations before init's first write; route destination writes/copies through `ProjectFS` while packaged template inputs remain read-only.
-- [ ] 5.5 Run projection/init targeted tests and byte-compare normal generated views/templates against the pre-change golden outputs.
+- [x] 5.1 Make projection serialization publish through safe atomic writes and make retired projection removal use safe regular-file unlink; keep LF UTF-8 bytes and all 13 renderer outputs unchanged.
+- [x] 5.2 Make projection verification use safe reads for live views and preserve independent snapshot rendering without trusting linked expected or actual files.
+- [x] 5.3 Preflight the full projection set before any mutation commit, including normal mutation, rebuild, same-schema migration, and repair publication.
+- [x] 5.4 Preflight DB family, lock/sentinel, `.gitignore`, projections, retired view, and three template destinations before init's first write; route destination writes/copies through `ProjectFS` while packaged template inputs remain read-only.
+- [x] 5.5 Run projection/init targeted tests and byte-compare normal generated views/templates against the pre-change golden outputs.
 
 ## 6. Execution And Artifact Evidence
 

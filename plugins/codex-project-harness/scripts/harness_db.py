@@ -52,12 +52,15 @@ from core.schema_guard import (
 )
 from core.store import (
     DB_PATH,
+    MIGRATION_SENTINEL_PATH,
+    OPERATION_LOCK_PATH,
     InMemoryStore,
     SqliteStore,
     Store,
     project_db_operation,
     raise_if_project_migration_announced,
 )
+from core.project_fs import ProjectFS
 from core.schema_lifecycle import (
     SCHEMA30_CATALOG_TABLES,
     SCHEMA30_TABLES,
@@ -150,10 +153,39 @@ def _project_mutation(function: Callable[..., Any]) -> Callable[..., Any]:
     def locked(root: Path, *args: Any, **kwargs: Any) -> Any:
         if isinstance(get_store(root), InMemoryStore):
             return function(root, *args, **kwargs)
+        if function.__name__ == "init_runtime":
+            _preflight_init_paths(root)
         with project_db_operation(root):
+            from core.projections import preflight_projection_paths
+
+            preflight_projection_paths(root)
             return function(root, *args, **kwargs)
 
     return locked
+
+
+def _preflight_init_paths(root: Path) -> None:
+    """Audit every canonical init destination before the operation lock writes."""
+
+    from core.projections import PROJECTION_ROLLBACK_PATHS
+
+    database_family = SqliteStore._db_family()
+    templates = tuple(
+        Path(".codex/agents") / name
+        for name in sorted(CODEX_AGENT_TEMPLATE_NAMES)
+    )
+    with ProjectFS.open(root) as project_fs:
+        project_fs.audit(
+            (
+                *database_family,
+                OPERATION_LOCK_PATH,
+                MIGRATION_SENTINEL_PATH,
+                Path(".gitignore"),
+                *PROJECTION_ROLLBACK_PATHS,
+                *templates,
+            ),
+            allow_missing=True,
+        )
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -272,19 +304,32 @@ def transaction(root: Path, *, validate_invariants: bool = True, touched: list[t
 
 
 def ensure_runtime_gitignore(root: Path) -> None:
-    path = root / ".gitignore"
-    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    normalized = {line.strip() for line in existing}
-    missing = [pattern for pattern in RUNTIME_GITIGNORE_PATTERNS if pattern not in normalized]
-    if not missing:
-        return
-    ensure_parent(path)
-    lines = existing[:]
-    if lines and lines[-1].strip():
-        lines.append("")
-    lines.append("# Codex Project Harness runtime state")
-    lines.extend(missing)
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    relative = Path(".gitignore")
+    with ProjectFS.open(root) as project_fs:
+        snapshot = project_fs._snapshot(relative, allow_missing=True)
+        existing = (
+            project_fs.read_bytes(relative).decode("utf-8").splitlines()
+            if snapshot.exists
+            else []
+        )
+        normalized = {line.strip() for line in existing}
+        missing = [
+            pattern
+            for pattern in RUNTIME_GITIGNORE_PATTERNS
+            if pattern not in normalized
+        ]
+        if not missing:
+            return
+        lines = existing[:]
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("# Codex Project Harness runtime state")
+        lines.extend(missing)
+        project_fs.atomic_write(
+            relative,
+            ("\n".join(lines).rstrip() + "\n").encode("utf-8"),
+            mode=0o644,
+        )
 
 
 def git_tracked_runtime_paths(root: Path) -> list[str]:
@@ -601,17 +646,28 @@ def install_project_agent_templates(root: Path) -> int:
             "agent template inventory mismatch: "
             f"actual={sorted(actual)} expected={sorted(CODEX_AGENT_TEMPLATE_NAMES)}"
         )
-    target_dir = root / ".codex" / "agents"
-    target_dir.mkdir(parents=True, exist_ok=True)
     installed = 0
-    for name in sorted(CODEX_AGENT_TEMPLATE_NAMES):
-        source = template_dir / name
-        validate_codex_agent_template(source)
-        target = target_dir / name
-        if target.exists():
-            continue
-        shutil.copyfile(source, target)
-        installed += 1
+    with ProjectFS.open(root) as project_fs:
+        destinations = tuple(
+            Path(".codex/agents") / name
+            for name in sorted(CODEX_AGENT_TEMPLATE_NAMES)
+        )
+        project_fs.audit(destinations, allow_missing=True)
+        for name, destination in zip(
+            sorted(CODEX_AGENT_TEMPLATE_NAMES),
+            destinations,
+            strict=True,
+        ):
+            source = template_dir / name
+            validate_codex_agent_template(source)
+            if project_fs._snapshot(destination, allow_missing=True).exists:
+                continue
+            project_fs.copy_from_external(
+                source,
+                destination,
+                mode=0o644,
+            )
+            installed += 1
     return installed
 
 

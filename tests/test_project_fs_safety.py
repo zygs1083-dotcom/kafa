@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import types
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -359,6 +361,65 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
 
                 self.assertEqual(external_identity(external), before)
                 self.assertFalse((root / ".ai-team/state/harness.db").exists())
+
+    def test_mutation_preflights_full_projection_inventory_before_commit(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            harness_db.init_runtime(root)
+            unsafe_relative = PROJECTION_PATHS[1]
+            unsafe = root / unsafe_relative
+            unsafe.unlink()
+            external = base / "outside-unselected-projection.md"
+            external.write_bytes(b"outside-unselected-projection\n")
+            before = external_identity(external)
+            unsafe.symlink_to(external)
+
+            with self.assertRaisesRegex(
+                Exception,
+                rf"unsafe-project-path: {unsafe_relative.as_posix()}",
+            ):
+                harness_db.record_decision(
+                    root,
+                    "must not commit",
+                    "another projection is unsafe",
+                )
+
+            with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select count(*) from decisions where decision='must not commit'"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertEqual(external_identity(external), before)
+
+    def test_projection_verifier_rejects_linked_live_view_without_reading_referent(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        from core.projections import projection_content_issues
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            harness_db.init_runtime(root)
+            relative = PROJECTION_PATHS[0]
+            target = root / relative
+            target.unlink()
+            external = base / "outside-verifier.yaml"
+            external.write_bytes(b"schema_version: 30\noutside: true\n")
+            before = external_identity(external)
+            target.symlink_to(external)
+
+            issues = projection_content_issues(root)
+
+            self.assertTrue(
+                any(f"missing or unsafe view: {relative.as_posix()}" in issue for issue in issues),
+                issues,
+            )
+            self.assertEqual(external_identity(external), before)
 
     def test_local_executor_rejects_linked_stdout_destination(self) -> None:
         if not hasattr(os, "symlink"):
