@@ -104,6 +104,52 @@ Initialization creates the schema 30 local runtime at:
 
 It also creates local Markdown views and the approved Native Codex agent templates. No remote credentials are requested, and no network call is part of project initialization.
 
+## Canonical project path safety
+
+Kafa-owned database, lock, sentinel, projection, template, and execution-artifact
+paths use one pinned project filesystem authority. A root-level symlink alias is
+resolved once when the operation starts. Every descendant must remain an ordinary
+directory or a regular single-link file; Kafa rejects symlinks, junctions, reparse
+points, hard-linked files, non-regular targets, and cross-device ancestors.
+
+The stable diagnostic is:
+
+```text
+unsafe-project-path: <relative>: <reason>
+```
+
+The closed reason set is:
+
+- `invalid-relative-path`
+- `unsafe-ancestor`
+- `unsafe-target`
+- `hard-linked-target`
+- `cross-device-ancestor`
+- `path-identity-changed`
+- `platform-safety-unavailable`
+
+Treat the reported relative path as untrusted authority. Stop the operation, preserve
+the database, sentinel, manifest, backups, and the reported object's bytes and metadata,
+then establish who owns the object. If the path is intended to be Kafa state, restore an
+ordinary in-project directory or regular single-link file from independently verified
+bytes and rerun `kafa project doctor`. Kafa never automatically follows, rewrites,
+deletes, or repairs an unsafe link, and operators must not remove a linked sentinel or
+replace a linked database merely to make doctor green.
+
+Python's standard `sqlite3` API cannot open an already pinned file descriptor. Kafa
+therefore precreates or validates the DB family, connects with a no-create URI, and
+rechecks filesystem identity immediately after connect, after journal setup, and before
+close. A bounded identity exchange is closed and rejected; a continuously active
+attacker with the same user authority is outside this guarantee. Inspect such a project
+under an isolated OS user or container before retrying.
+
+Project path safety does not sandbox arbitrary verification commands. Use the explicit
+container runner when a target requires sandbox or no-network execution; the path seam
+protects Kafa's own artifact reads and publications, not arbitrary command behavior.
+If an unsafe path prevents DB or projection restoration, retain every recovery artifact
+and follow the `rollback-incomplete` procedure below. Never relabel an incomplete restore
+as successful and never auto-repair the link.
+
 ## Upgrade
 
 First pull or checkout the desired Kafa source version, then refresh the installation:

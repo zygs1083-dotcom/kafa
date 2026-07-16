@@ -153,6 +153,27 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
 文件，post-execution candidate 会正确变化，该次 execution 将以 stale candidate
 丢弃；Kafa 不会为了结果文件而动态排除任意业务源码路径。
 
+## Canonical project path safety
+
+Kafa 自己管理的 DB、lock、sentinel、projection、template 和 execution artifact
+只接受 pinned project root 下的普通单链接对象。一个 root-level symlink alias 会在
+操作开始时解析一次；root 以下的 symlink、junction、reparse point、hard link、
+非普通文件或跨设备 ancestor 都会 fail closed。稳定错误格式为
+`unsafe-project-path: <relative>: <reason>`，完整 reason 与恢复步骤见
+[INSTALL.md](INSTALL.md#canonical-project-path-safety)。Kafa never automatically
+follows, rewrites, deletes, or repairs an unsafe link。
+
+Python 标准库 SQLite 只能接收 pathname，因此 Kafa 使用已验证且禁止隐式创建的 URI，
+并在 connect、journal setup 和 close 边界复核 identity；有限替换会关闭连接并返回
+`path-identity-changed`，不会被报告成功。持续拥有同一 OS user 权限的主动攻击者不在
+保证范围内；这类仓库应放入 isolated OS user or container。
+
+Kafa does not sandbox arbitrary verification commands。只有显式选择现有 container
+runner 时，才提供对应的本地 sandbox/no-network policy；ProjectFS 只保护 Kafa 自己
+的 canonical artifact 操作。若不安全路径出现在迁移回滚中，保留 sentinel、manifest、
+DB 和 projection backup，并按 `rollback-incomplete` 处理，不能自动移除链接或把失败
+描述为完整回滚。
+
 ## Delivery trust
 
 本地信任状态分为：

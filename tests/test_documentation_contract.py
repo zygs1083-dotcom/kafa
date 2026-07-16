@@ -123,6 +123,30 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("human-review-required", readme)
         self.assertIn("schema 30", readme)
 
+    def test_canonical_path_safety_and_remediation_are_documented(self) -> None:
+        guidance = self.read("README.md") + "\n" + self.read("INSTALL.md")
+        normalized = " ".join(guidance.split())
+
+        for reason in [
+            "invalid-relative-path",
+            "unsafe-ancestor",
+            "unsafe-target",
+            "hard-linked-target",
+            "cross-device-ancestor",
+            "path-identity-changed",
+            "platform-safety-unavailable",
+        ]:
+            self.assertIn(reason, normalized, reason)
+        for marker in [
+            "unsafe-project-path",
+            "root-level symlink alias",
+            "does not sandbox arbitrary verification commands",
+            "never automatically follows, rewrites, deletes, or repairs",
+            "rollback-incomplete",
+            "isolated OS user or container",
+        ]:
+            self.assertIn(marker, normalized, marker)
+
     def test_v1_operating_system_plan_is_explicitly_superseded(self) -> None:
         plan = self.read("docs/superpowers/plans/2026-06-22-harness-operating-system.md")
         self.assertIn("Status: Historical / Superseded", plan)

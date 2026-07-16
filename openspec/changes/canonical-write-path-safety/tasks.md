@@ -59,10 +59,10 @@
 
 ## 9. Contract, Performance, And Documentation
 
-- [ ] 9.1 Freeze schema 30/27 tables, 53 parser nodes, seven Skills, three Hooks, three templates, local-only runtime, and Native Host ownership in structure/architecture tests.
-- [ ] 9.2 Document stable path errors, safe remediation, root-alias behavior, arbitrary-command non-sandbox boundary, and `rollback-incomplete` recovery without suggesting automatic link repair.
-- [ ] 9.3 Run the 5k-fact benchmark and enforce mutation ≤0.050s, DB ≤320 KiB, plugin ≤1 MiB, and existing init/startup budgets.
-- [ ] 9.4 Checkpoint: run all path/store/projection/init/execution/migration/doctor targeted suites with warnings as errors, structure validation, OpenSpec validation, JSON validation, and `git diff --check`.
+- [x] 9.1 Freeze schema 30/27 tables, 53 parser nodes, seven Skills, three Hooks, three templates, local-only runtime, and Native Host ownership in structure/architecture tests.
+- [x] 9.2 Document stable path errors, safe remediation, root-alias behavior, arbitrary-command non-sandbox boundary, and `rollback-incomplete` recovery without suggesting automatic link repair.
+- [x] 9.3 Run the 5k-fact benchmark and enforce mutation ≤0.050s, DB ≤320 KiB, plugin ≤1 MiB, and existing init/startup budgets.
+- [x] 9.4 Checkpoint: run all path/store/projection/init/execution/migration/doctor targeted suites with warnings as errors, structure validation, OpenSpec validation, JSON validation, and `git diff --check`.
 
 ## 10. Independent QA And Full Delivery Evidence
 
