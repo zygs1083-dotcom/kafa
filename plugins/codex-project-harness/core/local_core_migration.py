@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +17,7 @@ from typing import Callable, Iterator
 
 from .execution import command_matches_template
 from .errors import HarnessError
-from .project_fs import ProjectFS, ProjectPathSafetyError
+from .project_fs import ProjectFS, ProjectPathSafetyError, _PathSnapshot
 from .projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS
 from .schema_lifecycle import (
     SCHEMA30_RUNTIME_VERSION,
@@ -28,7 +28,12 @@ from .schema_lifecycle import (
     backup_sqlite_database,
     create_schema30,
 )
-from .store import project_db_operation
+from .store import (
+    _apply_sqlite_teardown_errors,
+    _temporary_sqlite_family_cleanup_errors,
+    _verified_sqlite_connection,
+    project_db_operation,
+)
 
 
 class LocalCoreMigrationError(HarnessError):
@@ -39,18 +44,91 @@ class InjectedLocalCoreMigrationFailure(LocalCoreMigrationError):
     """Deterministic failure used to prove migration rollback boundaries."""
 
 
+@dataclass(frozen=True)
+class _FileAuthorityReceipt:
+    snapshot: _PathSnapshot
+    sha256: str
+    mode: int | None
+
+
 @dataclass
 class _MigrationGuard:
     lock_path: Path
     project_fs: ProjectFS
+    lock_snapshot: _PathSnapshot
     recovery_required: bool = False
     manifest_path: Path | None = None
     clear_allowed: bool = False
+    clear_verifier: Callable[[], None] | None = None
+    clear_failure_publisher: Callable[[BaseException], None] | None = None
+    recovery_manifest_relative: Path | None = None
+    recovery_manifest_snapshot: _PathSnapshot | None = None
+    recovery_manifest_sha256: str = ""
 
     def record_manifest(self, manifest_path: Path) -> None:
         self.manifest_path = manifest_path
 
-    def require_recovery(self, manifest_path: Path) -> None:
+    def record_recovery_manifest(
+        self,
+        manifest_path: Path,
+        snapshot: _PathSnapshot,
+    ) -> None:
+        relative = self.project_fs.relative_to_root(manifest_path)
+        self.project_fs._assert_unchanged(relative, snapshot)
+        digest = _safe_file_sha256(
+            self.project_fs,
+            relative,
+            expected=snapshot,
+        )
+        self.project_fs._assert_unchanged(relative, snapshot)
+        self.manifest_path = manifest_path
+        self.recovery_manifest_relative = relative
+        self.recovery_manifest_snapshot = snapshot
+        self.recovery_manifest_sha256 = digest
+
+    def verify_recovery_manifest(self, *, required: bool) -> None:
+        relative = self.recovery_manifest_relative
+        snapshot = self.recovery_manifest_snapshot
+        digest = self.recovery_manifest_sha256
+        if relative is None or snapshot is None or not digest:
+            if required:
+                raise LocalCoreMigrationError(
+                    "verified recovery manifest receipt is unavailable"
+                )
+            return
+        self.project_fs._assert_unchanged(relative, snapshot)
+        if (
+            _safe_file_sha256(
+                self.project_fs,
+                relative,
+                expected=snapshot,
+            )
+            != digest
+        ):
+            raise LocalCoreMigrationError(
+                "recovery manifest changed before sentinel publication"
+            )
+        self.project_fs._assert_unchanged(relative, snapshot)
+
+    def write_sentinel(self, payload: dict[str, object]) -> None:
+        self.lock_snapshot = _write_json_atomic(
+            self.lock_path,
+            payload,
+            project_fs=self.project_fs,
+            expected_destination=self.lock_snapshot,
+        )
+
+    def require_recovery(
+        self,
+        manifest_path: Path,
+        *,
+        snapshot: _PathSnapshot,
+    ) -> None:
+        self.recovery_required = True
+        self.manifest_path = manifest_path
+        self.clear_allowed = False
+        self.record_recovery_manifest(manifest_path, snapshot)
+        self.verify_recovery_manifest(required=True)
         payload: dict[str, object] = {
             "pid": os.getpid(),
             "created_at": _timestamp(),
@@ -58,18 +136,42 @@ class _MigrationGuard:
             "status": "recovery-required",
             "manifest_path": str(manifest_path),
         }
-        _write_json_atomic(
-            self.lock_path,
-            payload,
-            project_fs=self.project_fs,
-        )
-        self.recovery_required = True
-        self.manifest_path = manifest_path
-        self.clear_allowed = False
+        self.write_sentinel(payload)
+        try:
+            self.verify_recovery_manifest(required=True)
+        except BaseException as manifest_exc:
+            payload.pop("manifest_path", None)
+            payload["manifest_status"] = "changed"
+            payload["manifest_error"] = _exception_text(manifest_exc)
+            self.write_sentinel(payload)
+            raise
 
-    def mark_safe(self) -> None:
+    def arm_verified_clear(
+        self,
+        verifier: Callable[[], None],
+        failure_publisher: Callable[[BaseException], None],
+    ) -> None:
+        self.clear_verifier = verifier
+        self.clear_failure_publisher = failure_publisher
+
+    def verify_clear_authorities(self, *, required: bool) -> None:
+        if self.clear_verifier is None:
+            if required:
+                raise LocalCoreMigrationError(
+                    "migration success authority receipts are unavailable"
+                )
+            return
+        self.clear_verifier()
+
+    def mark_safe(
+        self,
+        verifier: Callable[[], None] | None = None,
+        failure_publisher: Callable[[BaseException], None] | None = None,
+    ) -> None:
         self.recovery_required = False
         self.clear_allowed = True
+        self.clear_verifier = verifier
+        self.clear_failure_publisher = failure_publisher
 
 
 def _sqlite_integer(value: object) -> int | None:
@@ -174,15 +276,31 @@ def _project_fs_scope(
         yield opened
 
 
-def _safe_file_sha256(project_fs: ProjectFS, relative: Path) -> str:
-    return hashlib.sha256(project_fs.read_bytes(relative)).hexdigest()
+def _safe_file_sha256(
+    project_fs: ProjectFS,
+    relative: Path,
+    *,
+    expected: _PathSnapshot | None = None,
+) -> str:
+    return hashlib.sha256(
+        project_fs.read_bytes(relative, expected=expected)
+    ).hexdigest()
 
 
-def _safe_file_mode(project_fs: ProjectFS, relative: Path) -> int:
+def _safe_file_mode(
+    project_fs: ProjectFS,
+    relative: Path,
+    *,
+    expected: _PathSnapshot | None = None,
+) -> int:
     snapshot = project_fs._snapshot(relative, allow_missing=False)
+    if expected is not None and snapshot != expected:
+        raise ProjectPathSafetyError(relative, "path-identity-changed")
     assert snapshot.identity is not None
     if os.name == "nt":
-        return stat.S_IMODE(project_fs.absolute(relative).stat().st_mode)
+        mode = stat.S_IMODE(project_fs.absolute(relative).stat().st_mode)
+        project_fs._assert_unchanged(relative, snapshot)
+        return mode
     return stat.S_IMODE(snapshot.identity.mode_or_attributes)
 
 
@@ -194,6 +312,86 @@ def _database_family(relative: Path) -> tuple[Path, Path, Path, Path]:
         Path(f"{value}-shm"),
         Path(f"{value}-journal"),
     )
+
+
+def _capture_database_family_receipts(
+    project_fs: ProjectFS,
+    active_relative: Path,
+    *,
+    expected_main: _PathSnapshot,
+    expected_digest: str,
+) -> dict[Path, _PathSnapshot]:
+    family = _database_family(active_relative)
+    receipts: dict[Path, _PathSnapshot] = {}
+    for index, relative in enumerate(family):
+        snapshot = project_fs._snapshot(
+            relative,
+            allow_missing=index != 0,
+        )
+        if index == 0:
+            if snapshot != expected_main:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+        elif snapshot.exists:
+            raise LocalCoreMigrationError(
+                "database sidecar remained at an authority boundary: "
+                f"{relative}"
+            )
+        receipts[relative] = snapshot
+    if (
+        _safe_database_digest(
+            project_fs,
+            active_relative,
+            expected=expected_main,
+        )
+        != expected_digest
+    ):
+        raise LocalCoreMigrationError(
+            "database digest changed at an authority boundary"
+        )
+    project_fs._assert_unchanged(active_relative, expected_main)
+    return receipts
+
+
+def _assert_database_family_receipts(
+    project_fs: ProjectFS,
+    active_relative: Path,
+    receipts: dict[Path, _PathSnapshot],
+    *,
+    expected_digest: str,
+) -> None:
+    family = _database_family(active_relative)
+    if set(receipts) != set(family):
+        raise LocalCoreMigrationError(
+            "database family receipts do not match the canonical inventory"
+        )
+    for index, relative in enumerate(family):
+        snapshot = receipts[relative]
+        project_fs._assert_unchanged(relative, snapshot)
+        if index == 0 and not snapshot.exists:
+            raise LocalCoreMigrationError(
+                "database authority is missing at completion"
+            )
+        if index != 0 and snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"database sidecar receipt must be absent: {relative}"
+            )
+    main_snapshot = receipts[active_relative]
+    if (
+        _safe_database_digest(
+            project_fs,
+            active_relative,
+            expected=main_snapshot,
+        )
+        != expected_digest
+    ):
+        raise LocalCoreMigrationError(
+            "database authority changed before migration completion"
+        )
+    for relative in family:
+        project_fs._assert_unchanged(relative, receipts[relative])
 
 
 def _safe_database_fingerprint(
@@ -215,20 +413,15 @@ def _safe_database_fingerprint(
     return fingerprint
 
 
-def _safe_database_digest(project_fs: ProjectFS, relative: Path) -> str:
-    return hashlib.sha256(project_fs.read_bytes(relative)).hexdigest()
-
-
-def _cleanup_database_family(
+def _safe_database_digest(
     project_fs: ProjectFS,
     relative: Path,
     *,
-    include_database: bool,
-) -> None:
-    family = _database_family(relative)
-    candidates = family if include_database else family[1:]
-    for candidate in reversed(candidates):
-        project_fs.unlink_regular(candidate, missing_ok=True)
+    expected: _PathSnapshot | None = None,
+) -> str:
+    return hashlib.sha256(
+        project_fs.read_bytes(relative, expected=expected)
+    ).hexdigest()
 
 
 TASK_STATUS_MAP = {
@@ -1213,11 +1406,11 @@ def stage_schema29_to_schema30(
         )
         source_absolute = active_source_fs.absolute(source_relative)
         staging_absolute = active_destination_fs.absolute(staging_relative)
-        source_uri = f"{source_absolute.as_uri()}?mode=ro"
-        staging_uri = f"{staging_absolute.as_uri()}?mode=rw"
         try:
-            with closing(
-                sqlite3.connect(source_uri, uri=True, timeout=5.0)
+            with _verified_sqlite_connection(
+                active_source_fs,
+                source_relative,
+                access="ro",
             ) as source:
                 source.row_factory = sqlite3.Row
                 source.execute("pragma query_only = on")
@@ -1240,8 +1433,11 @@ def stage_schema29_to_schema30(
                     )
                 project = _source_project(source)
                 source_counts = _row_counts(source)
-                with closing(
-                    sqlite3.connect(staging_uri, uri=True, timeout=5.0)
+                with _verified_sqlite_connection(
+                    active_destination_fs,
+                    staging_relative,
+                    access="rw",
+                    journal_mode="memory",
                 ) as destination:
                     destination.row_factory = sqlite3.Row
                     destination.execute("pragma foreign_keys = on")
@@ -1318,12 +1514,16 @@ def stage_schema29_to_schema30(
                 converted_validation_count=converted_validation_count,
                 invalidated_validation_count=invalidated_validation_count,
             )
-        except BaseException:
+        except BaseException as exc:
             if created_staging:
-                _cleanup_database_family(
-                    active_destination_fs,
-                    staging_relative,
-                    include_database=True,
+                _apply_sqlite_teardown_errors(
+                    exc,
+                    _temporary_sqlite_family_cleanup_errors(
+                        active_destination_fs,
+                        staging_relative,
+                        staging_snapshot,
+                        published=False,
+                    ),
                 )
             raise
 
@@ -1340,8 +1540,11 @@ def _read_source_version(
         relative = project_fs.relative_to_root(path)
         snapshot = project_fs._snapshot(relative, allow_missing=False)
         project_fs.audit(_database_family(relative), allow_missing=True)
-        uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="ro",
+        ) as conn:
             row = conn.execute(
                 "select schema_version from project where id=1"
             ).fetchone()
@@ -1398,23 +1601,22 @@ def _sqlite_backup_copy(
             destination_relative,
             allow_missing=False,
         )
-        source_uri = (
-            f"{active_source_fs.absolute(source_relative).as_uri()}?mode=ro"
-        )
-        destination_uri = (
-            f"{active_destination_fs.absolute(destination_relative).as_uri()}?mode=rw"
-        )
         try:
-            with closing(
-                sqlite3.connect(source_uri, uri=True, timeout=5.0)
+            with _verified_sqlite_connection(
+                active_source_fs,
+                source_relative,
+                access="ro",
             ) as source:
                 source.execute("pragma query_only = on")
                 active_source_fs._assert_unchanged(
                     source_relative,
                     source_snapshot,
                 )
-                with closing(
-                    sqlite3.connect(destination_uri, uri=True, timeout=5.0)
+                with _verified_sqlite_connection(
+                    active_destination_fs,
+                    destination_relative,
+                    access="rw",
+                    journal_mode="memory",
                 ) as destination:
                     source.backup(destination)
                     destination.execute("pragma journal_mode = delete")
@@ -1427,11 +1629,15 @@ def _sqlite_backup_copy(
                     source_relative,
                     source_snapshot,
                 )
-        except BaseException:
-            _cleanup_database_family(
-                active_destination_fs,
-                destination_relative,
-                include_database=True,
+        except BaseException as exc:
+            _apply_sqlite_teardown_errors(
+                exc,
+                _temporary_sqlite_family_cleanup_errors(
+                    active_destination_fs,
+                    destination_relative,
+                    destination_snapshot,
+                    published=False,
+                ),
             )
             raise
 
@@ -1451,9 +1657,10 @@ def _validate_legacy_trust_revisions(
         relative = project_fs.relative_to_root(source_path)
         snapshot = project_fs._snapshot(relative, allow_missing=False)
         project_fs.audit(_database_family(relative), allow_missing=True)
-        source_uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro"
-        with closing(
-            sqlite3.connect(source_uri, uri=True, timeout=5.0)
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="ro",
         ) as source:
             project = source.execute(
                 "select revision from project where id=1"
@@ -1531,9 +1738,10 @@ def stage_supported_schema_to_schema30(
             source_relative,
         )
         source_sha256 = _safe_database_digest(source_fs, source_relative)
-        source_uri = f"{source_fs.absolute(source_relative).as_uri()}?mode=ro"
-        with closing(
-            sqlite3.connect(source_uri, uri=True, timeout=5.0)
+        with _verified_sqlite_connection(
+            source_fs,
+            source_relative,
+            access="ro",
         ) as original:
             original_counts = _row_counts(original)
             source_fs._assert_unchanged(
@@ -1583,18 +1791,27 @@ def stage_supported_schema_to_schema30(
         source_relative = source_fs.relative_to_root(source_path)
         staging_relative = destination_fs.relative_to_root(staging_path)
         source_absolute = source_fs.absolute(source_relative)
+        staging_snapshot = destination_fs._snapshot(
+            staging_relative,
+            allow_missing=False,
+        )
         if (
             _safe_database_fingerprint(source_fs, source_relative)
             != source_fingerprint
         ):
-            _cleanup_database_family(
-                destination_fs,
-                staging_relative,
-                include_database=True,
-            )
-            raise LocalCoreMigrationError(
+            error = LocalCoreMigrationError(
                 f"active schema {source_version} database changed during isolated legacy conversion"
             )
+            _apply_sqlite_teardown_errors(
+                error,
+                _temporary_sqlite_family_cleanup_errors(
+                    destination_fs,
+                    staging_relative,
+                    staging_snapshot,
+                    published=False,
+                ),
+            )
+            raise error
     return replace(
         report,
         source_version=source_version,
@@ -1613,7 +1830,8 @@ def _write_json_atomic(
     payload: dict[str, object],
     *,
     project_fs: ProjectFS | None = None,
-) -> None:
+    expected_destination: _PathSnapshot | None = None,
+) -> _PathSnapshot:
     root = _project_root_for_internal_path(path)
     with _project_fs_scope(root, project_fs) as active_project_fs:
         relative = active_project_fs.relative_to_root(path)
@@ -1622,7 +1840,7 @@ def _write_json_atomic(
             (relative, legacy_temporary),
             allow_missing=True,
         )
-        active_project_fs.atomic_write(
+        return active_project_fs.atomic_write(
             relative,
             (
                 json.dumps(
@@ -1634,7 +1852,82 @@ def _write_json_atomic(
                 + "\n"
             ).encode("utf-8"),
             mode=0o600,
+            expected_destination=expected_destination,
         )
+
+
+def _create_fallback_recovery_manifest(
+    canonical_path: Path,
+    payload: dict[str, object],
+    *,
+    manifest_write_error: BaseException,
+    project_fs: ProjectFS,
+) -> tuple[Path, _PathSnapshot]:
+    project_fs.relative_to_root(canonical_path)
+    fallback_parent = Path(".ai-team/state")
+    for _ in range(128):
+        fallback_relative = fallback_parent / (
+            f"migration-recovery-{uuid.uuid4().hex}.json"
+        )
+        fallback_path = project_fs.absolute(fallback_relative)
+        fallback_payload = dict(payload)
+        fallback_payload.update(
+            {
+                "status": "rollback-incomplete",
+                "canonical_manifest_path": str(canonical_path),
+                "failed_manifest_path": str(canonical_path),
+                "manifest_write_error": _exception_text(
+                    manifest_write_error
+                ),
+                "recovery_manifest_path": str(fallback_path),
+            }
+        )
+        encoded = (
+            json.dumps(
+                fallback_payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            fallback_snapshot = project_fs.create_exclusive(
+                fallback_relative,
+                encoded,
+                mode=0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            project_fs._assert_unchanged(
+                fallback_relative,
+                fallback_snapshot,
+            )
+            if (
+                _safe_file_sha256(
+                    project_fs,
+                    fallback_relative,
+                    expected=fallback_snapshot,
+                )
+                != hashlib.sha256(encoded).hexdigest()
+            ):
+                raise LocalCoreMigrationError(
+                    "fallback recovery manifest changed during publication"
+                )
+            project_fs._assert_unchanged(
+                fallback_relative,
+                fallback_snapshot,
+            )
+        except (ProjectPathSafetyError, LocalCoreMigrationError):
+            # The raced entry is not ours to remove. Reserve a new unique
+            # diagnostic path and keep the changed entry fail-closed.
+            continue
+        return fallback_path, fallback_snapshot
+    raise LocalCoreMigrationError(
+        "cannot reserve a unique fallback migration recovery manifest for "
+        f"{canonical_path}"
+    )
 
 
 def _create_projection_backup(
@@ -1665,25 +1958,49 @@ def _create_projection_backup(
                 )
                 continue
 
-            mode = _safe_file_mode(project_fs, relative_path)
-            content = project_fs.read_bytes(relative_path)
+            mode = _safe_file_mode(
+                project_fs,
+                relative_path,
+                expected=snapshot,
+            )
+            content = project_fs.read_bytes(
+                relative_path,
+                expected=snapshot,
+            )
             digest = hashlib.sha256(content).hexdigest()
             projection_copy = (
                 projection_dir / f"{index:02d}-{relative_path.name}.bin"
             )
-            project_fs.create_exclusive(
+            projection_copy_snapshot = project_fs.create_exclusive(
                 projection_copy,
                 content,
                 mode=0o600,
             )
-            if _safe_file_sha256(project_fs, projection_copy) != digest:
+            if (
+                _safe_file_sha256(
+                    project_fs,
+                    projection_copy,
+                    expected=projection_copy_snapshot,
+                )
+                != digest
+            ):
                 raise LocalCoreMigrationError(
                     f"projection backup digest mismatch: {relative_path}"
                 )
             project_fs._assert_unchanged(relative_path, snapshot)
             if (
-                _safe_file_sha256(project_fs, relative_path) != digest
-                or _safe_file_mode(project_fs, relative_path) != mode
+                _safe_file_sha256(
+                    project_fs,
+                    relative_path,
+                    expected=snapshot,
+                )
+                != digest
+                or _safe_file_mode(
+                    project_fs,
+                    relative_path,
+                    expected=snapshot,
+                )
+                != mode
             ):
                 raise LocalCoreMigrationError(
                     "projection changed while its rollback backup was created: "
@@ -1712,7 +2029,7 @@ def _restore_projection_backup(
     projection_backup: dict[str, object],
     *,
     pinned_fs: ProjectFS | None = None,
-) -> None:
+) -> dict[Path, _PathSnapshot]:
     entries = projection_backup.get("entries")
     if not isinstance(entries, list):
         raise LocalCoreMigrationError("projection rollback metadata is missing its entries")
@@ -1734,6 +2051,7 @@ def _restore_projection_backup(
             Path(backup_directory_value)
         )
         project_fs.audit_directory(backup_directory, allow_missing=False)
+        restored_receipts: dict[Path, _PathSnapshot] = {}
 
         for relative_path, entry in zip(
             PROJECTION_ROLLBACK_PATHS,
@@ -1751,7 +2069,15 @@ def _restore_projection_backup(
                     allow_missing=True,
                 )
                 if snapshot.exists:
-                    project_fs.unlink_regular(relative_path)
+                    project_fs.unlink_regular(
+                        relative_path,
+                        expected=snapshot,
+                    )
+                    snapshot = project_fs._snapshot(
+                        relative_path,
+                        allow_missing=True,
+                    )
+                restored_receipts[relative_path] = snapshot
                 continue
             if existed is not True:
                 raise LocalCoreMigrationError(
@@ -1777,7 +2103,14 @@ def _restore_projection_backup(
                 raise LocalCoreMigrationError(
                     f"projection recovery copy is missing or invalid: {relative_path}"
                 )
-            backup_content = project_fs.read_bytes(backup_path)
+            backup_snapshot = project_fs._snapshot(
+                backup_path,
+                allow_missing=False,
+            )
+            backup_content = project_fs.read_bytes(
+                backup_path,
+                expected=backup_snapshot,
+            )
             if hashlib.sha256(backup_content).hexdigest() != digest:
                 raise LocalCoreMigrationError(
                     f"projection recovery copy is missing or invalid: {relative_path}"
@@ -1789,32 +2122,53 @@ def _restore_projection_backup(
             )
             if (
                 current.exists
-                and _safe_file_sha256(project_fs, relative_path) == digest
-                and _safe_file_mode(project_fs, relative_path) == mode
+                and _safe_file_sha256(
+                    project_fs,
+                    relative_path,
+                    expected=current,
+                )
+                == digest
+                and _safe_file_mode(
+                    project_fs,
+                    relative_path,
+                    expected=current,
+                )
+                == mode
             ):
+                restored_receipts[relative_path] = current
                 continue
-            project_fs.atomic_write(
+            restored_snapshot = project_fs.atomic_write(
                 relative_path,
                 backup_content,
                 mode=mode,
+                expected_destination=current,
             )
             if (
-                _safe_file_sha256(project_fs, relative_path) != digest
-                or _safe_file_mode(project_fs, relative_path) != mode
+                _safe_file_sha256(
+                    project_fs,
+                    relative_path,
+                    expected=restored_snapshot,
+                )
+                != digest
+                or _safe_file_mode(
+                    project_fs,
+                    relative_path,
+                    expected=restored_snapshot,
+                )
+                != mode
             ):
                 raise LocalCoreMigrationError(
                     f"restored projection failed verification: {relative_path}"
                 )
+            restored_receipts[relative_path] = restored_snapshot
 
         for relative_path, entry in zip(
             PROJECTION_ROLLBACK_PATHS,
             entries,
             strict=True,
         ):
-            snapshot = project_fs._snapshot(
-                relative_path,
-                allow_missing=True,
-            )
+            snapshot = restored_receipts[relative_path]
+            project_fs._assert_unchanged(relative_path, snapshot)
             if entry["existed"] is False:
                 if snapshot.exists:
                     raise LocalCoreMigrationError(
@@ -1823,14 +2177,307 @@ def _restore_projection_backup(
                 continue
             if (
                 not snapshot.exists
-                or _safe_file_sha256(project_fs, relative_path)
+                or _safe_file_sha256(
+                    project_fs,
+                    relative_path,
+                    expected=snapshot,
+                )
                 != entry["sha256"]
-                or _safe_file_mode(project_fs, relative_path) != entry["mode"]
+                or _safe_file_mode(
+                    project_fs,
+                    relative_path,
+                    expected=snapshot,
+                )
+                != entry["mode"]
             ):
                 raise LocalCoreMigrationError(
                     "projection rollback bundle failed final verification: "
                     f"{relative_path}"
                 )
+            project_fs._assert_unchanged(relative_path, snapshot)
+        return restored_receipts
+
+
+def _assert_projection_receipts(
+    project_fs: ProjectFS,
+    receipts: dict[Path, _PathSnapshot],
+    projection_backup: dict[str, object],
+) -> None:
+    expected_paths = set(PROJECTION_ROLLBACK_PATHS)
+    if set(receipts) != expected_paths:
+        raise LocalCoreMigrationError(
+            "projection rollback receipts do not match the canonical inventory"
+        )
+    entries = projection_backup.get("entries")
+    if not isinstance(entries, list) or len(entries) != len(
+        PROJECTION_ROLLBACK_PATHS
+    ):
+        raise LocalCoreMigrationError(
+            "projection rollback metadata is missing its canonical entries"
+        )
+    for relative_path, entry in zip(
+        PROJECTION_ROLLBACK_PATHS,
+        entries,
+        strict=True,
+    ):
+        if not isinstance(entry, dict) or entry.get("path") != relative_path.as_posix():
+            raise LocalCoreMigrationError(
+                f"invalid projection rollback receipt metadata: {relative_path}"
+            )
+        receipt = receipts[relative_path]
+        project_fs._assert_unchanged(
+            relative_path,
+            receipt,
+        )
+        if entry.get("existed") is False:
+            if receipt.exists:
+                raise LocalCoreMigrationError(
+                    f"projection should remain absent after rollback: {relative_path}"
+                )
+            continue
+        if (
+            entry.get("existed") is not True
+            or not receipt.exists
+            or _safe_file_sha256(
+                project_fs,
+                relative_path,
+                expected=receipt,
+            )
+            != entry.get("sha256")
+            or _safe_file_mode(
+                project_fs,
+                relative_path,
+                expected=receipt,
+            )
+            != entry.get("mode")
+        ):
+            raise LocalCoreMigrationError(
+                f"projection rollback receipt content changed: {relative_path}"
+            )
+        project_fs._assert_unchanged(relative_path, receipt)
+
+
+def _capture_published_projection_receipts(
+    project_fs: ProjectFS,
+) -> dict[Path, _FileAuthorityReceipt]:
+    receipts: dict[Path, _FileAuthorityReceipt] = {}
+    for relative_path in PROJECTION_ROLLBACK_PATHS:
+        canonical = relative_path in PROJECTION_PATHS
+        snapshot = project_fs._snapshot(
+            relative_path,
+            allow_missing=not canonical,
+        )
+        if not snapshot.exists:
+            receipts[relative_path] = _FileAuthorityReceipt(
+                snapshot=snapshot,
+                sha256="",
+                mode=None,
+            )
+            continue
+        if not canonical:
+            raise LocalCoreMigrationError(
+                f"retired projection remains present: {relative_path}"
+            )
+        digest = _safe_file_sha256(
+            project_fs,
+            relative_path,
+            expected=snapshot,
+        )
+        mode = _safe_file_mode(
+            project_fs,
+            relative_path,
+            expected=snapshot,
+        )
+        project_fs._assert_unchanged(relative_path, snapshot)
+        receipts[relative_path] = _FileAuthorityReceipt(
+            snapshot=snapshot,
+            sha256=digest,
+            mode=mode,
+        )
+    return receipts
+
+
+def _assert_published_projection_receipts(
+    project_fs: ProjectFS,
+    receipts: dict[Path, _FileAuthorityReceipt],
+) -> None:
+    if set(receipts) != set(PROJECTION_ROLLBACK_PATHS):
+        raise LocalCoreMigrationError(
+            "published projection receipts do not match the canonical inventory"
+        )
+    for relative_path in PROJECTION_ROLLBACK_PATHS:
+        receipt = receipts[relative_path]
+        project_fs._assert_unchanged(
+            relative_path,
+            receipt.snapshot,
+        )
+        if not receipt.snapshot.exists:
+            if receipt.sha256 or receipt.mode is not None:
+                raise LocalCoreMigrationError(
+                    f"invalid absent projection receipt: {relative_path}"
+                )
+            continue
+        if (
+            _safe_file_sha256(
+                project_fs,
+                relative_path,
+                expected=receipt.snapshot,
+            )
+            != receipt.sha256
+            or _safe_file_mode(
+                project_fs,
+                relative_path,
+                expected=receipt.snapshot,
+            )
+            != receipt.mode
+        ):
+            raise LocalCoreMigrationError(
+                f"published projection changed before migration completion: {relative_path}"
+            )
+        project_fs._assert_unchanged(
+            relative_path,
+            receipt.snapshot,
+        )
+
+
+def _capture_recovery_bundle_receipts(
+    project_fs: ProjectFS,
+    backup: SQLiteBackupManifest,
+    projection_backup: dict[str, object] | None = None,
+) -> dict[Path, _FileAuthorityReceipt]:
+    receipts: dict[Path, _FileAuthorityReceipt] = {}
+
+    def capture(
+        absolute_path: Path,
+        *,
+        expected_digest: str,
+        expected_mode: int | None = None,
+    ) -> None:
+        relative = project_fs.relative_to_root(absolute_path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        digest = _safe_file_sha256(
+            project_fs,
+            relative,
+            expected=snapshot,
+        )
+        mode = _safe_file_mode(
+            project_fs,
+            relative,
+            expected=snapshot,
+        )
+        if digest != expected_digest or (
+            expected_mode is not None and mode != expected_mode
+        ):
+            raise LocalCoreMigrationError(
+                f"recovery bundle file failed receipt validation: {relative}"
+            )
+        project_fs._assert_unchanged(relative, snapshot)
+        receipts[relative] = _FileAuthorityReceipt(
+            snapshot=snapshot,
+            sha256=digest,
+            mode=mode,
+        )
+
+    capture(
+        Path(backup.backup_path),
+        expected_digest=backup.sha256,
+    )
+    manifest_path = Path(backup.manifest_path)
+    manifest_relative = project_fs.relative_to_root(manifest_path)
+    manifest_snapshot = project_fs._snapshot(
+        manifest_relative,
+        allow_missing=False,
+    )
+    manifest_payload = project_fs.read_bytes(
+        manifest_relative,
+        expected=manifest_snapshot,
+    )
+    try:
+        parsed_manifest = json.loads(manifest_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LocalCoreMigrationError(
+            "verified backup manifest is not valid JSON"
+        ) from exc
+    if parsed_manifest != backup.safe_payload():
+        raise LocalCoreMigrationError(
+            "verified backup manifest does not match the backup receipt"
+        )
+    manifest_mode = _safe_file_mode(
+        project_fs,
+        manifest_relative,
+        expected=manifest_snapshot,
+    )
+    project_fs._assert_unchanged(
+        manifest_relative,
+        manifest_snapshot,
+    )
+    receipts[manifest_relative] = _FileAuthorityReceipt(
+        snapshot=manifest_snapshot,
+        sha256=hashlib.sha256(manifest_payload).hexdigest(),
+        mode=manifest_mode,
+    )
+
+    if projection_backup is not None:
+        entries = projection_backup.get("entries")
+        if not isinstance(entries, list):
+            raise LocalCoreMigrationError(
+                "projection recovery bundle entries are unavailable"
+            )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise LocalCoreMigrationError(
+                    "projection recovery bundle entry is invalid"
+                )
+            if entry.get("existed") is not True:
+                continue
+            backup_path = entry.get("backup_path")
+            digest = entry.get("sha256")
+            mode = entry.get("mode")
+            if (
+                not isinstance(backup_path, str)
+                or not backup_path
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or not isinstance(mode, int)
+            ):
+                raise LocalCoreMigrationError(
+                    "projection recovery bundle metadata is invalid"
+                )
+            capture(
+                Path(backup_path),
+                expected_digest=digest,
+            )
+    return receipts
+
+
+def _assert_recovery_bundle_receipts(
+    project_fs: ProjectFS,
+    receipts: dict[Path, _FileAuthorityReceipt],
+) -> None:
+    if not receipts:
+        raise LocalCoreMigrationError(
+            "recovery bundle receipts are unavailable"
+        )
+    for relative, receipt in receipts.items():
+        project_fs._assert_unchanged(relative, receipt.snapshot)
+        if (
+            _safe_file_sha256(
+                project_fs,
+                relative,
+                expected=receipt.snapshot,
+            )
+            != receipt.sha256
+            or _safe_file_mode(
+                project_fs,
+                relative,
+                expected=receipt.snapshot,
+            )
+            != receipt.mode
+        ):
+            raise LocalCoreMigrationError(
+                f"recovery bundle authority changed: {relative}"
+            )
+        project_fs._assert_unchanged(relative, receipt.snapshot)
 
 
 @contextmanager
@@ -1850,7 +2497,7 @@ def _project_migration_lock(
             sort_keys=True,
         ).encode("utf-8")
         try:
-            project_fs.create_exclusive(
+            lock_snapshot = project_fs.create_exclusive(
                 relative_lock,
                 payload,
                 mode=0o600,
@@ -1862,55 +2509,115 @@ def _project_migration_lock(
         guard = _MigrationGuard(
             lock_path=lock_path,
             project_fs=project_fs,
+            lock_snapshot=lock_snapshot,
         )
         completed = False
-        try:
-            with project_db_operation(
-                root,
-                purpose="migration",
-                project_fs=project_fs,
-            ) as locked_project_fs:
-                yield guard, locked_project_fs
-                completed = True
-        finally:
+
+        def finalize_guard() -> None:
+            def publish_failure_sentinel(status: str) -> None:
+                payload: dict[str, object] = {
+                    "pid": os.getpid(),
+                    "created_at": _timestamp(),
+                    "target_schema": SCHEMA30_VERSION,
+                    "status": status,
+                }
+                manifest_verified = False
+                try:
+                    guard.verify_recovery_manifest(required=True)
+                    manifest_verified = True
+                except BaseException as manifest_exc:
+                    payload["manifest_status"] = "untrusted"
+                    payload["manifest_error"] = _exception_text(
+                        manifest_exc
+                    )
+                if manifest_verified and guard.manifest_path is not None:
+                    payload["manifest_path"] = str(guard.manifest_path)
+                guard.write_sentinel(payload)
+                if manifest_verified:
+                    try:
+                        guard.verify_recovery_manifest(required=True)
+                    except BaseException as manifest_exc:
+                        payload.pop("manifest_path", None)
+                        payload["manifest_status"] = "changed"
+                        payload["manifest_error"] = _exception_text(
+                            manifest_exc
+                        )
+                        guard.write_sentinel(payload)
+
             if completed or guard.clear_allowed:
-                project_fs.unlink_regular(relative_lock, missing_ok=True)
+                try:
+                    receipts_required = (
+                        completed and guard.manifest_path is not None
+                    )
+                    guard.verify_clear_authorities(
+                        required=receipts_required
+                    )
+                    project_fs.unlink_regular(
+                        relative_lock,
+                        missing_ok=True,
+                        expected=guard.lock_snapshot,
+                    )
+                    guard.lock_snapshot = _PathSnapshot(False)
+                    guard.verify_clear_authorities(
+                        required=receipts_required
+                    )
+                except BaseException as clear_exc:
+                    guard.recovery_required = True
+                    guard.clear_allowed = False
+                    if guard.clear_failure_publisher is not None:
+                        try:
+                            guard.clear_failure_publisher(clear_exc)
+                        except BaseException:
+                            # Never point the sentinel at a diagnostic artifact
+                            # whose terminal failure publication was not itself
+                            # verified.
+                            guard.recovery_manifest_relative = None
+                            guard.recovery_manifest_snapshot = None
+                            guard.recovery_manifest_sha256 = ""
+                    try:
+                        current_lock_snapshot = project_fs._snapshot(
+                            relative_lock,
+                            allow_missing=True,
+                        )
+                        if (
+                            not current_lock_snapshot.exists
+                            or current_lock_snapshot == guard.lock_snapshot
+                        ):
+                            guard.lock_snapshot = current_lock_snapshot
+                            publish_failure_sentinel(
+                                "rollback-incomplete"
+                            )
+                    except BaseException:
+                        # An existing changed entry remains fail-closed.
+                        pass
+                    raise
             elif guard.recovery_required:
                 try:
-                    recovery_payload: dict[str, object] = {
-                        "pid": os.getpid(),
-                        "created_at": _timestamp(),
-                        "target_schema": SCHEMA30_VERSION,
-                        "status": "rollback-incomplete",
-                    }
-                    if guard.manifest_path is not None:
-                        recovery_payload["manifest_path"] = str(
-                            guard.manifest_path
-                        )
-                    _write_json_atomic(
-                        lock_path,
-                        recovery_payload,
-                        project_fs=project_fs,
-                    )
+                    publish_failure_sentinel("rollback-incomplete")
                 except BaseException:
                     # The exclusive original sentinel remains fail-closed.
                     pass
             elif guard.manifest_path is not None:
                 try:
-                    _write_json_atomic(
-                        lock_path,
-                        {
-                            "pid": os.getpid(),
-                            "created_at": _timestamp(),
-                            "target_schema": SCHEMA30_VERSION,
-                            "status": "migration-failed",
-                            "manifest_path": str(guard.manifest_path),
-                        },
-                        project_fs=project_fs,
-                    )
+                    publish_failure_sentinel("migration-failed")
                 except BaseException:
                     # Preserve the original diagnostic sentinel.
                     pass
+
+        with project_db_operation(
+            root,
+            purpose="migration",
+            project_fs=project_fs,
+        ) as locked_project_fs:
+            try:
+                yield guard, locked_project_fs
+                completed = True
+            finally:
+                # Authority verification and sentinel cleanup are part of the
+                # migration operation itself.  Releasing the operation lock
+                # first would let an ordinary writer commit in the gap and be
+                # misclassified as migration corruption.
+                finalize_guard()
 
 
 def _checkpoint_active_database(
@@ -1927,15 +2634,29 @@ def _checkpoint_active_database(
         relative = project_fs.relative_to_root(active_path)
         snapshot = project_fs._snapshot(relative, allow_missing=False)
         project_fs.audit(_database_family(relative), allow_missing=True)
-        uri = f"{project_fs.absolute(relative).as_uri()}?mode=rw"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+        checkpoint_result: list[object] = []
+
+        def checkpoint_database(conn: sqlite3.Connection) -> None:
             conn.execute("pragma busy_timeout = 5000")
             project_fs._assert_unchanged(relative, snapshot)
-            result = conn.execute(
-                "pragma wal_checkpoint(truncate)"
-            ).fetchone()
+            current_mode = conn.execute("pragma journal_mode").fetchone()
+            if current_mode is not None and str(current_mode[0]).lower() == "wal":
+                checkpoint_result.append(
+                    conn.execute("pragma wal_checkpoint(truncate)").fetchone()
+                )
+            else:
+                checkpoint_result.append((0, 0, 0))
             project_fs._assert_unchanged(relative, snapshot)
+
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="rw",
+            setup=checkpoint_database,
+        ):
+            pass
         project_fs.audit(_database_family(relative), allow_missing=True)
+        result = checkpoint_result[0] if checkpoint_result else None
     if result is None or int(result[0]) != 0:
         raise LocalCoreMigrationError(
             f"active database WAL checkpoint did not complete before migration: {result}"
@@ -1957,8 +2678,12 @@ def _finalize_staging_metadata(
         relative = project_fs.relative_to_root(staging_path)
         snapshot = project_fs._snapshot(relative, allow_missing=False)
         project_fs.audit(_database_family(relative), allow_missing=True)
-        uri = f"{project_fs.absolute(relative).as_uri()}?mode=rw"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="rw",
+            journal_mode="memory",
+        ) as conn:
             project_fs._assert_unchanged(relative, snapshot)
             conn.execute("pragma foreign_keys = on")
             conn.execute("begin immediate")
@@ -2023,8 +2748,12 @@ def _schema30_doctor(
         relative = project_fs.relative_to_root(path)
         snapshot = project_fs._snapshot(relative, allow_missing=False)
         project_fs.audit(_database_family(relative), allow_missing=True)
-        uri = f"{project_fs.absolute(relative).as_uri()}?mode=ro&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="ro",
+            immutable=True,
+        ) as conn:
             project_fs._assert_unchanged(relative, snapshot)
             _validate_staging_database(conn)
             triggers = {
@@ -2099,16 +2828,22 @@ def _quarantine_failed_database_sidecars(
                 )
 
         quarantined: list[Path] = []
-        for source, destination, source_snapshot in zip(
+        for source, destination, source_snapshot, destination_snapshot in zip(
             sources,
             destinations,
             source_snapshots,
+            destination_snapshots,
             strict=True,
         ):
             if not source_snapshot.exists:
                 continue
             project_fs._assert_unchanged(source, source_snapshot)
-            project_fs.replace_file(source, destination)
+            project_fs.replace_file(
+                source,
+                destination,
+                expected_source=source_snapshot,
+                expected_destination=destination_snapshot,
+            )
             if project_fs._snapshot(source, allow_missing=True).exists:
                 raise LocalCoreMigrationError(
                     "failed schema30 sidecar remained active after quarantine: "
@@ -2123,8 +2858,10 @@ def _restore_verified_backup(
     active_path: Path,
     backup: SQLiteBackupManifest,
     *,
+    expected_active_snapshot: _PathSnapshot,
+    expected_backup_snapshot: _PathSnapshot,
     pinned_fs: ProjectFS | None = None,
-) -> None:
+) -> dict[Path, _PathSnapshot]:
     root = _project_root_for_database(active_path)
     with _project_fs_scope(root, pinned_fs) as project_fs:
         active_relative = project_fs.relative_to_root(active_path)
@@ -2133,9 +2870,24 @@ def _restore_verified_backup(
             active_relative.name + ".restore"
         )
         sidecars = _database_family(active_relative)[1:]
-        project_fs._snapshot(backup_relative, allow_missing=False)
-        project_fs._snapshot(active_relative, allow_missing=True)
-        project_fs._snapshot(restore_relative, allow_missing=True)
+        project_fs._assert_unchanged(
+            backup_relative,
+            expected_backup_snapshot,
+        )
+        backup_snapshot = expected_backup_snapshot
+        active_snapshot = project_fs._snapshot(
+            active_relative,
+            allow_missing=True,
+        )
+        if active_snapshot != expected_active_snapshot:
+            raise ProjectPathSafetyError(
+                active_relative,
+                "path-identity-changed",
+            )
+        restore_destination_snapshot = project_fs._snapshot(
+            restore_relative,
+            allow_missing=True,
+        )
         sidecar_snapshots = tuple(
             project_fs._snapshot(path, allow_missing=True)
             for path in sidecars
@@ -2155,31 +2907,58 @@ def _restore_verified_backup(
                 + ", ".join(remaining_sidecars)
             )
 
-        backup_payload = project_fs.read_bytes(backup_relative)
+        backup_payload = project_fs.read_bytes(
+            backup_relative,
+            expected=backup_snapshot,
+        )
         if hashlib.sha256(backup_payload).hexdigest() != backup.sha256:
             raise LocalCoreMigrationError(
                 "verified migration backup is missing or has a digest mismatch"
             )
-        project_fs.atomic_write(
+        restore_snapshot = project_fs.atomic_write(
             restore_relative,
             backup_payload,
             mode=0o600,
+            expected_destination=restore_destination_snapshot,
         )
-        if _safe_database_digest(project_fs, restore_relative) != backup.sha256:
+        if (
+            _safe_database_digest(
+                project_fs,
+                restore_relative,
+                expected=restore_snapshot,
+            )
+            != backup.sha256
+        ):
             raise LocalCoreMigrationError(
                 "temporary restored database does not match the verified backup digest"
             )
-        project_fs.replace_file(restore_relative, active_relative)
+        project_fs._assert_unchanged(restore_relative, restore_snapshot)
+        project_fs.replace_file(
+            restore_relative,
+            active_relative,
+            expected_source=restore_snapshot,
+            expected_destination=active_snapshot,
+        )
         active_snapshot = project_fs._snapshot(
             active_relative,
             allow_missing=False,
         )
-        if _safe_database_digest(project_fs, active_relative) != backup.sha256:
+        if (
+            _safe_database_digest(
+                project_fs,
+                active_relative,
+                expected=active_snapshot,
+            )
+            != backup.sha256
+        ):
             raise LocalCoreMigrationError(
                 "restored active database does not match the verified backup digest"
             )
-        uri = f"{project_fs.absolute(active_relative).as_uri()}?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            active_relative,
+            access="ro",
+        ) as conn:
             integrity = [
                 str(row[0])
                 for row in conn.execute("pragma integrity_check")
@@ -2194,8 +2973,6 @@ def _restore_verified_backup(
                 active_relative,
                 active_snapshot,
             )
-        for sidecar in sidecars:
-            project_fs.unlink_regular(sidecar, missing_ok=True)
         if any(
             project_fs._snapshot(path, allow_missing=True).exists
             for path in sidecars
@@ -2214,6 +2991,25 @@ def _restore_verified_backup(
                 f"integrity={integrity} "
                 f"foreign_keys={len(foreign_keys)} version={version}"
             )
+        project_fs._assert_unchanged(active_relative, active_snapshot)
+        if (
+            _safe_database_digest(
+                project_fs,
+                active_relative,
+                expected=active_snapshot,
+            )
+            != backup.sha256
+        ):
+            raise LocalCoreMigrationError(
+                "restored active database changed after validation"
+            )
+        project_fs._assert_unchanged(active_relative, active_snapshot)
+        return _capture_database_family_receipts(
+            project_fs,
+            active_relative,
+            expected_main=active_snapshot,
+            expected_digest=backup.sha256,
+        )
 
 
 def _diagnostic_database_digest(
@@ -2227,35 +3023,53 @@ def _move_failed_schema30(
     project_fs: ProjectFS,
     source: Path,
     destination: Path,
+    *,
+    expected_source: _PathSnapshot,
+    expected_destination: _PathSnapshot,
 ) -> None:
-    project_fs.replace_file(source, destination)
+    project_fs.replace_file(
+        source,
+        destination,
+        expected_source=expected_source,
+        expected_destination=expected_destination,
+    )
 
 
 def _copy_failed_schema30(
     project_fs: ProjectFS,
     source: Path,
     destination: Path,
-) -> None:
-    project_fs.atomic_write(
+    *,
+    expected_source: _PathSnapshot,
+    expected_destination: _PathSnapshot,
+) -> _PathSnapshot:
+    return project_fs.atomic_write(
         destination,
-        project_fs.read_bytes(source),
+        project_fs.read_bytes(source, expected=expected_source),
         mode=0o600,
+        expected_destination=expected_destination,
     )
 
 
 def _cleanup_failed_schema30(
     project_fs: ProjectFS,
     relative: Path,
+    expected: _PathSnapshot,
 ) -> None:
-    project_fs.unlink_regular(relative, missing_ok=True)
+    project_fs.unlink_regular(
+        relative,
+        missing_ok=True,
+        expected=expected,
+    )
 
 
 def _preserve_failed_schema30(
     active_path: Path,
     failed_path: Path,
     *,
+    expected_active_snapshot: _PathSnapshot,
     pinned_fs: ProjectFS | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, _PathSnapshot]:
     """Best-effort diagnostic preservation that must never block authority restore."""
     root = _project_root_for_database(active_path)
     with _project_fs_scope(root, pinned_fs) as project_fs:
@@ -2265,6 +3079,11 @@ def _preserve_failed_schema30(
             active_relative,
             allow_missing=False,
         )
+        if active_snapshot != expected_active_snapshot:
+            raise ProjectPathSafetyError(
+                active_relative,
+                "path-identity-changed",
+            )
         failed_snapshot = project_fs._snapshot(
             failed_relative,
             allow_missing=True,
@@ -2305,6 +3124,7 @@ def _preserve_failed_schema30(
                 "failed",
                 "failed schema30 digest unavailable: "
                 f"{_exception_text(digest_exc)}",
+                active_snapshot,
             )
 
         try:
@@ -2312,15 +3132,20 @@ def _preserve_failed_schema30(
                 project_fs,
                 active_relative,
                 failed_relative,
+                expected_source=active_snapshot,
+                expected_destination=failed_snapshot,
             )
         except ProjectPathSafetyError:
             raise
         except BaseException as move_exc:
+            copied_snapshot: _PathSnapshot | None = None
             try:
-                _copy_failed_schema30(
+                copied_snapshot = _copy_failed_schema30(
                     project_fs,
                     active_relative,
                     failed_relative,
+                    expected_source=active_snapshot,
+                    expected_destination=failed_snapshot,
                 )
                 if (
                     _diagnostic_database_digest(
@@ -2340,6 +3165,7 @@ def _preserve_failed_schema30(
                     _cleanup_failed_schema30(
                         project_fs,
                         failed_relative,
+                        copied_snapshot or failed_snapshot,
                     )
                 except BaseException as cleanup_exc:
                     cleanup_error = (
@@ -2351,10 +3177,29 @@ def _preserve_failed_schema30(
                     f"atomic move failed: {_exception_text(move_exc)}; "
                     f"fallback copy failed: {_exception_text(copy_exc)}"
                     f"{cleanup_error}",
+                    active_snapshot,
                 )
             preservation_status = "copied-after-move-failure"
             preservation_error = _exception_text(move_exc)
+            active_after = project_fs._snapshot(
+                active_relative,
+                allow_missing=False,
+            )
+            if active_after != active_snapshot:
+                raise ProjectPathSafetyError(
+                    active_relative,
+                    "path-identity-changed",
+                )
         else:
+            active_after = project_fs._snapshot(
+                active_relative,
+                allow_missing=True,
+            )
+            if active_after.exists:
+                raise ProjectPathSafetyError(
+                    active_relative,
+                    "path-identity-changed",
+                )
             try:
                 if (
                     _diagnostic_database_digest(
@@ -2371,6 +3216,7 @@ def _preserve_failed_schema30(
                     "failed",
                     "atomic move completed but verification failed: "
                     f"{_exception_text(verify_exc)}",
+                    active_after,
                 )
             preservation_status = "moved"
             preservation_error = ""
@@ -2387,8 +3233,19 @@ def _preserve_failed_schema30(
             f"{preservation_error + '; ' if preservation_error else ''}"
             "failed schema30 sidecar quarantine failed: "
             f"{_exception_text(sidecar_exc)}",
+            active_after,
         )
-    return preservation_status, preservation_error
+    with _project_fs_scope(root, pinned_fs) as project_fs:
+        active_relative = project_fs.relative_to_root(active_path)
+        if project_fs._snapshot(
+            active_relative,
+            allow_missing=not active_after.exists,
+        ) != active_after:
+            raise ProjectPathSafetyError(
+                active_relative,
+                "path-identity-changed",
+            )
+    return preservation_status, preservation_error, active_after
 
 
 def _remove_empty_active_sidecars(
@@ -2402,6 +3259,7 @@ def _remove_empty_active_sidecars(
     ) as project_fs:
         active_relative = project_fs.relative_to_root(active_path)
         sidecars = _database_family(active_relative)[1:]
+        removable: dict[Path, _PathSnapshot] = {}
         for index, sidecar in enumerate(sidecars):
             snapshot = project_fs._snapshot(sidecar, allow_missing=True)
             if not snapshot.exists:
@@ -2416,16 +3274,38 @@ def _remove_empty_active_sidecars(
                     "stop project writers and checkpoint SQLite before activation: "
                     f"{project_fs.absolute(sidecar)}"
                 )
-        for sidecar in sidecars:
-            project_fs.unlink_regular(sidecar, missing_ok=True)
+            removable[sidecar] = snapshot
+        for sidecar, snapshot in removable.items():
+            project_fs.unlink_regular(
+                sidecar,
+                expected=snapshot,
+            )
 
 
 def _activate_staging_database(
     project_fs: ProjectFS,
     staging_relative: Path,
     active_relative: Path,
-) -> None:
-    project_fs.replace_file(staging_relative, active_relative)
+    *,
+    staging_snapshot: _PathSnapshot,
+    active_snapshot: _PathSnapshot,
+) -> _PathSnapshot:
+    project_fs.replace_file(
+        staging_relative,
+        active_relative,
+        expected_source=staging_snapshot,
+        expected_destination=active_snapshot,
+    )
+    activated_snapshot = project_fs._snapshot(
+        active_relative,
+        allow_missing=False,
+    )
+    if activated_snapshot != staging_snapshot:
+        raise ProjectPathSafetyError(
+            active_relative,
+            "path-identity-changed",
+        )
+    return activated_snapshot
 
 
 def migrate_project_to_schema30(
@@ -2461,6 +3341,7 @@ def migrate_project_to_schema30(
             raise LocalCoreMigrationError(
                 f"runtime database is missing: {active_path}"
             )
+        source_active_snapshot = active_snapshot
         project_fs.audit(
             _database_family(active_relative),
             allow_missing=True,
@@ -2487,6 +3368,10 @@ def migrate_project_to_schema30(
             source_path=active_path,
             expected_source_version=source_version,
             project_fs=project_fs,
+        )
+        recovery_bundle_receipts = _capture_recovery_bundle_receipts(
+            project_fs,
+            backup,
         )
         backup_dir = Path(backup.backup_path).parent
         staging_path = backup_dir / "harness.schema30.new.db"
@@ -2515,12 +3400,111 @@ def migrate_project_to_schema30(
             "projection_restore_status": "not-needed",
             "failure_point": fail_at or "",
         }
-        _write_json_atomic(
+        manifest_snapshot = _write_json_atomic(
             migration_manifest_path,
             manifest_payload,
             project_fs=project_fs,
         )
         migration_guard.record_manifest(migration_manifest_path)
+        migration_guard.record_recovery_manifest(
+            migration_manifest_path,
+            manifest_snapshot,
+        )
+        recovery_manifest_path = migration_manifest_path
+        recovery_manifest_snapshot = manifest_snapshot
+        manifest_fallback_used = False
+
+        def write_canonical_manifest() -> _PathSnapshot:
+            nonlocal manifest_snapshot, recovery_manifest_snapshot
+            manifest_snapshot = _write_json_atomic(
+                migration_manifest_path,
+                manifest_payload,
+                project_fs=project_fs,
+                expected_destination=manifest_snapshot,
+            )
+            if recovery_manifest_path == migration_manifest_path:
+                recovery_manifest_snapshot = manifest_snapshot
+            return manifest_snapshot
+
+        def write_failure_manifest() -> Path:
+            nonlocal recovery_manifest_path
+            nonlocal recovery_manifest_snapshot
+            nonlocal manifest_fallback_used
+            try:
+                recovery_manifest_snapshot = _write_json_atomic(
+                    recovery_manifest_path,
+                    manifest_payload,
+                    project_fs=project_fs,
+                    expected_destination=recovery_manifest_snapshot,
+                )
+                migration_guard.record_recovery_manifest(
+                    recovery_manifest_path,
+                    recovery_manifest_snapshot,
+                )
+            except BaseException as manifest_exc:
+                failed_manifest_path = recovery_manifest_path
+                manifest_payload["status"] = "rollback-incomplete"
+                manifest_payload["failed_manifest_path"] = str(
+                    failed_manifest_path
+                )
+                manifest_payload["manifest_write_error"] = _exception_text(
+                    manifest_exc
+                )
+                for _ in range(128):
+                    (
+                        recovery_manifest_path,
+                        recovery_manifest_snapshot,
+                    ) = _create_fallback_recovery_manifest(
+                        migration_manifest_path,
+                        manifest_payload,
+                        manifest_write_error=manifest_exc,
+                        project_fs=project_fs,
+                    )
+                    try:
+                        migration_guard.record_recovery_manifest(
+                            recovery_manifest_path,
+                            recovery_manifest_snapshot,
+                        )
+                    except (
+                        ProjectPathSafetyError,
+                        LocalCoreMigrationError,
+                    ) as recovery_race_exc:
+                        manifest_payload[
+                            "recovery_manifest_race_error"
+                        ] = _exception_text(recovery_race_exc)
+                        continue
+                    break
+                else:
+                    raise LocalCoreMigrationError(
+                        "cannot publish a stable fallback recovery manifest"
+                    )
+                manifest_fallback_used = True
+                migration_guard.record_manifest(recovery_manifest_path)
+                migration_guard.require_recovery(
+                    recovery_manifest_path,
+                    snapshot=recovery_manifest_snapshot,
+                )
+            return recovery_manifest_path
+
+        def publish_terminal_authority_failure(
+            failure: BaseException,
+        ) -> None:
+            previous_status = str(manifest_payload.get("status") or "")
+            manifest_payload["status"] = "rollback-incomplete"
+            manifest_payload["previous_terminal_status"] = previous_status
+            manifest_payload["terminal_authority_error"] = (
+                _exception_text(failure)
+            )
+            manifest_payload.setdefault(
+                "error",
+                _exception_text(failure),
+            )
+            write_failure_manifest()
+            migration_guard.require_recovery(
+                recovery_manifest_path,
+                snapshot=recovery_manifest_snapshot,
+            )
+
         try:
             projection_backup = _create_projection_backup(
                 root,
@@ -2531,22 +3515,32 @@ def migrate_project_to_schema30(
             manifest_payload["status"] = "failed-before-activation"
             manifest_payload["error"] = _exception_text(exc)
             manifest_payload["projection_backup"] = {"status": "failed"}
-            _write_json_atomic(
-                migration_manifest_path,
-                manifest_payload,
-                project_fs=project_fs,
-            )
+            write_failure_manifest()
             raise
         manifest_payload["projection_backup"] = projection_backup
-        _write_json_atomic(
-            migration_manifest_path,
-            manifest_payload,
-            project_fs=project_fs,
-        )
+        try:
+            recovery_bundle_receipts = _capture_recovery_bundle_receipts(
+                project_fs,
+                backup,
+                projection_backup,
+            )
+            write_canonical_manifest()
+        except BaseException as manifest_exc:
+            manifest_payload["status"] = "rollback-incomplete"
+            manifest_payload["error"] = _exception_text(manifest_exc)
+            manifest_payload["projection_restore_status"] = "not-needed"
+            write_failure_manifest()
+            migration_guard.require_recovery(
+                recovery_manifest_path,
+                snapshot=recovery_manifest_snapshot,
+            )
+            raise
         activated = False
         activation_attempted = False
         expected_active_sha256 = ""
         report: LocalCoreStagingReport | None = None
+        staging_snapshot: _PathSnapshot | None = None
+        activated_snapshot: _PathSnapshot | None = None
         try:
             _inject_failure(fail_at, "before_copy")
             report = stage_supported_schema_to_schema30(
@@ -2558,11 +3552,7 @@ def migrate_project_to_schema30(
             )
             manifest_payload["staging"] = asdict(report)
             manifest_payload["status"] = "staged"
-            _write_json_atomic(
-                migration_manifest_path,
-                manifest_payload,
-                project_fs=project_fs,
-            )
+            write_canonical_manifest()
             _finalize_staging_metadata(
                 staging_path,
                 report,
@@ -2579,6 +3569,10 @@ def migrate_project_to_schema30(
                 raise LocalCoreMigrationError(
                     "active source changed after staging and before activation"
                 )
+            project_fs._assert_unchanged(
+                active_relative,
+                source_active_snapshot,
+            )
             _inject_failure(fail_at, "before_atomic_replace")
             _remove_empty_active_sidecars(
                 active_path,
@@ -2596,41 +3590,46 @@ def migrate_project_to_schema30(
                 staging_relative,
                 staging_snapshot,
             )
-            migration_guard.require_recovery(migration_manifest_path)
+            migration_guard.require_recovery(
+                migration_manifest_path,
+                snapshot=manifest_snapshot,
+            )
             activation_attempted = True
-            _activate_staging_database(
+            activated_snapshot = _activate_staging_database(
                 project_fs,
                 staging_relative,
                 active_relative,
+                staging_snapshot=staging_snapshot,
+                active_snapshot=source_active_snapshot,
             )
             activated = True
             _inject_failure(fail_at, "after_atomic_replace")
-            _schema30_doctor(active_path, pinned_fs=project_fs)
-            active_snapshot = project_fs._snapshot(
+            project_fs._assert_unchanged(
                 active_relative,
-                allow_missing=False,
+                activated_snapshot,
             )
+            if (
+                _safe_database_digest(project_fs, active_relative)
+                != expected_active_sha256
+            ):
+                raise LocalCoreMigrationError(
+                    "activated database digest does not match verified staging"
+                )
+            project_fs._assert_unchanged(
+                active_relative,
+                activated_snapshot,
+            )
+            _schema30_doctor(active_path, pinned_fs=project_fs)
+            project_fs._assert_unchanged(
+                active_relative,
+                activated_snapshot,
+            )
+            active_snapshot = activated_snapshot
             project_fs.audit(
                 _database_family(active_relative),
                 allow_missing=True,
             )
-            active_uri = (
-                f"{project_fs.absolute(active_relative).as_uri()}?mode=rw"
-            )
-            with closing(
-                sqlite3.connect(active_uri, uri=True, timeout=5.0)
-            ) as callback_prep:
-                project_fs._assert_unchanged(
-                    active_relative,
-                    active_snapshot,
-                )
-                journal_mode = callback_prep.execute(
-                    "pragma journal_mode=wal"
-                ).fetchone()
-                if journal_mode is None or str(journal_mode[0]).lower() != "wal":
-                    raise LocalCoreMigrationError(
-                        f"cannot stabilize callback database journal mode: {journal_mode}"
-                    )
+            def prepare_callback_database(callback_prep: sqlite3.Connection) -> None:
                 checkpoint = callback_prep.execute(
                     "pragma wal_checkpoint(truncate)"
                 ).fetchone()
@@ -2638,10 +3637,22 @@ def migrate_project_to_schema30(
                     raise LocalCoreMigrationError(
                         f"cannot stabilize callback database WAL: {checkpoint}"
                     )
+
+            with _verified_sqlite_connection(
+                project_fs,
+                active_relative,
+                access="rw",
+                journal_mode="wal",
+                setup=prepare_callback_database,
+            ):
                 project_fs._assert_unchanged(
                     active_relative,
                     active_snapshot,
                 )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             project_fs.audit(
                 _database_family(active_relative),
                 allow_missing=True,
@@ -2650,8 +3661,16 @@ def migrate_project_to_schema30(
                 project_fs,
                 active_relative,
             )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             if active_validator:
                 active_validator(active_path)
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             post_callback_fingerprint = _safe_database_fingerprint(
                 project_fs,
                 active_relative,
@@ -2660,25 +3679,190 @@ def migrate_project_to_schema30(
                 raise LocalCoreMigrationError(
                     "projection callback mutated the active database authority"
                 )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             _schema30_doctor(active_path, pinned_fs=project_fs)
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             from core.projections import projection_content_issues
 
+            published_projection_receipts = (
+                _capture_published_projection_receipts(project_fs)
+            )
             projection_issues = projection_content_issues(root)
             if projection_issues:
                 raise LocalCoreMigrationError(
                     "post-activation projection content verification failed: "
                     + "; ".join(projection_issues)
                 )
+            _assert_published_projection_receipts(
+                project_fs,
+                published_projection_receipts,
+            )
+            if (
+                _safe_database_fingerprint(project_fs, active_relative)
+                != pre_callback_fingerprint
+            ):
+                raise LocalCoreMigrationError(
+                    "post-validation database authority changed"
+                )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
             active_sha256 = _safe_database_digest(
                 project_fs,
                 active_relative,
             )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
+            success_database_receipts = (
+                _capture_database_family_receipts(
+                    project_fs,
+                    active_relative,
+                    expected_main=active_snapshot,
+                    expected_digest=active_sha256,
+                )
+            )
+            _assert_recovery_bundle_receipts(
+                project_fs,
+                recovery_bundle_receipts,
+            )
             manifest_payload["status"] = "activated"
             manifest_payload["active_sha256"] = active_sha256
-            _write_json_atomic(
+            final_manifest_snapshot = write_canonical_manifest()
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
+            if (
+                _safe_database_digest(
+                    project_fs,
+                    active_relative,
+                    expected=active_snapshot,
+                )
+                != active_sha256
+            ):
+                raise LocalCoreMigrationError(
+                    "active database changed during final manifest publication"
+                )
+            project_fs._assert_unchanged(
+                active_relative,
+                active_snapshot,
+            )
+            _assert_published_projection_receipts(
+                project_fs,
+                published_projection_receipts,
+            )
+            _assert_database_family_receipts(
+                project_fs,
+                active_relative,
+                success_database_receipts,
+                expected_digest=active_sha256,
+            )
+            _assert_recovery_bundle_receipts(
+                project_fs,
+                recovery_bundle_receipts,
+            )
+            project_fs._assert_unchanged(
+                manifest_relative,
+                final_manifest_snapshot,
+            )
+            final_manifest_sha256 = _safe_file_sha256(
+                project_fs,
+                manifest_relative,
+                expected=final_manifest_snapshot,
+            )
+            project_fs._assert_unchanged(
+                manifest_relative,
+                final_manifest_snapshot,
+            )
+
+            def verify_success_authorities(
+                *,
+                expected_active: _PathSnapshot = active_snapshot,
+                expected_active_digest: str = active_sha256,
+                expected_database_family: dict[
+                    Path,
+                    _PathSnapshot,
+                ] = dict(success_database_receipts),
+                expected_projections: dict[
+                    Path,
+                    _FileAuthorityReceipt,
+                ] = dict(published_projection_receipts),
+                expected_recovery_bundle: dict[
+                    Path,
+                    _FileAuthorityReceipt,
+                ] = dict(recovery_bundle_receipts),
+                expected_manifest: _PathSnapshot = final_manifest_snapshot,
+                expected_manifest_digest: str = final_manifest_sha256,
+            ) -> None:
+                project_fs._assert_unchanged(
+                    active_relative,
+                    expected_active,
+                )
+                if (
+                    _safe_database_digest(
+                        project_fs,
+                        active_relative,
+                        expected=expected_active,
+                    )
+                    != expected_active_digest
+                ):
+                    raise LocalCoreMigrationError(
+                        "active database changed before migration sentinel cleanup"
+                    )
+                project_fs._assert_unchanged(
+                    active_relative,
+                    expected_active,
+                )
+                _assert_database_family_receipts(
+                    project_fs,
+                    active_relative,
+                    expected_database_family,
+                    expected_digest=expected_active_digest,
+                )
+                _assert_published_projection_receipts(
+                    project_fs,
+                    expected_projections,
+                )
+                _assert_recovery_bundle_receipts(
+                    project_fs,
+                    expected_recovery_bundle,
+                )
+                project_fs._assert_unchanged(
+                    manifest_relative,
+                    expected_manifest,
+                )
+                if (
+                    _safe_file_sha256(
+                        project_fs,
+                        manifest_relative,
+                        expected=expected_manifest,
+                    )
+                    != expected_manifest_digest
+                ):
+                    raise LocalCoreMigrationError(
+                        "migration manifest changed before sentinel cleanup"
+                    )
+                project_fs._assert_unchanged(
+                    manifest_relative,
+                    expected_manifest,
+                )
+
+            migration_guard.arm_verified_clear(
+                verify_success_authorities,
+                publish_terminal_authority_failure,
+            )
+            migration_guard.record_recovery_manifest(
                 migration_manifest_path,
-                manifest_payload,
-                project_fs=project_fs,
+                final_manifest_snapshot,
             )
             assert report is not None
             return LocalCoreMigrationResult(
@@ -2692,16 +3876,27 @@ def migrate_project_to_schema30(
             )
         except BaseException as exc:
             primary_error = _exception_text(exc)
+            rollback_active_snapshot: _PathSnapshot | None = None
+            rollback_active_sha256 = ""
+            rollback_database_receipts: dict[
+                Path,
+                _PathSnapshot,
+            ] | None = None
+            projection_restore_receipts: dict[
+                Path,
+                _PathSnapshot,
+            ] | None = None
+            activation_state_diverged = False
             if not activated and activation_attempted:
                 try:
-                    active_exists = project_fs._snapshot(
+                    detected_active_snapshot = project_fs._snapshot(
                         active_relative,
                         allow_missing=True,
-                    ).exists
-                    staging_exists = project_fs._snapshot(
+                    )
+                    detected_staging_snapshot = project_fs._snapshot(
                         staging_relative,
                         allow_missing=True,
-                    ).exists
+                    )
                 except BaseException as detection_exc:
                     activated = True
                     manifest_payload["activation_detection_status"] = (
@@ -2711,7 +3906,45 @@ def migrate_project_to_schema30(
                         detection_exc
                     )
                 else:
-                    activated = active_exists and not staging_exists
+                    active_matches_staging_identity = (
+                        staging_snapshot is not None
+                        and detected_active_snapshot == staging_snapshot
+                    )
+                    active_matches_staging_digest = False
+                    if detected_active_snapshot.exists:
+                        try:
+                            active_matches_staging_digest = (
+                                _safe_database_digest(
+                                    project_fs,
+                                    active_relative,
+                                )
+                                == expected_active_sha256
+                            )
+                        except BaseException as detection_exc:
+                            manifest_payload["activation_detection_error"] = (
+                                _exception_text(detection_exc)
+                            )
+                    activated = detected_active_snapshot.exists and (
+                        not detected_staging_snapshot.exists
+                        or active_matches_staging_identity
+                        or active_matches_staging_digest
+                    )
+                    activation_state_diverged = (
+                        not activated
+                        and detected_active_snapshot
+                        != source_active_snapshot
+                    )
+                    manifest_payload["activation_detection_status"] = (
+                        "activation-state-diverged-recovery-required"
+                        if activation_state_diverged
+                        else "matched-staging-identity"
+                        if active_matches_staging_identity
+                        else "matched-staging-digest"
+                        if active_matches_staging_digest
+                        else "staging-missing-assume-replacement"
+                        if activated
+                        else "not-activated"
+                    )
                 if activated and "activation_detection_status" not in manifest_payload:
                     activated = True
                     try:
@@ -2733,9 +3966,20 @@ def migrate_project_to_schema30(
                             else "staging-missing-active-digest-mismatch"
                         )
             if activated:
-                migration_guard.require_recovery(migration_manifest_path)
                 failed_path = backup_dir / "harness.schema30.failed-after-activation.db"
                 try:
+                    expected_failed_active_snapshot = (
+                        activated_snapshot
+                        if activated_snapshot is not None
+                        else staging_snapshot
+                    )
+                    if expected_failed_active_snapshot is None:
+                        raise LocalCoreMigrationError(
+                            "activated database receipt is unavailable"
+                        )
+                    restore_destination_snapshot = (
+                        expected_failed_active_snapshot
+                    )
                     failed_relative = project_fs.relative_to_root(failed_path)
                     while project_fs._snapshot(
                         failed_relative,
@@ -2751,9 +3995,13 @@ def migrate_project_to_schema30(
                     (
                         preservation_status,
                         preservation_error,
+                        restore_destination_snapshot,
                     ) = _preserve_failed_schema30(
                         active_path,
                         failed_path,
+                        expected_active_snapshot=(
+                            expected_failed_active_snapshot
+                        ),
                         pinned_fs=project_fs,
                     )
                 except Exception as preserve_exc:
@@ -2764,11 +4012,25 @@ def migrate_project_to_schema30(
                 if preservation_error:
                     manifest_payload["failed_schema30_preservation_error"] = preservation_error
                 try:
-                    _restore_verified_backup(
+                    rollback_database_receipts = _restore_verified_backup(
                         active_path,
                         backup,
+                        expected_active_snapshot=(
+                            restore_destination_snapshot
+                        ),
+                        expected_backup_snapshot=(
+                            recovery_bundle_receipts[
+                                project_fs.relative_to_root(
+                                    Path(backup.backup_path)
+                                )
+                            ].snapshot
+                        ),
                         pinned_fs=project_fs,
                     )
+                    rollback_active_snapshot = (
+                        rollback_database_receipts[active_relative]
+                    )
+                    rollback_active_sha256 = backup.sha256
                 except BaseException as restore_exc:
                     restore_error = _exception_text(restore_exc)
                     manifest_payload["status"] = "rollback-incomplete"
@@ -2779,18 +4041,14 @@ def migrate_project_to_schema30(
                         "not attempted because database restore failed"
                     )
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(
-                        migration_manifest_path,
-                        manifest_payload,
-                        project_fs=project_fs,
-                    )
+                    write_failure_manifest()
                     raise LocalCoreMigrationError(
                         f"migration failed after activation and database rollback failed: {restore_error}"
-                        f"; recovery manifest: {migration_manifest_path}"
+                        f"; recovery manifest: {recovery_manifest_path}"
                     ) from restore_exc
                 manifest_payload["database_restore_status"] = "restored"
                 try:
-                    _restore_projection_backup(
+                    projection_restore_receipts = _restore_projection_backup(
                         root,
                         projection_backup,
                         pinned_fs=project_fs,
@@ -2801,47 +4059,40 @@ def migrate_project_to_schema30(
                     manifest_payload["projection_restore_status"] = "failed"
                     manifest_payload["projection_restore_error"] = restore_error
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(
-                        migration_manifest_path,
-                        manifest_payload,
-                        project_fs=project_fs,
-                    )
+                    write_failure_manifest()
                     raise LocalCoreMigrationError(
                         f"{primary_error}; database restored but projection restore failed: {restore_error}"
-                        f"; recovery manifest: {migration_manifest_path}"
+                        f"; recovery manifest: {recovery_manifest_path}"
                     ) from restore_exc
                 manifest_payload["status"] = "rolled-back"
                 manifest_payload["projection_restore_status"] = "restored"
                 if preservation_status == "failed":
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(
-                        migration_manifest_path,
-                        manifest_payload,
-                        project_fs=project_fs,
-                    )
+                    write_failure_manifest()
                     raise LocalCoreMigrationError(
                         f"{primary_error}; database and projections restored but failed schema30 diagnostic "
                         f"preservation was incomplete: {preservation_error}; "
-                        f"recovery manifest: {migration_manifest_path}"
+                        f"recovery manifest: {recovery_manifest_path}"
                     ) from exc
             else:
                 try:
-                    staging_exists = project_fs._snapshot(
+                    current_staging_snapshot = project_fs._snapshot(
                         staging_relative,
                         allow_missing=True,
-                    ).exists
-                    if staging_exists:
+                    )
+                    if current_staging_snapshot.exists:
                         failed_path = backup_dir / (
                             "harness.schema30.failed-before-activation.db"
                         )
                         failed_relative = project_fs.relative_to_root(
                             failed_path
                         )
-                        if project_fs._snapshot(
+                        failed_destination_snapshot = project_fs._snapshot(
                             failed_relative,
                             allow_missing=True,
-                        ).exists:
+                        )
+                        if failed_destination_snapshot.exists:
                             failed_path = backup_dir / (
                                 "harness.schema30.failed-before-activation-"
                                 f"{uuid.uuid4().hex[:8]}.db"
@@ -2849,9 +4100,20 @@ def migrate_project_to_schema30(
                             failed_relative = project_fs.relative_to_root(
                                 failed_path
                             )
+                            failed_destination_snapshot = project_fs._snapshot(
+                                failed_relative,
+                                allow_missing=True,
+                            )
+                        expected_staging_snapshot = (
+                            staging_snapshot
+                            if staging_snapshot is not None
+                            else current_staging_snapshot
+                        )
                         project_fs.replace_file(
                             staging_relative,
                             failed_relative,
+                            expected_source=expected_staging_snapshot,
+                            expected_destination=failed_destination_snapshot,
                         )
                         _quarantine_failed_database_sidecars(
                             staging_path,
@@ -2868,51 +4130,259 @@ def migrate_project_to_schema30(
                     manifest_payload[
                         "failed_schema30_preservation_error"
                     ] = _exception_text(preservation_exc)
-                if (
-                    _safe_database_fingerprint(project_fs, active_relative)
-                    != source_fingerprint
-                ):
-                    manifest_payload["status"] = "source-changed-before-activation"
-                    manifest_payload["error"] = primary_error
-                    _write_json_atomic(
-                        migration_manifest_path,
-                        manifest_payload,
-                        project_fs=project_fs,
+                try:
+                    _remove_empty_active_sidecars(
+                        active_path,
+                        pinned_fs=project_fs,
                     )
+                    current_active_snapshot = project_fs._snapshot(
+                        active_relative,
+                        allow_missing=False,
+                    )
+                    active_fingerprint = _safe_database_fingerprint(
+                        project_fs,
+                        active_relative,
+                    )
+                except BaseException as active_check_exc:
+                    manifest_payload["active_source_check_error"] = (
+                        _exception_text(active_check_exc)
+                    )
+                    current_active_snapshot = _PathSnapshot(False)
+                    active_fingerprint = None
+                if (
+                    current_active_snapshot != source_active_snapshot
+                    or active_fingerprint != source_fingerprint
+                ):
+                    manifest_payload["status"] = (
+                        "rollback-incomplete"
+                        if activation_state_diverged
+                        else "source-changed-before-activation"
+                    )
+                    if activation_state_diverged:
+                        manifest_payload["database_restore_status"] = (
+                            "unknown-active-preserved"
+                        )
+                        manifest_payload["projection_restore_status"] = (
+                            "not-attempted"
+                        )
+                    manifest_payload["error"] = primary_error
+                    write_failure_manifest()
+                    if activation_state_diverged:
+                        migration_guard.require_recovery(
+                            recovery_manifest_path,
+                            snapshot=recovery_manifest_snapshot,
+                        )
                     raise LocalCoreMigrationError(
-                        "active source changed before activation; refusing to overwrite concurrent facts"
+                        (
+                            "activation state diverged after publication attempt; "
+                            "preserving the unknown active authority for recovery"
+                            if activation_state_diverged
+                            else "active source changed before activation; refusing to overwrite concurrent facts"
+                        )
                     ) from exc
                 manifest_payload["database_restore_status"] = "unchanged-verified"
+                rollback_active_snapshot = current_active_snapshot
+                rollback_active_sha256 = str(
+                    source_fingerprint.get(active_relative.name) or ""
+                )
+                rollback_database_receipts = (
+                    _capture_database_family_receipts(
+                        project_fs,
+                        active_relative,
+                        expected_main=current_active_snapshot,
+                        expected_digest=rollback_active_sha256,
+                    )
+                )
                 try:
-                    _restore_projection_backup(
+                    projection_restore_receipts = _restore_projection_backup(
                         root,
                         projection_backup,
                         pinned_fs=project_fs,
                     )
                 except BaseException as restore_exc:
                     restore_error = _exception_text(restore_exc)
-                    migration_guard.require_recovery(migration_manifest_path)
                     manifest_payload["status"] = "rollback-incomplete"
                     manifest_payload["projection_restore_status"] = "failed"
                     manifest_payload["projection_restore_error"] = restore_error
                     manifest_payload["error"] = primary_error
-                    _write_json_atomic(
-                        migration_manifest_path,
-                        manifest_payload,
-                        project_fs=project_fs,
+                    write_failure_manifest()
+                    migration_guard.require_recovery(
+                        recovery_manifest_path,
+                        snapshot=recovery_manifest_snapshot,
                     )
                     raise LocalCoreMigrationError(
                         f"{primary_error}; pre-activation projection rollback failed: "
-                        f"{restore_error}; recovery manifest: {migration_manifest_path}"
+                        f"{restore_error}; recovery manifest: {recovery_manifest_path}"
                     ) from restore_exc
                 manifest_payload["projection_restore_status"] = "restored"
                 manifest_payload["status"] = "failed-before-activation"
             manifest_payload["error"] = primary_error
-            _write_json_atomic(
-                migration_manifest_path,
-                manifest_payload,
-                project_fs=project_fs,
-            )
-            if manifest_payload["status"] in {"rolled-back", "failed-before-activation"}:
-                migration_guard.mark_safe()
+            write_failure_manifest()
+            if (
+                not manifest_fallback_used
+                and manifest_payload["status"]
+                in {"rolled-back", "failed-before-activation"}
+            ):
+                rollback_receipt_phase = "database"
+                try:
+                    if (
+                        rollback_active_snapshot is None
+                        or not rollback_active_sha256
+                        or rollback_database_receipts is None
+                        or projection_restore_receipts is None
+                    ):
+                        raise LocalCoreMigrationError(
+                            "terminal rollback receipts are incomplete"
+                        )
+                    project_fs._assert_unchanged(
+                        active_relative,
+                        rollback_active_snapshot,
+                    )
+                    _assert_database_family_receipts(
+                        project_fs,
+                        active_relative,
+                        rollback_database_receipts,
+                        expected_digest=rollback_active_sha256,
+                    )
+                    rollback_receipt_phase = "projection"
+                    _assert_projection_receipts(
+                        project_fs,
+                        projection_restore_receipts,
+                        projection_backup,
+                    )
+                    rollback_receipt_phase = "recovery-bundle"
+                    _assert_recovery_bundle_receipts(
+                        project_fs,
+                        recovery_bundle_receipts,
+                    )
+                    rollback_receipt_phase = "manifest"
+                    terminal_manifest_relative = (
+                        project_fs.relative_to_root(
+                            recovery_manifest_path
+                        )
+                    )
+                    terminal_manifest_snapshot = (
+                        recovery_manifest_snapshot
+                    )
+                    project_fs._assert_unchanged(
+                        terminal_manifest_relative,
+                        terminal_manifest_snapshot,
+                    )
+                    terminal_manifest_sha256 = _safe_file_sha256(
+                        project_fs,
+                        terminal_manifest_relative,
+                        expected=terminal_manifest_snapshot,
+                    )
+                    project_fs._assert_unchanged(
+                        terminal_manifest_relative,
+                        terminal_manifest_snapshot,
+                    )
+                except BaseException as continuity_exc:
+                    continuity_error = _exception_text(continuity_exc)
+                    manifest_payload["status"] = "rollback-incomplete"
+                    manifest_payload["rollback_receipt_phase"] = (
+                        rollback_receipt_phase
+                    )
+                    manifest_payload["rollback_receipt_error"] = (
+                        continuity_error
+                    )
+                    if rollback_receipt_phase == "database":
+                        manifest_payload["database_restore_status"] = "failed"
+                        manifest_payload["database_restore_error"] = (
+                            continuity_error
+                        )
+                    elif rollback_receipt_phase == "projection":
+                        manifest_payload["projection_restore_status"] = "failed"
+                        manifest_payload["projection_restore_error"] = (
+                            continuity_error
+                        )
+                    elif rollback_receipt_phase == "recovery-bundle":
+                        manifest_payload["recovery_bundle_status"] = "failed"
+                        manifest_payload["recovery_bundle_error"] = (
+                            continuity_error
+                        )
+                    else:
+                        manifest_payload["manifest_receipt_error"] = (
+                            continuity_error
+                        )
+                    manifest_payload["error"] = primary_error
+                    write_failure_manifest()
+                    migration_guard.require_recovery(
+                        recovery_manifest_path,
+                        snapshot=recovery_manifest_snapshot,
+                    )
+                else:
+                    frozen_projection_receipts = dict(
+                        projection_restore_receipts
+                    )
+                    frozen_database_receipts = dict(
+                        rollback_database_receipts
+                    )
+                    frozen_recovery_bundle = dict(
+                        recovery_bundle_receipts
+                    )
+
+                    def verify_rollback_authorities(
+                        *,
+                        expected_active: _PathSnapshot = rollback_active_snapshot,
+                        expected_active_digest: str = rollback_active_sha256,
+                        expected_database_family: dict[
+                            Path,
+                            _PathSnapshot,
+                        ] = frozen_database_receipts,
+                        expected_projections: dict[
+                            Path,
+                            _PathSnapshot,
+                        ] = frozen_projection_receipts,
+                        expected_recovery_bundle: dict[
+                            Path,
+                            _FileAuthorityReceipt,
+                        ] = frozen_recovery_bundle,
+                        expected_manifest_relative: Path = terminal_manifest_relative,
+                        expected_manifest: _PathSnapshot = terminal_manifest_snapshot,
+                        expected_manifest_digest: str = terminal_manifest_sha256,
+                    ) -> None:
+                        project_fs._assert_unchanged(
+                            active_relative,
+                            expected_active,
+                        )
+                        _assert_database_family_receipts(
+                            project_fs,
+                            active_relative,
+                            expected_database_family,
+                            expected_digest=expected_active_digest,
+                        )
+                        _assert_projection_receipts(
+                            project_fs,
+                            expected_projections,
+                            projection_backup,
+                        )
+                        _assert_recovery_bundle_receipts(
+                            project_fs,
+                            expected_recovery_bundle,
+                        )
+                        project_fs._assert_unchanged(
+                            expected_manifest_relative,
+                            expected_manifest,
+                        )
+                        if (
+                            _safe_file_sha256(
+                                project_fs,
+                                expected_manifest_relative,
+                                expected=expected_manifest,
+                            )
+                            != expected_manifest_digest
+                        ):
+                            raise LocalCoreMigrationError(
+                                "rollback manifest changed before sentinel cleanup"
+                            )
+                        project_fs._assert_unchanged(
+                            expected_manifest_relative,
+                            expected_manifest,
+                        )
+
+                    migration_guard.mark_safe(
+                        verify_rollback_authorities,
+                        publish_terminal_authority_failure,
+                    )
             raise

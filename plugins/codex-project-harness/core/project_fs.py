@@ -8,14 +8,16 @@ commands, which are intentionally outside this boundary.
 from __future__ import annotations
 
 import errno
+import ctypes
 import os
 import secrets
 import stat
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from .errors import HarnessError
 
@@ -39,6 +41,78 @@ _POSIX_DIR_FD_AVAILABLE = all(
     function in os.supports_dir_fd
     for function in (os.open, os.stat, os.mkdir, os.unlink, os.rmdir)
 )
+
+
+def _posix_flagged_rename(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+    *,
+    exchange: bool,
+) -> None:
+    if os.name == "nt":
+        raise OSError(errno.ENOSYS, "POSIX rename flags are unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = getattr(libc, "renameatx_np", None)
+        flag = 0x00000002 if exchange else 0x00000004
+    elif sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        flag = 0x00000002 if exchange else 0x00000001
+    else:
+        function = None
+        flag = 0
+    if function is None:
+        raise OSError(errno.ENOSYS, "atomic rename flags are unavailable")
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    result = function(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        flag,
+    )
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _posix_rename_exchange(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    _posix_flagged_rename(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        exchange=True,
+    )
+
+
+def _posix_rename_noreplace(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    _posix_flagged_rename(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        exchange=False,
+    )
 
 
 def _before_atomic_replace(_fs: "ProjectFS", _relative: Path) -> None:
@@ -139,11 +213,20 @@ class _MissingAncestor(Exception):
 
 
 def _validate_relative(value: Path | str) -> Path:
-    raw = os.fspath(value)
+    windows_path = isinstance(value, PureWindowsPath)
+    raw = value.as_posix() if windows_path else os.fspath(value)
     if not isinstance(raw, str):
         raw = os.fsdecode(raw)
-    if not raw or raw in {".", ".."} or "\x00" in raw or "\\" in raw:
+    if (
+        not raw
+        or raw in {".", ".."}
+        or "\x00" in raw
+        or (not windows_path and "\\" in raw)
+    ):
         raise ProjectPathSafetyError(Path(raw or "."), "invalid-relative-path")
+    lexical_parts = raw.split("/")
+    if any(part in {"", ".", ".."} for part in lexical_parts):
+        raise ProjectPathSafetyError(Path(raw), "invalid-relative-path")
     windows = PureWindowsPath(raw)
     candidate = Path(raw)
     if candidate.is_absolute() or windows.is_absolute() or windows.drive:
@@ -197,18 +280,23 @@ class _PosixBackend:
         if not all(required):
             raise ProjectPathSafetyError(Path("."), "platform-safety-unavailable")
         self.root = root
-        descriptor = self._open_root()
+        descriptor = self._open_root_path()
         try:
             metadata = os.fstat(descriptor)
-        finally:
+            identity = _posix_identity(metadata)
+            if identity.kind != "directory":
+                raise ProjectPathSafetyError(Path("."), "unsafe-ancestor")
+            self.root_identity = identity
+            self.root_descriptor = descriptor
+        except BaseException:
             os.close(descriptor)
-        self.root_identity = _posix_identity(metadata)
+            raise
 
     @property
     def identity_key(self) -> tuple[object, ...]:
         return ("posix", self.root_identity.volume, self.root_identity.file_id)
 
-    def _open_root(self) -> int:
+    def _open_root_path(self) -> int:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         flags |= getattr(os, "O_CLOEXEC", 0)
         try:
@@ -216,12 +304,33 @@ class _PosixBackend:
         except OSError as exc:
             raise ProjectPathSafetyError(Path("."), "path-identity-changed") from exc
         os.set_inheritable(descriptor, False)
-        if hasattr(self, "root_identity"):
-            identity = _posix_identity(os.fstat(descriptor))
-            if identity != self.root_identity:
-                os.close(descriptor)
-                raise ProjectPathSafetyError(Path("."), "path-identity-changed")
         return descriptor
+
+    def _open_root(self) -> int:
+        try:
+            descriptor = os.dup(self.root_descriptor)
+        except OSError as exc:
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed") from exc
+        os.set_inheritable(descriptor, False)
+        if _posix_identity(os.fstat(descriptor)) != self.root_identity:
+            os.close(descriptor)
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed")
+        return descriptor
+
+    def assert_root_path(self) -> None:
+        try:
+            current = _posix_identity(os.stat(self.root, follow_symlinks=False))
+        except OSError as exc:
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed") from exc
+        if current != self.root_identity:
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed")
+
+    def close(self) -> None:
+        descriptor = getattr(self, "root_descriptor", None)
+        if descriptor is None:
+            return
+        self.root_descriptor = None
+        os.close(descriptor)
 
     @contextmanager
     def _parent(
@@ -230,6 +339,7 @@ class _PosixBackend:
         *,
         create: bool,
     ) -> Iterator[tuple[int, str, tuple[tuple[int, str, _PathIdentity], ...]]]:
+        self.assert_root_path()
         descriptors: list[int] = []
         ancestry: list[tuple[int, str, _PathIdentity]] = []
         current = self._open_root()
@@ -283,6 +393,7 @@ class _PosixBackend:
         relative: Path,
         ancestry: tuple[tuple[int, str, _PathIdentity], ...],
     ) -> None:
+        self.assert_root_path()
         for parent, component, expected in ancestry:
             try:
                 actual = _posix_identity(
@@ -292,6 +403,7 @@ class _PosixBackend:
                 raise ProjectPathSafetyError(relative, "path-identity-changed") from exc
             if actual != expected:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
+        self.assert_root_path()
 
     def _snapshot_at(
         self,
@@ -320,6 +432,53 @@ class _PosixBackend:
             raise ProjectPathSafetyError(relative, "hard-linked-target")
         return _PathSnapshot(True, identity)
 
+    def _raw_snapshot_at(
+        self,
+        parent: int,
+        name: str,
+        relative: Path,
+        *,
+        allow_missing: bool,
+    ) -> _PathSnapshot:
+        """Capture a no-follow entry identity solely for rename recovery.
+
+        Unlike ``_snapshot_at``, this helper intentionally does not authorize
+        the leaf for reads, writes, or deletion.  Recovery must be able to
+        recognize and reverse an exchange even when the displaced entry is a
+        symlink, a hard link, or another unsafe object raced into the final
+        syscall window.
+        """
+
+        try:
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            if allow_missing:
+                return _PathSnapshot(False)
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        except OSError as exc:
+            raise ProjectPathSafetyError(
+                relative,
+                "path-identity-changed",
+            ) from exc
+        return _PathSnapshot(True, _posix_identity(metadata))
+
+    @staticmethod
+    def _same_raw_object(
+        actual: _PathSnapshot,
+        expected: _PathSnapshot,
+    ) -> bool:
+        if actual.exists != expected.exists:
+            return False
+        if not actual.exists:
+            return True
+        if actual.identity is None or expected.identity is None:
+            return False
+        return (
+            actual.identity.volume == expected.identity.volume
+            and actual.identity.file_id == expected.identity.file_id
+            and actual.identity.kind == expected.identity.kind
+        )
+
     def snapshot(
         self,
         relative: Path,
@@ -340,6 +499,7 @@ class _PosixBackend:
                 return snapshot
         except _MissingAncestor:
             if allow_missing:
+                self.assert_root_path()
                 return _PathSnapshot(False)
             raise ProjectPathSafetyError(relative, "unsafe-target")
 
@@ -359,6 +519,7 @@ class _PosixBackend:
                         relative,
                         "unsafe-ancestor",
                     )
+                self._check_ancestry(relative, ancestry)
         except ProjectPathSafetyError as exc:
             if exc.relative == marker:
                 raise ProjectPathSafetyError(relative, exc.reason) from exc
@@ -377,11 +538,19 @@ class _PosixBackend:
             expect_directory=expect_directory,
         )
 
-    def read_bytes(self, relative: Path, *, max_bytes: int | None) -> bytes:
+    def read_bytes(
+        self,
+        relative: Path,
+        *,
+        max_bytes: int | None,
+        expected: _PathSnapshot | None = None,
+    ) -> bytes:
         with self._parent(relative, create=False) as (parent, name, ancestry):
-            expected = self._snapshot_at(
+            snapshot = self._snapshot_at(
                 parent, name, relative, allow_missing=False
             )
+            if expected is not None and snapshot != expected:
+                raise ProjectPathSafetyError(relative, "path-identity-changed")
             flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
             try:
                 descriptor = os.open(name, flags, dir_fd=parent)
@@ -389,7 +558,7 @@ class _PosixBackend:
                 raise ProjectPathSafetyError(relative, "path-identity-changed") from exc
             try:
                 os.set_inheritable(descriptor, False)
-                if _posix_identity(os.fstat(descriptor)) != expected.identity:
+                if _posix_identity(os.fstat(descriptor)) != snapshot.identity:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
                 chunks: list[bytes] = []
                 remaining = max_bytes
@@ -402,7 +571,7 @@ class _PosixBackend:
                     if remaining is not None:
                         remaining -= len(chunk)
                 data = b"".join(chunks)
-                if _posix_identity(os.fstat(descriptor)) != expected.identity:
+                if _posix_identity(os.fstat(descriptor)) != snapshot.identity:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
             finally:
                 os.close(descriptor)
@@ -410,9 +579,56 @@ class _PosixBackend:
             current = self._snapshot_at(
                 parent, name, relative, allow_missing=False
             )
-            if current != expected:
+            if current != snapshot:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
+            self._check_ancestry(relative, ancestry)
             return data
+
+    def sync_regular(
+        self,
+        relative: Path,
+        expected: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
+        with self._parent(relative, create=False) as (parent, name, ancestry):
+            snapshot = expected or self._snapshot_at(
+                parent,
+                name,
+                relative,
+                allow_missing=False,
+            )
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent)
+            except OSError as exc:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                ) from exc
+            try:
+                os.set_inheritable(descriptor, False)
+                if _posix_identity(os.fstat(descriptor)) != snapshot.identity:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+                os.fsync(descriptor)
+                if _posix_identity(os.fstat(descriptor)) != snapshot.identity:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+            finally:
+                os.close(descriptor)
+            self._check_ancestry(relative, ancestry)
+            if self._snapshot_at(
+                parent,
+                name,
+                relative,
+                allow_missing=False,
+            ) != snapshot:
+                raise ProjectPathSafetyError(relative, "path-identity-changed")
+            self._check_ancestry(relative, ancestry)
+            return snapshot
 
     def _write_all(self, descriptor: int, data: bytes) -> None:
         view = memoryview(data)
@@ -423,17 +639,866 @@ class _PosixBackend:
                 raise OSError("short project-file write")
             written += count
 
-    def atomic_write(self, fs: "ProjectFS", relative: Path, data: bytes, mode: int) -> None:
+    @staticmethod
+    def _rename_error(
+        relative: Path,
+        error: OSError,
+    ) -> ProjectPathSafetyError:
+        unsupported = {
+            errno.ENOSYS,
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+            errno.EOPNOTSUPP,
+        }
+        reason = (
+            "platform-safety-unavailable"
+            if error.errno in unsupported
+            else "path-identity-changed"
+        )
+        return ProjectPathSafetyError(relative, reason)
+
+    def _reconcile_exchange_interruption(
+        self,
+        source_parent: int,
+        source_name: str,
+        source: Path,
+        source_snapshot: _PathSnapshot,
+        destination_parent: int,
+        destination_name: str,
+        destination: Path,
+        destination_snapshot: _PathSnapshot,
+        error: BaseException,
+    ) -> None:
+        try:
+            source_after = self._raw_snapshot_at(
+                source_parent,
+                source_name,
+                source,
+                allow_missing=True,
+            )
+            destination_after = self._raw_snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=True,
+            )
+            if (
+                self._same_raw_object(source_after, source_snapshot)
+                and self._same_raw_object(
+                    destination_after,
+                    destination_snapshot,
+                )
+            ):
+                return
+            if self._same_raw_object(source_after, source_snapshot):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+            if self._same_raw_object(
+                destination_after,
+                destination_snapshot,
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+            if (
+                not source_after.exists
+                or not destination_after.exists
+                or not (
+                    self._same_raw_object(
+                        source_after,
+                        destination_snapshot,
+                    )
+                    or self._same_raw_object(
+                        destination_after,
+                        source_snapshot,
+                    )
+                )
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+            try:
+                _posix_rename_exchange(
+                    source_parent,
+                    source_name,
+                    destination_parent,
+                    destination_name,
+                )
+            except BaseException as rollback_error:
+                if (
+                    self._same_raw_object(
+                        self._raw_snapshot_at(
+                            source_parent,
+                            source_name,
+                            source,
+                            allow_missing=True,
+                        ),
+                        source_snapshot,
+                    )
+                    and self._same_raw_object(
+                        self._raw_snapshot_at(
+                            destination_parent,
+                            destination_name,
+                            destination,
+                            allow_missing=True,
+                        ),
+                        source_after,
+                    )
+                ):
+                    return
+                raise rollback_error
+            if (
+                not self._same_raw_object(
+                    self._raw_snapshot_at(
+                        source_parent,
+                        source_name,
+                        source,
+                        allow_missing=False,
+                    ),
+                    source_snapshot,
+                )
+                or not self._same_raw_object(
+                    self._raw_snapshot_at(
+                        destination_parent,
+                        destination_name,
+                        destination,
+                        allow_missing=False,
+                    ),
+                    source_after,
+                )
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+        except BaseException as rollback_error:
+            error.add_note(
+                f"atomic exchange interruption rollback failed: {rollback_error}"
+            )
+
+    def _reconcile_noreplace_interruption(
+        self,
+        source_parent: int,
+        source_name: str,
+        source: Path,
+        source_snapshot: _PathSnapshot,
+        destination_parent: int,
+        destination_name: str,
+        destination: Path,
+        error: BaseException,
+    ) -> None:
+        try:
+            source_after = self._snapshot_at(
+                source_parent,
+                source_name,
+                source,
+                allow_missing=True,
+            )
+            destination_after = self._snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=True,
+            )
+            if source_after == source_snapshot and not destination_after.exists:
+                return
+            if source_after.exists or not destination_after.exists:
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+            try:
+                _posix_rename_noreplace(
+                    destination_parent,
+                    destination_name,
+                    source_parent,
+                    source_name,
+                )
+            except BaseException as rollback_error:
+                if (
+                    self._snapshot_at(
+                        source_parent,
+                        source_name,
+                        source,
+                        allow_missing=True,
+                    )
+                    == destination_after
+                    and not self._snapshot_at(
+                        destination_parent,
+                        destination_name,
+                        destination,
+                        allow_missing=True,
+                    ).exists
+                ):
+                    return
+                raise rollback_error
+            if (
+                self._snapshot_at(
+                    source_parent,
+                    source_name,
+                    source,
+                    allow_missing=False,
+                )
+                != destination_after
+                or self._snapshot_at(
+                    destination_parent,
+                    destination_name,
+                    destination,
+                    allow_missing=True,
+                ).exists
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+        except BaseException as rollback_error:
+            error.add_note(
+                f"exclusive rename interruption rollback failed: {rollback_error}"
+            )
+
+    def _exchange_checked(
+        self,
+        source_parent: int,
+        source_name: str,
+        source: Path,
+        source_snapshot: _PathSnapshot,
+        destination_parent: int,
+        destination_name: str,
+        destination: Path,
+        destination_snapshot: _PathSnapshot,
+    ) -> None:
+        try:
+            source_before = self._raw_snapshot_at(
+                source_parent,
+                source_name,
+                source,
+                allow_missing=False,
+            )
+            destination_before = self._raw_snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=False,
+            )
+        except ProjectPathSafetyError as exc:
+            raise ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            ) from exc
+        if (
+            source_before != source_snapshot
+            or destination_before != destination_snapshot
+        ):
+            raise ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+        try:
+            _posix_rename_exchange(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+        except BaseException as exc:
+            self._reconcile_exchange_interruption(
+                source_parent,
+                source_name,
+                source,
+                source_snapshot,
+                destination_parent,
+                destination_name,
+                destination,
+                destination_snapshot,
+                exc,
+            )
+            if isinstance(exc, OSError):
+                raise self._rename_error(destination, exc) from exc
+            raise
+        try:
+            displaced = self._raw_snapshot_at(
+                source_parent,
+                source_name,
+                source,
+                allow_missing=False,
+            )
+            published = self._raw_snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=False,
+            )
+        except BaseException as exc:
+            error = ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+            self._reconcile_exchange_interruption(
+                source_parent,
+                source_name,
+                source,
+                source_snapshot,
+                destination_parent,
+                destination_name,
+                destination,
+                destination_snapshot,
+                error,
+            )
+            raise error from exc
+        if displaced == destination_snapshot and published == source_snapshot:
+            return
+        error = ProjectPathSafetyError(destination, "path-identity-changed")
+        self._reconcile_exchange_interruption(
+            source_parent,
+            source_name,
+            source,
+            source_snapshot,
+            destination_parent,
+            destination_name,
+            destination,
+            destination_snapshot,
+            error,
+        )
+        raise error
+
+    def _rename_noreplace_checked(
+        self,
+        source_parent: int,
+        source_name: str,
+        source: Path,
+        source_snapshot: _PathSnapshot,
+        destination_parent: int,
+        destination_name: str,
+        destination: Path,
+    ) -> None:
+        try:
+            _posix_rename_noreplace(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+        except BaseException as exc:
+            self._reconcile_noreplace_interruption(
+                source_parent,
+                source_name,
+                source,
+                source_snapshot,
+                destination_parent,
+                destination_name,
+                destination,
+                exc,
+            )
+            if isinstance(exc, OSError):
+                raise self._rename_error(destination, exc) from exc
+            raise
+        try:
+            published = self._snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=False,
+            )
+            source_after = self._snapshot_at(
+                source_parent,
+                source_name,
+                source,
+                allow_missing=True,
+            )
+        except BaseException as exc:
+            self._reconcile_noreplace_interruption(
+                source_parent,
+                source_name,
+                source,
+                source_snapshot,
+                destination_parent,
+                destination_name,
+                destination,
+                exc,
+            )
+            raise
+        if published == source_snapshot and not source_after.exists:
+            return
+        error = ProjectPathSafetyError(destination, "path-identity-changed")
+        try:
+            if (
+                not source_after.exists
+                and self._snapshot_at(
+                    destination_parent,
+                    destination_name,
+                    destination,
+                    allow_missing=False,
+                )
+                == published
+            ):
+                _posix_rename_noreplace(
+                    destination_parent,
+                    destination_name,
+                    source_parent,
+                    source_name,
+                )
+                if (
+                    self._snapshot_at(
+                        source_parent,
+                        source_name,
+                        source,
+                        allow_missing=False,
+                    )
+                    != source_snapshot
+                ):
+                    raise ProjectPathSafetyError(
+                        source,
+                        "path-identity-changed",
+                    )
+            else:
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+        except BaseException as rollback_error:
+            error.add_note(f"exclusive rename rollback failed: {rollback_error}")
+        raise error
+
+    def _quarantine_entry_checked(
+        self,
+        parent: int,
+        name: str,
+        relative: Path,
+        expected: _PathSnapshot,
+        *,
+        expect_directory: bool = False,
+        consume: Callable[[str, Path], None] | None = None,
+    ) -> tuple[str, Path]:
+        def reconcile_interruption(
+            quarantine_name: str,
+            quarantine_relative: Path,
+            error: BaseException,
+        ) -> None:
+            try:
+                current = self._snapshot_at(
+                    parent,
+                    name,
+                    relative,
+                    expect_directory=expect_directory,
+                    allow_missing=True,
+                )
+                quarantined = self._snapshot_at(
+                    parent,
+                    quarantine_name,
+                    quarantine_relative,
+                    expect_directory=expect_directory,
+                    allow_missing=True,
+                )
+                if current == expected:
+                    return
+                if not current.exists and quarantined == expected:
+                    _posix_rename_noreplace(
+                        parent,
+                        quarantine_name,
+                        parent,
+                        name,
+                    )
+                    if (
+                        self._snapshot_at(
+                            parent,
+                            name,
+                            relative,
+                            expect_directory=expect_directory,
+                            allow_missing=False,
+                        )
+                        != expected
+                        or self._snapshot_at(
+                            parent,
+                            quarantine_name,
+                            quarantine_relative,
+                            expect_directory=expect_directory,
+                            allow_missing=True,
+                        ).exists
+                    ):
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    return
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"quarantine interruption rollback failed: {rollback_error}"
+                )
+
+        for _ in range(128):
+            quarantine_name = (
+                f".{name}.kafa-delete-{secrets.token_hex(12)}.tmp"
+            )
+            quarantine_relative = relative.with_name(quarantine_name)
+            try:
+                _posix_rename_noreplace(
+                    parent,
+                    name,
+                    parent,
+                    quarantine_name,
+                )
+            except BaseException as exc:
+                if isinstance(exc, OSError) and exc.errno == errno.EEXIST:
+                    current = self._snapshot_at(
+                        parent,
+                        name,
+                        relative,
+                        expect_directory=expect_directory,
+                        allow_missing=True,
+                    )
+                    if current == expected:
+                        continue
+                    reconcile_interruption(
+                        quarantine_name,
+                        quarantine_relative,
+                        exc,
+                    )
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    ) from exc
+                reconcile_interruption(
+                    quarantine_name,
+                    quarantine_relative,
+                    exc,
+                )
+                if isinstance(exc, OSError):
+                    raise self._rename_error(relative, exc) from exc
+                raise
+            try:
+                quarantined = self._snapshot_at(
+                    parent,
+                    quarantine_name,
+                    quarantine_relative,
+                    expect_directory=expect_directory,
+                    allow_missing=False,
+                )
+                current = self._snapshot_at(
+                    parent,
+                    name,
+                    relative,
+                    expect_directory=expect_directory,
+                    allow_missing=True,
+                )
+            except BaseException as exc:
+                reconcile_interruption(
+                    quarantine_name,
+                    quarantine_relative,
+                    exc,
+                )
+                raise
+            if quarantined == expected and not current.exists:
+                if consume is not None:
+                    try:
+                        consume(quarantine_name, quarantine_relative)
+                    except BaseException as exc:
+                        reconcile_interruption(
+                            quarantine_name,
+                            quarantine_relative,
+                            exc,
+                        )
+                        raise
+                return quarantine_name, quarantine_relative
+            error = ProjectPathSafetyError(relative, "path-identity-changed")
+            try:
+                if not current.exists:
+                    _posix_rename_noreplace(
+                        parent,
+                        quarantine_name,
+                        parent,
+                        name,
+                    )
+                    if self._snapshot_at(
+                        parent,
+                        name,
+                        relative,
+                        expect_directory=expect_directory,
+                        allow_missing=False,
+                    ) != quarantined:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                else:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"quarantine rename rollback failed: {rollback_error}"
+                )
+            raise error
+        raise ProjectPathSafetyError(relative, "path-identity-changed")
+
+    def _delete_quarantined_regular(
+        self,
+        parent: int,
+        quarantine_name: str,
+        quarantine_relative: Path,
+        expected: _PathSnapshot,
+        descriptor: int,
+        restore_name: str,
+        restore_relative: Path,
+        report_relative: Path,
+    ) -> None:
+        # The caller pins the canonical object before quarantine.  The
+        # exclusive rename above then moves that object to a fresh 96-bit
+        # random name.  A same-user process continuously discovering and
+        # replacing unpredictable quarantine names is outside the documented
+        # threat model; bounded races on canonical names are closed before
+        # this point.
+        if _posix_identity(os.fstat(descriptor)) != expected.identity:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+        if self._snapshot_at(
+            parent,
+            quarantine_name,
+            quarantine_relative,
+            allow_missing=False,
+        ) != expected:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+        try:
+            os.unlink(quarantine_name, dir_fd=parent)
+            deleted = _posix_identity(os.fstat(descriptor))
+            assert expected.identity is not None
+            if (
+                deleted.volume != expected.identity.volume
+                or deleted.file_id != expected.identity.file_id
+                or deleted.nlink != 0
+            ):
+                raise ProjectPathSafetyError(
+                    report_relative,
+                    "path-identity-changed",
+                )
+        except BaseException as exc:
+            rollback_note: str | None = None
+            try:
+                if self._snapshot_at(
+                    parent,
+                    restore_name,
+                    restore_relative,
+                    allow_missing=True,
+                ).exists:
+                    raise ProjectPathSafetyError(
+                        restore_relative,
+                        "path-identity-changed",
+                    )
+                if self._snapshot_at(
+                    parent,
+                    quarantine_name,
+                    quarantine_relative,
+                    allow_missing=False,
+                ) != expected:
+                    raise ProjectPathSafetyError(
+                        report_relative,
+                        "path-identity-changed",
+                    )
+                _posix_rename_noreplace(
+                    parent,
+                    quarantine_name,
+                    parent,
+                    restore_name,
+                )
+                if self._snapshot_at(
+                    parent,
+                    restore_name,
+                    restore_relative,
+                    allow_missing=False,
+                ) != expected:
+                    raise ProjectPathSafetyError(
+                        restore_relative,
+                        "path-identity-changed",
+                    )
+            except BaseException as rollback_error:
+                rollback_note = (
+                    f"quarantine delete rollback failed: {rollback_error}"
+                )
+            if isinstance(exc, OSError):
+                error = ProjectPathSafetyError(
+                    report_relative,
+                    "unsafe-target",
+                )
+                if rollback_note is not None:
+                    error.add_note(rollback_note)
+                raise error from exc
+            if rollback_note is not None:
+                exc.add_note(rollback_note)
+            raise
+        if self._snapshot_at(
+            parent,
+            quarantine_name,
+            quarantine_relative,
+            allow_missing=True,
+        ).exists:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+
+    def _delete_quarantined_directory(
+        self,
+        parent: int,
+        quarantine_name: str,
+        quarantine_relative: Path,
+        expected: _PathSnapshot,
+        descriptor: int,
+        restore_name: str,
+        restore_relative: Path,
+        report_relative: Path,
+    ) -> None:
+        if _posix_identity(os.fstat(descriptor)) != expected.identity:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+        if self._snapshot_at(
+            parent,
+            quarantine_name,
+            quarantine_relative,
+            expect_directory=True,
+            allow_missing=False,
+        ) != expected:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+        try:
+            os.rmdir(quarantine_name, dir_fd=parent)
+        except BaseException as exc:
+            rollback_note: str | None = None
+            try:
+                if self._snapshot_at(
+                    parent,
+                    restore_name,
+                    restore_relative,
+                    expect_directory=True,
+                    allow_missing=True,
+                ).exists:
+                    raise ProjectPathSafetyError(
+                        restore_relative,
+                        "path-identity-changed",
+                    )
+                if self._snapshot_at(
+                    parent,
+                    quarantine_name,
+                    quarantine_relative,
+                    expect_directory=True,
+                    allow_missing=False,
+                ) != expected:
+                    raise ProjectPathSafetyError(
+                        report_relative,
+                        "path-identity-changed",
+                    )
+                _posix_rename_noreplace(
+                    parent,
+                    quarantine_name,
+                    parent,
+                    restore_name,
+                )
+                if self._snapshot_at(
+                    parent,
+                    restore_name,
+                    restore_relative,
+                    expect_directory=True,
+                    allow_missing=False,
+                ) != expected:
+                    raise ProjectPathSafetyError(
+                        restore_relative,
+                        "path-identity-changed",
+                    )
+            except BaseException as rollback_error:
+                rollback_note = (
+                    f"directory delete rollback failed: {rollback_error}"
+                )
+            if isinstance(exc, OSError):
+                error = ProjectPathSafetyError(
+                    report_relative,
+                    "unsafe-target",
+                )
+                if rollback_note is not None:
+                    error.add_note(rollback_note)
+                raise error from exc
+            if rollback_note is not None:
+                exc.add_note(rollback_note)
+            raise
+        if self._snapshot_at(
+            parent,
+            quarantine_name,
+            quarantine_relative,
+            expect_directory=True,
+            allow_missing=True,
+        ).exists:
+            raise ProjectPathSafetyError(
+                report_relative,
+                "path-identity-changed",
+            )
+
+    def _open_pinned_regular(
+        self,
+        parent: int,
+        name: str,
+        relative: Path,
+        expected: _PathSnapshot,
+    ) -> int:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent)
+        except OSError as exc:
+            raise ProjectPathSafetyError(relative, "unsafe-target") from exc
+        try:
+            os.set_inheritable(descriptor, False)
+            if _posix_identity(os.fstat(descriptor)) != expected.identity:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def atomic_write(
+        self,
+        fs: "ProjectFS",
+        relative: Path,
+        data: bytes,
+        mode: int,
+        expected_destination: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
         with self._parent(relative, create=True) as (parent, name, ancestry):
             expected = self._snapshot_at(
                 parent, name, relative, allow_missing=True
             )
+            if (
+                expected_destination is not None
+                and expected != expected_destination
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
             temporary_name = f".{name}.kafa-{secrets.token_hex(12)}.tmp"
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
             flags |= getattr(os, "O_CLOEXEC", 0)
             descriptor: int | None = None
+            displaced_descriptor: int | None = None
             temporary_identity: _PathIdentity | None = None
             published = False
+            operation_error: BaseException | None = None
             try:
                 descriptor = os.open(
                     temporary_name,
@@ -466,12 +1531,101 @@ class _PosixBackend:
                     raise
                 if current != expected:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
-                os.replace(
-                    temporary_name,
-                    name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
+                temporary_snapshot = _PathSnapshot(
+                    True,
+                    temporary_identity,
                 )
+                if expected.exists:
+                    displaced_descriptor = self._open_pinned_regular(
+                        parent,
+                        name,
+                        relative,
+                        expected,
+                    )
+                    try:
+                        self._exchange_checked(
+                            parent,
+                            temporary_name,
+                            relative.with_name(temporary_name),
+                            temporary_snapshot,
+                            parent,
+                            name,
+                            relative,
+                            expected,
+                        )
+                        try:
+                            self._quarantine_entry_checked(
+                                parent,
+                                temporary_name,
+                                relative.with_name(temporary_name),
+                                expected,
+                                consume=lambda discarded_name, discarded_relative: (
+                                    self._delete_quarantined_regular(
+                                        parent,
+                                        discarded_name,
+                                        discarded_relative,
+                                        expected,
+                                        displaced_descriptor,
+                                        temporary_name,
+                                        relative.with_name(temporary_name),
+                                        relative,
+                                    )
+                                ),
+                            )
+                        except BaseException as cleanup_error:
+                            try:
+                                rollback_source_snapshot = self._raw_snapshot_at(
+                                    parent,
+                                    temporary_name,
+                                    relative.with_name(temporary_name),
+                                    allow_missing=False,
+                                )
+                                self._exchange_checked(
+                                    parent,
+                                    temporary_name,
+                                    relative.with_name(temporary_name),
+                                    rollback_source_snapshot,
+                                    parent,
+                                    name,
+                                    relative,
+                                    temporary_snapshot,
+                                )
+                                self._quarantine_entry_checked(
+                                    parent,
+                                    temporary_name,
+                                    relative.with_name(temporary_name),
+                                    temporary_snapshot,
+                                    consume=lambda retry_name, retry_relative: (
+                                        self._delete_quarantined_regular(
+                                            parent,
+                                            retry_name,
+                                            retry_relative,
+                                            temporary_snapshot,
+                                            descriptor,
+                                            temporary_name,
+                                            relative.with_name(temporary_name),
+                                            relative,
+                                        )
+                                    ),
+                                )
+                            except BaseException as rollback_error:
+                                cleanup_error.add_note(
+                                    f"atomic publication rollback failed: {rollback_error}"
+                                )
+                            raise
+                    finally:
+                        os.close(displaced_descriptor)
+                        displaced_descriptor = None
+                else:
+                    self._rename_noreplace_checked(
+                        parent,
+                        temporary_name,
+                        relative.with_name(temporary_name),
+                        temporary_snapshot,
+                        parent,
+                        name,
+                        relative,
+                    )
                 published = True
                 final = self._snapshot_at(
                     parent, name, relative, allow_missing=False
@@ -479,29 +1633,74 @@ class _PosixBackend:
                 if final.identity != temporary_identity:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
                 os.fsync(parent)
+                self._check_ancestry(relative, ancestry)
+                if self._snapshot_at(
+                    parent,
+                    name,
+                    relative,
+                    allow_missing=False,
+                ).identity != temporary_identity:
+                    raise ProjectPathSafetyError(relative, "path-identity-changed")
+            except BaseException as exc:
+                operation_error = exc
+                raise
             finally:
+                if displaced_descriptor is not None:
+                    os.close(displaced_descriptor)
+                if not published and descriptor is not None:
+                    try:
+                        owned_snapshot = _PathSnapshot(
+                            True,
+                            _posix_identity(os.fstat(descriptor)),
+                        )
+                        if self._snapshot_at(
+                            parent,
+                            temporary_name,
+                            relative.with_name(temporary_name),
+                            allow_missing=True,
+                        ) == owned_snapshot:
+                            self._quarantine_entry_checked(
+                                parent,
+                                temporary_name,
+                                relative.with_name(temporary_name),
+                                owned_snapshot,
+                                consume=lambda cleanup_name, cleanup_relative: (
+                                    self._delete_quarantined_regular(
+                                        parent,
+                                        cleanup_name,
+                                        cleanup_relative,
+                                        owned_snapshot,
+                                        descriptor,
+                                        temporary_name,
+                                        relative.with_name(temporary_name),
+                                        relative,
+                                    )
+                                ),
+                            )
+                    except BaseException as cleanup_error:
+                        cleanup_detail = str(cleanup_error)
+                        cleanup_cause = getattr(cleanup_error, "__cause__", None)
+                        if cleanup_cause is not None:
+                            cleanup_detail += f" (caused by {cleanup_cause})"
+                        note = (
+                            "atomic temporary cleanup failed for "
+                            f"{relative.with_name(temporary_name)}: {cleanup_detail}"
+                        )
+                        if operation_error is not None:
+                            operation_error.add_note(note)
+                        else:
+                            raise
                 if descriptor is not None:
                     os.close(descriptor)
-                if not published:
-                    try:
-                        metadata = os.stat(
-                            temporary_name,
-                            dir_fd=parent,
-                            follow_symlinks=False,
-                        )
-                    except OSError:
-                        pass
-                    else:
-                        if (
-                            temporary_identity is not None
-                            and _posix_identity(metadata) == temporary_identity
-                        ):
-                            try:
-                                os.unlink(temporary_name, dir_fd=parent)
-                            except OSError:
-                                pass
+            assert temporary_identity is not None
+            return _PathSnapshot(True, temporary_identity)
 
-    def create_exclusive(self, relative: Path, data: bytes, mode: int) -> None:
+    def create_exclusive(
+        self,
+        relative: Path,
+        data: bytes,
+        mode: int,
+    ) -> _PathSnapshot:
         with self._parent(relative, create=True) as (parent, name, ancestry):
             existing = self._snapshot_at(
                 parent, name, relative, allow_missing=True
@@ -530,25 +1729,47 @@ class _PosixBackend:
                 identity = _posix_identity(os.fstat(descriptor))
                 if identity.kind != "file" or identity.nlink != 1:
                     raise ProjectPathSafetyError(relative, "unsafe-target")
-            except BaseException:
-                os.close(descriptor)
+            except BaseException as error:
                 try:
-                    current = _posix_identity(
-                        os.stat(
-                            name,
-                            dir_fd=parent,
-                            follow_symlinks=False,
-                        )
+                    created_snapshot = _PathSnapshot(
+                        True,
+                        created_identity,
                     )
-                except OSError:
-                    pass
-                else:
-                    if current == created_identity:
-                        try:
-                            os.unlink(name, dir_fd=parent)
-                            os.fsync(parent)
-                        except OSError:
-                            pass
+                    if self._snapshot_at(
+                        parent,
+                        name,
+                        relative,
+                        allow_missing=False,
+                    ) != created_snapshot:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    self._quarantine_entry_checked(
+                        parent,
+                        name,
+                        relative,
+                        created_snapshot,
+                        consume=lambda quarantine_name, quarantine_relative: (
+                            self._delete_quarantined_regular(
+                                parent,
+                                quarantine_name,
+                                quarantine_relative,
+                                created_snapshot,
+                                descriptor,
+                                name,
+                                relative,
+                                relative,
+                            )
+                        ),
+                    )
+                    os.fsync(parent)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"exclusive create cleanup failed: {cleanup_error}"
+                    )
+                finally:
+                    os.close(descriptor)
                 raise
             else:
                 os.close(descriptor)
@@ -558,16 +1779,25 @@ class _PosixBackend:
             ).identity != identity:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
             os.fsync(parent)
+            self._check_ancestry(relative, ancestry)
+            return _PathSnapshot(True, identity)
 
     def open_lock_fd(self, relative: Path, mode: int) -> int:
         with self._parent(relative, create=True) as (parent, name, ancestry):
             expected = self._snapshot_at(
                 parent, name, relative, allow_missing=True
             )
-            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+            flags = os.O_RDWR | os.O_NOFOLLOW
+            if not expected.exists:
+                flags |= os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0)
             try:
                 descriptor = os.open(name, flags, mode, dir_fd=parent)
+            except FileExistsError as exc:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                ) from exc
             except OSError as exc:
                 raise ProjectPathSafetyError(relative, "unsafe-target") from exc
             try:
@@ -584,38 +1814,114 @@ class _PosixBackend:
                         else "unsafe-target"
                     )
                     raise ProjectPathSafetyError(relative, reason)
-                if expected.exists and expected.identity != identity:
-                    raise ProjectPathSafetyError(relative, "path-identity-changed")
+                if expected.exists:
+                    assert expected.identity is not None
+                    expected_object = (
+                        expected.identity.volume,
+                        expected.identity.file_id,
+                        expected.identity.kind,
+                        expected.identity.nlink,
+                    )
+                    opened_object = (
+                        identity.volume,
+                        identity.file_id,
+                        identity.kind,
+                        identity.nlink,
+                    )
+                    if expected_object != opened_object:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
                 os.fchmod(descriptor, mode)
+                identity = _posix_identity(os.fstat(descriptor))
                 self._check_ancestry(relative, ancestry)
                 current = self._snapshot_at(
                     parent, name, relative, allow_missing=False
                 )
                 if current.identity != identity:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
+                self._check_ancestry(relative, ancestry)
                 return descriptor
             except BaseException:
                 os.close(descriptor)
                 raise
 
-    def unlink_regular(self, relative: Path, *, missing_ok: bool) -> None:
+    def open_exclusion_fd(self) -> int:
+        self.assert_root_path()
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(".", flags, dir_fd=self.root_descriptor)
+        except OSError as exc:
+            raise ProjectPathSafetyError(
+                Path("."),
+                "platform-safety-unavailable",
+            ) from exc
+        os.set_inheritable(descriptor, False)
+        if _posix_identity(os.fstat(descriptor)) != self.root_identity:
+            os.close(descriptor)
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed")
+        try:
+            self.assert_root_path()
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def unlink_regular(
+        self,
+        relative: Path,
+        *,
+        missing_ok: bool,
+        expected: _PathSnapshot | None = None,
+    ) -> None:
         try:
             with self._parent(relative, create=False) as (parent, name, ancestry):
-                expected = self._snapshot_at(
+                snapshot = self._snapshot_at(
                     parent, name, relative, allow_missing=missing_ok
                 )
-                if not expected.exists:
+                if expected is not None and snapshot != expected:
+                    raise ProjectPathSafetyError(relative, "path-identity-changed")
+                if not snapshot.exists:
                     return
                 self._check_ancestry(relative, ancestry)
                 if self._snapshot_at(
                     parent, name, relative, allow_missing=False
-                ) != expected:
+                ) != snapshot:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
-                os.unlink(name, dir_fd=parent)
+                descriptor = self._open_pinned_regular(
+                    parent,
+                    name,
+                    relative,
+                    snapshot,
+                )
+                try:
+                    self._quarantine_entry_checked(
+                        parent,
+                        name,
+                        relative,
+                        snapshot,
+                        consume=lambda quarantine_name, quarantine_relative: (
+                            self._delete_quarantined_regular(
+                                parent,
+                                quarantine_name,
+                                quarantine_relative,
+                                snapshot,
+                                descriptor,
+                                name,
+                                relative,
+                                relative,
+                            )
+                        ),
+                    )
+                finally:
+                    os.close(descriptor)
                 os.fsync(parent)
+                self._check_ancestry(relative, ancestry)
         except _MissingAncestor:
             if not missing_ok:
                 raise ProjectPathSafetyError(relative, "unsafe-target")
+            self.assert_root_path()
 
     def create_unique_directory(self, parent_relative: Path, prefix: str) -> Path:
         self.ensure_directory(parent_relative)
@@ -634,6 +1940,7 @@ class _PosixBackend:
                 if identity.kind != "directory" or identity.volume != self.root_identity.volume:
                     raise ProjectPathSafetyError(parent_relative / name, "unsafe-target")
                 os.fsync(parent)
+                self._check_ancestry(parent_relative, ancestry)
                 return parent_relative / name
         raise ProjectPathSafetyError(parent_relative, "path-identity-changed")
 
@@ -660,8 +1967,15 @@ class _PosixBackend:
             if identity.kind != "directory" or identity.volume != self.root_identity.volume:
                 raise ProjectPathSafetyError(relative, "unsafe-target")
             os.fsync(parent)
+            self._check_ancestry(relative, ancestry)
 
-    def replace_file(self, source: Path, destination: Path) -> None:
+    def replace_file(
+        self,
+        source: Path,
+        destination: Path,
+        expected_source: _PathSnapshot | None = None,
+        expected_destination: _PathSnapshot | None = None,
+    ) -> None:
         if source == destination:
             raise ProjectPathSafetyError(destination, "invalid-relative-path")
         with self._parent(source, create=False) as (
@@ -685,6 +1999,19 @@ class _PosixBackend:
                 destination,
                 allow_missing=True,
             )
+            if expected_source is not None and source_snapshot != expected_source:
+                raise ProjectPathSafetyError(
+                    source,
+                    "path-identity-changed",
+                )
+            if (
+                expected_destination is not None
+                and destination_snapshot != expected_destination
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
             self._check_ancestry(source, source_ancestry)
             self._check_ancestry(destination, destination_ancestry)
             if self._snapshot_at(
@@ -701,12 +2028,87 @@ class _PosixBackend:
                 allow_missing=True,
             ) != destination_snapshot:
                 raise ProjectPathSafetyError(destination, "path-identity-changed")
-            os.replace(
+            source_descriptor = self._open_pinned_regular(
+                source_parent,
                 source_name,
-                destination_name,
-                src_dir_fd=source_parent,
-                dst_dir_fd=destination_parent,
+                source,
+                source_snapshot,
             )
+            destination_descriptor: int | None = None
+            try:
+                if destination_snapshot.exists:
+                    destination_descriptor = self._open_pinned_regular(
+                        destination_parent,
+                        destination_name,
+                        destination,
+                        destination_snapshot,
+                    )
+                    self._exchange_checked(
+                        source_parent,
+                        source_name,
+                        source,
+                        source_snapshot,
+                        destination_parent,
+                        destination_name,
+                        destination,
+                        destination_snapshot,
+                    )
+                    try:
+                        self._quarantine_entry_checked(
+                            source_parent,
+                            source_name,
+                            source,
+                            destination_snapshot,
+                            consume=lambda discarded_name, discarded_relative: (
+                                self._delete_quarantined_regular(
+                                    source_parent,
+                                    discarded_name,
+                                    discarded_relative,
+                                    destination_snapshot,
+                                    destination_descriptor,
+                                    source_name,
+                                    source,
+                                    source,
+                                )
+                            ),
+                        )
+                    except BaseException as cleanup_error:
+                        try:
+                            rollback_source_snapshot = self._raw_snapshot_at(
+                                source_parent,
+                                source_name,
+                                source,
+                                allow_missing=False,
+                            )
+                            self._exchange_checked(
+                                source_parent,
+                                source_name,
+                                source,
+                                rollback_source_snapshot,
+                                destination_parent,
+                                destination_name,
+                                destination,
+                                source_snapshot,
+                            )
+                        except BaseException as rollback_error:
+                            cleanup_error.add_note(
+                                f"file replacement rollback failed: {rollback_error}"
+                            )
+                        raise
+                else:
+                    self._rename_noreplace_checked(
+                        source_parent,
+                        source_name,
+                        source,
+                        source_snapshot,
+                        destination_parent,
+                        destination_name,
+                        destination,
+                    )
+            finally:
+                if destination_descriptor is not None:
+                    os.close(destination_descriptor)
+                os.close(source_descriptor)
             final = self._snapshot_at(
                 destination_parent,
                 destination_name,
@@ -718,6 +2120,15 @@ class _PosixBackend:
             os.fsync(source_parent)
             if destination_parent != source_parent:
                 os.fsync(destination_parent)
+            self._check_ancestry(source, source_ancestry)
+            self._check_ancestry(destination, destination_ancestry)
+            if self._snapshot_at(
+                destination_parent,
+                destination_name,
+                destination,
+                allow_missing=False,
+            ).identity != source_snapshot.identity:
+                raise ProjectPathSafetyError(destination, "path-identity-changed")
 
     def remove_empty_directory(self, relative: Path, *, missing_ok: bool) -> None:
         marker = relative.parent / "__kafa_directory_parent__"
@@ -737,11 +2148,52 @@ class _PosixBackend:
                 if not snapshot.exists:
                     return
                 self._check_ancestry(relative, ancestry)
-                os.rmdir(relative.name, dir_fd=parent)
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                try:
+                    descriptor = os.open(
+                        relative.name,
+                        flags,
+                        dir_fd=parent,
+                    )
+                except OSError as exc:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "unsafe-target",
+                    ) from exc
+                try:
+                    if _posix_identity(os.fstat(descriptor)) != snapshot.identity:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    self._quarantine_entry_checked(
+                        parent,
+                        relative.name,
+                        relative,
+                        snapshot,
+                        expect_directory=True,
+                        consume=lambda quarantine_name, quarantine_relative: (
+                            self._delete_quarantined_directory(
+                                parent,
+                                quarantine_name,
+                                quarantine_relative,
+                                snapshot,
+                                descriptor,
+                                relative.name,
+                                relative,
+                                relative,
+                            )
+                        ),
+                    )
+                finally:
+                    os.close(descriptor)
                 os.fsync(parent)
+                self._check_ancestry(relative, ancestry)
         except _MissingAncestor:
             if not missing_ok:
                 raise ProjectPathSafetyError(relative, "unsafe-target")
+            self.assert_root_path()
 
 
 if os.name == "nt":  # pragma: no cover - exercised by the Windows matrix
@@ -758,15 +2210,24 @@ if os.name == "nt":  # pragma: no cover - exercised by the Windows matrix
     _CREATE_NEW = 1
     _OPEN_EXISTING = 3
     _OPEN_ALWAYS = 4
+    _FILE_ATTRIBUTE_READONLY = 0x00000001
     _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_BASIC_INFO_CLASS = 0
     _FILE_DISPOSITION_INFO_CLASS = 4
+    _FILE_DISPOSITION_INFO_EX_CLASS = 21
     _FILE_RENAME_INFO_EX_CLASS = 22
+    _FILE_DISPOSITION_DELETE = 0x00000001
+    _FILE_DISPOSITION_POSIX_SEMANTICS = 0x00000002
+    _FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE = 0x00000010
     _FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
     _FILE_RENAME_POSIX_SEMANTICS = 0x00000002
+    _FILE_RENAME_IGNORE_READONLY_ATTRIBUTE = 0x00000040
     _FILE_ID_INFO_CLASS = 18
+    _REPLACEFILE_FLAGS_NONE = 0
 
     class _FILETIME(ctypes.Structure):
         _fields_ = (("low", wintypes.DWORD), ("high", wintypes.DWORD))
@@ -796,6 +2257,18 @@ if os.name == "nt":  # pragma: no cover - exercised by the Windows matrix
 
     class _FILE_DISPOSITION_INFO(ctypes.Structure):
         _fields_ = (("delete_file", ctypes.c_ubyte),)
+
+    class _FILE_DISPOSITION_INFO_EX(ctypes.Structure):
+        _fields_ = (("flags", wintypes.DWORD),)
+
+    class _FILE_BASIC_INFO(ctypes.Structure):
+        _fields_ = (
+            ("creation_time", ctypes.c_longlong),
+            ("last_access_time", ctypes.c_longlong),
+            ("last_write_time", ctypes.c_longlong),
+            ("change_time", ctypes.c_longlong),
+            ("file_attributes", wintypes.DWORD),
+        )
 
     class _FILE_RENAME_INFO(ctypes.Structure):
         _fields_ = (
@@ -862,6 +2335,16 @@ class _WindowsApi:
                 wintypes.LPVOID,
             )
             self.WriteFile.restype = wintypes.BOOL
+            self.ReplaceFileW = kernel32.ReplaceFileW
+            self.ReplaceFileW.argtypes = (
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.LPVOID,
+            )
+            self.ReplaceFileW.restype = wintypes.BOOL
             self.CloseHandle = kernel32.CloseHandle
             self.CloseHandle.argtypes = (wintypes.HANDLE,)
             self.CloseHandle.restype = wintypes.BOOL
@@ -884,8 +2367,10 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         handle = self._open_handle(root, directory=True)
         try:
             self.root_identity = self._identity(handle, expect_directory=True, relative=Path("."))
-        finally:
+            self.root_handle = handle
+        except BaseException:
             self._close(handle)
+            raise
 
     @property
     def identity_key(self) -> tuple[object, ...]:
@@ -894,6 +2379,31 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
     def _close(self, handle: int) -> None:
         if handle not in (None, _INVALID_HANDLE_VALUE):
             self.api.CloseHandle(handle)
+
+    def assert_root_path(self) -> None:
+        try:
+            handle = self._open_handle(self.root, directory=True)
+        except OSError as exc:
+            raise ProjectPathSafetyError(Path("."), "path-identity-changed") from exc
+        try:
+            if (
+                self._identity(
+                    handle,
+                    expect_directory=True,
+                    relative=Path("."),
+                )
+                != self.root_identity
+            ):
+                raise ProjectPathSafetyError(Path("."), "path-identity-changed")
+        finally:
+            self._close(handle)
+
+    def close(self) -> None:
+        handle = getattr(self, "root_handle", _INVALID_HANDLE_VALUE)
+        if handle == _INVALID_HANDLE_VALUE:
+            return
+        self.root_handle = _INVALID_HANDLE_VALUE
+        self._close(handle)
 
     def _open_handle(
         self,
@@ -919,11 +2429,10 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             raise self.api.error()
         return handle
 
-    def _identity(
+    def _raw_identity(
         self,
         handle: int,
         *,
-        expect_directory: bool,
         relative: Path,
     ) -> _PathIdentity:
         basic = _BY_HANDLE_FILE_INFORMATION()
@@ -938,27 +2447,46 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         ):
             raise ProjectPathSafetyError(relative, "platform-safety-unavailable")
         attributes = int(basic.attributes)
-        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise ProjectPathSafetyError(relative, "unsafe-target")
         is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
-        if is_directory != expect_directory:
-            raise ProjectPathSafetyError(relative, "unsafe-target")
+        is_reparse = bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
         identity = _PathIdentity(
             volume=int(file_id.volume_serial),
             file_id=bytes(file_id.file_id.identifier),
-            kind="directory" if is_directory else "file",
+            kind=(
+                "reparse"
+                if is_reparse
+                else "directory" if is_directory else "file"
+            ),
             mode_or_attributes=attributes,
             nlink=0 if is_directory else int(basic.nlinks),
         )
+        return identity
+
+    def _identity(
+        self,
+        handle: int,
+        *,
+        expect_directory: bool,
+        relative: Path,
+    ) -> _PathIdentity:
+        identity = self._raw_identity(handle, relative=relative)
+        expected_kind = "directory" if expect_directory else "file"
+        if identity.kind != expected_kind:
+            raise ProjectPathSafetyError(relative, "unsafe-target")
+        is_directory = identity.kind == "directory"
         if not is_directory and identity.nlink != 1:
             raise ProjectPathSafetyError(relative, "hard-linked-target")
         return identity
 
     def _delete_on_close(self, handle: int, relative: Path) -> None:
-        disposition = _FILE_DISPOSITION_INFO(1)
+        disposition = _FILE_DISPOSITION_INFO_EX(
+            _FILE_DISPOSITION_DELETE
+            | _FILE_DISPOSITION_POSIX_SEMANTICS
+            | _FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+        )
         if not self.api.SetFileInformationByHandle(
             handle,
-            _FILE_DISPOSITION_INFO_CLASS,
+            _FILE_DISPOSITION_INFO_EX_CLASS,
             ctypes.byref(disposition),
             ctypes.sizeof(disposition),
         ):
@@ -967,6 +2495,109 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 "platform-safety-unavailable",
             ) from self.api.error()
 
+    def _apply_file_mode(self, handle: int, relative: Path, mode: int) -> None:
+        basic = _BY_HANDLE_FILE_INFORMATION()
+        if not self.api.GetFileInformationByHandle(handle, ctypes.byref(basic)):
+            raise ProjectPathSafetyError(
+                relative,
+                "platform-safety-unavailable",
+            ) from self.api.error()
+        attributes = int(basic.attributes) & ~_FILE_ATTRIBUTE_NORMAL
+        if mode & 0o222:
+            attributes &= ~_FILE_ATTRIBUTE_READONLY
+        else:
+            attributes |= _FILE_ATTRIBUTE_READONLY
+        if attributes == 0:
+            attributes = _FILE_ATTRIBUTE_NORMAL
+        information = _FILE_BASIC_INFO(0, 0, 0, 0, attributes)
+        if not self.api.SetFileInformationByHandle(
+            handle,
+            _FILE_BASIC_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ProjectPathSafetyError(
+                relative,
+                "platform-safety-unavailable",
+            ) from self.api.error()
+
+    def _reconcile_windows_handle_rename_interruption(
+        self,
+        source_handle: int,
+        source_identity: _PathIdentity,
+        destination: Path,
+        relative: Path,
+        rollback_destination: Path,
+        rollback_relative: Path,
+        error: BaseException,
+    ) -> None:
+        try:
+            source_after = self.snapshot(
+                rollback_relative,
+                allow_missing=True,
+            )
+            destination_after = self.snapshot(
+                relative,
+                allow_missing=True,
+            )
+            if (
+                self._same_windows_object(source_after, source_identity)
+                and not destination_after.exists
+            ):
+                return
+            if (
+                source_after.exists
+                or not self._same_windows_object(
+                    destination_after,
+                    source_identity,
+                )
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+            try:
+                self._rename_by_handle(
+                    source_handle,
+                    rollback_destination,
+                    rollback_relative,
+                    replace_existing=False,
+                )
+            except BaseException as rollback_error:
+                if (
+                    self._same_windows_object(
+                        self.snapshot(
+                            rollback_relative,
+                            allow_missing=False,
+                        ),
+                        source_identity,
+                    )
+                    and not self.snapshot(
+                        relative,
+                        allow_missing=True,
+                    ).exists
+                ):
+                    return
+                raise rollback_error
+            if (
+                not self._same_windows_object(
+                    self.snapshot(
+                        rollback_relative,
+                        allow_missing=False,
+                    ),
+                    source_identity,
+                )
+                or self.snapshot(relative, allow_missing=True).exists
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+        except BaseException as rollback_error:
+            error.add_note(
+                f"Windows handle rename interruption rollback failed: {rollback_error}"
+            )
+
     def _rename_by_handle(
         self,
         source_handle: int,
@@ -974,6 +2605,9 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         relative: Path,
         *,
         replace_existing: bool,
+        rollback_destination: Path | None = None,
+        rollback_relative: Path | None = None,
+        source_identity: _PathIdentity | None = None,
     ) -> None:
         encoded_name = os.fspath(destination).encode("utf-16-le")
         file_name_offset = _FILE_RENAME_INFO.file_name.offset
@@ -987,6 +2621,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         rename_info.flags = (
             _FILE_RENAME_REPLACE_IF_EXISTS
             | _FILE_RENAME_POSIX_SEMANTICS
+            | _FILE_RENAME_IGNORE_READONLY_ATTRIBUTE
             if replace_existing
             else 0
         )
@@ -997,17 +2632,601 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             encoded_name,
             len(encoded_name),
         )
-        if not self.api.SetFileInformationByHandle(
-            source_handle,
-            _FILE_RENAME_INFO_EX_CLASS,
-            buffer,
-            len(buffer),
-        ):
+        try:
+            renamed = self.api.SetFileInformationByHandle(
+                source_handle,
+                _FILE_RENAME_INFO_EX_CLASS,
+                buffer,
+                len(buffer),
+            )
+        except BaseException as exc:
+            if (
+                rollback_destination is not None
+                and rollback_relative is not None
+                and source_identity is not None
+            ):
+                self._reconcile_windows_handle_rename_interruption(
+                    source_handle,
+                    source_identity,
+                    destination,
+                    relative,
+                    rollback_destination,
+                    rollback_relative,
+                    exc,
+                )
+            raise
+        if not renamed:
             error = self.api.error()
-            raise ProjectPathSafetyError(
+            failure = ProjectPathSafetyError(
                 relative,
                 _windows_rename_error_reason(error),
-            ) from error
+            )
+            if (
+                rollback_destination is not None
+                and rollback_relative is not None
+                and source_identity is not None
+            ):
+                self._reconcile_windows_handle_rename_interruption(
+                    source_handle,
+                    source_identity,
+                    destination,
+                    relative,
+                    rollback_destination,
+                    rollback_relative,
+                    failure,
+                )
+            raise failure from error
+
+    def _publish_handle_rename_checked(
+        self,
+        source_handle: int,
+        source_path: Path,
+        source: Path,
+        source_identity: _PathIdentity,
+        destination_path: Path,
+        destination: Path,
+        *,
+        flush: bool,
+    ) -> None:
+        """Publish a missing-target rename and restore its exact pre-state on failure."""
+
+        try:
+            self._rename_by_handle(
+                source_handle,
+                destination_path,
+                destination,
+                replace_existing=False,
+                rollback_destination=source_path,
+                rollback_relative=source,
+                source_identity=source_identity,
+            )
+            if self._identity(
+                source_handle,
+                expect_directory=False,
+                relative=destination,
+            ) != source_identity:
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+            if flush and not self.api.FlushFileBuffers(source_handle):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                ) from self.api.error()
+        except BaseException as exc:
+            self._reconcile_windows_handle_rename_interruption(
+                source_handle,
+                source_identity,
+                destination_path,
+                destination,
+                source_path,
+                source,
+                exc,
+            )
+            raise
+
+    @staticmethod
+    def _same_windows_object(
+        snapshot: _PathSnapshot,
+        identity: _PathIdentity,
+    ) -> bool:
+        if not snapshot.exists or snapshot.identity is None:
+            return False
+        actual = snapshot.identity
+        return (
+            actual.volume == identity.volume
+            and actual.file_id == identity.file_id
+            and actual.kind == identity.kind
+            and actual.nlink == identity.nlink
+        )
+
+    @staticmethod
+    def _same_windows_raw_object(
+        actual: _PathSnapshot,
+        expected: _PathSnapshot,
+    ) -> bool:
+        if actual.exists != expected.exists:
+            return False
+        if not actual.exists:
+            return True
+        if actual.identity is None or expected.identity is None:
+            return False
+        return (
+            actual.identity.volume == expected.identity.volume
+            and actual.identity.file_id == expected.identity.file_id
+            and actual.identity.kind == expected.identity.kind
+        )
+
+    def _apply_file_attributes(
+        self,
+        handle: int,
+        relative: Path,
+        attributes: int,
+    ) -> None:
+        normalized = int(attributes) & ~_FILE_ATTRIBUTE_NORMAL
+        if normalized == 0:
+            normalized = _FILE_ATTRIBUTE_NORMAL
+        information = _FILE_BASIC_INFO(0, 0, 0, 0, normalized)
+        if not self.api.SetFileInformationByHandle(
+            handle,
+            _FILE_BASIC_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ProjectPathSafetyError(
+                relative,
+                "platform-safety-unavailable",
+            ) from self.api.error()
+
+    def _reconcile_windows_replace_interruption(
+        self,
+        source_path: Path,
+        source: Path,
+        source_identity: _PathIdentity,
+        destination_path: Path,
+        destination: Path,
+        destination_snapshot: _PathSnapshot,
+        backup_path: Path,
+        backup_relative: Path,
+        error: BaseException,
+    ) -> None:
+        source_snapshot = _PathSnapshot(True, source_identity)
+        try:
+            final = self._raw_snapshot(destination, allow_missing=True)
+            displaced = self._raw_snapshot(
+                backup_relative,
+                allow_missing=True,
+            )
+            source_after = self._raw_snapshot(source, allow_missing=True)
+            if (
+                self._same_windows_raw_object(final, destination_snapshot)
+                and self._same_windows_raw_object(
+                    source_after,
+                    source_snapshot,
+                )
+                and not displaced.exists
+            ):
+                return
+            if (
+                final.exists
+                and not source_after.exists
+                and displaced.exists
+            ):
+                try:
+                    if not self.api.ReplaceFileW(
+                        os.fspath(destination_path),
+                        os.fspath(backup_path),
+                        os.fspath(source_path),
+                        _REPLACEFILE_FLAGS_NONE,
+                        None,
+                        None,
+                    ):
+                        raise ProjectPathSafetyError(
+                            destination,
+                            "path-identity-changed",
+                        ) from self.api.error()
+                except BaseException as rollback_error:
+                    if (
+                        self._same_windows_raw_object(
+                            self._raw_snapshot(
+                                destination,
+                                allow_missing=False,
+                            ),
+                            displaced,
+                        )
+                        and self._same_windows_raw_object(
+                            self._raw_snapshot(
+                                source,
+                                allow_missing=False,
+                            ),
+                            final,
+                        )
+                        and not self._raw_snapshot(
+                            backup_relative,
+                            allow_missing=True,
+                        ).exists
+                    ):
+                        return
+                    raise rollback_error
+                if (
+                    not self._same_windows_raw_object(
+                        self._raw_snapshot(
+                            destination,
+                            allow_missing=False,
+                        ),
+                        displaced,
+                    )
+                    or not self._same_windows_raw_object(
+                        self._raw_snapshot(
+                            source,
+                            allow_missing=False,
+                        ),
+                        final,
+                    )
+                    or self._raw_snapshot(
+                        backup_relative,
+                        allow_missing=True,
+                    ).exists
+                ):
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                return
+            if (
+                not final.exists
+                and self._same_windows_raw_object(
+                    source_after,
+                    source_snapshot,
+                )
+                and displaced.exists
+            ):
+                try:
+                    if displaced == destination_snapshot:
+                        self.replace_file(
+                            backup_relative,
+                            destination,
+                            expected_destination=final,
+                        )
+                    else:
+                        raw_handle = self._open_handle(
+                            backup_path,
+                            directory=True,
+                            access=_DELETE,
+                        )
+                        try:
+                            if not self._same_windows_raw_object(
+                                _PathSnapshot(
+                                    True,
+                                    self._raw_identity(
+                                        raw_handle,
+                                        relative=backup_relative,
+                                    ),
+                                ),
+                                displaced,
+                            ):
+                                raise ProjectPathSafetyError(
+                                    destination,
+                                    "path-identity-changed",
+                                )
+                            self._rename_by_handle(
+                                raw_handle,
+                                destination_path,
+                                destination,
+                                replace_existing=False,
+                            )
+                        finally:
+                            self._close(raw_handle)
+                except BaseException as rollback_error:
+                    if (
+                        self._same_windows_raw_object(
+                            self._raw_snapshot(
+                                destination,
+                                allow_missing=False,
+                            ),
+                            displaced,
+                        )
+                        and self._same_windows_raw_object(
+                            self._raw_snapshot(
+                                source,
+                                allow_missing=False,
+                            ),
+                            source_snapshot,
+                        )
+                        and not self._raw_snapshot(
+                            backup_relative,
+                            allow_missing=True,
+                        ).exists
+                    ):
+                        return
+                    raise rollback_error
+                if (
+                    not self._same_windows_raw_object(
+                        self._raw_snapshot(
+                            destination,
+                            allow_missing=False,
+                        ),
+                        displaced,
+                    )
+                    or not self._same_windows_raw_object(
+                        self._raw_snapshot(
+                            source,
+                            allow_missing=False,
+                        ),
+                        source_snapshot,
+                    )
+                    or self._raw_snapshot(
+                        backup_relative,
+                        allow_missing=True,
+                    ).exists
+                ):
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                return
+            raise ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+        except BaseException as rollback_error:
+            error.add_note(
+                f"Windows replacement interruption rollback failed: {rollback_error}"
+            )
+
+    def _replace_with_backup_checked(
+        self,
+        source_path: Path,
+        source: Path,
+        source_identity: _PathIdentity,
+        destination_path: Path,
+        destination: Path,
+        destination_snapshot: _PathSnapshot,
+    ) -> _PathIdentity:
+        backup_relative: Path | None = None
+        backup_path: Path | None = None
+        for _ in range(128):
+            candidate = destination.with_name(
+                f".{destination.name}.kafa-displaced-{secrets.token_hex(12)}.tmp"
+            )
+            if self.snapshot(candidate, allow_missing=True).exists:
+                continue
+            backup_relative = candidate
+            backup_path = destination_path.with_name(candidate.name)
+            break
+        if backup_relative is None or backup_path is None:
+            raise ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+        replace_error: OSError | None = None
+        try:
+            replaced = self.api.ReplaceFileW(
+                os.fspath(destination_path),
+                os.fspath(source_path),
+                os.fspath(backup_path),
+                _REPLACEFILE_FLAGS_NONE,
+                None,
+                None,
+            )
+        except BaseException as exc:
+            self._reconcile_windows_replace_interruption(
+                source_path,
+                source,
+                source_identity,
+                destination_path,
+                destination,
+                destination_snapshot,
+                backup_path,
+                backup_relative,
+                exc,
+            )
+            raise
+        if not replaced:
+            # ReplaceFileW documents a partial failure (1177) where the old
+            # destination has already moved to the backup name and the
+            # replacement remains at its source name.  Capture GetLastError
+            # before any state inspection calls overwrite it.
+            replace_error = self.api.error()
+        try:
+            final = self._raw_snapshot(destination, allow_missing=True)
+            displaced = self._raw_snapshot(
+                backup_relative,
+                allow_missing=True,
+            )
+            source_after = self._raw_snapshot(source, allow_missing=True)
+        except BaseException as exc:
+            error = ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+            self._reconcile_windows_replace_interruption(
+                source_path,
+                source,
+                source_identity,
+                destination_path,
+                destination,
+                destination_snapshot,
+                backup_path,
+                backup_relative,
+                error,
+            )
+            raise error from exc
+        correct = (
+            self._same_windows_object(final, source_identity)
+            and displaced == destination_snapshot
+            and not source_after.exists
+        )
+        original = (
+            final == destination_snapshot
+            and self._same_windows_object(source_after, source_identity)
+            and not displaced.exists
+        )
+        partial_failure = (
+            not final.exists
+            and displaced == destination_snapshot
+            and self._same_windows_object(source_after, source_identity)
+        )
+        if replace_error is not None and partial_failure:
+            try:
+                self.replace_file(
+                    source,
+                    destination,
+                    expected_destination=final,
+                )
+            except BaseException as completion_error:
+                error = ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
+                error.add_note(
+                    f"Windows partial replacement completion failed: {completion_error}"
+                )
+                try:
+                    current_final = self.snapshot(
+                        destination,
+                        allow_missing=True,
+                    )
+                    current_displaced = self.snapshot(
+                        backup_relative,
+                        allow_missing=True,
+                    )
+                    current_source = self.snapshot(
+                        source,
+                        allow_missing=True,
+                    )
+                    if (
+                        current_final.exists
+                        or current_displaced != destination_snapshot
+                        or not self._same_windows_object(
+                            current_source,
+                            source_identity,
+                        )
+                    ):
+                        raise ProjectPathSafetyError(
+                            destination,
+                            "path-identity-changed",
+                        )
+                    self.replace_file(
+                        backup_relative,
+                        destination,
+                        expected_destination=current_final,
+                    )
+                    if (
+                        self.snapshot(destination, allow_missing=False)
+                        != destination_snapshot
+                        or self.snapshot(
+                            backup_relative,
+                            allow_missing=True,
+                        ).exists
+                    ):
+                        raise ProjectPathSafetyError(
+                            destination,
+                            "path-identity-changed",
+                        )
+                except BaseException as rollback_error:
+                    error.add_note(
+                        f"Windows partial replacement rollback failed: {rollback_error}"
+                    )
+                raise error from replace_error
+            final = self._raw_snapshot(destination, allow_missing=True)
+            displaced = self._raw_snapshot(
+                backup_relative,
+                allow_missing=True,
+            )
+            source_after = self._raw_snapshot(source, allow_missing=True)
+            correct = (
+                self._same_windows_object(final, source_identity)
+                and displaced == destination_snapshot
+                and not source_after.exists
+            )
+        elif replace_error is not None and original:
+            raise ProjectPathSafetyError(
+                destination,
+                _windows_rename_error_reason(replace_error),
+            ) from replace_error
+        if not correct:
+            error = ProjectPathSafetyError(
+                destination,
+                "path-identity-changed",
+            )
+            if replace_error is not None:
+                error.add_note(f"ReplaceFileW failed: {replace_error}")
+            self._reconcile_windows_replace_interruption(
+                source_path,
+                source,
+                source_identity,
+                destination_path,
+                destination,
+                destination_snapshot,
+                backup_path,
+                backup_relative,
+                error,
+            )
+            if replace_error is not None:
+                raise error from replace_error
+            raise error
+
+        final_handle = _INVALID_HANDLE_VALUE
+        final_identity = source_identity
+        try:
+            try:
+                final_handle = self._open_handle(
+                    destination_path,
+                    directory=False,
+                    access=_GENERIC_READ | _GENERIC_WRITE,
+                )
+                final_identity = self._identity(
+                    final_handle,
+                    expect_directory=False,
+                    relative=destination,
+                )
+                if not self._same_windows_object(
+                    _PathSnapshot(True, final_identity),
+                    source_identity,
+                ):
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                self._apply_file_attributes(
+                    final_handle,
+                    destination,
+                    source_identity.mode_or_attributes,
+                )
+                if not self.api.FlushFileBuffers(final_handle):
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    ) from self.api.error()
+                final_identity = self._identity(
+                    final_handle,
+                    expect_directory=False,
+                    relative=destination,
+                )
+            finally:
+                self._close(final_handle)
+                final_handle = _INVALID_HANDLE_VALUE
+            self.unlink_regular(
+                backup_relative,
+                missing_ok=False,
+                expected=displaced,
+            )
+        except BaseException as exc:
+            self._reconcile_windows_replace_interruption(
+                source_path,
+                source,
+                source_identity,
+                destination_path,
+                destination,
+                destination_snapshot,
+                backup_path,
+                backup_relative,
+                exc,
+            )
+            raise
+        return final_identity
 
     @contextmanager
     def _ancestors(
@@ -1038,7 +3257,20 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                         handle = self._open_handle(current, directory=True)
                     except OSError as retry_exc:
                         raise ProjectPathSafetyError(relative, "unsafe-ancestor") from retry_exc
-                identity = self._identity(handle, expect_directory=True, relative=relative)
+                try:
+                    identity = self._identity(
+                        handle,
+                        expect_directory=True,
+                        relative=relative,
+                    )
+                except ProjectPathSafetyError as exc:
+                    self._close(handle)
+                    if exc.reason == "unsafe-target":
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "unsafe-ancestor",
+                        ) from exc
+                    raise
                 if identity.volume != self.root_identity.volume:
                     self._close(handle)
                     raise ProjectPathSafetyError(relative, "cross-device-ancestor")
@@ -1082,6 +3314,49 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 return _PathSnapshot(False)
             raise ProjectPathSafetyError(relative, "unsafe-ancestor") from exc
 
+    def _raw_snapshot(
+        self,
+        relative: Path,
+        *,
+        allow_missing: bool,
+    ) -> _PathSnapshot:
+        """Capture a no-follow leaf identity solely for rename recovery.
+
+        The returned identity never authorizes content access or deletion.  It
+        deliberately permits hard links and reparse points so an interrupted
+        ReplaceFileW can identify and reverse the exact directory-entry move.
+        """
+
+        try:
+            with self._ancestors(relative, create=False) as parent:
+                path = parent / relative.name
+                try:
+                    # BACKUP_SEMANTICS permits opening a directory if an
+                    # attacker raced one into the leaf, while OPEN_REPARSE_POINT
+                    # in _open_handle keeps the operation no-follow.
+                    handle = self._open_handle(path, directory=True)
+                except OSError as exc:
+                    if allow_missing and exc.errno in {2, 3}:
+                        return _PathSnapshot(False)
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    ) from exc
+                try:
+                    identity = self._raw_identity(handle, relative=relative)
+                finally:
+                    self._close(handle)
+                return _PathSnapshot(True, identity)
+        except ProjectPathSafetyError:
+            raise
+        except OSError as exc:
+            if allow_missing and exc.errno in {2, 3}:
+                return _PathSnapshot(False)
+            raise ProjectPathSafetyError(
+                relative,
+                "path-identity-changed",
+            ) from exc
+
     def ensure_directory(self, relative: Path) -> None:
         marker = relative / "__kafa_directory_marker__"
         try:
@@ -1105,7 +3380,13 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             expect_directory=expect_directory,
         )
 
-    def read_bytes(self, relative: Path, *, max_bytes: int | None) -> bytes:
+    def read_bytes(
+        self,
+        relative: Path,
+        *,
+        max_bytes: int | None,
+        expected: _PathSnapshot | None = None,
+    ) -> bytes:
         with self._ancestors(relative, create=False) as parent:
             path = parent / relative.name
             try:
@@ -1118,6 +3399,11 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 raise ProjectPathSafetyError(relative, "unsafe-target") from exc
             try:
                 identity = self._identity(handle, expect_directory=False, relative=relative)
+                if expected is not None and identity != expected.identity:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
                 handle = _INVALID_HANDLE_VALUE
                 try:
@@ -1139,6 +3425,55 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             if self.snapshot(relative, allow_missing=False).identity != identity:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
             return data
+
+    def sync_regular(
+        self,
+        relative: Path,
+        expected: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
+        snapshot = expected or self.snapshot(relative, allow_missing=False)
+        with self._ancestors(relative, create=False) as parent:
+            path = parent / relative.name
+            try:
+                handle = self._open_handle(
+                    path,
+                    directory=False,
+                    access=_GENERIC_READ | _GENERIC_WRITE,
+                )
+            except OSError as exc:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                ) from exc
+            try:
+                if self._identity(
+                    handle,
+                    expect_directory=False,
+                    relative=relative,
+                ) != snapshot.identity:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+                if not self.api.FlushFileBuffers(handle):
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    ) from self.api.error()
+                if self._identity(
+                    handle,
+                    expect_directory=False,
+                    relative=relative,
+                ) != snapshot.identity:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+            finally:
+                self._close(handle)
+        if self.snapshot(relative, allow_missing=False) != snapshot:
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        return snapshot
 
     def _write_handle(self, handle: int, data: bytes, relative: Path) -> None:
         view = memoryview(data)
@@ -1257,6 +3592,12 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 relative=relative,
             )
             self._write_handle(handle, data, relative)
+            self._apply_file_mode(handle, relative, mode)
+            identity = self._identity(
+                handle,
+                expect_directory=False,
+                relative=relative,
+            )
         except BaseException as exc:
             cleanup_error = self._cleanup_created_handle(
                 handle,
@@ -1268,7 +3609,6 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             if cleanup_error:
                 exc.add_note(cleanup_error)
             raise
-        _ = mode
         assert identity is not None
         return handle, identity
 
@@ -1319,10 +3659,25 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         # never followed.
         return _INVALID_HANDLE_VALUE, None
 
-    def atomic_write(self, fs: "ProjectFS", relative: Path, data: bytes, mode: int) -> None:
+    def atomic_write(
+        self,
+        fs: "ProjectFS",
+        relative: Path,
+        data: bytes,
+        mode: int,
+        expected_destination: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
         with self._ancestors(relative, create=True) as parent:
             target = parent / relative.name
             expected = self.snapshot(relative, allow_missing=True)
+            if (
+                expected_destination is not None
+                and expected != expected_destination
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
             temporary_relative = relative.with_name(
                 f".{relative.name}.kafa-{secrets.token_hex(12)}.tmp"
             )
@@ -1370,33 +3725,70 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                             relative,
                             "path-identity-changed",
                         )
-                self._rename_by_handle(
-                    temporary_handle,
-                    target,
-                    relative,
-                    replace_existing=expected.exists,
-                )
-                published = True
-                if self._identity(
-                    temporary_handle,
-                    expect_directory=False,
-                    relative=relative,
-                ) != temporary_identity:
-                    raise ProjectPathSafetyError(relative, "path-identity-changed")
-                if not self.api.FlushFileBuffers(temporary_handle):
-                    raise ProjectPathSafetyError(
+                    if self.snapshot(relative, allow_missing=False) != expected:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    self._close(destination_handle)
+                    destination_handle = _INVALID_HANDLE_VALUE
+                    self._close(temporary_handle)
+                    temporary_handle = _INVALID_HANDLE_VALUE
+                    self._replace_with_backup_checked(
+                        temporary,
+                        temporary_relative,
+                        temporary_identity,
+                        target,
                         relative,
-                        "path-identity-changed",
-                    ) from self.api.error()
-            except BaseException as exc:
-                if not published:
-                    cleanup_error = self._cleanup_created_handle(
+                        expected,
+                    )
+                    published = True
+                else:
+                    if self.snapshot(relative, allow_missing=True).exists:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    self._publish_handle_rename_checked(
                         temporary_handle,
                         temporary,
                         temporary_relative,
                         temporary_identity,
+                        target,
+                        relative,
+                        flush=True,
                     )
-                    temporary_handle = _INVALID_HANDLE_VALUE
+                    published = True
+            except BaseException as exc:
+                if not published:
+                    if temporary_handle != _INVALID_HANDLE_VALUE:
+                        cleanup_error = self._cleanup_created_handle(
+                            temporary_handle,
+                            temporary,
+                            temporary_relative,
+                            temporary_identity,
+                        )
+                        temporary_handle = _INVALID_HANDLE_VALUE
+                    else:
+                        cleanup_error = ""
+                        try:
+                            remaining = self.snapshot(
+                                temporary_relative,
+                                allow_missing=True,
+                            )
+                            if remaining.exists:
+                                if remaining.identity != temporary_identity:
+                                    raise ProjectPathSafetyError(
+                                        temporary_relative,
+                                        "path-identity-changed",
+                                    )
+                                self.unlink_regular(
+                                    temporary_relative,
+                                    missing_ok=False,
+                                    expected=remaining,
+                                )
+                        except BaseException as cleanup_exc:
+                            cleanup_error = str(cleanup_exc)
                     if cleanup_error:
                         exc.add_note(cleanup_error)
                 raise
@@ -1405,8 +3797,14 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 self._close(temporary_handle)
             if self.snapshot(relative, allow_missing=False).identity != temporary_identity:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
+            return _PathSnapshot(True, temporary_identity)
 
-    def create_exclusive(self, relative: Path, data: bytes, mode: int) -> None:
+    def create_exclusive(
+        self,
+        relative: Path,
+        data: bytes,
+        mode: int,
+    ) -> _PathSnapshot:
         with self._ancestors(relative, create=True) as parent:
             target = parent / relative.name
             if self.snapshot(relative, allow_missing=True).exists:
@@ -1422,6 +3820,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 raise ProjectPathSafetyError(relative, "path-identity-changed") from exc
             if self.snapshot(relative, allow_missing=False).identity != expected:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
+            return _PathSnapshot(True, expected)
 
     def open_lock_fd(self, relative: Path, mode: int) -> int:
         with self._ancestors(relative, create=True) as parent:
@@ -1439,16 +3838,34 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 identity = self._identity(handle, expect_directory=False, relative=relative)
                 if self.snapshot(relative, allow_missing=False).identity != identity:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
+                self._apply_file_mode(handle, relative, mode)
+                identity = self._identity(
+                    handle,
+                    expect_directory=False,
+                    relative=relative,
+                )
+                if self.snapshot(relative, allow_missing=False).identity != identity:
+                    raise ProjectPathSafetyError(relative, "path-identity-changed")
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR)
                 handle = _INVALID_HANDLE_VALUE
                 os.set_inheritable(descriptor, False)
-                _ = mode
                 return descriptor
             finally:
                 self._close(handle)
 
-    def unlink_regular(self, relative: Path, *, missing_ok: bool) -> None:
+    def open_exclusion_fd(self) -> None:
+        return None
+
+    def unlink_regular(
+        self,
+        relative: Path,
+        *,
+        missing_ok: bool,
+        expected: _PathSnapshot | None = None,
+    ) -> None:
         snapshot = self.snapshot(relative, allow_missing=missing_ok)
+        if expected is not None and snapshot != expected:
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
         if not snapshot.exists:
             return
         with self._ancestors(relative, create=False) as parent:
@@ -1532,7 +3949,13 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 expect_directory=True,
             )
 
-    def replace_file(self, source: Path, destination: Path) -> None:
+    def replace_file(
+        self,
+        source: Path,
+        destination: Path,
+        expected_source: _PathSnapshot | None = None,
+        expected_destination: _PathSnapshot | None = None,
+    ) -> None:
         if source == destination:
             raise ProjectPathSafetyError(destination, "invalid-relative-path")
         with self._ancestors(source, create=False) as source_parent, self._ancestors(
@@ -1540,6 +3963,19 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         ) as destination_parent:
             source_snapshot = self.snapshot(source, allow_missing=False)
             destination_snapshot = self.snapshot(destination, allow_missing=True)
+            if expected_source is not None and source_snapshot != expected_source:
+                raise ProjectPathSafetyError(
+                    source,
+                    "path-identity-changed",
+                )
+            if (
+                expected_destination is not None
+                and destination_snapshot != expected_destination
+            ):
+                raise ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
             source_path = source_parent / source.name
             destination_path = destination_parent / destination.name
             source_handle = self._open_handle(
@@ -1595,20 +4031,45 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                             destination,
                             "path-identity-changed",
                         )
-                self._rename_by_handle(
-                    source_handle,
-                    destination_path,
-                    destination,
-                    replace_existing=destination_snapshot.exists,
-                )
-                if self._identity(
-                    source_handle,
-                    expect_directory=False,
-                    relative=destination,
-                ) != source_identity:
-                    raise ProjectPathSafetyError(
+                    if (
+                        self.snapshot(destination, allow_missing=False)
+                        != destination_snapshot
+                    ):
+                        raise ProjectPathSafetyError(
+                            destination,
+                            "path-identity-changed",
+                        )
+                    if self.snapshot(source, allow_missing=False) != source_snapshot:
+                        raise ProjectPathSafetyError(
+                            source,
+                            "path-identity-changed",
+                        )
+                    self._close(destination_handle)
+                    destination_handle = _INVALID_HANDLE_VALUE
+                    self._close(source_handle)
+                    source_handle = _INVALID_HANDLE_VALUE
+                    self._replace_with_backup_checked(
+                        source_path,
+                        source,
+                        source_identity,
+                        destination_path,
                         destination,
-                        "path-identity-changed",
+                        destination_snapshot,
+                    )
+                else:
+                    if self.snapshot(destination, allow_missing=True).exists:
+                        raise ProjectPathSafetyError(
+                            destination,
+                            "path-identity-changed",
+                        )
+                    self._publish_handle_rename_checked(
+                        source_handle,
+                        source_path,
+                        source,
+                        source_identity,
+                        destination_path,
+                        destination,
+                        flush=False,
                     )
             finally:
                 self._close(destination_handle)
@@ -1684,10 +4145,12 @@ class ProjectFS:
         backend: _PosixBackend | _WindowsBackend,
         *,
         root_alias: Path,
+        owns_backend: bool = True,
     ) -> None:
         self._root = root
         self._root_alias = root_alias
         self._backend = backend
+        self._owns_backend = owns_backend
         self._closed = False
 
     @classmethod
@@ -1707,11 +4170,37 @@ class ProjectFS:
             raise ProjectPathSafetyError(Path("."), "unsafe-ancestor") from exc
         if not resolved.is_dir():
             raise ProjectPathSafetyError(Path("."), "unsafe-ancestor")
+        try:
+            root_before = _posix_identity(
+                os.stat(resolved, follow_symlinks=False)
+            )
+        except OSError as exc:
+            raise ProjectPathSafetyError(Path("."), "unsafe-ancestor") from exc
+        if root_before.kind != "directory":
+            raise ProjectPathSafetyError(Path("."), "unsafe-ancestor")
         backend: _PosixBackend | _WindowsBackend
-        if os.name == "nt":
-            backend = _WindowsBackend(resolved)
-        else:
-            backend = _PosixBackend(resolved)
+        try:
+            if os.name == "nt":
+                backend = _WindowsBackend(resolved)
+            else:
+                backend = _PosixBackend(resolved)
+            root_after = _posix_identity(
+                os.stat(resolved, follow_symlinks=False)
+            )
+            if root_after != root_before:
+                raise ProjectPathSafetyError(
+                    Path("."),
+                    "path-identity-changed",
+                )
+            if os.name != "nt" and backend.root_identity != root_before:
+                raise ProjectPathSafetyError(
+                    Path("."),
+                    "path-identity-changed",
+                )
+        except BaseException:
+            if "backend" in locals():
+                backend.close()
+            raise
         return cls(
             resolved,
             backend,
@@ -1731,10 +4220,14 @@ class ProjectFS:
             self._root,
             self._backend,
             root_alias=self._root_alias,
+            owns_backend=False,
         )
 
     @property
     def root(self) -> Path:
+        if self._closed:
+            raise RuntimeError("ProjectFS is closed")
+        self._backend.assert_root_path()
         return self._root
 
     @property
@@ -1742,7 +4235,11 @@ class ProjectFS:
         return self._backend.identity_key
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
+        if self._owns_backend:
+            self._backend.close()
 
     def __enter__(self) -> "ProjectFS":
         if self._closed:
@@ -1772,7 +4269,9 @@ class ProjectFS:
         raise ProjectPathSafetyError(path, "invalid-relative-path")
 
     def absolute(self, relative: Path | str) -> Path:
-        return self._root / self._relative(relative)
+        normalized = self._relative(relative)
+        self._backend.assert_root_path()
+        return self._root / normalized
 
     def audit(
         self,
@@ -1840,11 +4339,27 @@ class ProjectFS:
         relative: Path | str,
         *,
         max_bytes: int | None = None,
+        expected: _PathSnapshot | None = None,
     ) -> bytes:
         normalized = self._relative(relative)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("max_bytes must be non-negative")
-        return self._backend.read_bytes(normalized, max_bytes=max_bytes)
+        return self._backend.read_bytes(
+            normalized,
+            max_bytes=max_bytes,
+            expected=expected,
+        )
+
+    def sync_regular(
+        self,
+        relative: Path | str,
+        *,
+        expected: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
+        """Flush one exact regular-file authority without following aliases."""
+
+        normalized = self._relative(relative)
+        return self._backend.sync_regular(normalized, expected)
 
     def atomic_write(
         self,
@@ -1852,9 +4367,16 @@ class ProjectFS:
         data: bytes,
         *,
         mode: int = 0o600,
-    ) -> None:
+        expected_destination: _PathSnapshot | None = None,
+    ) -> _PathSnapshot:
         normalized = self._relative(relative)
-        self._backend.atomic_write(self, normalized, bytes(data), mode)
+        return self._backend.atomic_write(
+            self,
+            normalized,
+            bytes(data),
+            mode,
+            expected_destination,
+        )
 
     def create_exclusive(
         self,
@@ -1862,9 +4384,9 @@ class ProjectFS:
         data: bytes = b"",
         *,
         mode: int = 0o600,
-    ) -> None:
+    ) -> _PathSnapshot:
         normalized = self._relative(relative)
-        self._backend.create_exclusive(normalized, bytes(data), mode)
+        return self._backend.create_exclusive(normalized, bytes(data), mode)
 
     def open_lock_fd(
         self,
@@ -1875,14 +4397,24 @@ class ProjectFS:
         normalized = self._relative(relative)
         return self._backend.open_lock_fd(normalized, mode)
 
+    def open_exclusion_fd(self) -> int | None:
+        if self._closed:
+            raise RuntimeError("ProjectFS is closed")
+        return self._backend.open_exclusion_fd()
+
     def unlink_regular(
         self,
         relative: Path | str,
         *,
         missing_ok: bool = False,
+        expected: _PathSnapshot | None = None,
     ) -> None:
         normalized = self._relative(relative)
-        self._backend.unlink_regular(normalized, missing_ok=missing_ok)
+        self._backend.unlink_regular(
+            normalized,
+            missing_ok=missing_ok,
+            expected=expected,
+        )
 
     def create_unique_directory(
         self,
@@ -1892,6 +4424,10 @@ class ProjectFS:
         normalized = self._relative(parent)
         if not prefix or "/" in prefix or "\\" in prefix:
             raise ProjectPathSafetyError(normalized, "invalid-relative-path")
+        # Every backend appends exactly sixteen hexadecimal characters.  Check
+        # the complete candidate grammar before a parent directory is created;
+        # this rejects Windows ADS/reserved-name aliases on every host.
+        self._relative(normalized / f"{prefix}{'0' * 16}")
         return self._backend.create_unique_directory(normalized, prefix)
 
     def create_directory_exclusive(
@@ -1908,10 +4444,18 @@ class ProjectFS:
         self,
         source: Path | str,
         destination: Path | str,
+        *,
+        expected_source: _PathSnapshot | None = None,
+        expected_destination: _PathSnapshot | None = None,
     ) -> None:
         source_relative = self._relative(source)
         destination_relative = self._relative(destination)
-        self._backend.replace_file(source_relative, destination_relative)
+        self._backend.replace_file(
+            source_relative,
+            destination_relative,
+            expected_source=expected_source,
+            expected_destination=expected_destination,
+        )
 
     def remove_empty_directory(
         self,
@@ -1991,4 +4535,4 @@ class ProjectFS:
             if not create:
                 raise ProjectPathSafetyError(normalized, "unsafe-target")
             self.create_exclusive(normalized, b"", mode=0o600)
-        return self._root / normalized
+        return self.absolute(normalized)

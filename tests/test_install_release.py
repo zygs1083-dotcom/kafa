@@ -695,6 +695,53 @@ class InstallReleaseTest(unittest.TestCase):
         )
         self.assertEqual(report["next_commands"], [])
 
+    def test_project_doctor_uses_single_gitignore_probe_without_reopening_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            initialized = run_kafa(
+                "project",
+                "init",
+                "--repo",
+                str(root),
+                check=False,
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stdout + initialized.stderr,
+            )
+            gitignore = root / ".gitignore"
+            gitignore.write_text(".ai-team/state/\n", encoding="utf-8")
+            replacement = root / ".gitignore.replacement"
+            replacement.write_text(
+                ".ai-team/state/\n.ai-team/backups/\n.ai-team/runtime/\n"
+                "__pycache__/\n*.pyc\n",
+                encoding="utf-8",
+            )
+            exchange_called = False
+
+            def exchange_after_probe(_repo: Path, _probe: dict[str, object]) -> None:
+                nonlocal exchange_called
+                exchange_called = True
+                os.replace(replacement, gitignore)
+
+            with patch.object(
+                kafa_cli,
+                "_after_project_doctor_probe",
+                side_effect=exchange_after_probe,
+                create=True,
+            ):
+                report = kafa_cli.project_doctor_report(root)
+
+            runtime_gitignore = next(
+                check
+                for check in report["checks"]
+                if check["name"] == "runtime gitignore"
+            )
+            self.assertTrue(exchange_called)
+            self.assertFalse(runtime_gitignore["ok"])
+            self.assertIn(".ai-team/runtime/", runtime_gitignore["details"])
+
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "business"

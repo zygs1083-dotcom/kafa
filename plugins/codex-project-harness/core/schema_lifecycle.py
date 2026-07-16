@@ -6,7 +6,6 @@ import json
 import hashlib
 import os
 import sqlite3
-from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +14,12 @@ from harness_lib import now_iso
 from . import RUNTIME_VERSION, SCHEMA_VERSION
 from .errors import HarnessError
 from .project_fs import ProjectFS
-from .store import project_db_operation
+from .store import (
+    _apply_sqlite_teardown_errors,
+    _temporary_sqlite_family_cleanup_errors,
+    _verified_sqlite_connection,
+    project_db_operation,
+)
 
 
 class SchemaLifecycleError(HarnessError):
@@ -658,9 +662,13 @@ def _backup_sqlite_database_locked(
     project_fs.ensure_directory(backups_root)
     backup_dir: Path | None = None
     partial_path: Path | None = None
+    partial_snapshot = None
     try:
-        source_uri = f"{source.as_uri()}?mode=ro"
-        with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source_conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            source_relative,
+            access="ro",
+        ) as source_conn:
             source_conn.execute("pragma query_only = on")
             project_fs._assert_unchanged(source_relative, source_snapshot)
             source_version = _schema_version(source_conn)
@@ -681,15 +689,22 @@ def _backup_sqlite_database_locked(
                 source_version,
                 timestamp,
             )
+            final_path = backup_dir / "harness.db"
+            final_destination_snapshot = project_fs._snapshot(
+                final_path,
+                allow_missing=True,
+            )
             partial_path = backup_dir / "harness.db.partial"
             project_fs.create_exclusive(partial_path, b"", mode=0o600)
             partial_snapshot = project_fs._snapshot(
                 partial_path,
                 allow_missing=False,
             )
-            partial_uri = f"{project_fs.absolute(partial_path).as_uri()}?mode=rw"
-            with closing(
-                sqlite3.connect(partial_uri, uri=True, timeout=5.0)
+            with _verified_sqlite_connection(
+                project_fs,
+                partial_path,
+                access="rw",
+                journal_mode="memory",
             ) as destination_conn:
                 source_conn.backup(destination_conn)
                 destination_conn.execute("pragma journal_mode = delete")
@@ -697,13 +712,20 @@ def _backup_sqlite_database_locked(
                 project_fs._assert_unchanged(partial_path, partial_snapshot)
             project_fs._assert_unchanged(source_relative, source_snapshot)
 
-        final_path = backup_dir / "harness.db"
-        project_fs.replace_file(partial_path, final_path)
+        project_fs.replace_file(
+            partial_path,
+            final_path,
+            expected_source=partial_snapshot,
+            expected_destination=final_destination_snapshot,
+        )
         partial_path = None
         final_snapshot = project_fs._snapshot(final_path, allow_missing=False)
 
-        backup_uri = f"{project_fs.absolute(final_path).as_uri()}?mode=ro"
-        with closing(sqlite3.connect(backup_uri, uri=True, timeout=5.0)) as backup_conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            final_path,
+            access="ro",
+        ) as backup_conn:
             backup_integrity, backup_fk_issues = _database_integrity(backup_conn)
             backup_counts = _database_row_counts(backup_conn)
             backup_version = _schema_version(backup_conn)
@@ -749,19 +771,25 @@ def _backup_sqlite_database_locked(
         )
         project_fs._assert_unchanged(source_relative, source_snapshot)
         return manifest
-    except BaseException:
-        if partial_path is not None:
-            project_fs.unlink_regular(partial_path, missing_ok=True)
-            for suffix in ("-wal", "-shm", "-journal"):
-                project_fs.unlink_regular(
-                    Path(f"{partial_path.as_posix()}{suffix}"),
-                    missing_ok=True,
+    except BaseException as exc:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if partial_path is not None and partial_snapshot is not None:
+            cleanup_errors.extend(
+                _temporary_sqlite_family_cleanup_errors(
+                    project_fs,
+                    partial_path,
+                    partial_snapshot,
+                    published=False,
                 )
+            )
         if backup_dir is not None:
             try:
                 project_fs.remove_empty_directory(backup_dir, missing_ok=True)
-            except OSError:
-                pass
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(
+                    ("temporary SQLite backup directory cleanup failed", cleanup_exc)
+                )
+        _apply_sqlite_teardown_errors(exc, cleanup_errors)
         raise
 
 

@@ -54,7 +54,9 @@ def write_view(root: Path, relpath: str, content: str) -> None:
 
 def _remove_retired_projection(root: Path, relative: Path) -> None:
     with ProjectFS.open(root) as project_fs:
-        project_fs.unlink_regular(relative, missing_ok=True)
+        snapshot = project_fs._snapshot(relative, allow_missing=True)
+        if snapshot.exists:
+            project_fs.unlink_regular(relative, expected=snapshot)
 
 
 def render_requirements(root: Path) -> None:

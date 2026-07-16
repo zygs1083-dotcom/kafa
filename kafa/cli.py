@@ -877,6 +877,13 @@ def codex_plugin_health(
     return False, missing, False, "not checked: plugin registration missing"
 
 
+def _after_project_doctor_probe(
+    _repo: Path,
+    _probe: dict[str, object],
+) -> None:
+    """Deterministic test seam after the single pinned runtime probe."""
+
+
 def project_doctor_report(repo: Path) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     next_commands: list[str] = []
@@ -891,8 +898,17 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
 
     db_path = repo / ".ai-team" / "state" / "harness.db"
     runtime_blocked = False
+    gitignore_issues: list[str] = []
     try:
-        initialized = harness_project_initialized(repo)
+        probe = harness_project_doctor_probe(repo)
+        _after_project_doctor_probe(repo, probe)
+        initialized = bool(probe.get("initialized"))
+        raw_gitignore_issues = probe.get("gitignore_issues", [])
+        gitignore_issues = (
+            [str(issue) for issue in raw_gitignore_issues]
+            if isinstance(raw_gitignore_issues, list)
+            else ["runtime gitignore probe returned invalid issues"]
+        )
         initialized_details = str(db_path) if initialized else f"missing initialized runtime at {db_path}"
     except KafaError as exc:
         initialized = False
@@ -905,21 +921,12 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
     elif initialized:
         next_commands.append(f"kafa project quickstart --repo {shlex.quote(str(repo))} status")
 
-    gitignore = repo / ".gitignore"
-    ignored = True
-    details = "runtime state should stay out of git"
     if runtime_blocked:
         ignored = False
         details = f"not checked: runtime path audit blocked: {initialized_details}"
-    elif repo.exists() and gitignore.exists():
-        text = gitignore.read_text(encoding="utf-8")
-        required = [".ai-team/state/", ".ai-team/runtime/"]
-        missing = [pattern for pattern in required if pattern not in text]
-        ignored = not missing
-        details = "ok" if ignored else "missing " + ", ".join(missing)
-    elif repo.exists():
-        ignored = False
-        details = "missing .gitignore runtime rules"
+    else:
+        ignored = not gitignore_issues
+        details = "ok" if ignored else "; ".join(gitignore_issues)
     add_check(checks, "runtime gitignore", ignored, details)
     add_check(checks, "local-only runtime boundary", True, "project doctor requires no remote profile or credential")
     return {"ok": all(check["ok"] for check in checks), "kind": "project", "repo": str(repo), "checks": checks, "next_commands": next_commands}
@@ -968,6 +975,17 @@ def harness_project_initialized(root: Path) -> bool:
         return bool(runtime_api.runtime_initialized(root))
     except runtime_api.HarnessError as exc:
         raise KafaError(str(exc)) from exc
+
+
+def harness_project_doctor_probe(root: Path) -> dict[str, object]:
+    runtime_api = _load_project_runtime_api(root)
+    try:
+        probe = runtime_api.project_doctor_probe(root)
+    except runtime_api.HarnessError as exc:
+        raise KafaError(str(exc)) from exc
+    if not isinstance(probe, dict):
+        raise KafaError("installed project runtime returned an invalid doctor probe")
+    return {str(key): value for key, value in probe.items()}
 
 
 def local_only_runtime_boundary(source: Path) -> tuple[bool, str]:

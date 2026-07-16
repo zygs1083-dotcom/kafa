@@ -24,6 +24,7 @@ from .cycle_ledger import (
     traceability_issues,
 )
 from .execution import command_matches_template
+from .project_fs import ProjectFS, ProjectPathSafetyError
 
 
 HIGH_RISK_LEVELS = frozenset({"high", "critical"})
@@ -284,15 +285,20 @@ def _artifact_issues(root: Path, execution: sqlite3.Row) -> list[str]:
     expected = str(execution["stdout_sha256"] or "").strip().lower()
     if not relative:
         return [f"execution artifact path is empty: {execution['id']}"]
-    candidate = Path(relative)
-    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
     try:
-        resolved.relative_to(root.resolve())
-    except ValueError:
-        return [f"execution artifact escapes project root: {execution['id']}"]
-    if not resolved.is_file():
-        return [f"execution artifact is unavailable: {execution['id']} path={relative}"]
-    data = resolved.read_bytes()
+        with ProjectFS.open(root) as project_fs:
+            candidate = project_fs.relative_to_root(Path(relative))
+            snapshot = project_fs._snapshot(
+                candidate,
+                allow_missing=True,
+            )
+            if not snapshot.exists:
+                return [
+                    f"execution artifact is unavailable: {execution['id']} path={relative}"
+                ]
+            data = project_fs.read_bytes(candidate)
+    except ProjectPathSafetyError as exc:
+        return [f"execution artifact path is unsafe: {execution['id']}: {exc}"]
     if not data:
         return [f"execution artifact is empty: {execution['id']} path={relative}"]
     actual = hashlib.sha256(data).hexdigest()
