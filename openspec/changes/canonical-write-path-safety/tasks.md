@@ -53,9 +53,9 @@
 
 ## 8. Doctor And CLI Integration
 
-- [ ] 8.1 Add a bounded canonical-path audit used by runtime status/doctor before SQLite, with migration sentinel guidance taking precedence over uninitialized advice.
-- [ ] 8.2 Replace `kafa project doctor`'s independent lock/SQLite opener with delegation to the hardened runtime audit while preserving its JSON keys, exit codes, and actionable messages.
-- [ ] 8.3 Run project-doctor, runtime doctor, uninitialized/recovery, CLI help, and install-release targeted suites on normal and adversarial projects.
+- [x] 8.1 Add a bounded canonical-path audit used by runtime status/doctor before SQLite, with migration sentinel guidance taking precedence over uninitialized advice.
+- [x] 8.2 Replace `kafa project doctor`'s independent lock/SQLite opener with delegation to the hardened runtime audit while preserving its JSON keys, exit codes, and actionable messages.
+- [x] 8.3 Run project-doctor, runtime doctor, uninitialized/recovery, CLI help, and install-release targeted suites on normal and adversarial projects.
 
 ## 9. Contract, Performance, And Documentation
 

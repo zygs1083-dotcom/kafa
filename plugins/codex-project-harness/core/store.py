@@ -389,13 +389,23 @@ class SqliteStore:
             remaining = max(0.1, deadline - time.monotonic())
             uri = f"{path.as_uri()}?mode=rw"
             conn = sqlite3.connect(uri, uri=True, timeout=remaining)
-            conn.row_factory = sqlite3.Row
-            conn.execute(f"pragma busy_timeout = {int(remaining * 1000)}")
-            project_fs._assert_unchanged(DB_PATH, database_identity)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute(f"pragma busy_timeout = {int(remaining * 1000)}")
+                project_fs._assert_unchanged(DB_PATH, database_identity)
+            except BaseException:
+                try:
+                    conn.close()
+                except BaseException:
+                    pass
+                raise
             try:
                 conn.execute("pragma journal_mode = wal")
             except sqlite3.OperationalError as exc:
-                conn.close()
+                try:
+                    conn.close()
+                except BaseException:
+                    pass
                 if "locked" not in str(exc).lower():
                     raise
                 last_error = exc
@@ -403,13 +413,26 @@ class SqliteStore:
                     break
                 time.sleep(0.05)
                 continue
-            conn.execute("pragma foreign_keys = on")
-            project_fs._assert_unchanged(DB_PATH, database_identity)
-            family_identity = {
-                relative: project_fs._snapshot(relative, allow_missing=True)
-                for relative in self._db_family()[1:]
-            }
-            return conn, database_identity, family_identity
+            except BaseException:
+                try:
+                    conn.close()
+                except BaseException:
+                    pass
+                raise
+            try:
+                conn.execute("pragma foreign_keys = on")
+                project_fs._assert_unchanged(DB_PATH, database_identity)
+                family_identity = {
+                    relative: project_fs._snapshot(relative, allow_missing=True)
+                    for relative in self._db_family()[1:]
+                }
+                return conn, database_identity, family_identity
+            except BaseException:
+                try:
+                    conn.close()
+                except BaseException:
+                    pass
+                raise
         raise last_error or sqlite3.OperationalError("database is locked")
 
     @staticmethod

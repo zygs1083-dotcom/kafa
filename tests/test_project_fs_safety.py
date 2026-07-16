@@ -61,6 +61,136 @@ def project_fs(root: Path):
 
 
 class CanonicalPathPublicRedTests(unittest.TestCase):
+    def test_runtime_initialized_missing_root_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "missing-project"
+
+            self.assertFalse(harness_db.runtime_initialized(root))
+            self.assertFalse(root.exists())
+
+    def test_doctor_missing_root_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "missing-project"
+
+            self.assertEqual(
+                harness_db.doctor(root),
+                ["missing sqlite state: .ai-team/state/harness.db"],
+            )
+            self.assertFalse(root.exists())
+
+    def test_status_lines_uninitialized_project_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            with self.assertRaises(Exception):
+                harness_db.status_lines(root)
+
+            self.assertFalse((root / ".ai-team").exists())
+
+    def test_store_root_exchange_after_connect_closes_untrusted_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            replacement = base / "replacement"
+            detached = base / "detached-project"
+            harness_db.init_runtime(root)
+            harness_db.init_runtime(replacement)
+            replacement_state = replacement / ".ai-team/state"
+            before = {
+                path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                for path in replacement_state.iterdir()
+                if path.is_file()
+            }
+            real_connect = sqlite3.connect
+            opened: list[object] = []
+
+            class TrackedConnection:
+                def __init__(self, delegate) -> None:
+                    object.__setattr__(self, "delegate", delegate)
+                    object.__setattr__(self, "closed", False)
+                    object.__setattr__(self, "commands", [])
+
+                def __getattr__(self, name):
+                    return getattr(self.delegate, name)
+
+                def __setattr__(self, name, value) -> None:
+                    if name in {"delegate", "closed", "commands"}:
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self.delegate, name, value)
+
+                def execute(self, sql, *args, **kwargs):
+                    self.commands.append(str(sql))
+                    return self.delegate.execute(sql, *args, **kwargs)
+
+                def close(self) -> None:
+                    if not self.closed:
+                        self.delegate.close()
+                        self.closed = True
+
+            def exchange_root_then_connect(*args, **kwargs):
+                root.rename(detached)
+                replacement.rename(root)
+                tracked = TrackedConnection(real_connect(*args, **kwargs))
+                opened.append(tracked)
+                return tracked
+
+            try:
+                with patch(
+                    "core.store.sqlite3.connect",
+                    side_effect=exchange_root_then_connect,
+                ):
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "unsafe-project-path: .*path-identity-changed",
+                    ):
+                        with SqliteStore(root).connection():
+                            self.fail("root-exchanged SQLite connection was yielded")
+
+                self.assertEqual(len(opened), 1)
+                tracked = opened[0]
+                self.assertTrue(tracked.closed)
+                self.assertFalse(
+                    any("journal_mode" in command for command in tracked.commands)
+                )
+                after_state = root / ".ai-team/state"
+                after = {
+                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                    for path in after_state.iterdir()
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+            finally:
+                for tracked in opened:
+                    tracked.close()
+
+    def test_runtime_doctor_and_status_audit_templates_before_sqlite(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        for operation in (harness_db.doctor, harness_db.status_lines):
+            with self.subTest(operation=operation.__name__), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp)
+                root = base / "project"
+                harness_db.init_runtime(root)
+                target = root / ".codex/agents/qa-reviewer.toml"
+                target.unlink()
+                external = base / "outside-qa-reviewer.toml"
+                external.write_bytes(b'name = "outside"\n')
+                before = external_identity(external)
+                target.symlink_to(external)
+
+                with patch(
+                    "sqlite3.connect",
+                    side_effect=AssertionError("SQLite must stay closed"),
+                ):
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "unsafe-project-path: .codex/agents/qa-reviewer.toml",
+                    ):
+                        operation(root)
+
+                self.assertEqual(external_identity(external), before)
+
     def test_init_rejects_symlinked_gitignore_without_mutating_referent(self) -> None:
         if not hasattr(os, "symlink"):
             self.skipTest("symlink primitive unavailable")
@@ -168,6 +298,37 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                     self.fail("hard-linked operation lock was acquired")
 
             self.assertEqual(external_identity(external), before)
+
+    def test_nested_project_fs_open_borrows_pinned_root_and_rejects_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            root.mkdir()
+            detached = base / "detached-project"
+            marker = b"replacement-root-must-remain-untouched\n"
+
+            with project_db_operation(root) as pinned_fs:
+                root.rename(detached)
+                root.mkdir()
+                replacement_marker = root / "replacement-marker.txt"
+                replacement_marker.write_bytes(marker)
+
+                with project_fs(root) as nested_fs:
+                    self.assertEqual(
+                        nested_fs.root_identity_key,
+                        pinned_fs.root_identity_key,
+                    )
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "unsafe-project-path: .*path-identity-changed",
+                    ):
+                        nested_fs.audit((Path(".gitignore"),), allow_missing=True)
+
+                self.assertEqual(replacement_marker.read_bytes(), marker)
+                self.assertEqual(
+                    sorted(path.name for path in root.iterdir()),
+                    ["replacement-marker.txt"],
+                )
 
     def test_store_rejects_symlinked_database_before_sqlite_open(self) -> None:
         if not hasattr(os, "symlink"):

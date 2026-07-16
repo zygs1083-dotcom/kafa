@@ -661,6 +661,40 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertIn("do not remove", initialized["details"])
         self.assertEqual(report["next_commands"], [])
 
+    def test_project_doctor_rejects_linked_sentinel_via_runtime_audit(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            state = root / ".ai-team/state"
+            state.mkdir(parents=True)
+            external = base / "outside-sentinel.json"
+            external.write_text(
+                json.dumps({"pid": 999999, "created_at": "outside"}) + "\n",
+                encoding="utf-8",
+            )
+            before = external.read_bytes()
+            (state / "local-core-migration.lock").symlink_to(external)
+
+            with patch(
+                "sqlite3.connect",
+                side_effect=AssertionError("SQLite must stay closed"),
+            ):
+                report = kafa_cli.project_doctor_report(root)
+            self.assertEqual(external.read_bytes(), before)
+
+        initialized = next(
+            check for check in report["checks"] if check["name"] == "harness initialized"
+        )
+        self.assertFalse(report["ok"])
+        self.assertFalse(initialized["ok"])
+        self.assertIn(
+            "unsafe-project-path: .ai-team/state/local-core-migration.lock",
+            initialized["details"],
+        )
+        self.assertEqual(report["next_commands"], [])
+
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "business"

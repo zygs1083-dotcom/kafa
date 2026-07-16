@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import ast
-import errno
 import hashlib
+import importlib
 import json
 import os
 import shlex
@@ -13,19 +13,11 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
 import tomllib
-from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-
-if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
-    import msvcrt
-else:  # pragma: no branch - exactly one platform backend is loaded
-    import fcntl
-
 
 PLUGIN_NAME = "codex-project-harness"
 DEFAULT_MARKETPLACE_NAME = "kafa-local"
@@ -81,115 +73,6 @@ FORBIDDEN_PROVIDER_IMPORTS = {"github", "linear", "notion_client", "figma", "sla
 
 class KafaError(RuntimeError):
     """User-facing CLI error."""
-
-
-def _migration_in_progress_error(sentinel: Path) -> KafaError | None:
-    try:
-        with sentinel.open("r", encoding="utf-8") as handle:
-            raw = handle.read(4096)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        return KafaError(
-            f"migration-in-progress: sentinel exists at {sentinel} (metadata unreadable: {exc}); "
-            "verify database/projection authority before considering removal"
-        )
-
-    metadata: list[str] = []
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        for field in ("pid", "created_at", "target_schema", "status", "manifest_path"):
-            value = payload.get(field)
-            if value not in (None, ""):
-                metadata.append(f"{field}={value}")
-    suffix = f" ({', '.join(metadata)})" if metadata else " (metadata invalid or incomplete)"
-    recovery_required = isinstance(payload, dict) and payload.get("status") in {
-        "recovery-required",
-        "rollback-incomplete",
-    }
-    guidance = (
-        "recover and verify database/projection authority using the recorded manifest; "
-        "do not remove the sentinel until recovery is complete"
-        if recovery_required
-        else (
-            "inspect the owner, confirm no migration is active, and verify database/projection "
-            "authority before considering sentinel removal"
-        )
-    )
-    return KafaError(
-        f"migration-in-progress: sentinel exists at {sentinel}{suffix}; {guidance}"
-    )
-
-
-def _raise_if_migration_in_progress(sentinel: Path) -> None:
-    error = _migration_in_progress_error(sentinel)
-    if error is not None:
-        raise error
-
-
-def _try_cli_operation_lock(descriptor: int) -> None:
-    if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _unlock_cli_operation_lock(descriptor: int) -> None:
-    if os.name == "nt":  # pragma: no cover - exercised by the Windows validation job
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-
-
-@contextmanager
-def _project_doctor_db_operation(root: Path, *, timeout: float = 5.0):
-    state_dir = root / ".ai-team/state"
-    sentinel = state_dir / "local-core-migration.lock"
-    operation_lock = state_dir / "harness.db.operation.lock"
-    _raise_if_migration_in_progress(sentinel)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(operation_lock, os.O_RDWR | os.O_CREAT, 0o600)
-    locked = False
-    try:
-        os.set_inheritable(descriptor, False)
-        if os.fstat(descriptor).st_size == 0:
-            os.write(descriptor, b"\0")
-            os.fsync(descriptor)
-        os.chmod(operation_lock, 0o600)
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                _try_cli_operation_lock(descriptor)
-                locked = True
-                break
-            except OSError as exc:
-                if not isinstance(exc, BlockingIOError) and exc.errno not in {
-                    errno.EACCES,
-                    errno.EAGAIN,
-                    errno.EDEADLK,
-                }:
-                    raise KafaError(f"project-db-operation-lock-error: cannot lock {operation_lock}: {exc}") from exc
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise KafaError(
-                        "project-db-operation-timeout: could not acquire exclusive operation lock "
-                        f"{operation_lock} within {timeout:.1f} seconds"
-                    ) from exc
-                time.sleep(min(0.05, remaining))
-        _raise_if_migration_in_progress(sentinel)
-        yield
-    finally:
-        if locked:
-            try:
-                _unlock_cli_operation_lock(descriptor)
-            except OSError:
-                pass
-        os.close(descriptor)
 
 
 def release_version() -> str:
@@ -1009,7 +892,7 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
     db_path = repo / ".ai-team" / "state" / "harness.db"
     runtime_blocked = False
     try:
-        initialized = harness_project_initialized(db_path)
+        initialized = harness_project_initialized(repo)
         initialized_details = str(db_path) if initialized else f"missing initialized runtime at {db_path}"
     except KafaError as exc:
         initialized = False
@@ -1025,7 +908,10 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
     gitignore = repo / ".gitignore"
     ignored = True
     details = "runtime state should stay out of git"
-    if repo.exists() and gitignore.exists():
+    if runtime_blocked:
+        ignored = False
+        details = f"not checked: runtime path audit blocked: {initialized_details}"
+    elif repo.exists() and gitignore.exists():
         text = gitignore.read_text(encoding="utf-8")
         required = [".ai-team/state/", ".ai-team/runtime/"]
         missing = [pattern for pattern in required if pattern not in text]
@@ -1039,21 +925,49 @@ def project_doctor_report(repo: Path) -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "kind": "project", "repo": str(repo), "checks": checks, "next_commands": next_commands}
 
 
-def harness_project_initialized(db_path: Path) -> bool:
-    root = db_path.resolve().parents[2]
-    with _project_doctor_db_operation(root):
-        if not db_path.exists():
-            return False
-        try:
-            import sqlite3
+def _load_project_runtime_api(root: Path) -> Any:
+    plugin_root = installed_plugin_root(root)
+    expected = (plugin_root / "core" / "api.py").resolve()
+    added: list[str] = []
+    for path in (plugin_root / "scripts", plugin_root):
+        value = str(path)
+        if value not in sys.path:
+            sys.path.insert(0, value)
+            added.append(value)
+    try:
+        importlib.invalidate_caches()
+        runtime_api = importlib.import_module("core.api")
+    except (ImportError, OSError) as exc:
+        raise KafaError(
+            f"installed project runtime could not be loaded from {plugin_root}: {exc}"
+        ) from exc
+    finally:
+        for value in added:
+            try:
+                sys.path.remove(value)
+            except ValueError:
+                pass
+    actual_value = getattr(runtime_api, "__file__", "")
+    try:
+        actual = Path(str(actual_value)).resolve(strict=True)
+    except OSError as exc:
+        raise KafaError(
+            f"installed project runtime identity is unavailable: {actual_value}"
+        ) from exc
+    if actual != expected:
+        raise KafaError(
+            "installed project runtime identity mismatch: "
+            f"loaded={actual} expected={expected}; restart the Kafa command after upgrading"
+        )
+    return runtime_api
 
-            with closing(sqlite3.connect(db_path)) as conn:
-                exists = conn.execute("select 1 from sqlite_master where type='table' and name='project'").fetchone()
-                if not exists:
-                    return False
-                return conn.execute("select 1 from project where id = 1").fetchone() is not None
-        except sqlite3.Error:
-            return False
+
+def harness_project_initialized(root: Path) -> bool:
+    runtime_api = _load_project_runtime_api(root)
+    try:
+        return bool(runtime_api.runtime_initialized(root))
+    except runtime_api.HarnessError as exc:
+        raise KafaError(str(exc)) from exc
 
 
 def local_only_runtime_boundary(source: Path) -> tuple[bool, str]:
