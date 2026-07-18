@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .execution import command_matches_template
-from .errors import HarnessError
+from .errors import HarnessError, exception_text as _exception_text
 from .project_fs import ProjectFS, ProjectPathSafetyError, _PathSnapshot
 from .projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS
 from .schema_lifecycle import (
@@ -246,10 +246,6 @@ MIGRATION_FAILURE_POINTS = frozenset(
 def _inject_failure(fail_at: str | None, point: str) -> None:
     if fail_at == point:
         raise InjectedLocalCoreMigrationFailure(f"injected local-core migration failure at {point}")
-
-
-def _exception_text(exc: BaseException) -> str:
-    return str(exc) or type(exc).__name__
 
 
 def _project_root_for_internal_path(path: Path) -> Path:

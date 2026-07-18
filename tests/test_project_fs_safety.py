@@ -128,6 +128,18 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             detached = base / "detached-project"
             harness_db.init_runtime(root)
             harness_db.init_runtime(replacement)
+            if os.name == "nt":
+                with project_db_operation(root):
+                    with self.assertRaises(OSError) as blocked:
+                        root.rename(detached)
+                self.assertIsInstance(blocked.exception, PermissionError)
+                self.assertIn(
+                    getattr(blocked.exception, "winerror", None),
+                    {5, 32},
+                )
+                self.assertTrue(root.is_dir())
+                self.assertFalse(detached.exists())
+                return
             replacement_state = replacement / ".ai-team/state"
             before = {
                 path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
@@ -193,6 +205,83 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                     if path.is_file()
                 }
                 self.assertEqual(after, before)
+            finally:
+                for tracked in opened:
+                    tracked.close()
+
+    def test_store_post_connect_authority_failure_closes_connection(self) -> None:
+        from core.project_fs import ProjectPathSafetyError
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness_db.init_runtime(root)
+            real_connect = sqlite3.connect
+            real_verify = SqliteStore._verify_connection_authority
+            opened: list[object] = []
+            verify_calls = 0
+
+            class TrackedConnection:
+                def __init__(self, delegate) -> None:
+                    object.__setattr__(self, "delegate", delegate)
+                    object.__setattr__(self, "closed", False)
+                    object.__setattr__(self, "commands", [])
+
+                def __getattr__(self, name):
+                    return getattr(self.delegate, name)
+
+                def __setattr__(self, name, value) -> None:
+                    if name in {"delegate", "closed", "commands"}:
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self.delegate, name, value)
+
+                def execute(self, sql, *args, **kwargs):
+                    self.commands.append(str(sql))
+                    return self.delegate.execute(sql, *args, **kwargs)
+
+                def close(self) -> None:
+                    if not self.closed:
+                        self.delegate.close()
+                        self.closed = True
+
+            def tracked_connect(*args, **kwargs):
+                tracked = TrackedConnection(real_connect(*args, **kwargs))
+                opened.append(tracked)
+                return tracked
+
+            def fail_first_authority_check(*args, **kwargs):
+                nonlocal verify_calls
+                verify_calls += 1
+                if verify_calls == 1:
+                    raise ProjectPathSafetyError(
+                        Path(".ai-team/state/harness.db"),
+                        "path-identity-changed",
+                    )
+                return real_verify(*args, **kwargs)
+
+            try:
+                with (
+                    patch("core.store.sqlite3.connect", side_effect=tracked_connect),
+                    patch.object(
+                        SqliteStore,
+                        "_verify_connection_authority",
+                        side_effect=fail_first_authority_check,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ProjectPathSafetyError,
+                        "path-identity-changed",
+                    ):
+                        with SqliteStore(root).connection():
+                            self.fail("unsafe SQLite connection was yielded")
+
+                self.assertEqual(len(opened), 1)
+                tracked = opened[0]
+                self.assertTrue(tracked.closed)
+                self.assertFalse(
+                    any("journal_mode" in command for command in tracked.commands)
+                )
+                self.assertEqual(verify_calls, 3)
             finally:
                 for tracked in opened:
                     tracked.close()
@@ -489,6 +578,25 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             root.mkdir()
             detached = base / "detached-project"
             marker = b"replacement-root-must-remain-untouched\n"
+
+            if os.name == "nt":
+                with project_db_operation(root) as pinned_fs:
+                    with self.assertRaises(OSError) as blocked:
+                        root.rename(detached)
+                    self.assertIsInstance(blocked.exception, PermissionError)
+                    self.assertIn(
+                        getattr(blocked.exception, "winerror", None),
+                        {5, 32},
+                    )
+                    with project_fs(root) as nested_fs:
+                        self.assertEqual(
+                            nested_fs.root_identity_key,
+                            pinned_fs.root_identity_key,
+                        )
+                        nested_fs.audit((Path(".gitignore"),), allow_missing=True)
+                self.assertTrue(root.is_dir())
+                self.assertFalse(detached.exists())
+                return
 
             with self.assertRaisesRegex(
                 Exception,
@@ -1074,6 +1182,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             store = SqliteStore(root)
             real_connect = store._connect
             exchanged_sidecars: list[Path] = []
+            blocked_exchanges: list[OSError] = []
 
             class ExchangedJournalFailingSource:
                 def __init__(self, delegate) -> None:
@@ -1093,7 +1202,21 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                     journal = Path(f"{database_path}-journal")
                     if not journal.exists():
                         raise AssertionError("SQLite PERSIST journal was not created")
-                    journal.unlink()
+                    try:
+                        journal.unlink()
+                    except OSError as exc:
+                        if os.name != "nt":
+                            raise
+                        if not isinstance(exc, PermissionError) or getattr(
+                            exc,
+                            "winerror",
+                            None,
+                        ) not in {5, 32}:
+                            raise
+                        blocked_exchanges.append(exc)
+                        raise RuntimeError(
+                            "injected exchanged-journal backup failure"
+                        ) from exc
                     journal.symlink_to(external)
                     exchanged_sidecars.append(journal)
                     raise RuntimeError("injected exchanged-journal backup failure")
@@ -1118,6 +1241,18 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                     store.backup_to(destination)
 
             notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertFalse(destination.exists())
+            remaining = tuple(base.glob(".snapshot.db.kafa-backup-*.tmp*"))
+            self.assertEqual(len(remaining), 1)
+            self.assertTrue(remaining[0].name.endswith(".tmp-journal"))
+            if os.name == "nt":
+                self.assertEqual(len(blocked_exchanges), 1)
+                self.assertEqual(exchanged_sidecars, [])
+                self.assertTrue(remaining[0].is_file())
+                self.assertFalse(remaining[0].is_symlink())
+                self.assertIn("unverified temporary backup sidecar retained", notes)
+                self.assertEqual(external_identity(external), external_before)
+                return
             self.assertIn("temporary backup sidecar cleanup failed", notes)
             self.assertIn("unsafe-target", notes)
             self.assertEqual(len(exchanged_sidecars), 1)
@@ -1136,6 +1271,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             store = SqliteStore(root)
             real_connect = store._connect
             exchanged_sidecars: list[Path] = []
+            blocked_exchanges: list[OSError] = []
 
             class RegularJournalFailingSource:
                 def __init__(self, delegate) -> None:
@@ -1153,7 +1289,21 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                         target.execute("pragma database_list").fetchone()[2]
                     )
                     journal = Path(f"{database_path}-journal")
-                    journal.unlink()
+                    try:
+                        journal.unlink()
+                    except OSError as exc:
+                        if os.name != "nt":
+                            raise
+                        if not isinstance(exc, PermissionError) or getattr(
+                            exc,
+                            "winerror",
+                            None,
+                        ) not in {5, 32}:
+                            raise
+                        blocked_exchanges.append(exc)
+                        raise RuntimeError(
+                            "injected regular-journal backup failure"
+                        ) from exc
                     external.rename(journal)
                     exchanged_sidecars.append(journal)
                     raise RuntimeError("injected regular-journal backup failure")
@@ -1177,6 +1327,21 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 ) as raised:
                     store.backup_to(destination)
 
+            self.assertFalse(destination.exists())
+            remaining = tuple(base.glob(".snapshot.db.kafa-backup-*.tmp*"))
+            self.assertEqual(len(remaining), 1)
+            self.assertTrue(remaining[0].name.endswith(".tmp-journal"))
+            if os.name == "nt":
+                self.assertEqual(len(blocked_exchanges), 1)
+                self.assertEqual(exchanged_sidecars, [])
+                self.assertTrue(remaining[0].is_file())
+                self.assertFalse(remaining[0].is_symlink())
+                self.assertEqual(external_identity(external), external_before)
+                self.assertIn(
+                    "unverified temporary backup sidecar retained",
+                    "\n".join(getattr(raised.exception, "__notes__", ())),
+                )
+                return
             self.assertEqual(len(exchanged_sidecars), 1)
             self.assertEqual(
                 external_identity(exchanged_sidecars[0]),
@@ -4398,14 +4563,14 @@ class ProjectFSContractRedTests(unittest.TestCase):
             source.write_bytes(b"verified-staging\n")
             destination.write_bytes(b"previous-active\n")
             original_hook = project_fs_module._before_windows_handle_rename
-            attacker_errors: list[BaseException] = []
+            attacker_errors: list[OSError] = []
             attacker_done = threading.Event()
 
             def attack_source_path() -> None:
                 try:
                     os.replace(source, parked)
                     source.write_bytes(b"substituted-staging\n")
-                except BaseException as exc:
+                except OSError as exc:
                     attacker_errors.append(exc)
                 finally:
                     attacker_done.set()
@@ -4665,16 +4830,103 @@ class ProjectFSContractRedTests(unittest.TestCase):
                 original_hook,
             )
 
-            with project_fs(root) as fs:
-                created = fs.create_unique_directory(
-                    Path("backups"),
-                    "schema-",
+            created: Path | None = None
+            operation_error: BaseException | None = None
+            try:
+                with project_fs(root) as fs:
+                    created = fs.create_unique_directory(
+                        Path("backups"),
+                        "schema-",
+                    )
+            except BaseException as exc:
+                operation_error = exc
+
+            if attacker_errors:
+                self.assertIsInstance(attacker_errors[0], PermissionError)
+                self.assertIn(
+                    getattr(attacker_errors[0], "winerror", None),
+                    {5, 32},
+                )
+                self.assertIsNone(operation_error)
+                self.assertIsNotNone(created)
+                assert created is not None
+                self.assertTrue((root / created).is_dir())
+                self.assertFalse(parked.exists())
+            else:
+                self.assertIsNotNone(operation_error)
+                self.assertIn("path-identity-changed", str(operation_error))
+                self.assertFalse(parent.exists())
+                self.assertTrue(parked.is_dir())
+                self.assertEqual(tuple(parked.iterdir()), ())
+
+    @unittest.skipUnless(os.name == "nt", "Windows final-leaf pin contract")
+    def test_windows_final_leaf_stays_pinned_through_backup_cleanup(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            target = root / "target.txt"
+            parked = base / "parked-target.txt"
+            outside_alias = base / "target-alias.txt"
+            blocked_moves: list[OSError] = []
+            blocked_writes: list[OSError] = []
+            blocked_links: list[OSError] = []
+            original_hook = project_fs_module._before_windows_backup_cleanup
+
+            def require_sharing_denial(
+                operation,
+                failures: list[OSError],
+            ) -> None:
+                try:
+                    operation()
+                except OSError as exc:
+                    if not isinstance(exc, PermissionError) or getattr(
+                        exc,
+                        "winerror",
+                        None,
+                    ) not in {5, 32}:
+                        raise
+                    failures.append(exc)
+
+            def attempt_final_move(
+                _backend,
+                destination: Path,
+                _backup: Path,
+            ) -> None:
+                if destination != Path("target.txt"):
+                    return
+                require_sharing_denial(
+                    lambda: target.rename(parked),
+                    blocked_moves,
+                )
+                require_sharing_denial(
+                    lambda: target.write_bytes(b"attacker\n"),
+                    blocked_writes,
+                )
+                require_sharing_denial(
+                    lambda: os.link(target, outside_alias),
+                    blocked_links,
                 )
 
-            self.assertTrue(attacker_errors)
-            self.assertIsInstance(attacker_errors[0], OSError)
-            self.assertTrue((root / created).is_dir())
+            project_fs_module._before_windows_backup_cleanup = attempt_final_move
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_backup_cleanup",
+                original_hook,
+            )
+
+            with project_fs(root) as fs:
+                fs.atomic_write(Path("target.txt"), b"old\n", mode=0o600)
+                fs.atomic_write(Path("target.txt"), b"new\n", mode=0o600)
+
+            self.assertEqual(len(blocked_moves), 1)
+            self.assertEqual(len(blocked_writes), 1)
+            self.assertEqual(len(blocked_links), 1)
+            self.assertEqual(target.read_bytes(), b"new\n")
             self.assertFalse(parked.exists())
+            self.assertFalse(outside_alias.exists())
 
 
 class ProjectFSFoundationTests(unittest.TestCase):
@@ -4763,6 +5015,13 @@ class ProjectFSFoundationTests(unittest.TestCase):
                 fs.atomic_write(Path("state/mode.txt"), b"writable\n", mode=0o600)
                 writable_mode = stat.S_IMODE(target.stat().st_mode)
                 self.assertTrue(writable_mode & stat.S_IWUSR)
+                fs.atomic_write(
+                    Path("state/mode.txt"),
+                    b"readonly-again\n",
+                    mode=0o444,
+                )
+                readonly_again_mode = stat.S_IMODE(target.stat().st_mode)
+                self.assertFalse(readonly_again_mode & stat.S_IWUSR)
 
     @unittest.skipUnless(os.name == "nt", "Windows readonly delete contract")
     def test_windows_unlink_regular_removes_readonly_file(self) -> None:
@@ -4834,7 +5093,12 @@ class ProjectFSFoundationTests(unittest.TestCase):
 
     def test_windows_replacefile_documented_failure_states_are_reconciled(self) -> None:
         from core import project_fs as project_fs_module
-        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+        from core.project_fs import (
+            ProjectPathSafetyError,
+            _PathIdentity,
+            _PathSnapshot,
+            _WindowsBackend,
+        )
 
         source = Path("source.txt")
         destination = Path("target.txt")
@@ -4868,6 +5132,8 @@ class ProjectFSFoundationTests(unittest.TestCase):
                     backup: missing,
                 }
                 moves: list[tuple[Path, Path]] = []
+                closed_handles: list[int] = []
+                opened_handles: list[dict[str, object]] = []
 
                 class FakeApi:
                     def ReplaceFileW(
@@ -4917,15 +5183,22 @@ class ProjectFSFoundationTests(unittest.TestCase):
 
                 def unlink_regular(relative: Path, *, expected, **_kwargs) -> None:
                     relative = Path(relative)
+                    if error_code == 1177:
+                        self.assertNotIn(101, closed_handles)
                     self.assertEqual(state[relative], expected)
                     state[relative] = missing
 
                 backend.snapshot = snapshot
                 backend._raw_snapshot = snapshot
                 backend.replace_file = replace_file
-                backend._open_handle = lambda *_args, **_kwargs: 101
+
+                def open_handle(*_args, **kwargs):
+                    opened_handles.append(dict(kwargs))
+                    return 101
+
+                backend._open_handle = open_handle
                 backend._identity = lambda *_args, **_kwargs: source_identity
-                backend._close = lambda _handle: None
+                backend._close = lambda handle: closed_handles.append(int(handle))
                 backend._apply_file_attributes = lambda *_args, **_kwargs: None
                 backend.unlink_regular = unlink_regular
 
@@ -4950,7 +5223,10 @@ class ProjectFSFoundationTests(unittest.TestCase):
                             if error_code == 50
                             else "path-identity-changed"
                         )
-                        with self.assertRaisesRegex(Exception, expected_reason):
+                        with self.assertRaisesRegex(
+                            Exception,
+                            expected_reason,
+                        ) as raised:
                             backend._replace_with_backup_checked(
                                 root / source,
                                 source,
@@ -4959,6 +5235,12 @@ class ProjectFSFoundationTests(unittest.TestCase):
                                 destination,
                                 destination_snapshot,
                             )
+                        self.assertIn(
+                            "complete source metadata rollback is not verified",
+                            "\n".join(
+                                getattr(raised.exception, "__notes__", ())
+                            ),
+                        )
                         self.assertEqual(moves, [])
                     else:
                         result = backend._replace_with_backup_checked(
@@ -4971,6 +5253,14 @@ class ProjectFSFoundationTests(unittest.TestCase):
                         )
                         self.assertEqual(result, source_identity)
                         self.assertEqual(moves, [(source, destination)])
+                        self.assertEqual(closed_handles, [101])
+                        self.assertTrue(
+                            any(
+                                opened.get("exclusive_share") is True
+                                for opened in opened_handles
+                            ),
+                            opened_handles,
+                        )
 
                 if error_code in (50, 1175, 1176):
                     self.assertEqual(state[source], source_snapshot)
@@ -4980,6 +5270,549 @@ class ProjectFSFoundationTests(unittest.TestCase):
                     self.assertEqual(state[source], missing)
                     self.assertEqual(state[destination], source_snapshot)
                     self.assertEqual(state[backup], missing)
+
+    def test_windows_1177_completion_failure_restores_known_source_attributes_and_warns(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        root = Path("C:/project")
+        source = Path("source.txt")
+        destination = Path("target.txt")
+        backup = Path(
+            ".target.txt.kafa-displaced-aaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+        )
+        source_identity = _PathIdentity(1, b"source", "file", 0x01, 1)
+        mutated_source_identity = _PathIdentity(
+            1,
+            b"source",
+            "file",
+            0x80,
+            1,
+        )
+        destination_identity = _PathIdentity(
+            1,
+            b"destination",
+            "file",
+            0x80,
+            1,
+        )
+        source_snapshot = _PathSnapshot(True, source_identity)
+        destination_snapshot = _PathSnapshot(True, destination_identity)
+        missing = _PathSnapshot(False)
+        state = {
+            source: source_snapshot,
+            destination: destination_snapshot,
+            backup: missing,
+        }
+
+        class FakeApi:
+            calls = 0
+
+            def ReplaceFileW(self, *_args) -> bool:
+                self.calls += 1
+                if self.calls == 1:
+                    state[source] = _PathSnapshot(True, mutated_source_identity)
+                    state[destination] = missing
+                    state[backup] = destination_snapshot
+                    return False
+                state[source] = state[destination]
+                state[destination] = state[backup]
+                state[backup] = missing
+                return True
+
+            @staticmethod
+            def error() -> OSError:
+                return OSError(1177, "injected ERROR_UNABLE_TO_MOVE_REPLACEMENT_2")
+
+        backend = object.__new__(_WindowsBackend)
+        backend.root = root
+        backend.api = FakeApi()
+
+        def snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            result = state.get(Path(relative), missing)
+            if not allow_missing and not result.exists:
+                raise AssertionError(f"unexpected missing path: {relative}")
+            return result
+
+        completion_failure: BaseException = RuntimeError(
+            "injected partial completion failure"
+        )
+        completion_commits_before_failure = False
+
+        def replace_file(
+            move_source: Path,
+            move_destination: Path,
+            expected_destination=None,
+        ) -> None:
+            move_source = Path(move_source)
+            move_destination = Path(move_destination)
+            self.assertEqual(state[move_destination], expected_destination)
+            if move_source == source:
+                if completion_commits_before_failure:
+                    state[move_destination] = state[move_source]
+                    state[move_source] = missing
+                raise completion_failure
+            self.assertEqual(move_source, backup)
+            state[move_destination] = state[move_source]
+            state[move_source] = missing
+
+        def apply_file_attributes(_handle, relative: Path, attributes: int) -> None:
+            self.assertEqual(Path(relative), source)
+            current = state[source].identity
+            assert current is not None
+            state[source] = _PathSnapshot(
+                True,
+                _PathIdentity(
+                    current.volume,
+                    current.file_id,
+                    current.kind,
+                    int(attributes),
+                    current.nlink,
+                ),
+            )
+
+        backend.snapshot = snapshot
+        backend._raw_snapshot = snapshot
+        backend.replace_file = replace_file
+        backend._open_handle = lambda *_args, **_kwargs: 101
+        backend._identity = (
+            lambda *_args, **_kwargs: state[source].identity
+        )
+        backend._close = lambda _handle: None
+        backend._apply_file_attributes = apply_file_attributes
+
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _FILE_WRITE_ATTRIBUTES=0x0100,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                Exception,
+                "path-identity-changed",
+            ) as raised:
+                backend._replace_with_backup_checked(
+                    root / source,
+                    source,
+                    source_identity,
+                    root / destination,
+                    destination,
+                    destination_snapshot,
+                )
+
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("partial replacement completion failed", notes)
+        self.assertIn("complete source metadata rollback is not verified", notes)
+        self.assertIn("requires manual review", notes)
+
+        cancellation = KeyboardInterrupt(
+            "injected partial completion cancellation"
+        )
+        backend.api.calls = 0
+        completion_failure = cancellation
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _FILE_WRITE_ATTRIBUTES=0x0100,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+            self.assertRaises(KeyboardInterrupt) as cancelled,
+        ):
+            backend._replace_with_backup_checked(
+                root / source,
+                source,
+                source_identity,
+                root / destination,
+                destination,
+                destination_snapshot,
+            )
+
+        self.assertIs(cancelled.exception, cancellation)
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        cancellation_notes = "\n".join(
+            getattr(cancellation, "__notes__", ())
+        )
+        self.assertIn("partial replacement completion failed", cancellation_notes)
+        self.assertIn(
+            "complete source metadata rollback is not verified",
+            cancellation_notes,
+        )
+        self.assertIn("requires manual review", cancellation_notes)
+
+        after_effect_cancellation = KeyboardInterrupt(
+            "injected cancellation after partial completion committed"
+        )
+        completion_failure = after_effect_cancellation
+        completion_commits_before_failure = True
+        backend.api.calls = 0
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _FILE_WRITE_ATTRIBUTES=0x0100,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+            self.assertRaises(KeyboardInterrupt) as after_effect,
+        ):
+            backend._replace_with_backup_checked(
+                root / source,
+                source,
+                source_identity,
+                root / destination,
+                destination,
+                destination_snapshot,
+            )
+
+        self.assertIs(after_effect.exception, after_effect_cancellation)
+        self.assertEqual(backend.api.calls, 2)
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        after_effect_notes = "\n".join(
+            getattr(after_effect_cancellation, "__notes__", ())
+        )
+        self.assertIn("partial replacement completion failed", after_effect_notes)
+        self.assertIn("requires manual review", after_effect_notes)
+
+    def test_windows_replace_error_retrieval_cancellation_reconciles_partial_state(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        root = Path("C:/project")
+        source = Path("source.txt")
+        destination = Path("target.txt")
+        backup = Path(
+            ".target.txt.kafa-displaced-aaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+        )
+        source_identity = _PathIdentity(1, b"source", "file", 0x01, 1)
+        mutated_source = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"source", "file", 0x80, 1),
+        )
+        source_snapshot = _PathSnapshot(True, source_identity)
+        destination_snapshot = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"destination", "file", 0x80, 1),
+        )
+        missing = _PathSnapshot(False)
+        state = {
+            source: source_snapshot,
+            destination: destination_snapshot,
+            backup: missing,
+        }
+        cancellation = KeyboardInterrupt("cancel during GetLastError")
+        restored_attributes: list[int] = []
+
+        class FakeApi:
+            @staticmethod
+            def ReplaceFileW(*_args) -> bool:
+                state[source] = mutated_source
+                state[destination] = missing
+                state[backup] = destination_snapshot
+                return False
+
+            @staticmethod
+            def error() -> OSError:
+                raise cancellation
+
+        backend = object.__new__(_WindowsBackend)
+        backend.root = root
+        backend.api = FakeApi()
+
+        def snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            result = state.get(Path(relative), missing)
+            if not allow_missing and not result.exists:
+                raise AssertionError(f"unexpected missing path: {relative}")
+            return result
+
+        def replace_file(move_source: Path, move_destination: Path, **_kwargs) -> None:
+            move_source = Path(move_source)
+            move_destination = Path(move_destination)
+            state[move_destination] = state[move_source]
+            state[move_source] = missing
+
+        def restore_attributes(*_args) -> None:
+            restored_attributes.append(source_identity.mode_or_attributes)
+            state[source] = source_snapshot
+
+        backend.snapshot = snapshot
+        backend._raw_snapshot = snapshot
+        backend.replace_file = replace_file
+        backend._restore_known_file_attributes = restore_attributes
+
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            backend._replace_with_backup_checked(
+                root / source,
+                source,
+                source_identity,
+                root / destination,
+                destination,
+                destination_snapshot,
+            )
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        self.assertEqual(restored_attributes, [0x01])
+        self.assertIn(
+            "requires manual review",
+            "\n".join(getattr(cancellation, "__notes__", ())),
+        )
+
+    def test_windows_replace_state_inspection_cancellation_preserves_cancellation(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        root = Path("C:/project")
+        source = Path("source.txt")
+        destination = Path("target.txt")
+        backup = Path(
+            ".target.txt.kafa-displaced-aaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+        )
+        source_identity = _PathIdentity(1, b"source", "file", 0x01, 1)
+        source_snapshot = _PathSnapshot(True, source_identity)
+        destination_snapshot = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"destination", "file", 0x80, 1),
+        )
+        missing = _PathSnapshot(False)
+        state = {
+            source: source_snapshot,
+            destination: destination_snapshot,
+            backup: missing,
+        }
+        cancellation = KeyboardInterrupt("cancel during state inspection")
+        inspect_calls = 0
+        restored_attributes: list[int] = []
+
+        class FakeApi:
+            calls = 0
+
+            def ReplaceFileW(self, *_args) -> bool:
+                self.calls += 1
+                if self.calls == 1:
+                    state[source] = missing
+                    state[destination] = source_snapshot
+                    state[backup] = destination_snapshot
+                else:
+                    state[source] = state[destination]
+                    state[destination] = state[backup]
+                    state[backup] = missing
+                return True
+
+        backend = object.__new__(_WindowsBackend)
+        backend.root = root
+        backend.api = FakeApi()
+
+        def snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            result = state.get(Path(relative), missing)
+            if not allow_missing and not result.exists:
+                raise AssertionError(f"unexpected missing path: {relative}")
+            return result
+
+        def raw_snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            nonlocal inspect_calls
+            inspect_calls += 1
+            if inspect_calls == 1:
+                raise cancellation
+            return snapshot(relative, allow_missing=allow_missing)
+
+        def restore_attributes(*_args) -> None:
+            restored_attributes.append(source_identity.mode_or_attributes)
+
+        backend.snapshot = snapshot
+        backend._raw_snapshot = raw_snapshot
+        backend._restore_known_file_attributes = restore_attributes
+
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            backend._replace_with_backup_checked(
+                root / source,
+                source,
+                source_identity,
+                root / destination,
+                destination,
+                destination_snapshot,
+            )
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertEqual(backend.api.calls, 2)
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        self.assertEqual(restored_attributes, [0x01])
+        self.assertIn(
+            "requires manual review",
+            "\n".join(getattr(cancellation, "__notes__", ())),
+        )
+
+    def test_windows_1177_post_completion_inspection_cancellation_rolls_back(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        root = Path("C:/project")
+        source = Path("source.txt")
+        destination = Path("target.txt")
+        backup = Path(
+            ".target.txt.kafa-displaced-aaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+        )
+        source_identity = _PathIdentity(1, b"source", "file", 0x01, 1)
+        source_snapshot = _PathSnapshot(True, source_identity)
+        destination_snapshot = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"destination", "file", 0x80, 1),
+        )
+        missing = _PathSnapshot(False)
+        state = {
+            source: source_snapshot,
+            destination: destination_snapshot,
+            backup: missing,
+        }
+        cancellation = KeyboardInterrupt(
+            "cancel after partial replacement completion"
+        )
+        raw_calls = 0
+        restored_attributes: list[int] = []
+
+        class FakeApi:
+            calls = 0
+
+            def ReplaceFileW(self, *_args) -> bool:
+                self.calls += 1
+                if self.calls == 1:
+                    state[destination] = missing
+                    state[backup] = destination_snapshot
+                    return False
+                state[source] = state[destination]
+                state[destination] = state[backup]
+                state[backup] = missing
+                return True
+
+            @staticmethod
+            def error() -> OSError:
+                return OSError(
+                    1177,
+                    "injected ERROR_UNABLE_TO_MOVE_REPLACEMENT_2",
+                )
+
+        backend = object.__new__(_WindowsBackend)
+        backend.root = root
+        backend.api = FakeApi()
+
+        def snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            result = state.get(Path(relative), missing)
+            if not allow_missing and not result.exists:
+                raise AssertionError(f"unexpected missing path: {relative}")
+            return result
+
+        def raw_snapshot(relative: Path, *, allow_missing: bool, **_kwargs):
+            nonlocal raw_calls
+            raw_calls += 1
+            if raw_calls == 4:
+                raise cancellation
+            return snapshot(relative, allow_missing=allow_missing)
+
+        def replace_file(move_source: Path, move_destination: Path, **_kwargs) -> None:
+            move_source = Path(move_source)
+            move_destination = Path(move_destination)
+            state[move_destination] = state[move_source]
+            state[move_source] = missing
+
+        def restore_attributes(*_args) -> None:
+            restored_attributes.append(source_identity.mode_or_attributes)
+
+        backend.snapshot = snapshot
+        backend._raw_snapshot = raw_snapshot
+        backend.replace_file = replace_file
+        backend._restore_known_file_attributes = restore_attributes
+
+        with (
+            patch.object(
+                project_fs_module.secrets,
+                "token_hex",
+                return_value="a" * 24,
+            ),
+            patch.multiple(
+                project_fs_module,
+                _REPLACEFILE_FLAGS_NONE=0,
+                create=True,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            backend._replace_with_backup_checked(
+                root / source,
+                source,
+                source_identity,
+                root / destination,
+                destination,
+                destination_snapshot,
+            )
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertEqual(backend.api.calls, 2)
+        self.assertEqual(state[source], source_snapshot)
+        self.assertEqual(state[destination], destination_snapshot)
+        self.assertEqual(state[backup], missing)
+        self.assertEqual(restored_attributes, [0x01])
+        self.assertIn(
+            "requires manual review",
+            "\n".join(getattr(cancellation, "__notes__", ())),
+        )
 
     def test_windows_replacefile_restores_raced_destination_and_source(self) -> None:
         from core import project_fs as project_fs_module
@@ -5370,7 +6203,12 @@ class ProjectFSFoundationTests(unittest.TestCase):
 
     def test_windows_replace_finalization_cancellation_rolls_back(self) -> None:
         from core import project_fs as project_fs_module
-        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+        from core.project_fs import (
+            ProjectPathSafetyError,
+            _PathIdentity,
+            _PathSnapshot,
+            _WindowsBackend,
+        )
 
         root = Path("C:/project")
         source = Path("source.txt")
@@ -5384,7 +6222,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
         source_snapshot = _PathSnapshot(True, source_identity)
         destination_snapshot = _PathSnapshot(True, destination_identity)
 
-        for stage in ("attributes", "flush", "backup-delete"):
+        for stage in ("open", "attributes", "flush", "backup-delete"):
             with self.subTest(stage=stage):
                 state = {
                     source: source_snapshot,
@@ -5442,9 +6280,14 @@ class ProjectFSFoundationTests(unittest.TestCase):
                         )
                     state[backup] = missing
 
+                def open_handle(*_args, **_kwargs):
+                    if stage == "open":
+                        raise OSError(32, "injected sharing violation")
+                    return 101
+
                 backend.snapshot = snapshot
                 backend._raw_snapshot = snapshot
-                backend._open_handle = lambda *_args, **_kwargs: 101
+                backend._open_handle = open_handle
                 backend._identity = lambda *_args, **_kwargs: source_identity
                 backend._close = lambda _handle: None
                 backend._apply_file_attributes = apply_attributes
@@ -5461,22 +6304,37 @@ class ProjectFSFoundationTests(unittest.TestCase):
                         _INVALID_HANDLE_VALUE=-1,
                         _GENERIC_READ=0x80000000,
                         _GENERIC_WRITE=0x40000000,
+                        _FILE_WRITE_ATTRIBUTES=0x0100,
                         _REPLACEFILE_FLAGS_NONE=0,
                         create=True,
                     ),
                 ):
-                    with self.assertRaisesRegex(
-                        KeyboardInterrupt,
-                        "injected finalization cancellation",
-                    ):
-                        backend._replace_with_backup_checked(
-                            root / source,
-                            source,
-                            source_identity,
-                            root / destination,
-                            destination,
-                            destination_snapshot,
-                        )
+                    if stage == "open":
+                        with self.assertRaisesRegex(
+                            ProjectPathSafetyError,
+                            "path-identity-changed",
+                        ):
+                            backend._replace_with_backup_checked(
+                                root / source,
+                                source,
+                                source_identity,
+                                root / destination,
+                                destination,
+                                destination_snapshot,
+                            )
+                    else:
+                        with self.assertRaisesRegex(
+                            KeyboardInterrupt,
+                            "injected finalization cancellation",
+                        ):
+                            backend._replace_with_backup_checked(
+                                root / source,
+                                source,
+                                source_identity,
+                                root / destination,
+                                destination,
+                                destination_snapshot,
+                            )
 
                 self.assertEqual(backend.api.calls, 2)
                 self.assertEqual(state[source], source_snapshot)
@@ -5685,6 +6543,463 @@ class ProjectFSFoundationTests(unittest.TestCase):
                         operation(relative, allow_missing=True),
                         _PathSnapshot(False),
                     )
+
+    def test_windows_known_snapshot_recheck_normalizes_raced_path_classes(self) -> None:
+        from core.project_fs import (
+            ProjectPathSafetyError,
+            _PathIdentity,
+            _PathSnapshot,
+            _WindowsBackend,
+        )
+
+        backend = object.__new__(_WindowsBackend)
+        relative = Path("state/result.txt")
+        expected = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"expected", "file", 0, 1),
+        )
+        for reason in (
+            "unsafe-ancestor",
+            "unsafe-target",
+            "hard-linked-target",
+            "cross-device-ancestor",
+        ):
+            with self.subTest(reason=reason):
+                backend.snapshot = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    ProjectPathSafetyError(relative, reason)
+                )
+                with self.assertRaisesRegex(
+                    ProjectPathSafetyError,
+                    "path-identity-changed",
+                ):
+                    backend._recheck_snapshot(relative, expected)
+
+        backend.snapshot = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProjectPathSafetyError(relative, "platform-safety-unavailable")
+        )
+        with self.assertRaisesRegex(
+            ProjectPathSafetyError,
+            "platform-safety-unavailable",
+        ):
+            backend._recheck_snapshot(relative, expected)
+
+    def test_windows_zero_link_identity_is_changed_not_hard_link(self) -> None:
+        from core.project_fs import (
+            ProjectPathSafetyError,
+            _PathIdentity,
+            _WindowsBackend,
+        )
+
+        backend = object.__new__(_WindowsBackend)
+        for links, expected_reason in (
+            (0, "path-identity-changed"),
+            (2, "hard-linked-target"),
+        ):
+            with self.subTest(links=links):
+                backend._raw_identity = lambda *_args, **_kwargs: _PathIdentity(
+                    1,
+                    b"leaf",
+                    "file",
+                    0,
+                    links,
+                )
+                with self.assertRaisesRegex(
+                    ProjectPathSafetyError,
+                    expected_reason,
+                ):
+                    backend._identity(
+                        101,
+                        expect_directory=False,
+                        relative=Path("leaf.txt"),
+                    )
+
+    def test_windows_directory_creation_uses_only_pinned_parent_handle(self) -> None:
+        from core.project_fs import _PathIdentity, _WindowsBackend
+
+        calls: list[tuple[int, str]] = []
+
+        class FakeApi:
+            @staticmethod
+            def create_directory_relative(parent_handle: int, leaf: str) -> int:
+                calls.append((parent_handle, leaf))
+                return 303
+
+        backend = object.__new__(_WindowsBackend)
+        backend.api = FakeApi()
+        identity = _PathIdentity(1, b"directory", "directory", 0, 0)
+        backend.root_identity = _PathIdentity(1, b"root", "directory", 0, 0)
+        backend._identity = lambda *_args, **_kwargs: identity
+
+        handle, actual = backend._create_directory_at(
+            202,
+            "schema-0123456789abcdef",
+            Path("backups/schema-0123456789abcdef"),
+        )
+
+        self.assertEqual(calls, [(202, "schema-0123456789abcdef")])
+        self.assertEqual(handle, 303)
+        self.assertEqual(actual, identity)
+
+    def test_windows_native_directory_create_uses_exact_relative_abi(self) -> None:
+        import ctypes
+
+        from core import project_fs as project_fs_module
+        from core.project_fs import (
+            _NT_FILE_CREATED,
+            _NT_FILE_CREATE,
+            _NT_FILE_DIRECTORY_FILE,
+            _NT_FILE_READ_ATTRIBUTES,
+            _NT_FILE_SYNCHRONOUS_IO_NONALERT,
+            _NT_FILE_WRITE_THROUGH,
+            _NT_IO_STATUS_BLOCK,
+            _NT_OBJECT_ATTRIBUTES,
+            _NT_OBJ_CASE_INSENSITIVE,
+            _NT_SYNCHRONIZE,
+            _NT_UNICODE_STRING,
+            _WindowsApi,
+        )
+
+        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+        self.assertEqual(
+            ctypes.sizeof(_NT_UNICODE_STRING),
+            16 if pointer_size == 8 else 8,
+        )
+        self.assertEqual(
+            ctypes.sizeof(_NT_OBJECT_ATTRIBUTES),
+            48 if pointer_size == 8 else 24,
+        )
+        self.assertEqual(
+            ctypes.sizeof(_NT_IO_STATUS_BLOCK),
+            16 if pointer_size == 8 else 8,
+        )
+
+        captured: dict[str, object] = {}
+        closed: list[int] = []
+
+        def nt_create_file(
+            handle_pointer,
+            desired_access,
+            object_attributes_pointer,
+            status_block_pointer,
+            allocation_size,
+            file_attributes,
+            share_access,
+            create_disposition,
+            create_options,
+            ea_buffer,
+            ea_length,
+        ) -> int:
+            attributes = ctypes.cast(
+                object_attributes_pointer,
+                ctypes.POINTER(_NT_OBJECT_ATTRIBUTES),
+            ).contents
+            name = attributes.object_name.contents
+            encoded = ctypes.string_at(name.buffer, name.length)
+            terminated = ctypes.string_at(name.buffer, name.maximum_length)
+            captured.update(
+                desired_access=int(desired_access),
+                root_directory=int(attributes.root_directory),
+                object_attributes=int(attributes.attributes),
+                leaf=encoded.decode("utf-16-le"),
+                length=int(name.length),
+                maximum_length=int(name.maximum_length),
+                terminated=terminated,
+                allocation_size=allocation_size,
+                file_attributes=int(file_attributes),
+                share_access=int(share_access),
+                create_disposition=int(create_disposition),
+                create_options=int(create_options),
+                ea_buffer=ea_buffer,
+                ea_length=int(ea_length),
+            )
+            ctypes.cast(
+                handle_pointer,
+                ctypes.POINTER(ctypes.c_void_p),
+            ).contents.value = 303
+            ctypes.cast(
+                status_block_pointer,
+                ctypes.POINTER(_NT_IO_STATUS_BLOCK),
+            ).contents.information = _NT_FILE_CREATED
+            return 0
+
+        api = object.__new__(_WindowsApi)
+        api.NtCreateFile = nt_create_file
+        api.RtlNtStatusToDosError = lambda _status: self.fail(
+            "successful NtCreateFile must not translate status"
+        )
+        api.CloseHandle = lambda handle: closed.append(int(handle))
+        leaf = "schema-rocket-\U0001F680"
+        encoded = leaf.encode("utf-16-le")
+
+        with patch.multiple(
+            project_fs_module,
+            _DELETE=0x00010000,
+            _FILE_ATTRIBUTE_NORMAL=0x00000080,
+            _FILE_SHARE_READ=0x00000001,
+            _FILE_SHARE_WRITE=0x00000002,
+            _INVALID_HANDLE_VALUE=ctypes.c_void_p(-1).value,
+            create=True,
+        ):
+            handle = api.create_directory_relative(202, leaf)
+
+        self.assertEqual(handle, 303)
+        self.assertEqual(closed, [])
+        self.assertEqual(captured["root_directory"], 202)
+        self.assertEqual(captured["leaf"], leaf)
+        self.assertEqual(captured["length"], len(encoded))
+        self.assertEqual(captured["maximum_length"], len(encoded) + 2)
+        self.assertTrue(bytes(captured["terminated"]).endswith(b"\x00\x00"))
+        self.assertEqual(captured["object_attributes"], _NT_OBJ_CASE_INSENSITIVE)
+        self.assertEqual(
+            captured["desired_access"],
+            0x00010000 | _NT_FILE_READ_ATTRIBUTES | _NT_SYNCHRONIZE,
+        )
+        self.assertEqual(captured["share_access"], 0x00000003)
+        self.assertEqual(captured["create_disposition"], _NT_FILE_CREATE)
+        self.assertEqual(
+            captured["create_options"],
+            _NT_FILE_DIRECTORY_FILE
+            | _NT_FILE_WRITE_THROUGH
+            | _NT_FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        self.assertEqual(captured["allocation_size"], None)
+        self.assertEqual(captured["ea_buffer"], None)
+        self.assertEqual(captured["ea_length"], 0)
+
+    def test_windows_native_directory_create_fails_closed_on_status_anomalies(
+        self,
+    ) -> None:
+        import ctypes
+
+        from core import project_fs as project_fs_module
+        from core.project_fs import (
+            _NT_ERROR_MR_MID_NOT_FOUND,
+            _NT_FILE_CREATED,
+            _NT_IO_STATUS_BLOCK,
+            _NT_STATUS_OBJECT_NAME_COLLISION,
+            _WindowsApi,
+            _WindowsCapabilityError,
+        )
+
+        closed: list[int] = []
+        api = object.__new__(_WindowsApi)
+        api.CloseHandle = lambda handle: closed.append(int(handle))
+        constants = {
+            "_DELETE": 0x00010000,
+            "_FILE_ATTRIBUTE_NORMAL": 0x00000080,
+            "_FILE_SHARE_READ": 0x00000001,
+            "_FILE_SHARE_WRITE": 0x00000002,
+            "_INVALID_HANDLE_VALUE": ctypes.c_void_p(-1).value,
+        }
+
+        with patch.multiple(project_fs_module, **constants, create=True):
+            api.NtCreateFile = lambda *_args: ctypes.c_int32(
+                _NT_STATUS_OBJECT_NAME_COLLISION
+            ).value
+            api.RtlNtStatusToDosError = lambda _status: self.fail(
+                "collision must not use the generic status converter"
+            )
+            with self.assertRaises(FileExistsError):
+                api.create_directory_relative(202, "collision")
+
+            def unmapped_status(handle_pointer, *_args) -> int:
+                ctypes.cast(
+                    handle_pointer,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ).contents.value = 405
+                return -1
+
+            api.NtCreateFile = unmapped_status
+            api.RtlNtStatusToDosError = (
+                lambda _status: _NT_ERROR_MR_MID_NOT_FOUND
+            )
+            with self.assertRaises(_WindowsCapabilityError):
+                api.create_directory_relative(202, "unmapped")
+
+            def unexpected_success(handle_pointer, *_args) -> int:
+                ctypes.cast(
+                    handle_pointer,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ).contents.value = 404
+                status_block_pointer = _args[2]
+                ctypes.cast(
+                    status_block_pointer,
+                    ctypes.POINTER(_NT_IO_STATUS_BLOCK),
+                ).contents.information = _NT_FILE_CREATED - 1
+                return 0
+
+            api.NtCreateFile = unexpected_success
+            api.RtlNtStatusToDosError = lambda _status: self.fail(
+                "successful status must not use the converter"
+            )
+            with self.assertRaises(_WindowsCapabilityError):
+                api.create_directory_relative(202, "unexpected")
+
+            def interrupted(handle_pointer, *_args) -> int:
+                ctypes.cast(
+                    handle_pointer,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ).contents.value = 505
+                raise KeyboardInterrupt("injected native create cancellation")
+
+            api.NtCreateFile = interrupted
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "injected native create cancellation",
+            ):
+                api.create_directory_relative(202, "interrupted")
+
+        self.assertEqual(closed, [405, 404, 505])
+
+    def test_windows_readonly_replacement_uses_exact_writable_handle_and_restores(self) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        readonly = 0x01
+        normal = 0x80
+        attributes = readonly
+        applied: list[int] = []
+        backend = object.__new__(_WindowsBackend)
+        relative = Path("state/readonly.txt")
+
+        def apply_attributes(_handle, _relative, value) -> None:
+            nonlocal attributes
+            applied.append(int(value))
+            attributes = int(value) or normal
+
+        def identity(*_args, **_kwargs):
+            return _PathIdentity(1, b"readonly", "file", attributes, 1)
+
+        backend._apply_file_attributes = apply_attributes
+        backend._identity = identity
+        backend._raw_identity = identity
+        backend.snapshot = lambda *_args, **_kwargs: _PathSnapshot(
+            True,
+            identity(),
+        )
+        original = _PathSnapshot(True, identity())
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_ATTRIBUTE_READONLY=readonly,
+            _FILE_ATTRIBUTE_NORMAL=normal,
+            create=True,
+        ):
+            with self.assertRaisesRegex(KeyboardInterrupt, "cancel replacement"):
+                with backend._temporarily_writable_destination(
+                    101,
+                    relative,
+                    original,
+                ) as lease:
+                    self.assertFalse(attributes & readonly)
+                    self.assertEqual(
+                        lease.working_snapshot.identity.mode_or_attributes,
+                        normal,
+                    )
+                    raise KeyboardInterrupt("cancel replacement")
+
+        self.assertEqual(applied, [0, readonly])
+        self.assertEqual(attributes, readonly)
+
+    def test_windows_readonly_destination_pin_allows_exact_attribute_restore(self) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        readonly = 0x01
+        write_attributes = 0x0100
+        expected = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"readonly", "file", readonly, 1),
+        )
+        opened: list[dict[str, object]] = []
+        backend = object.__new__(_WindowsBackend)
+
+        def open_handle(_path, **kwargs):
+            opened.append(kwargs)
+            return 101
+
+        backend._open_handle = open_handle
+        backend._identity = lambda *_args, **_kwargs: expected.identity
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_ATTRIBUTE_READONLY=readonly,
+            _FILE_WRITE_ATTRIBUTES=write_attributes,
+            create=True,
+        ):
+            handle, identity = backend._pin_destination(
+                Path("C:/project/state/readonly.txt"),
+                Path("state/readonly.txt"),
+                expected,
+            )
+
+        self.assertEqual(handle, 101)
+        self.assertEqual(identity, expected.identity)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(int(opened[0]["access"]) & write_attributes)
+        self.assertIs(opened[0]["share_delete"], True)
+
+    def test_windows_disposed_readonly_destination_preserves_primary_error(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        readonly = 0x01
+        normal = 0x80
+        attributes = readonly
+        disposed = False
+        applied: list[int] = []
+        backend = object.__new__(_WindowsBackend)
+        relative = Path("state/readonly.txt")
+
+        def identity(*_args, **_kwargs):
+            return _PathIdentity(
+                1,
+                b"readonly",
+                "file",
+                attributes,
+                0 if disposed else 1,
+            )
+
+        def apply_attributes(_handle, _relative, value) -> None:
+            nonlocal attributes
+            applied.append(int(value))
+            attributes = int(value) or normal
+
+        backend._identity = identity
+        backend._raw_identity = identity
+        backend._apply_file_attributes = apply_attributes
+        backend.snapshot = lambda *_args, **_kwargs: _PathSnapshot(
+            True,
+            identity(),
+        )
+        original = _PathSnapshot(
+            True,
+            _PathIdentity(1, b"readonly", "file", readonly, 1),
+        )
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_ATTRIBUTE_READONLY=readonly,
+            _FILE_ATTRIBUTE_NORMAL=normal,
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "post-delete verification failed",
+            ) as raised:
+                with backend._temporarily_writable_destination(
+                    101,
+                    relative,
+                    original,
+                ) as lease:
+                    disposed = True
+                    raise RuntimeError("post-delete verification failed")
+
+        self.assertTrue(lease.discarded)
+        self.assertEqual(applied, [0])
+        self.assertEqual(getattr(raised.exception, "__notes__", ()), ())
 
     def test_windows_rename_error_mapping_distinguishes_capability_and_race(self) -> None:
         from core.project_fs import _windows_rename_error_reason

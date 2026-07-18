@@ -129,6 +129,31 @@ def successful_container_result(
 
 
 class SandboxExecutionTest(unittest.TestCase):
+    def test_cli_renders_exception_notes_for_manual_review(self) -> None:
+        error = harness.HarnessError("unsafe-project-path: target.txt")
+        error.add_note("complete metadata rollback requires manual review")
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(
+                harness,
+                "projection_rebuild",
+                side_effect=error,
+            ),
+        ):
+            returncode, output = run_cli_in_process(
+                Path(temp),
+                "projection",
+                "rebuild",
+            )
+
+        self.assertEqual(returncode, 1)
+        self.assertIn("ERROR: unsafe-project-path: target.txt", output)
+        self.assertIn(
+            "NOTE: complete metadata rollback requires manual review",
+            output,
+        )
+
     def test_container_verify_run_fails_closed_when_engine_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

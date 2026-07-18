@@ -151,6 +151,16 @@ def add_retired_schema29_fixture_surface(conn: sqlite3.Connection) -> None:
 
 
 class Schema30BackupTests(unittest.TestCase):
+    def test_exception_text_preserves_manual_review_notes(self) -> None:
+        error = LocalCoreMigrationError("unsafe-project-path: target.txt")
+        error.add_note("complete metadata rollback requires manual review")
+
+        self.assertEqual(
+            local_core_migration._exception_text(error),
+            "unsafe-project-path: target.txt\n"
+            "NOTE: complete metadata rollback requires manual review",
+        )
+
     def test_backup_records_safe_recovery_metadata_and_preserves_complete_database(self) -> None:
         secret = "connector-token-must-not-enter-manifest"
         with tempfile.TemporaryDirectory() as temp:
@@ -1950,7 +1960,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             backup_directory.mkdir(parents=True)
             backup_path = backup_directory / "project-state.yaml"
             expected_content = b"original-projection\n"
-            expected_mode = 0o640
+            expected_mode = 0o666 if os.name == "nt" else 0o640
             backup_path.write_bytes(expected_content)
             backup_path.chmod(expected_mode)
             expected_digest = hashlib.sha256(expected_content).hexdigest()
@@ -2453,16 +2463,54 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             detached = base / "detached-project"
             replacement_marker = b"replacement-root-must-remain-untouched\n"
             original_checkpoint = local_core_migration._checkpoint_active_database
+            blocked_replacements: list[OSError] = []
 
             def replace_root_then_checkpoint(
                 active_path: Path,
                 *,
                 pinned_fs=None,
             ) -> None:
-                root.rename(detached)
+                try:
+                    root.rename(detached)
+                except OSError as exc:
+                    if os.name != "nt":
+                        raise
+                    if not isinstance(exc, PermissionError) or getattr(
+                        exc,
+                        "winerror",
+                        None,
+                    ) not in {5, 32}:
+                        raise
+                    blocked_replacements.append(exc)
+                    original_checkpoint(active_path, pinned_fs=pinned_fs)
+                    return
                 root.mkdir()
                 (root / "replacement-marker.txt").write_bytes(replacement_marker)
                 original_checkpoint(active_path, pinned_fs=pinned_fs)
+
+            if os.name == "nt":
+                with patch.object(
+                    local_core_migration,
+                    "_checkpoint_active_database",
+                    side_effect=replace_root_then_checkpoint,
+                ):
+                    migrate_project_to_schema30(root)
+
+                self.assertEqual(len(blocked_replacements), 1)
+                self.assertTrue(root.is_dir())
+                self.assertFalse(detached.exists())
+                self.assertFalse((root / "replacement-marker.txt").exists())
+                self.assertFalse(
+                    (root / ".ai-team/state/local-core-migration.lock").exists()
+                )
+                with closing(sqlite3.connect(active)) as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "select schema_version from project where id=1"
+                        ).fetchone()[0],
+                        30,
+                    )
+                return
 
             with patch.object(
                 local_core_migration,

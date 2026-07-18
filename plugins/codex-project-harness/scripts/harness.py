@@ -55,6 +55,7 @@ from core.api import (
     runtime_initialized,
     uninitialized_lines,
 )
+from core.errors import exception_text
 
 
 RETIRED_V2_COMMANDS = {"adapter", "connector", "dispatch", "agent", "agents", "session"}
@@ -616,7 +617,7 @@ def main() -> int:
         else:
             parser.error("unknown command")
     except HarnessError as exc:
-        print(f"ERROR: {exc}")
+        print(f"ERROR: {exception_text(exc)}")
         return 1
     return 0
 

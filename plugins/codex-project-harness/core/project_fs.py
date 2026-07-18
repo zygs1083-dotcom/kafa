@@ -25,6 +25,21 @@ from .errors import HarnessError
 MAX_AUDIT_PATHS = 256
 _PINNED_PROJECT_FILESYSTEMS = threading.local()
 _WINDOWS_RENAME_CAPABILITY_ERRORS = frozenset({1, 50, 87, 120, 124})
+_NT_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_NT_ERROR_MR_MID_NOT_FOUND = 317
+_NT_OBJ_CASE_INSENSITIVE = 0x00000040
+_NT_FILE_READ_ATTRIBUTES = 0x00000080
+_NT_SYNCHRONIZE = 0x00100000
+_NT_FILE_CREATE = 0x00000002
+_NT_FILE_CREATED = 0x00000002
+_NT_FILE_DIRECTORY_FILE = 0x00000001
+_NT_FILE_WRITE_THROUGH = 0x00000002
+_NT_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_WINDOWS_REPLACE_METADATA_UNVERIFIED = (
+    "Windows ReplaceFileW failure may have changed source streams or security "
+    "metadata; complete source metadata rollback is not verified and requires "
+    "manual review"
+)
 _WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -149,6 +164,14 @@ def _before_windows_directory_create(
     """Deterministic test seam while Windows parent handles remain pinned."""
 
 
+def _before_windows_backup_cleanup(
+    _backend: "_WindowsBackend",
+    _destination: Path,
+    _backup: Path,
+) -> None:
+    """Deterministic test seam while the published Windows leaf is pinned."""
+
+
 def _windows_rename_error_reason(error: OSError) -> str:
     code = getattr(error, "winerror", None)
     if code is None:
@@ -208,8 +231,52 @@ class _PathSnapshot:
     identity: _PathIdentity | None = None
 
 
+@dataclass
+class _WritableDestinationLease:
+    restore_required: bool
+    working_snapshot: _PathSnapshot
+    discarded: bool = False
+
+
 class _MissingAncestor(Exception):
     pass
+
+
+class _WindowsCapabilityError(OSError):
+    pass
+
+
+class _NT_UNICODE_STRING(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_uint16),
+        ("maximum_length", ctypes.c_uint16),
+        ("buffer", ctypes.POINTER(ctypes.c_uint16)),
+    )
+
+
+class _NT_OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_uint32),
+        ("root_directory", ctypes.c_void_p),
+        ("object_name", ctypes.POINTER(_NT_UNICODE_STRING)),
+        ("attributes", ctypes.c_uint32),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    )
+
+
+class _NT_IO_STATUS_VALUE(ctypes.Union):
+    _fields_ = (
+        ("status", ctypes.c_int32),
+        ("pointer", ctypes.c_void_p),
+    )
+
+
+class _NT_IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = (
+        ("value", _NT_IO_STATUS_VALUE),
+        ("information", ctypes.c_size_t),
+    )
 
 
 def _validate_relative(value: Path | str) -> Path:
@@ -2205,8 +2272,10 @@ if os.name == "nt":  # pragma: no cover - exercised by the Windows matrix
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
     _DELETE = 0x00010000
+    _FILE_WRITE_ATTRIBUTES = 0x00000100
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
     _CREATE_NEW = 1
     _OPEN_EXISTING = 3
     _OPEN_ALWAYS = 4
@@ -2288,6 +2357,25 @@ class _WindowsApi:
             return
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            self.NtCreateFile = ntdll.NtCreateFile
+            self.NtCreateFile.argtypes = (
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint32,
+                ctypes.POINTER(_NT_OBJECT_ATTRIBUTES),
+                ctypes.POINTER(_NT_IO_STATUS_BLOCK),
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            )
+            self.NtCreateFile.restype = ctypes.c_int32
+            self.RtlNtStatusToDosError = ntdll.RtlNtStatusToDosError
+            self.RtlNtStatusToDosError.argtypes = (ctypes.c_int32,)
+            self.RtlNtStatusToDosError.restype = ctypes.c_uint32
             self.CreateFileW = kernel32.CreateFileW
             self.CreateFileW.argtypes = (
                 wintypes.LPCWSTR,
@@ -2357,6 +2445,94 @@ class _WindowsApi:
         code = ctypes.get_last_error()
         return OSError(code, ctypes.FormatError(code))
 
+    def create_directory_relative(self, parent_handle: int, leaf: str) -> int:
+        if (
+            not leaf
+            or leaf in {".", ".."}
+            or "\x00" in leaf
+            or "/" in leaf
+            or "\\" in leaf
+        ):
+            raise OSError(errno.EINVAL, "invalid relative directory leaf", leaf)
+        try:
+            encoded = leaf.encode("utf-16-le")
+        except UnicodeEncodeError as exc:
+            raise OSError(errno.EINVAL, "invalid UTF-16 directory leaf", leaf) from exc
+        if not encoded or len(encoded) > 0xFFFC:
+            raise OSError(errno.ENAMETOOLONG, "directory leaf is too long", leaf)
+
+        units = (ctypes.c_uint16 * (len(encoded) // 2 + 1))()
+        ctypes.memmove(units, encoded, len(encoded))
+        name = _NT_UNICODE_STRING(
+            len(encoded),
+            len(encoded) + 2,
+            ctypes.cast(units, ctypes.POINTER(ctypes.c_uint16)),
+        )
+        attributes = _NT_OBJECT_ATTRIBUTES(
+            ctypes.sizeof(_NT_OBJECT_ATTRIBUTES),
+            ctypes.c_void_p(parent_handle),
+            ctypes.pointer(name),
+            _NT_OBJ_CASE_INSENSITIVE,
+            None,
+            None,
+        )
+        status_block = _NT_IO_STATUS_BLOCK()
+        handle = ctypes.c_void_p()
+        def close_output_handle() -> None:
+            actual = handle.value
+            if actual not in (None, _INVALID_HANDLE_VALUE):
+                self.CloseHandle(actual)
+                handle.value = None
+
+        try:
+            status = int(
+                self.NtCreateFile(
+                    ctypes.byref(handle),
+                    _DELETE
+                    | _NT_FILE_READ_ATTRIBUTES
+                    | _NT_SYNCHRONIZE,
+                    ctypes.byref(attributes),
+                    ctypes.byref(status_block),
+                    None,
+                    _FILE_ATTRIBUTE_NORMAL,
+                    _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                    _NT_FILE_CREATE,
+                    _NT_FILE_DIRECTORY_FILE
+                    | _NT_FILE_WRITE_THROUGH
+                    | _NT_FILE_SYNCHRONOUS_IO_NONALERT,
+                    None,
+                    0,
+                )
+            )
+        except BaseException:
+            close_output_handle()
+            raise
+        if status < 0:
+            close_output_handle()
+            if status & 0xFFFFFFFF == _NT_STATUS_OBJECT_NAME_COLLISION:
+                raise FileExistsError(errno.EEXIST, "directory already exists", leaf)
+            code = int(self.RtlNtStatusToDosError(status))
+            if code == _NT_ERROR_MR_MID_NOT_FOUND:
+                raise _WindowsCapabilityError(
+                    errno.ENOSYS,
+                    f"unmapped NtCreateFile status 0x{status & 0xFFFFFFFF:08x}",
+                    leaf,
+                )
+            raise ctypes.WinError(code)
+
+        actual_handle = handle.value
+        if (
+            actual_handle in (None, _INVALID_HANDLE_VALUE)
+            or int(status_block.information) != _NT_FILE_CREATED
+        ):
+            close_output_handle()
+            raise _WindowsCapabilityError(
+                errno.EIO,
+                "NtCreateFile did not return a newly created directory",
+                leaf,
+            )
+        return int(actual_handle)
+
 
 class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
     def __init__(self, root: Path, api: _WindowsApi | None = None) -> None:
@@ -2412,14 +2588,25 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         directory: bool,
         access: int = 0,
         disposition: int | None = None,
+        share_delete: bool = False,
+        exclusive_share: bool = False,
     ) -> int:
         flags = _FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
             flags |= _FILE_FLAG_BACKUP_SEMANTICS
+        if exclusive_share and share_delete:
+            raise ValueError(
+                "exclusive_share and share_delete are mutually exclusive"
+            )
+        share = 0
+        if not exclusive_share:
+            share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+            if share_delete:
+                share |= _FILE_SHARE_DELETE
         handle = self.api.CreateFileW(
             os.fspath(path),
             access,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            share,
             None,
             disposition or _OPEN_EXISTING,
             flags,
@@ -2474,8 +2661,10 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         if identity.kind != expected_kind:
             raise ProjectPathSafetyError(relative, "unsafe-target")
         is_directory = identity.kind == "directory"
-        if not is_directory and identity.nlink != 1:
+        if not is_directory and identity.nlink > 1:
             raise ProjectPathSafetyError(relative, "hard-linked-target")
+        if not is_directory and identity.nlink == 0:
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
         return identity
 
     def _delete_on_close(self, handle: int, relative: Path) -> None:
@@ -2520,6 +2709,61 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 relative,
                 "platform-safety-unavailable",
             ) from self.api.error()
+
+    def _cleanup_created_directory_handle(
+        self,
+        handle: int,
+        relative: Path,
+    ) -> str:
+        try:
+            self._delete_on_close(handle, relative)
+        except BaseException as exc:
+            return f"directory delete-on-close failed: {exc}"
+        finally:
+            self._close(handle)
+        return ""
+
+    def _create_directory_at(
+        self,
+        parent_handle: int,
+        leaf: str,
+        relative: Path,
+    ) -> tuple[int, _PathIdentity]:
+        try:
+            handle = self.api.create_directory_relative(parent_handle, leaf)
+        except FileExistsError:
+            raise
+        except _WindowsCapabilityError as exc:
+            raise ProjectPathSafetyError(
+                relative,
+                "platform-safety-unavailable",
+            ) from exc
+        except OSError as exc:
+            raise ProjectPathSafetyError(
+                relative,
+                _windows_rename_error_reason(exc),
+            ) from exc
+
+        try:
+            identity = self._identity(
+                handle,
+                expect_directory=True,
+                relative=relative,
+            )
+            if identity.volume != self.root_identity.volume:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "cross-device-ancestor",
+                )
+        except BaseException as exc:
+            cleanup_error = self._cleanup_created_directory_handle(
+                handle,
+                relative,
+            )
+            if cleanup_error:
+                exc.add_note(cleanup_error)
+            raise
+        return handle, identity
 
     def _reconcile_windows_handle_rename_interruption(
         self,
@@ -2787,6 +3031,85 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 "platform-safety-unavailable",
             ) from self.api.error()
 
+    def _restore_known_file_attributes(
+        self,
+        path: Path,
+        relative: Path,
+        expected: _PathIdentity,
+    ) -> None:
+        try:
+            handle = self._open_handle(
+                path,
+                directory=False,
+                access=_FILE_WRITE_ATTRIBUTES,
+            )
+        except OSError as exc:
+            raise ProjectPathSafetyError(
+                relative,
+                "path-identity-changed",
+            ) from exc
+        try:
+            current = self._identity(
+                handle,
+                expect_directory=False,
+                relative=relative,
+            )
+            if not self._same_windows_object(
+                _PathSnapshot(True, current),
+                expected,
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+            self._apply_file_attributes(
+                handle,
+                relative,
+                expected.mode_or_attributes,
+            )
+            restored = self._identity(
+                handle,
+                expect_directory=False,
+                relative=relative,
+            )
+            restored_snapshot = _PathSnapshot(True, restored)
+            if (
+                restored != expected
+                or self._recheck_snapshot(relative, restored_snapshot)
+                != restored_snapshot
+            ):
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+        finally:
+            self._close(handle)
+
+    def _annotate_windows_replace_uncertainty(
+        self,
+        source_path: Path,
+        source: Path,
+        source_identity: _PathIdentity,
+        error: BaseException,
+    ) -> None:
+        try:
+            self._restore_known_file_attributes(
+                source_path,
+                source,
+                source_identity,
+            )
+        except BaseException as source_restore_error:
+            error.add_note(
+                "Windows failed replacement source attribute restore failed: "
+                f"{source_restore_error}"
+            )
+        if _WINDOWS_REPLACE_METADATA_UNVERIFIED not in getattr(
+            error,
+            "__notes__",
+            (),
+        ):
+            error.add_note(_WINDOWS_REPLACE_METADATA_UNVERIFIED)
+
     def _reconcile_windows_replace_interruption(
         self,
         source_path: Path,
@@ -2991,7 +3314,13 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         destination_path: Path,
         destination: Path,
         destination_snapshot: _PathSnapshot,
+        destination_lease: _WritableDestinationLease | None = None,
     ) -> _PathIdentity:
+        if destination_lease is None:
+            destination_lease = _WritableDestinationLease(
+                restore_required=False,
+                working_snapshot=destination_snapshot,
+            )
         backup_relative: Path | None = None
         backup_path: Path | None = None
         for _ in range(128):
@@ -3030,13 +3359,39 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 backup_relative,
                 exc,
             )
+            self._annotate_windows_replace_uncertainty(
+                source_path,
+                source,
+                source_identity,
+                exc,
+            )
             raise
         if not replaced:
             # ReplaceFileW documents a partial failure (1177) where the old
             # destination has already moved to the backup name and the
             # replacement remains at its source name.  Capture GetLastError
             # before any state inspection calls overwrite it.
-            replace_error = self.api.error()
+            try:
+                replace_error = self.api.error()
+            except BaseException as exc:
+                self._reconcile_windows_replace_interruption(
+                    source_path,
+                    source,
+                    source_identity,
+                    destination_path,
+                    destination,
+                    destination_snapshot,
+                    backup_path,
+                    backup_relative,
+                    exc,
+                )
+                self._annotate_windows_replace_uncertainty(
+                    source_path,
+                    source,
+                    source_identity,
+                    exc,
+                )
+                raise
         try:
             final = self._raw_snapshot(destination, allow_missing=True)
             displaced = self._raw_snapshot(
@@ -3045,10 +3400,12 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             )
             source_after = self._raw_snapshot(source, allow_missing=True)
         except BaseException as exc:
-            error = ProjectPathSafetyError(
-                destination,
-                "path-identity-changed",
-            )
+            error: BaseException = exc
+            if isinstance(exc, Exception):
+                error = ProjectPathSafetyError(
+                    destination,
+                    "path-identity-changed",
+                )
             self._reconcile_windows_replace_interruption(
                 source_path,
                 source,
@@ -3060,6 +3417,14 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 backup_relative,
                 error,
             )
+            self._annotate_windows_replace_uncertainty(
+                source_path,
+                source,
+                source_identity,
+                error,
+            )
+            if error is exc:
+                raise
             raise error from exc
         correct = (
             self._same_windows_object(final, source_identity)
@@ -3084,76 +3449,88 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     expected_destination=final,
                 )
             except BaseException as completion_error:
-                error = ProjectPathSafetyError(
-                    destination,
-                    "path-identity-changed",
-                )
+                error: BaseException = completion_error
+                if isinstance(completion_error, Exception):
+                    error = ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                error.add_note(f"ReplaceFileW failed: {replace_error}")
                 error.add_note(
                     f"Windows partial replacement completion failed: {completion_error}"
                 )
-                try:
-                    current_final = self.snapshot(
-                        destination,
-                        allow_missing=True,
-                    )
-                    current_displaced = self.snapshot(
-                        backup_relative,
-                        allow_missing=True,
-                    )
-                    current_source = self.snapshot(
-                        source,
-                        allow_missing=True,
-                    )
-                    if (
-                        current_final.exists
-                        or current_displaced != destination_snapshot
-                        or not self._same_windows_object(
-                            current_source,
-                            source_identity,
-                        )
-                    ):
-                        raise ProjectPathSafetyError(
-                            destination,
-                            "path-identity-changed",
-                        )
-                    self.replace_file(
-                        backup_relative,
-                        destination,
-                        expected_destination=current_final,
-                    )
-                    if (
-                        self.snapshot(destination, allow_missing=False)
-                        != destination_snapshot
-                        or self.snapshot(
-                            backup_relative,
-                            allow_missing=True,
-                        ).exists
-                    ):
-                        raise ProjectPathSafetyError(
-                            destination,
-                            "path-identity-changed",
-                        )
-                except BaseException as rollback_error:
-                    error.add_note(
-                        f"Windows partial replacement rollback failed: {rollback_error}"
-                    )
+                self._reconcile_windows_replace_interruption(
+                    source_path,
+                    source,
+                    source_identity,
+                    destination_path,
+                    destination,
+                    destination_snapshot,
+                    backup_path,
+                    backup_relative,
+                    error,
+                )
+                self._annotate_windows_replace_uncertainty(
+                    source_path,
+                    source,
+                    source_identity,
+                    error,
+                )
+                if error is completion_error:
+                    raise
                 raise error from replace_error
-            final = self._raw_snapshot(destination, allow_missing=True)
-            displaced = self._raw_snapshot(
-                backup_relative,
-                allow_missing=True,
-            )
-            source_after = self._raw_snapshot(source, allow_missing=True)
+            try:
+                final = self._raw_snapshot(destination, allow_missing=True)
+                displaced = self._raw_snapshot(
+                    backup_relative,
+                    allow_missing=True,
+                )
+                source_after = self._raw_snapshot(source, allow_missing=True)
+            except BaseException as exc:
+                error = exc
+                if isinstance(exc, Exception):
+                    error = ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                self._reconcile_windows_replace_interruption(
+                    source_path,
+                    source,
+                    source_identity,
+                    destination_path,
+                    destination,
+                    destination_snapshot,
+                    backup_path,
+                    backup_relative,
+                    error,
+                )
+                self._annotate_windows_replace_uncertainty(
+                    source_path,
+                    source,
+                    source_identity,
+                    error,
+                )
+                if error is exc:
+                    raise
+                raise error from exc
             correct = (
                 self._same_windows_object(final, source_identity)
                 and displaced == destination_snapshot
                 and not source_after.exists
             )
         elif replace_error is not None and original:
-            raise ProjectPathSafetyError(
+            error = ProjectPathSafetyError(
                 destination,
                 _windows_rename_error_reason(replace_error),
-            ) from replace_error
+            )
+            error.add_note(f"ReplaceFileW failed: {replace_error}")
+            self._annotate_windows_replace_uncertainty(
+                source_path,
+                source,
+                source_identity,
+                error,
+            )
+            raise error from replace_error
         if not correct:
             error = ProjectPathSafetyError(
                 destination,
@@ -3172,6 +3549,12 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 backup_relative,
                 error,
             )
+            self._annotate_windows_replace_uncertainty(
+                source_path,
+                source,
+                source_identity,
+                error,
+            )
             if replace_error is not None:
                 raise error from replace_error
             raise error
@@ -3180,11 +3563,18 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         final_identity = source_identity
         try:
             try:
-                final_handle = self._open_handle(
-                    destination_path,
-                    directory=False,
-                    access=_GENERIC_READ | _GENERIC_WRITE,
-                )
+                try:
+                    final_handle = self._open_handle(
+                        destination_path,
+                        directory=False,
+                        access=_GENERIC_READ | _GENERIC_WRITE,
+                        exclusive_share=True,
+                    )
+                except OSError as exc:
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    ) from exc
                 final_identity = self._identity(
                     final_handle,
                     expect_directory=False,
@@ -3213,14 +3603,38 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     expect_directory=False,
                     relative=destination,
                 )
+                _before_windows_backup_cleanup(
+                    self,
+                    destination,
+                    backup_relative,
+                )
+                if self._identity(
+                    final_handle,
+                    expect_directory=False,
+                    relative=destination,
+                ) != final_identity:
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                self.unlink_regular(
+                    backup_relative,
+                    missing_ok=False,
+                    expected=displaced,
+                )
+                if self._identity(
+                    final_handle,
+                    expect_directory=False,
+                    relative=destination,
+                ) != final_identity:
+                    raise ProjectPathSafetyError(
+                        destination,
+                        "path-identity-changed",
+                    )
+                destination_lease.discarded = True
             finally:
                 self._close(final_handle)
                 final_handle = _INVALID_HANDLE_VALUE
-            self.unlink_regular(
-                backup_relative,
-                missing_ok=False,
-                expected=displaced,
-            )
         except BaseException as exc:
             self._reconcile_windows_replace_interruption(
                 source_path,
@@ -3233,6 +3647,12 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 backup_relative,
                 exc,
             )
+            self._annotate_windows_replace_uncertainty(
+                source_path,
+                source,
+                source_identity,
+                exc,
+            )
             raise
         return final_identity
 
@@ -3243,7 +3663,8 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         *,
         create: bool,
         allow_missing: bool = False,
-    ) -> Iterator[Path]:
+        with_handle: bool = False,
+    ) -> Iterator[Path | tuple[Path, int]]:
         handles: list[int] = []
         current = self.root
         try:
@@ -3253,6 +3674,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
             for component in relative.parts[:-1]:
                 current = current / component
+                created_identity: _PathIdentity | None = None
                 try:
                     handle = self._open_handle(current, directory=True)
                 except OSError as exc:
@@ -3266,15 +3688,21 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     if not create or not missing:
                         raise ProjectPathSafetyError(relative, "unsafe-ancestor") from exc
                     try:
-                        os.mkdir(current, 0o700)
+                        handle, created_identity = self._create_directory_at(
+                            handles[-1],
+                            component,
+                            relative,
+                        )
                     except FileExistsError:
-                        pass
-                    try:
-                        handle = self._open_handle(current, directory=True)
-                    except OSError as retry_exc:
-                        raise ProjectPathSafetyError(relative, "unsafe-ancestor") from retry_exc
+                        try:
+                            handle = self._open_handle(current, directory=True)
+                        except OSError as retry_exc:
+                            raise ProjectPathSafetyError(
+                                relative,
+                                "unsafe-ancestor",
+                            ) from retry_exc
                 try:
-                    identity = self._identity(
+                    identity = created_identity or self._identity(
                         handle,
                         expect_directory=True,
                         relative=relative,
@@ -3291,7 +3719,10 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     self._close(handle)
                     raise ProjectPathSafetyError(relative, "cross-device-ancestor")
                 handles.append(handle)
-            yield current
+            if with_handle:
+                yield current, handles[-1]
+            else:
+                yield current
         finally:
             for handle in reversed(handles):
                 self._close(handle)
@@ -3335,6 +3766,32 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             if allow_missing and exc.errno in {2, 3}:
                 return _PathSnapshot(False)
             raise ProjectPathSafetyError(relative, "unsafe-ancestor") from exc
+
+    def _recheck_snapshot(
+        self,
+        relative: Path,
+        expected: _PathSnapshot,
+        *,
+        expect_directory: bool = False,
+    ) -> _PathSnapshot:
+        try:
+            return self.snapshot(
+                relative,
+                allow_missing=not expected.exists,
+                expect_directory=expect_directory,
+            )
+        except ProjectPathSafetyError as exc:
+            if exc.reason in {
+                "unsafe-ancestor",
+                "unsafe-target",
+                "hard-linked-target",
+                "cross-device-ancestor",
+            }:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                ) from exc
+            raise
 
     def _raw_snapshot(
         self,
@@ -3663,7 +4120,19 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         expected: _PathSnapshot,
     ) -> tuple[int, _PathIdentity | None]:
         if expected.exists:
-            handle = self._open_handle(path, directory=False)
+            assert expected.identity is not None
+            access = (
+                _FILE_WRITE_ATTRIBUTES
+                if expected.identity.mode_or_attributes
+                & _FILE_ATTRIBUTE_READONLY
+                else 0
+            )
+            handle = self._open_handle(
+                path,
+                directory=False,
+                access=access,
+                share_delete=True,
+            )
             try:
                 identity = self._identity(
                     handle,
@@ -3686,6 +4155,105 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         # concurrently created leaf is replaced as a directory entry and is
         # never followed.
         return _INVALID_HANDLE_VALUE, None
+
+    @contextmanager
+    def _temporarily_writable_destination(
+        self,
+        handle: int,
+        relative: Path,
+        expected: _PathSnapshot,
+    ) -> Iterator[_WritableDestinationLease]:
+        assert expected.exists and expected.identity is not None
+        original = expected.identity
+        needs_restore = bool(
+            original.mode_or_attributes & _FILE_ATTRIBUTE_READONLY
+        )
+        lease = _WritableDestinationLease(
+            restore_required=needs_restore,
+            working_snapshot=expected,
+        )
+        restore_allowed = False
+        primary_error: BaseException | None = None
+        try:
+            current = self._identity(
+                handle,
+                expect_directory=False,
+                relative=relative,
+            )
+            if current != original:
+                raise ProjectPathSafetyError(
+                    relative,
+                    "path-identity-changed",
+                )
+            if needs_restore:
+                restore_allowed = True
+                writable_attributes = (
+                    original.mode_or_attributes & ~_FILE_ATTRIBUTE_READONLY
+                )
+                self._apply_file_attributes(
+                    handle,
+                    relative,
+                    writable_attributes,
+                )
+                writable = self._identity(
+                    handle,
+                    expect_directory=False,
+                    relative=relative,
+                )
+                normalized_writable = (
+                    writable_attributes & ~_FILE_ATTRIBUTE_NORMAL
+                ) or _FILE_ATTRIBUTE_NORMAL
+                if (
+                    not self._same_windows_object(
+                        _PathSnapshot(True, writable),
+                        original,
+                    )
+                    or writable.mode_or_attributes != normalized_writable
+                    or self._recheck_snapshot(relative, _PathSnapshot(True, writable))
+                    != _PathSnapshot(True, writable)
+                ):
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+                lease.working_snapshot = _PathSnapshot(True, writable)
+            yield lease
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if restore_allowed and not lease.discarded:
+                try:
+                    current_raw = self._raw_identity(handle, relative=relative)
+                    if not self._same_windows_raw_object(
+                        _PathSnapshot(True, current_raw),
+                        expected,
+                    ):
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                    if current_raw.nlink == 0:
+                        lease.discarded = True
+                    else:
+                        self._apply_file_attributes(
+                            handle,
+                            relative,
+                            original.mode_or_attributes,
+                        )
+                        restored = self._raw_identity(handle, relative=relative)
+                        if restored != original:
+                            raise ProjectPathSafetyError(
+                                relative,
+                                "path-identity-changed",
+                            )
+                except BaseException as restore_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "Windows readonly destination restore failed: "
+                        f"{restore_error}"
+                    )
 
     def atomic_write(
         self,
@@ -3721,7 +4289,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             published = False
             try:
                 _before_atomic_replace(fs, relative)
-                if self.snapshot(relative, allow_missing=True) != expected:
+                if self._recheck_snapshot(relative, expected) != expected:
                     raise ProjectPathSafetyError(relative, "path-identity-changed")
                 destination_handle, destination_identity = self._pin_destination(
                     target,
@@ -3753,26 +4321,30 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                             relative,
                             "path-identity-changed",
                         )
-                    if self.snapshot(relative, allow_missing=False) != expected:
+                    if self._recheck_snapshot(relative, expected) != expected:
                         raise ProjectPathSafetyError(
                             relative,
                             "path-identity-changed",
                         )
-                    self._close(destination_handle)
-                    destination_handle = _INVALID_HANDLE_VALUE
-                    self._close(temporary_handle)
-                    temporary_handle = _INVALID_HANDLE_VALUE
-                    self._replace_with_backup_checked(
-                        temporary,
-                        temporary_relative,
-                        temporary_identity,
-                        target,
+                    with self._temporarily_writable_destination(
+                        destination_handle,
                         relative,
                         expected,
-                    )
+                    ) as destination_lease:
+                        self._close(temporary_handle)
+                        temporary_handle = _INVALID_HANDLE_VALUE
+                        self._replace_with_backup_checked(
+                            temporary,
+                            temporary_relative,
+                            temporary_identity,
+                            target,
+                            relative,
+                            destination_lease.working_snapshot,
+                            destination_lease,
+                        )
                     published = True
                 else:
-                    if self.snapshot(relative, allow_missing=True).exists:
+                    if self._recheck_snapshot(relative, expected).exists:
                         raise ProjectPathSafetyError(
                             relative,
                             "path-identity-changed",
@@ -3823,7 +4395,8 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             finally:
                 self._close(destination_handle)
                 self._close(temporary_handle)
-            if self.snapshot(relative, allow_missing=False).identity != temporary_identity:
+            final_expected = _PathSnapshot(True, temporary_identity)
+            if self._recheck_snapshot(relative, final_expected) != final_expected:
                 raise ProjectPathSafetyError(relative, "path-identity-changed")
             return _PathSnapshot(True, temporary_identity)
 
@@ -3941,29 +4514,61 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
 
     def create_unique_directory(self, parent_relative: Path, prefix: str) -> Path:
         marker = parent_relative / "__kafa_unique_directory_parent__"
-        with self._ancestors(marker, create=True) as parent:
+        with self._ancestors(
+            marker,
+            create=True,
+            with_handle=True,
+        ) as parent_receipt:
+            parent, parent_handle = parent_receipt
             for _ in range(128):
                 relative = parent_relative / f"{prefix}{secrets.token_hex(8)}"
-                target = parent / relative.name
                 _before_windows_directory_create(self, relative)
                 try:
-                    os.mkdir(target, 0o700)
+                    handle, identity = self._create_directory_at(
+                        parent_handle,
+                        relative.name,
+                        relative,
+                    )
                 except FileExistsError:
                     continue
-                self.snapshot(
-                    relative,
-                    allow_missing=False,
-                    expect_directory=True,
-                )
+                expected = _PathSnapshot(True, identity)
+                try:
+                    if self._recheck_snapshot(
+                        relative,
+                        expected,
+                        expect_directory=True,
+                    ) != expected:
+                        raise ProjectPathSafetyError(
+                            relative,
+                            "path-identity-changed",
+                        )
+                except BaseException as exc:
+                    cleanup_error = self._cleanup_created_directory_handle(
+                        handle,
+                        relative,
+                    )
+                    if cleanup_error:
+                        exc.add_note(cleanup_error)
+                    raise
+                self._close(handle)
                 return relative
         raise ProjectPathSafetyError(parent_relative, "path-identity-changed")
 
     def create_directory_exclusive(self, relative: Path, mode: int) -> None:
+        _ = mode
         marker = relative.parent / "__kafa_directory_parent__"
-        with self._ancestors(marker, create=True) as parent:
-            target = parent / relative.name
+        with self._ancestors(
+            marker,
+            create=True,
+            with_handle=True,
+        ) as parent_receipt:
+            _parent, parent_handle = parent_receipt
             try:
-                os.mkdir(target, mode)
+                handle, identity = self._create_directory_at(
+                    parent_handle,
+                    relative.name,
+                    relative,
+                )
             except FileExistsError:
                 self.snapshot(
                     relative,
@@ -3971,11 +4576,26 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     expect_directory=True,
                 )
                 raise
-            self.snapshot(
-                relative,
-                allow_missing=False,
-                expect_directory=True,
-            )
+            expected = _PathSnapshot(True, identity)
+            try:
+                if self._recheck_snapshot(
+                    relative,
+                    expected,
+                    expect_directory=True,
+                ) != expected:
+                    raise ProjectPathSafetyError(
+                        relative,
+                        "path-identity-changed",
+                    )
+            except BaseException as exc:
+                cleanup_error = self._cleanup_created_directory_handle(
+                    handle,
+                    relative,
+                )
+                if cleanup_error:
+                    exc.add_note(cleanup_error)
+                raise
+            self._close(handle)
 
     def replace_file(
         self,
@@ -4060,32 +4680,42 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                             "path-identity-changed",
                         )
                     if (
-                        self.snapshot(destination, allow_missing=False)
+                        self._recheck_snapshot(
+                            destination,
+                            destination_snapshot,
+                        )
                         != destination_snapshot
                     ):
                         raise ProjectPathSafetyError(
                             destination,
                             "path-identity-changed",
                         )
-                    if self.snapshot(source, allow_missing=False) != source_snapshot:
+                    if self._recheck_snapshot(source, source_snapshot) != source_snapshot:
                         raise ProjectPathSafetyError(
                             source,
                             "path-identity-changed",
                         )
-                    self._close(destination_handle)
-                    destination_handle = _INVALID_HANDLE_VALUE
-                    self._close(source_handle)
-                    source_handle = _INVALID_HANDLE_VALUE
-                    self._replace_with_backup_checked(
-                        source_path,
-                        source,
-                        source_identity,
-                        destination_path,
+                    with self._temporarily_writable_destination(
+                        destination_handle,
                         destination,
                         destination_snapshot,
-                    )
+                    ) as destination_lease:
+                        self._close(source_handle)
+                        source_handle = _INVALID_HANDLE_VALUE
+                        self._replace_with_backup_checked(
+                            source_path,
+                            source,
+                            source_identity,
+                            destination_path,
+                            destination,
+                            destination_lease.working_snapshot,
+                            destination_lease,
+                        )
                 else:
-                    if self.snapshot(destination, allow_missing=True).exists:
+                    if self._recheck_snapshot(
+                        destination,
+                        destination_snapshot,
+                    ).exists:
                         raise ProjectPathSafetyError(
                             destination,
                             "path-identity-changed",
@@ -4102,9 +4732,12 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             finally:
                 self._close(destination_handle)
                 self._close(source_handle)
-            if self.snapshot(destination, allow_missing=False).identity != source_snapshot.identity:
+            if self._recheck_snapshot(
+                destination,
+                _PathSnapshot(True, source_snapshot.identity),
+            ).identity != source_snapshot.identity:
                 raise ProjectPathSafetyError(destination, "path-identity-changed")
-            if self.snapshot(source, allow_missing=True).exists:
+            if self._recheck_snapshot(source, _PathSnapshot(False)).exists:
                 raise ProjectPathSafetyError(source, "path-identity-changed")
 
     def remove_empty_directory(self, relative: Path, *, missing_ok: bool) -> None:
