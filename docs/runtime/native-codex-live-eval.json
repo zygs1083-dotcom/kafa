@@ -1,10 +1,10 @@
 {
-  "agent_runtime_seconds": 36.582628,
+  "agent_runtime_seconds": 39.730518,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-18T09:22:48+00:00",
+    "generated_at": "2026-07-18T09:44:47+00:00",
     "git_dirty": false,
-    "git_head": "9698ea8a3f19599031431afe2d065edb8149b35f",
+    "git_head": "17d93e1addcf3da9de4f37f21d0fc025d5b8f313",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -19,7 +19,7 @@
     ],
     "status_entry_count": 0,
     "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "workspace_sha256": "14f5c9a2052c31fac0232c23e63b189b6b02b86952ea6f543da25ff392315f1c"
+    "workspace_sha256": "1f23c96f4b0a06693dce69640940931f63bfc749f50be98c86e179d6b8f45d4e"
   },
   "evidence_scope": "live-codex",
   "live_skipped": false,
@@ -66,17 +66,17 @@
         ],
         "last_message_recorded": true,
         "native_returncode": 0,
-        "native_runtime_seconds": 36.582628,
+        "native_runtime_seconds": 39.730518,
         "native_runtime_source": "controller-wall-clock",
-        "native_token_count": 51973,
+        "native_token_count": 51890,
         "native_token_scope": "native-producers-only",
         "native_token_source": "codex-json-turn.completed",
         "native_usage": {
-          "cached_input_tokens": 36352,
-          "input_tokens": 51370,
-          "output_tokens": 603,
+          "cached_input_tokens": 39424,
+          "input_tokens": 51364,
+          "output_tokens": 526,
           "reasoning_output_tokens": 0,
-          "token_count": 51973
+          "token_count": 51890
         },
         "pre_edit_returncode": 1,
         "producer_changed_files": [
@@ -94,7 +94,7 @@
         "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
         "workload_units": 1
       },
-      "duration_seconds": 38.079076,
+      "duration_seconds": 41.241545,
       "mode": "live-codex",
       "name": "native_codex_edit_and_controller_verify",
       "pass": true,
@@ -102,7 +102,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 38.079099,
+    "duration_seconds": 41.241568,
     "expected_human_review_required_count": 0,
     "failed_count": 0,
     "false_pass_count": 0,
@@ -114,12 +114,12 @@
     "skipped_count": 0,
     "sqlite_lock_error_count": 0
   },
-  "token_count": 51973,
+  "token_count": 51890,
   "token_usage": {
-    "cached_input_tokens": 36352,
-    "input_tokens": 51370,
-    "output_tokens": 603,
+    "cached_input_tokens": 39424,
+    "input_tokens": 51364,
+    "output_tokens": 526,
     "reasoning_output_tokens": 0,
-    "token_count": 51973
+    "token_count": 51890
   }
 }

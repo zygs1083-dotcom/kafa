@@ -7,6 +7,10 @@
 - Baseline `main`: `a24f69a1cae0f9628e4e2632c5948cbf3f366339`.
 - Exact production candidate:
   `9698ea8a3f19599031431afe2d065edb8149b35f`.
+- Exact source/test/evidence candidate:
+  `17d93e1addcf3da9de4f37f21d0fc025d5b8f313`.
+  Relative to the production candidate, it changes only the Windows
+  writable-mode test assertion; production bytes are unchanged.
 - Runtime / kernel / schema: `5.0.0` / `5.0.0` / `30`.
 - Source candidate: `2.0.0-beta.1` (`2.0.0b1`, development state).
 - Public inventory remains 27 active tables, 53 recursive CLI parser nodes,
@@ -23,10 +27,13 @@ network dependency.
 
 Publication, archive, and merge evidence is filled only from completed jobs.
 The first publication at `3794c7d` completed with Ubuntu/macOS success and a
-real Windows failure in both push and pull-request matrices. The corrected
-candidate has not yet completed a remote matrix, so native Windows for the fix
-remains `not-run`; local deterministic Windows fakes are not substituted for
-that evidence.
+real Windows production failure in both push and pull-request matrices. The
+second publication at `1cec82d` closed those production defects and completed
+with Ubuntu/macOS success, but its Windows jobs exposed one POSIX-specific
+test assertion rather than a production failure. The assertion-only correction
+at `17d93e1` has not yet completed a remote matrix, so native Windows for the
+exact source/test candidate remains `not-run`; local deterministic Windows
+fakes are not substituted for that evidence.
 
 ## Delivered behavior
 
@@ -94,28 +101,35 @@ writer/migration races.
 
 ## Local validation
 
-Every passing row below was executed for source candidate `9698ea8`. Evidence
-profiles remain distinct: fixture checks do not prove Native Host behavior, and
-deterministic Windows fakes do not prove native Windows behavior.
+The final strict suite, runtime smoke, Native reports and benchmark were
+executed for source/test candidate `17d93e1`. The unchanged targeted,
+Skill-fixture, fixture/stability E2E and artifact rows bind production candidate
+`9698ea8`; the later commit changes only a cross-platform test assertion.
+Evidence profiles remain distinct: fixture checks do not prove Native Host
+behavior, and deterministic Windows fakes do not prove native Windows behavior.
 
 | Gate | Result |
 | --- | --- |
-| Complete strict unittest discovery | 551 total in 193.323 s; 541 actual passed, 10 native-Windows cases skipped/not-run, 0 failure, 0 error, 0 expected failure; `ResourceWarning` promoted to error |
+| Complete strict unittest discovery | 551 total in 190.339 s; 541 actual passed, 10 native-Windows cases skipped/not-run, 0 failure, 0 error, 0 expected failure; `ResourceWarning` promoted to error |
 | Windows-fix affected ProjectFS/hardening/trust selection | 200 total; 190 actual passed, the same 10 native-Windows cases skipped/not-run, 0 failure/error; rerun outside the restricted socket sandbox |
 | QA-B migration/execution/structured targeted | 94/94 passed; separate 8/8 recovery/artifact attacks and 8/8 parser false-pass cases also passed |
 | Windows-fix focused red/green and delta QA | 7/7 main focused tests; independent delta QA 5/5 and 80/80 actual in its 83-test selection, with three native-Windows cases explicitly not run locally |
-| Runtime smoke | 2/2; all 15 lifecycle return codes zero; directed/full invariant ratio 44.983424 vs 10x minimum |
+| Final Windows mode assertion delta | 2/2 focused cases passed; Windows checks the writable bit, POSIX still requires exact `0o640`; independent read-only review found no production relaxation and Critical/High/Medium = 0 |
+| Runtime smoke | 2/2; all 15 lifecycle return codes zero; directed/full invariant ratio 45.932030 vs 10x minimum |
 | Skill transcript fixture | 17/17 required ordered markers; fixture evidence only |
 | Fixture E2E | 6/6 in 6.780291 s; skipped, failure, false-pass, SQLite-lock and human-intervention counts all zero |
 | Stability E2E | 11/11 in 10.842731 s; skipped, failure, false-pass, SQLite-lock and human-intervention counts all zero |
+| Documentation/release/freeze/control contracts | 49/49 passed with `ResourceWarning` promoted to error |
 | OpenSpec before publication | 4/4 artifacts; strict validation passed |
 | Native persistent report consistency | Single and parallel reports each returned `[]` against current source, Git state, binary and matrix contract |
 
-The immediately preceding full attempt ran 551 tests in 192.777 s and had one
-failure because the reports still named the old source SHA. That attempt is
-failed evidence, not reused as a pass; both Native profiles were regenerated
-before the successful complete rerun above. The older 549-test attempt with one
-stale-report failure also remains failed historical evidence.
+An early full attempt ran 551 tests in 192.777 s and had one failure because the
+reports still named the old source SHA. That attempt is failed evidence, not
+reused as a pass. After both Native profiles were regenerated, production
+candidate `9698ea8` passed 551 tests in 193.323 s. The test-only `17d93e1`
+candidate regenerated those reports again and produced the final 551-test,
+190.339-second pass above. The older 549-test attempt with one stale-report
+failure also remains failed historical evidence.
 
 The source repository intentionally has no `.ai-team` runtime. It was not
 initialized to manufacture delivery facts; OpenSpec, exact-source tests, Native
@@ -132,9 +146,9 @@ workspaces. The controller used its private Kafa snapshot locally.
 
 Both successful reports bind:
 
-- Git HEAD: `9698ea8a3f19599031431afe2d065edb8149b35f`;
+- Git HEAD: `17d93e1addcf3da9de4f37f21d0fc025d5b8f313`;
 - executable workspace SHA-256:
-  `14f5c9a2052c31fac0232c23e63b189b6b02b86952ea6f543da25ff392315f1c`;
+  `1f23c96f4b0a06693dce69640940931f63bfc749f50be98c86e179d6b8f45d4e`;
 - clean status SHA-256:
   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
 - status entries: 0;
@@ -144,15 +158,15 @@ Both successful reports bind:
 
 | Profile | Workload/result | Tokens | Native timing | Controller verification |
 | --- | --- | ---: | ---: | --- |
-| Single | one unit; only `candidate.py`; passed | 51,973 | 36.582628 s | one structured target, rc=0 |
-| Parallel | two disjoint units; `alpha.py` / `beta.py`; passed | 103,986 | 44.739583 s wall; 44.732995 s overlap | two targeted plus combined verification, all rc=0 |
+| Single | one unit; only `candidate.py`; passed | 51,890 | 39.730518 s | 41.241568 s controller; one structured target, rc=0 |
+| Parallel | two disjoint units; `alpha.py` / `beta.py`; passed | 131,715 | 45.364938 s wall; 36.678433 s overlap | 49.129055 s controller; two targeted plus combined verification, all rc=0 |
 
-Parallel used 51,912 and 52,074 tokens for its two producer units. It proves
+Parallel used 65,444 and 66,271 tokens for its two producer units. It proves
 real wall-clock overlap for independent work, not token savings: total parallel
-tokens are about twice the single profile. Shared-context/single execution stays
-the conservative default; parallel fan-out is reserved for independent bounded
-work with deterministic integration checks. Host model identity, monetary cost
-and delivery provenance are not exposed and are not inferred.
+tokens are about 2.54 times the single profile. Shared-context/single execution
+stays the conservative default; parallel fan-out is reserved for independent
+bounded work with deterministic integration checks. Host model identity,
+monetary cost and delivery provenance are not exposed and are not inferred.
 
 Before authorization, two sandboxed single attempts failed solely on DNS for
 the WebSocket and HTTPS Host endpoints, with no token record, no last message
@@ -170,13 +184,13 @@ mutation at most 0.050 s, DB at most 320 KiB, and Plugin payload at most 1 MiB.
 | --- | ---: | ---: | --- |
 | Fresh DB | 315,392 B | 315,392 B | within 320 KiB |
 | Plugin payload file bytes, caches excluded | 695,552 B | 1,022,876 B | within 1 MiB; 25,700 B headroom |
-| Fresh init median | 0.092643 s | 0.163010 s | measured; no new numeric gate |
-| One mutation after 5k facts | 0.004734 s | 0.019125 s | pass vs 0.050 s |
-| Targeted three-view projection | 0.003168 s | 0.014818 s | measured |
-| Full 13-view projection | 0.024034 s | 0.076404 s | measured |
-| Strict full suite | 375 / 146.518 s | 551 / 193.323 s | suite green; below existing 300 s reference |
-| In-scope Python LOC | 32,794 | 49,506 | +50.96% |
-| Test Python LOC | 14,750 | 22,539 | +52.81% |
+| Fresh init median | 0.092643 s | 0.166791 s | measured; no new numeric gate |
+| One mutation after 5k facts | 0.004734 s | 0.018170 s | pass vs 0.050 s |
+| Targeted three-view projection | 0.003168 s | 0.014144 s | measured |
+| Full 13-view projection | 0.024034 s | 0.076529 s | measured |
+| Strict full suite | 375 / 146.518 s | 551 / 190.339 s | suite green; below existing 300 s reference |
+| In-scope Python LOC | 32,794 | 49,512 | +50.98% |
+| Test Python LOC | 14,750 | 22,545 | +52.85% |
 | Plugin Python LOC | 15,903 | 24,894 | +56.54% |
 
 The safety seam and adversarial coverage materially expand code and tests. The
@@ -194,6 +208,10 @@ The real PEP 517 build used the workflow-pinned `build==1.5.1` and produced:
   `bd74d5d8c54c088745533d899e0a4e79248d109bca5904676dce78b089ffbbf3`;
 - sdist `kafa-2.0.0b1.tar.gz`, SHA-256
   `5bbee38bfdcaa82fbcdedabbd1a88f0351bbee9461786e2f2817f53fcaba4b1e`.
+
+The artifact build and smoke bind production candidate `9698ea8`; the later
+`17d93e1` commit changes only a test assertion and does not change artifact
+inputs or production bytes.
 
 Artifact mode passed in a temporary venv, HOME and CODEX_HOME. It verified wheel
 import isolation, sdist manifest identity, marketplace and cache discovery,
@@ -218,9 +236,10 @@ must remain equal after merge.
 
 ## Independent QA and adversarial review
 
-The three broad read-only reviews of source candidate `22523b5`, plus an
-independent review of the exact `22523b5..9698ea8` Windows delta, now have zero
-open Critical, High or Medium finding for the corrected source candidate:
+The three broad read-only reviews of source candidate `22523b5`, an independent
+review of the exact `22523b5..9698ea8` Windows production delta, and a second
+independent review of the `17d93e1` assertion-only delta now have zero open
+Critical, High or Medium finding for the exact source/test candidate:
 
 - QA A reviewed POSIX/Windows ProjectFS, SQLite/Store and operation-lock safety.
   It found the Medium `InMemoryStore` cancellation leak. Main added a
@@ -240,8 +259,15 @@ open Critical, High or Medium finding for the corrected source candidate:
   `FILE_RENAME_INFO` buffer was undersized. They also exposed two POSIX-only
   test seams. Main established portable red tests, fixed the production paths
   and test seams, and an independent delta reviewer signed `9698ea8` with
-  Critical/High/Medium = 0. Native Windows confirmation of the correction
-  remains a remote CI gate.
+  Critical/High/Medium = 0.
+- GitHub's second native Windows matrices passed 60/61 targeted tests and
+  exposed one final test-only mismatch: the assertion required POSIX's exact
+  `0o640` mode on Windows, whose supported contract is readonly/writable mode
+  semantics. The exact `17d93e1` delta keeps POSIX's exact check and asserts
+  the Windows writable bit; an independent reviewer reran both focused cases,
+  found no production relaxation, and signed off with Critical/High/Medium = 0.
+  Native Windows confirmation of this exact source/test candidate remains a
+  remote CI gate.
 
 The adversarial scope explicitly included logical gaps, factual errors, simpler
 alternatives, same-user threat overclaims, data loss, stale candidates, missing
@@ -261,7 +287,8 @@ cancelled or not-run jobs are never called passing.
 | Revision | Push Ubuntu/macOS/Windows | PR Ubuntu/macOS/Windows |
 | --- | --- | --- |
 | First publication `3794c7d` | run `29638103502`: success / success / **failed** (20 failures, 9 errors) | run `29638189380`: success / success / **failed** (20 failures, 9 errors) |
-| Corrected implementation/evidence | not-run | not-run |
+| Corrected implementation/evidence `1cec82d` | run `29639496313`: success / success / **failed** (60/61 targeted passed; one POSIX-specific mode assertion) | run `29639497554`: success / success / **failed** (60/61 targeted passed; one POSIX-specific mode assertion) |
+| Exact source/test/evidence `17d93e1` | not-run | not-run |
 | Closure | not-run | not-run |
 
 ## Residual boundaries
@@ -279,8 +306,9 @@ cancelled or not-run jobs are never called passing.
   sacrificed: sentinel and `rollback-incomplete` diagnostics remain.
 - Native reports prove local capability and report consistency, not independent
   delivery provenance.
-- Native Windows for `9698ea8` remains `not-run` until GitHub's corrected-head
-  Windows jobs execute; the completed `3794c7d` jobs are recorded as failed.
+- Native Windows for exact source/test candidate `17d93e1` remains `not-run`
+  until GitHub's corrected-head Windows jobs execute; the completed `3794c7d`
+  and `1cec82d` Windows jobs are recorded as failed rather than reused.
 - The Plugin payload is within its cap with limited headroom; future growth must
   be measured rather than assumed safe.
 

@@ -28,9 +28,9 @@
   {
     "name": "directed_invariant_benchmark",
     "pass": true,
-    "full_seconds": 0.004183458862826228,
-    "directed_seconds": 9.300000965595245e-05,
-    "ratio": 44.98342396202608,
+    "full_seconds": 0.003988417098298669,
+    "directed_seconds": 8.683302439749241e-05,
+    "ratio": 45.932030192119484,
     "minimum_ratio": 10.0
   }
 ]
