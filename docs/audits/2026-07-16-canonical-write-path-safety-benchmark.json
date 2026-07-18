@@ -15,10 +15,10 @@
   "benchmark_kind": "comparative-report-only",
   "comparison": {
     "current_full_over_targeted_projection": {
-      "baseline": 0.013871,
-      "current": 0.065813,
-      "current_over_baseline": 4.744647,
-      "delta": 0.051942,
+      "baseline": 0.014818,
+      "current": 0.076404,
+      "current_over_baseline": 5.156161,
+      "delta": 0.061586,
       "status": "measured"
     },
     "empty_db_bytes": {
@@ -30,36 +30,36 @@
     },
     "full_test_seconds": {
       "baseline": 406.72,
-      "current": 198.848,
-      "current_over_baseline": 0.488906,
-      "delta": -207.872,
+      "current": 193.323,
+      "current_over_baseline": 0.475322,
+      "delta": -213.397,
       "status": "measured"
     },
     "init_seconds": {
       "baseline": 0.31,
-      "current": 0.161116,
-      "current_over_baseline": 0.519729,
-      "delta": -0.148884,
+      "current": 0.16301,
+      "current_over_baseline": 0.525839,
+      "delta": -0.14699,
       "status": "measured"
     },
     "single_mutation_seconds": {
       "baseline": 0.146113,
-      "current": 0.017312,
-      "current_over_baseline": 0.118484,
-      "delta": -0.128801,
+      "current": 0.019125,
+      "current_over_baseline": 0.130892,
+      "delta": -0.126988,
       "status": "measured"
     },
     "targeted_projection_seconds": {
       "baseline": null,
-      "current": 0.013871,
+      "current": 0.014818,
       "current_over_baseline": null,
       "delta": null,
       "status": "not-comparable"
     }
   },
-  "created_at": "2026-07-18T08:45:45.398521+00:00",
+  "created_at": "2026-07-18T09:32:01.160942+00:00",
   "environment": {
-    "head": "22523b53d9d26c790dae49f763eed2bc5a8c4bc5",
+    "head": "9698ea8a3f19599031431afe2d065edb8149b35f",
     "machine": "arm64",
     "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
     "python": "3.14.6",
@@ -84,7 +84,7 @@
       ]
     },
     "full_projection": {
-      "median_seconds": 0.065813,
+      "median_seconds": 0.076404,
       "projection_count": 13,
       "projections": [
         "project-state",
@@ -103,47 +103,47 @@
       ],
       "sample_count": 5,
       "samples_seconds": [
-        0.064432,
-        0.065813,
-        0.068141,
-        0.081176,
-        0.065509
+        0.071102,
+        0.076404,
+        0.084821,
+        0.083573,
+        0.07147
       ]
     },
     "full_test": {
       "command": "python3 -W error::ResourceWarning -m unittest discover -s tests -p test_*.py",
-      "seconds": 198.848,
+      "seconds": 193.323,
       "status": "passed",
-      "test_count": 549
+      "test_count": 551
     },
     "init": {
-      "median_seconds": 0.161116,
+      "median_seconds": 0.16301,
       "sample_count": 5,
       "samples_seconds": [
-        0.16264,
-        0.161116,
-        0.148586,
-        0.162936,
-        0.151074
+        0.164378,
+        0.16301,
+        0.157216,
+        0.181685,
+        0.159016
       ]
     },
     "runtime_version": "5.0.0",
     "schema_version": 30,
     "single_mutation_after_local_facts": {
       "fact_count": 5000,
-      "median_seconds": 0.017312,
+      "median_seconds": 0.019125,
       "projection_count": 3,
       "sample_count": 5,
       "samples_seconds": [
-        0.017781,
-        0.017669,
-        0.017312,
-        0.017227,
-        0.016941
+        0.019271,
+        0.018661,
+        0.024855,
+        0.019125,
+        0.01909
       ]
     },
     "targeted_projection": {
-      "median_seconds": 0.013871,
+      "median_seconds": 0.014818,
       "projection_count": 3,
       "projections": [
         "project-state",
@@ -152,11 +152,11 @@
       ],
       "sample_count": 5,
       "samples_seconds": [
-        0.01329,
-        0.013871,
-        0.013146,
-        0.014,
-        0.01474
+        0.014515,
+        0.01455,
+        0.014818,
+        0.0214,
+        0.015016
       ]
     }
   },
