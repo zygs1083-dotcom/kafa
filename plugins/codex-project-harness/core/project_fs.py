@@ -2611,8 +2611,16 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
     ) -> None:
         encoded_name = os.fspath(destination).encode("utf-16-le")
         file_name_offset = _FILE_RENAME_INFO.file_name.offset
+        # FILE_RENAME_INFO needs the complete declared structure plus the
+        # variable UTF-16 filename bytes.  The former buffer stopped at the
+        # flexible-array offset, four bytes short of sizeof(FILE_RENAME_INFO)
+        # on x64.  Keep an additional zeroed UTF-16 code unit defensively;
+        # FileNameLength still excludes it.
+        buffer_size = (
+            ctypes.sizeof(_FILE_RENAME_INFO) + len(encoded_name) + 2
+        )
         buffer = ctypes.create_string_buffer(
-            file_name_offset + len(encoded_name)
+            buffer_size
         )
         rename_info = ctypes.cast(
             buffer,
@@ -3234,6 +3242,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         relative: Path,
         *,
         create: bool,
+        allow_missing: bool = False,
     ) -> Iterator[Path]:
         handles: list[int] = []
         current = self.root
@@ -3247,7 +3256,14 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 try:
                     handle = self._open_handle(current, directory=True)
                 except OSError as exc:
-                    if not create or exc.errno not in {2, 3}:
+                    missing = (
+                        isinstance(exc, FileNotFoundError)
+                        or exc.errno in {2, 3}
+                        or getattr(exc, "winerror", None) in {2, 3}
+                    )
+                    if not create and allow_missing and missing:
+                        raise _MissingAncestor from exc
+                    if not create or not missing:
                         raise ProjectPathSafetyError(relative, "unsafe-ancestor") from exc
                     try:
                         os.mkdir(current, 0o700)
@@ -3288,7 +3304,11 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         expect_directory: bool = False,
     ) -> _PathSnapshot:
         try:
-            with self._ancestors(relative, create=False) as parent:
+            with self._ancestors(
+                relative,
+                create=False,
+                allow_missing=allow_missing,
+            ) as parent:
                 path = parent / relative.name
                 try:
                     handle = self._open_handle(path, directory=expect_directory)
@@ -3307,6 +3327,8 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 if identity.volume != self.root_identity.volume:
                     raise ProjectPathSafetyError(relative, "cross-device-ancestor")
                 return _PathSnapshot(True, identity)
+        except _MissingAncestor:
+            return _PathSnapshot(False)
         except ProjectPathSafetyError:
             raise
         except OSError as exc:
@@ -3328,7 +3350,11 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         """
 
         try:
-            with self._ancestors(relative, create=False) as parent:
+            with self._ancestors(
+                relative,
+                create=False,
+                allow_missing=allow_missing,
+            ) as parent:
                 path = parent / relative.name
                 try:
                     # BACKUP_SEMANTICS permits opening a directory if an
@@ -3347,6 +3373,8 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 finally:
                     self._close(handle)
                 return _PathSnapshot(True, identity)
+        except _MissingAncestor:
+            return _PathSnapshot(False)
         except ProjectPathSafetyError:
             raise
         except OSError as exc:

@@ -78,7 +78,7 @@ jobs:
           rm -rf .agents
 
       - name: Run local core hardening targeted tests
-        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests.test_local_core_hardening tests.test_local_delivery_policy
+        run: ${{ matrix.python }} -W error::ResourceWarning -m unittest tests.test_local_core_hardening tests.test_local_delivery_policy tests.test_project_fs_safety.ProjectFSFoundationTests.test_safe_read_write_copy_lock_unique_directory_and_unlink
 
       - name: Isolated artifact install smoke
         run: |

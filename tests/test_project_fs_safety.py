@@ -5645,6 +5645,41 @@ class ProjectFSFoundationTests(unittest.TestCase):
                 ):
                     self.fail("unsafe Windows ancestor was accepted")
 
+    def test_windows_snapshot_allows_a_missing_ancestor_when_missing_is_allowed(self) -> None:
+        from core.project_fs import (
+            _PathIdentity,
+            _PathSnapshot,
+            _WindowsBackend,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            backend = object.__new__(_WindowsBackend)
+            backend.root = Path(temp)
+            backend.root_identity = _PathIdentity(
+                volume=1,
+                file_id=b"root",
+                kind="directory",
+                mode_or_attributes=0,
+                nlink=0,
+            )
+
+            def open_handle(path: Path, **_kwargs):
+                if Path(path) == backend.root:
+                    return 101
+                raise FileNotFoundError(2, "injected missing ancestor")
+
+            backend._open_handle = open_handle
+            backend._close = lambda _handle: None
+            backend._identity = lambda *_args, **_kwargs: backend.root_identity
+
+            relative = Path(".ai-team/state/local-core-migration.lock")
+            for operation in (backend.snapshot, backend._raw_snapshot):
+                with self.subTest(operation=operation.__name__):
+                    self.assertEqual(
+                        operation(relative, allow_missing=True),
+                        _PathSnapshot(False),
+                    )
+
     def test_windows_rename_error_mapping_distinguishes_capability_and_race(self) -> None:
         from core.project_fs import _windows_rename_error_reason
 
@@ -5660,6 +5695,76 @@ class ProjectFSFoundationTests(unittest.TestCase):
                     _windows_rename_error_reason(OSError(code, "race")),
                     "path-identity-changed",
                 )
+
+    def test_windows_handle_rename_buffer_contains_a_terminated_utf16_path(self) -> None:
+        import ctypes
+
+        from core import project_fs as project_fs_module
+        from core.project_fs import _WindowsBackend
+
+        class FakeRenameInfo(ctypes.Structure):
+            _fields_ = (
+                ("flags", ctypes.c_uint32),
+                ("root_directory", ctypes.c_void_p),
+                ("file_name_length", ctypes.c_uint32),
+                ("file_name", ctypes.c_uint16 * 1),
+            )
+
+        captured: dict[str, object] = {}
+
+        class FakeApi:
+            @staticmethod
+            def SetFileInformationByHandle(
+                _handle,
+                information_class,
+                buffer,
+                buffer_size,
+            ) -> bool:
+                information = ctypes.cast(
+                    buffer,
+                    ctypes.POINTER(FakeRenameInfo),
+                ).contents
+                captured.update(
+                    information_class=information_class,
+                    file_name_length=int(information.file_name_length),
+                    buffer_size=buffer_size,
+                    raw=ctypes.string_at(buffer, buffer_size),
+                )
+                return True
+
+        backend = object.__new__(_WindowsBackend)
+        backend.api = FakeApi()
+        destination = Path("C:/project/state/target.txt")
+        encoded = os.fspath(destination).encode("utf-16-le")
+        offset = FakeRenameInfo.file_name.offset
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_RENAME_INFO=FakeRenameInfo,
+            _FILE_RENAME_INFO_EX_CLASS=22,
+            _FILE_RENAME_REPLACE_IF_EXISTS=0x01,
+            _FILE_RENAME_POSIX_SEMANTICS=0x02,
+            _FILE_RENAME_IGNORE_READONLY_ATTRIBUTE=0x40,
+            create=True,
+        ):
+            backend._rename_by_handle(
+                101,
+                destination,
+                Path("state/target.txt"),
+                replace_existing=False,
+            )
+
+        raw = captured["raw"]
+        self.assertIsInstance(raw, bytes)
+        assert isinstance(raw, bytes)
+        self.assertEqual(captured["information_class"], 22)
+        self.assertEqual(captured["file_name_length"], len(encoded))
+        self.assertGreaterEqual(
+            captured["buffer_size"],
+            ctypes.sizeof(FakeRenameInfo) + len(encoded),
+        )
+        self.assertEqual(raw[offset : offset + len(encoded)], encoded)
+        self.assertEqual(raw[offset + len(encoded) : offset + len(encoded) + 2], b"\0\0")
 
     @unittest.skipUnless(os.name == "nt", "Windows partial-write cleanup contract")
     def test_windows_partial_write_preserves_primary_error_and_cleans_target(self) -> None:
