@@ -15,7 +15,7 @@ import stat
 import sys
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable, Iterator
 
@@ -35,6 +35,9 @@ _NT_FILE_CREATED = 0x00000002
 _NT_FILE_DIRECTORY_FILE = 0x00000001
 _NT_FILE_WRITE_THROUGH = 0x00000002
 _NT_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_FILE_WRITE_ATTRIBUTES = 0x00000100
+_FILE_ATTRIBUTE_READONLY = 0x00000001
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WINDOWS_REPLACE_METADATA_UNVERIFIED = (
     "Windows ReplaceFileW failure may have changed source streams or security "
     "metadata; complete source metadata rollback is not verified and requires "
@@ -2272,16 +2275,13 @@ if os.name == "nt":  # pragma: no cover - exercised by the Windows matrix
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
     _DELETE = 0x00010000
-    _FILE_WRITE_ATTRIBUTES = 0x00000100
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
     _FILE_SHARE_DELETE = 0x00000004
     _CREATE_NEW = 1
     _OPEN_EXISTING = 3
     _OPEN_ALWAYS = 4
-    _FILE_ATTRIBUTE_READONLY = 0x00000001
     _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
-    _FILE_ATTRIBUTE_NORMAL = 0x00000080
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -3031,6 +3031,28 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 "platform-safety-unavailable",
             ) from self.api.error()
 
+    def _restore_pinned_file_attributes(
+        self,
+        handle: int,
+        relative: Path,
+        expected: _PathIdentity,
+        *,
+        allow_disposed: bool = False,
+    ) -> bool:
+        current = self._raw_identity(handle, relative=relative)
+        current_snapshot = _PathSnapshot(True, current)
+        expected_snapshot = _PathSnapshot(True, expected)
+        if not self._same_windows_raw_object(current_snapshot, expected_snapshot):
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        if current.nlink == 0:
+            if allow_disposed:
+                return False
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        self._apply_file_attributes(handle, relative, expected.mode_or_attributes)
+        if self._raw_identity(handle, relative=relative) != expected:
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        return True
+
     def _restore_known_file_attributes(
         self,
         path: Path,
@@ -3337,17 +3359,8 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 destination,
                 "path-identity-changed",
             )
-        replace_error: OSError | None = None
-        try:
-            replaced = self.api.ReplaceFileW(
-                os.fspath(destination_path),
-                os.fspath(source_path),
-                os.fspath(backup_path),
-                _REPLACEFILE_FLAGS_NONE,
-                None,
-                None,
-            )
-        except BaseException as exc:
+
+        def reconcile_failure(error: BaseException) -> None:
             self._reconcile_windows_replace_interruption(
                 source_path,
                 source,
@@ -3357,14 +3370,32 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 destination_snapshot,
                 backup_path,
                 backup_relative,
-                exc,
+                error,
             )
             self._annotate_windows_replace_uncertainty(
                 source_path,
                 source,
                 source_identity,
-                exc,
+                error,
             )
+
+        replace_error: OSError | None = None
+        try:
+            self._prepare_replacement_source(
+                source_path,
+                source,
+                source_identity,
+            )
+            replaced = self.api.ReplaceFileW(
+                os.fspath(destination_path),
+                os.fspath(source_path),
+                os.fspath(backup_path),
+                _REPLACEFILE_FLAGS_NONE,
+                None,
+                None,
+            )
+        except BaseException as exc:
+            reconcile_failure(exc)
             raise
         if not replaced:
             # ReplaceFileW documents a partial failure (1177) where the old
@@ -3374,23 +3405,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             try:
                 replace_error = self.api.error()
             except BaseException as exc:
-                self._reconcile_windows_replace_interruption(
-                    source_path,
-                    source,
-                    source_identity,
-                    destination_path,
-                    destination,
-                    destination_snapshot,
-                    backup_path,
-                    backup_relative,
-                    exc,
-                )
-                self._annotate_windows_replace_uncertainty(
-                    source_path,
-                    source,
-                    source_identity,
-                    exc,
-                )
+                reconcile_failure(exc)
                 raise
         try:
             final = self._raw_snapshot(destination, allow_missing=True)
@@ -3406,23 +3421,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                     destination,
                     "path-identity-changed",
                 )
-            self._reconcile_windows_replace_interruption(
-                source_path,
-                source,
-                source_identity,
-                destination_path,
-                destination,
-                destination_snapshot,
-                backup_path,
-                backup_relative,
-                error,
-            )
-            self._annotate_windows_replace_uncertainty(
-                source_path,
-                source,
-                source_identity,
-                error,
-            )
+            reconcile_failure(error)
             if error is exc:
                 raise
             raise error from exc
@@ -3459,23 +3458,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 error.add_note(
                     f"Windows partial replacement completion failed: {completion_error}"
                 )
-                self._reconcile_windows_replace_interruption(
-                    source_path,
-                    source,
-                    source_identity,
-                    destination_path,
-                    destination,
-                    destination_snapshot,
-                    backup_path,
-                    backup_relative,
-                    error,
-                )
-                self._annotate_windows_replace_uncertainty(
-                    source_path,
-                    source,
-                    source_identity,
-                    error,
-                )
+                reconcile_failure(error)
                 if error is completion_error:
                     raise
                 raise error from replace_error
@@ -3493,23 +3476,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                         destination,
                         "path-identity-changed",
                     )
-                self._reconcile_windows_replace_interruption(
-                    source_path,
-                    source,
-                    source_identity,
-                    destination_path,
-                    destination,
-                    destination_snapshot,
-                    backup_path,
-                    backup_relative,
-                    error,
-                )
-                self._annotate_windows_replace_uncertainty(
-                    source_path,
-                    source,
-                    source_identity,
-                    error,
-                )
+                reconcile_failure(error)
                 if error is exc:
                     raise
                 raise error from exc
@@ -3538,23 +3505,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             )
             if replace_error is not None:
                 error.add_note(f"ReplaceFileW failed: {replace_error}")
-            self._reconcile_windows_replace_interruption(
-                source_path,
-                source,
-                source_identity,
-                destination_path,
-                destination,
-                destination_snapshot,
-                backup_path,
-                backup_relative,
-                error,
-            )
-            self._annotate_windows_replace_uncertainty(
-                source_path,
-                source,
-                source_identity,
-                error,
-            )
+            reconcile_failure(error)
             if replace_error is not None:
                 raise error from replace_error
             raise error
@@ -3636,23 +3587,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 self._close(final_handle)
                 final_handle = _INVALID_HANDLE_VALUE
         except BaseException as exc:
-            self._reconcile_windows_replace_interruption(
-                source_path,
-                source,
-                source_identity,
-                destination_path,
-                destination,
-                destination_snapshot,
-                backup_path,
-                backup_relative,
-                exc,
-            )
-            self._annotate_windows_replace_uncertainty(
-                source_path,
-                source,
-                source_identity,
-                exc,
-            )
+            reconcile_failure(exc)
             raise
         return final_identity
 
@@ -3733,6 +3668,7 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         *,
         allow_missing: bool,
         expect_directory: bool = False,
+        leaf_share_delete: bool = False,
     ) -> _PathSnapshot:
         try:
             with self._ancestors(
@@ -3742,7 +3678,11 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
             ) as parent:
                 path = parent / relative.name
                 try:
-                    handle = self._open_handle(path, directory=expect_directory)
+                    handle = self._open_handle(
+                        path,
+                        directory=expect_directory,
+                        share_delete=leaf_share_delete,
+                    )
                 except OSError as exc:
                     if allow_missing and exc.errno in {2, 3}:
                         return _PathSnapshot(False)
@@ -3773,12 +3713,14 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         expected: _PathSnapshot,
         *,
         expect_directory: bool = False,
+        leaf_share_delete: bool = False,
     ) -> _PathSnapshot:
         try:
             return self.snapshot(
                 relative,
                 allow_missing=not expected.exists,
                 expect_directory=expect_directory,
+                leaf_share_delete=leaf_share_delete,
             )
         except ProjectPathSafetyError as exc:
             if exc.reason in {
@@ -4156,6 +4098,71 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         # never followed.
         return _INVALID_HANDLE_VALUE, None
 
+    def _make_pinned_file_writable(
+        self,
+        handle: int,
+        relative: Path,
+        expected: _PathIdentity,
+        *,
+        leaf_share_delete: bool = False,
+    ) -> _PathIdentity:
+        current = self._identity(handle, expect_directory=False, relative=relative)
+        if current != expected:
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        writable_attributes = expected.mode_or_attributes & ~_FILE_ATTRIBUTE_READONLY
+        self._apply_file_attributes(handle, relative, writable_attributes)
+        writable = self._identity(handle, expect_directory=False, relative=relative)
+        snapshot = _PathSnapshot(True, writable)
+        normalized = (writable_attributes & ~_FILE_ATTRIBUTE_NORMAL) or _FILE_ATTRIBUTE_NORMAL
+        if (
+            writable != replace(expected, mode_or_attributes=normalized)
+            or self._recheck_snapshot(relative, snapshot, leaf_share_delete=leaf_share_delete)
+            != snapshot
+        ):
+            raise ProjectPathSafetyError(relative, "path-identity-changed")
+        return writable
+
+    def _make_replacement_source_writable(
+        self,
+        handle: int,
+        relative: Path,
+        expected: _PathIdentity,
+    ) -> None:
+        if not expected.mode_or_attributes & _FILE_ATTRIBUTE_READONLY:
+            return
+        try:
+            self._make_pinned_file_writable(
+                handle, relative, expected, leaf_share_delete=True
+            )
+        except BaseException as exc:
+            try:
+                self._restore_pinned_file_attributes(handle, relative, expected)
+            except BaseException as restore_error:
+                exc.add_note(
+                    "Windows readonly replacement source restore failed: "
+                    f"{restore_error}"
+                )
+            raise
+
+    def _prepare_replacement_source(
+        self,
+        path: Path,
+        relative: Path,
+        expected: _PathIdentity,
+    ) -> None:
+        if not expected.mode_or_attributes & _FILE_ATTRIBUTE_READONLY:
+            return
+        try:
+            handle = self._open_handle(
+                path, directory=False, access=_FILE_WRITE_ATTRIBUTES
+            )
+        except OSError as exc:
+            raise ProjectPathSafetyError(relative, "path-identity-changed") from exc
+        try:
+            self._make_replacement_source_writable(handle, relative, expected)
+        finally:
+            self._close(handle)
+
     @contextmanager
     def _temporarily_writable_destination(
         self,
@@ -4187,35 +4194,11 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
                 )
             if needs_restore:
                 restore_allowed = True
-                writable_attributes = (
-                    original.mode_or_attributes & ~_FILE_ATTRIBUTE_READONLY
-                )
-                self._apply_file_attributes(
+                writable = self._make_pinned_file_writable(
                     handle,
                     relative,
-                    writable_attributes,
+                    original,
                 )
-                writable = self._identity(
-                    handle,
-                    expect_directory=False,
-                    relative=relative,
-                )
-                normalized_writable = (
-                    writable_attributes & ~_FILE_ATTRIBUTE_NORMAL
-                ) or _FILE_ATTRIBUTE_NORMAL
-                if (
-                    not self._same_windows_object(
-                        _PathSnapshot(True, writable),
-                        original,
-                    )
-                    or writable.mode_or_attributes != normalized_writable
-                    or self._recheck_snapshot(relative, _PathSnapshot(True, writable))
-                    != _PathSnapshot(True, writable)
-                ):
-                    raise ProjectPathSafetyError(
-                        relative,
-                        "path-identity-changed",
-                    )
                 lease.working_snapshot = _PathSnapshot(True, writable)
             yield lease
         except BaseException as exc:
@@ -4224,29 +4207,13 @@ class _WindowsBackend:  # pragma: no cover - exercised by Windows validation
         finally:
             if restore_allowed and not lease.discarded:
                 try:
-                    current_raw = self._raw_identity(handle, relative=relative)
-                    if not self._same_windows_raw_object(
-                        _PathSnapshot(True, current_raw),
-                        expected,
+                    if not self._restore_pinned_file_attributes(
+                        handle,
+                        relative,
+                        original,
+                        allow_disposed=True,
                     ):
-                        raise ProjectPathSafetyError(
-                            relative,
-                            "path-identity-changed",
-                        )
-                    if current_raw.nlink == 0:
                         lease.discarded = True
-                    else:
-                        self._apply_file_attributes(
-                            handle,
-                            relative,
-                            original.mode_or_attributes,
-                        )
-                        restored = self._raw_identity(handle, relative=relative)
-                        if restored != original:
-                            raise ProjectPathSafetyError(
-                                relative,
-                                "path-identity-changed",
-                            )
                 except BaseException as restore_error:
                     if primary_error is None:
                         raise

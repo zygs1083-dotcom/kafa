@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import multiprocessing
 import os
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import types
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
@@ -4877,17 +4878,29 @@ class ProjectFSContractRedTests(unittest.TestCase):
             def require_sharing_denial(
                 operation,
                 failures: list[OSError],
+                *,
+                allow_crt_eacces: bool = False,
             ) -> None:
                 try:
                     operation()
                 except OSError as exc:
-                    if not isinstance(exc, PermissionError) or getattr(
+                    native_sharing_denial = getattr(
                         exc,
                         "winerror",
                         None,
-                    ) not in {5, 32}:
+                    ) in {5, 32}
+                    crt_sharing_denial = (
+                        allow_crt_eacces
+                        and getattr(exc, "winerror", None) is None
+                        and exc.errno == errno.EACCES
+                    )
+                    if not isinstance(exc, PermissionError) or not (
+                        native_sharing_denial or crt_sharing_denial
+                    ):
                         raise
                     failures.append(exc)
+                else:
+                    self.fail("attacker operation unexpectedly succeeded")
 
             def attempt_final_move(
                 _backend,
@@ -4903,6 +4916,7 @@ class ProjectFSContractRedTests(unittest.TestCase):
                 require_sharing_denial(
                     lambda: target.write_bytes(b"attacker\n"),
                     blocked_writes,
+                    allow_crt_eacces=True,
                 )
                 require_sharing_denial(
                     lambda: os.link(target, outside_alias),
@@ -4927,6 +4941,12 @@ class ProjectFSContractRedTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"new\n")
             self.assertFalse(parked.exists())
             self.assertFalse(outside_alias.exists())
+            target.write_bytes(b"after-close\n")
+            target.rename(parked)
+            parked.rename(target)
+            os.link(target, outside_alias)
+            outside_alias.unlink()
+            self.assertEqual(target.read_bytes(), b"after-close\n")
 
 
 class ProjectFSFoundationTests(unittest.TestCase):
@@ -5368,7 +5388,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
                     current.volume,
                     current.file_id,
                     current.kind,
-                    int(attributes),
+                    int(attributes) or 0x80,
                     current.nlink,
                 ),
             )
@@ -5380,6 +5400,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
         backend._identity = (
             lambda *_args, **_kwargs: state[source].identity
         )
+        backend._raw_identity = backend._identity
         backend._close = lambda _handle: None
         backend._apply_file_attributes = apply_file_attributes
 
@@ -5566,6 +5587,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
         backend._raw_snapshot = snapshot
         backend.replace_file = replace_file
         backend._restore_known_file_attributes = restore_attributes
+        backend._prepare_replacement_source = lambda *_args: None
 
         with (
             patch.object(
@@ -5665,6 +5687,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
         backend.snapshot = snapshot
         backend._raw_snapshot = raw_snapshot
         backend._restore_known_file_attributes = restore_attributes
+        backend._prepare_replacement_source = lambda *_args: None
 
         with (
             patch.object(
@@ -5780,6 +5803,7 @@ class ProjectFSFoundationTests(unittest.TestCase):
         backend._raw_snapshot = raw_snapshot
         backend.replace_file = replace_file
         backend._restore_known_file_attributes = restore_attributes
+        backend._prepare_replacement_source = lambda *_args: None
 
         with (
             patch.object(
@@ -6900,6 +6924,159 @@ class ProjectFSFoundationTests(unittest.TestCase):
 
         self.assertEqual(applied, [0, readonly])
         self.assertEqual(attributes, readonly)
+
+    def test_windows_readonly_replacement_source_is_prepared_through_pinned_handle(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        readonly = 0x01
+        normal = 0x80
+        attributes = readonly
+        applied: list[int] = []
+        recheck_share_delete: list[bool] = []
+        backend = object.__new__(_WindowsBackend)
+        relative = Path("state/replacement.txt")
+        original = _PathIdentity(1, b"replacement", "file", readonly, 1)
+
+        def identity(*_args, **_kwargs):
+            return _PathIdentity(1, b"replacement", "file", attributes, 1)
+
+        def apply_attributes(_handle, _relative, value) -> None:
+            nonlocal attributes
+            applied.append(int(value))
+            attributes = int(value) or normal
+
+        backend._identity = identity
+        backend._raw_identity = identity
+        backend._apply_file_attributes = apply_attributes
+
+        def recheck(*_args, **kwargs):
+            recheck_share_delete.append(
+                bool(kwargs.get("leaf_share_delete", False))
+            )
+            return _PathSnapshot(True, identity())
+
+        backend._recheck_snapshot = recheck
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_ATTRIBUTE_READONLY=readonly,
+            _FILE_ATTRIBUTE_NORMAL=normal,
+            create=True,
+        ):
+            backend._make_replacement_source_writable(
+                101,
+                relative,
+                original,
+            )
+
+        self.assertEqual(applied, [0])
+        self.assertEqual(attributes, normal)
+        self.assertEqual(recheck_share_delete, [True])
+
+    def test_windows_snapshot_share_delete_is_scoped_to_the_leaf_handle(
+        self,
+    ) -> None:
+        from core.project_fs import _PathIdentity, _WindowsBackend
+
+        backend = object.__new__(_WindowsBackend)
+        backend.root_identity = _PathIdentity(
+            1,
+            b"root",
+            "directory",
+            0x10,
+            0,
+        )
+        leaf_identity = _PathIdentity(1, b"leaf", "file", 0x80, 1)
+        opened: list[dict[str, object]] = []
+
+        @contextmanager
+        def ancestors(*_args, **_kwargs):
+            yield Path("C:/project/state")
+
+        def open_handle(_path, **kwargs):
+            opened.append(dict(kwargs))
+            return 101
+
+        backend._ancestors = ancestors
+        backend._open_handle = open_handle
+        backend._identity = lambda *_args, **_kwargs: leaf_identity
+        backend._close = lambda _handle: None
+
+        shared = backend.snapshot(
+            Path("state/replacement.txt"),
+            allow_missing=False,
+            leaf_share_delete=True,
+        )
+        ordinary = backend.snapshot(
+            Path("state/replacement.txt"),
+            allow_missing=False,
+        )
+
+        self.assertEqual(shared.identity, leaf_identity)
+        self.assertEqual(ordinary.identity, leaf_identity)
+        self.assertEqual(
+            [entry.get("share_delete") for entry in opened],
+            [True, False],
+        )
+
+    def test_windows_replacement_source_preflight_restores_on_path_exchange(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import _PathIdentity, _PathSnapshot, _WindowsBackend
+
+        readonly = 0x01
+        normal = 0x80
+        attributes = readonly
+        applied: list[int] = []
+        recheck_share_delete: list[bool] = []
+        backend = object.__new__(_WindowsBackend)
+        relative = Path("state/replacement.txt")
+        original = _PathIdentity(1, b"replacement", "file", readonly, 1)
+        attacker = _PathIdentity(1, b"attacker", "file", normal, 1)
+
+        def identity(*_args, **_kwargs):
+            return _PathIdentity(1, b"replacement", "file", attributes, 1)
+
+        def apply_attributes(_handle, _relative, value) -> None:
+            nonlocal attributes
+            applied.append(int(value))
+            attributes = int(value) or normal
+
+        backend._identity = identity
+        backend._raw_identity = identity
+        backend._apply_file_attributes = apply_attributes
+
+        def recheck(*_args, **kwargs):
+            recheck_share_delete.append(
+                bool(kwargs.get("leaf_share_delete", False))
+            )
+            return _PathSnapshot(True, attacker)
+
+        backend._recheck_snapshot = recheck
+
+        with patch.multiple(
+            project_fs_module,
+            _FILE_ATTRIBUTE_READONLY=readonly,
+            _FILE_ATTRIBUTE_NORMAL=normal,
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                Exception,
+                "path-identity-changed",
+            ):
+                backend._make_replacement_source_writable(
+                    101,
+                    relative,
+                    original,
+                )
+
+        self.assertEqual(applied, [0, readonly])
+        self.assertEqual(attributes, readonly)
+        self.assertEqual(recheck_share_delete, [True])
 
     def test_windows_readonly_destination_pin_allows_exact_attribute_restore(self) -> None:
         from core import project_fs as project_fs_module
