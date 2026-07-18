@@ -12,6 +12,10 @@
   The final commit changes only tests and evidence. Production and wheel
   payload inputs are unchanged from `c99bf9b`; the final sdist includes the
   test delta and was built from the exact `889fee31` workspace.
+- Exact archive/closure candidate:
+  `a5f7fae97a71fa5026581459ee8096a2875e88ba`.
+- Normal PR #16 merge commit:
+  `267f2e9d0295d729418bd75b1cde82546220eb84`.
 - Runtime / kernel / schema: `5.0.0` / `5.0.0` / `30`.
 - Source candidate: `2.0.0-beta.1` (`2.0.0b1`, development state).
 - Public inventory remains 27 active tables, 53 recursive CLI parser nodes,
@@ -30,8 +34,9 @@ The exact `889fee31` push run `29649886701` and pull-request run `29649888195`
 each completed successfully on Ubuntu, macOS, and native Windows. Earlier
 Windows failures remain failed historical evidence below; no corrected run is
 used to relabel them. OpenSpec archive completed locally as
-`2026-07-18-canonical-write-path-safety`; closure publication is still
-`not-run` at this audit checkpoint.
+`2026-07-18-canonical-write-path-safety`. Exact closure push run
+`29651876789` and pull-request run `29651878279` each passed Ubuntu, macOS,
+and native Windows before PR #16 was normally merged.
 
 ## Delivered behavior
 
@@ -262,13 +267,29 @@ later green run does not change the earlier result.
 | `cf02a71` canonical race fixes | run `29643657623`: success / success / **failed** (567 total; 2 errors, 27 skipped) | run `29643658989`: success / success / **failed** (same two errors) |
 | `c99bf9b` readonly-source fix | run `29648440031`: success / success / **failed** (570 total; 1 failure, 27 skipped; incorrect test assumption that an exclusive handle blocks hardlink creation) | run `29648441419`: success / success / **failed** (same assertion) |
 | Exact `889fee31` source/test/evidence | run `29649886701`: **success / success / success** (Windows: 571 total, 27 skipped) | run `29649888195`: **success / success / success** (Windows: 571 total, 27 skipped) |
-| Closure head | not-run | not-run |
+| Superseded closure `24d83a1` | run `29651540784`: success / success / **cancelled** (Windows cancelled after the audit digest was corrected) | run `29651542120`: success / success / **cancelled** (same supersession) |
+| Exact closure `a5f7fae` | run `29651876789`: **success / success / success** (Windows: 571 total, 27 skipped) | run `29651878279`: **success / success / success** (Windows: 571 total, 27 skipped) |
 
-All six successful `889fee31` jobs have one warning annotation: GitHub reports
-Node.js 20 deprecation for `actions/checkout@v4` and `actions/setup-python@v5`
-and currently forces those actions to Node.js 24. The annotation is recorded as
-a maintenance warning, not a failed test. Platform-conditional skipped steps
-inside a successful job remain skipped; they are not described as passes.
+Each of the six successful `889fee31` jobs and six successful `a5f7fae` jobs
+has one warning annotation: GitHub reports Node.js 20 deprecation for
+`actions/checkout@v4` and `actions/setup-python@v5` and currently forces those
+actions to Node.js 24. The annotation is recorded as a maintenance warning,
+not a failed test. Platform-conditional skipped steps inside a successful job
+remain skipped; they are not described as passes.
+
+## Merge and installation closure
+
+- PR #16 merged exact head `a5f7fae` normally at
+  `2026-07-18T16:41:26Z`; merge commit is `267f2e9`.
+- After fetch/prune and fast-forward, local `main` and `origin/main` both
+  resolved to `267f2e9`. The feature head was proved to be a `main` ancestor,
+  then the merged local and remote feature branches were deleted.
+- Post-merge `kafa --version` remains `2.0.0-beta.1`. Official user-scope
+  doctor returns `ok=true`; deployment source, installed Plugin, and Codex
+  cache remain equal at digest `e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed`.
+- The merge commit has no tag, the latest GitHub release remains
+  `v1.21.3-beta.1` from 2026-06-27, and no release workflow run exists for this
+  delivery. No business project migration was executed.
 
 ## Residual boundaries
 
@@ -291,7 +312,6 @@ inside a successful job remain skipped; they are not described as passes.
   independent delivery provenance.
 - Plugin payload headroom is only 4,487 B. The Node 20 action annotation is a
   real maintenance item even though the exact matrices are successful.
-- Closure matrices remain `not-run` until the archive commit is pushed.
 
 No tag, release, deploy, production/business-project migration, secret change,
 or current user-plugin replacement is authorized or performed by this change.

@@ -77,5 +77,5 @@
 
 - [x] 11.1 Update the final audit with red/green evidence, before/after metrics, exact local and CI run IDs, QA findings, residual risks, and explicit no-tag/no-release/no-deploy status.
 - [x] 11.2 Mark every checklist item from actual evidence, validate the completed change strictly, and archive it into the canonical `local-delivery-kernel` spec.
-- [ ] 11.3 Run the post-archive documentation contract and exact final-source checks, commit/push the closure, wait for all six matrix jobs, and normally merge the PR.
-- [ ] 11.4 Fetch/prune, confirm local `main==origin/main` and the PR is merged, remove only the merged feature branch, and verify the current user plugin installation was not replaced.
+- [x] 11.3 Run the post-archive documentation contract and exact final-source checks, commit/push the closure, wait for all six matrix jobs, and normally merge the PR.
+- [x] 11.4 Fetch/prune, confirm local `main==origin/main` and the PR is merged, remove only the merged feature branch, and verify the current user plugin installation was not replaced.
