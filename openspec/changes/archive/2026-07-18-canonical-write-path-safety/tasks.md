@@ -70,12 +70,12 @@
 - [x] 10.2 Run runtime smoke, fixture/stability E2E, Skill eval, isolated wheel/sdist installation, cache/discovery/doctor/hook/uninstall, and artifact checksum validation.
 - [x] 10.3 Regenerate real Native single and parallel reports for the exact source candidate; validate source/status/binary/token/scope/timing consistency and do not infer token savings.
 - [x] 10.4 Independent read-only QA A reviews POSIX/Windows filesystem and SQLite/store safety; QA B reviews migration/recovery and execution-evidence safety. Main/deep applies every fix, then reruns and re-reviews.
-- [ ] 10.5 Push only after local gates pass, require both push and pull-request Ubuntu/macOS/Windows matrices for the exact implementation head, and record annotations separately from failures.
+- [x] 10.5 Push only after local gates pass, require both push and pull-request Ubuntu/macOS/Windows matrices for the exact implementation head, and record annotations separately from failures.
 - [x] 10.6 Complete adversarial review for logic gaps, incorrect facts, simpler alternatives, same-user threat overclaims, data loss, stale candidate, and missing evidence; resolve every Critical/High/Medium finding.
 
 ## 11. Archive And Merge
 
-- [ ] 11.1 Update the final audit with red/green evidence, before/after metrics, exact local and CI run IDs, QA findings, residual risks, and explicit no-tag/no-release/no-deploy status.
-- [ ] 11.2 Mark every checklist item from actual evidence, validate the completed change strictly, and archive it into the canonical `local-delivery-kernel` spec.
+- [x] 11.1 Update the final audit with red/green evidence, before/after metrics, exact local and CI run IDs, QA findings, residual risks, and explicit no-tag/no-release/no-deploy status.
+- [x] 11.2 Mark every checklist item from actual evidence, validate the completed change strictly, and archive it into the canonical `local-delivery-kernel` spec.
 - [ ] 11.3 Run the post-archive documentation contract and exact final-source checks, commit/push the closure, wait for all six matrix jobs, and normally merge the PR.
 - [ ] 11.4 Fetch/prune, confirm local `main==origin/main` and the PR is merged, remove only the merged feature branch, and verify the current user plugin installation was not replaced.
