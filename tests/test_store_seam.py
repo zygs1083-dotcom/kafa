@@ -70,6 +70,33 @@ class StoreSeamTest(unittest.TestCase):
 
             self.assertEqual((status, evidence, accepted_by), ("planned", "", ""))
 
+    def test_in_memory_transaction_rolls_back_base_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = self.use_in_memory_store(Path(temp))
+            with store.connection() as conn:
+                conn.execute("create table sample (value text not null)")
+                conn.commit()
+
+            with self.assertRaisesRegex(KeyboardInterrupt, "injected-cancel"):
+                with store.transaction() as conn:
+                    conn.execute("insert into sample (value) values ('cancelled')")
+                    raise KeyboardInterrupt("injected-cancel")
+
+            with store.connection() as conn:
+                self.assertFalse(conn.in_transaction)
+                self.assertEqual(
+                    conn.execute("select count(*) from sample").fetchone()[0],
+                    0,
+                )
+
+            with store.transaction() as conn:
+                conn.execute("insert into sample (value) values ('recovered')")
+            with store.connection() as conn:
+                self.assertEqual(
+                    conn.execute("select count(*) from sample").fetchone()[0],
+                    1,
+                )
+
     def test_store_seam_static_boundaries(self) -> None:
         store_text = (PLUGIN_ROOT / "core/store.py").read_text(encoding="utf-8")
         harness_db_text = (SCRIPTS_ROOT / "harness_db.py").read_text(encoding="utf-8")

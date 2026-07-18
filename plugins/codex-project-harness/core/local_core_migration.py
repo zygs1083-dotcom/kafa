@@ -36,6 +36,9 @@ from .store import (
 )
 
 
+_WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
+
+
 class LocalCoreMigrationError(HarnessError):
     """Raised when a local-core staging conversion is unsafe or incomplete."""
 
@@ -298,9 +301,12 @@ def _safe_file_mode(
         raise ProjectPathSafetyError(relative, "path-identity-changed")
     assert snapshot.identity is not None
     if os.name == "nt":
-        mode = stat.S_IMODE(project_fs.absolute(relative).stat().st_mode)
-        project_fs._assert_unchanged(relative, snapshot)
-        return mode
+        return (
+            0o444
+            if snapshot.identity.mode_or_attributes
+            & _WINDOWS_FILE_ATTRIBUTE_READONLY
+            else 0o666
+        )
     return stat.S_IMODE(snapshot.identity.mode_or_attributes)
 
 

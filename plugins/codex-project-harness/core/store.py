@@ -1341,6 +1341,9 @@ class InMemoryStore:
             if before_commit is not None:
                 before_commit(conn)
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                exc.add_note(f"SQLite rollback failed: {rollback_error}")
             raise

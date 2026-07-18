@@ -1105,6 +1105,44 @@ class ProjectionPathContractTests(unittest.TestCase):
         )
         self.assertEqual(len(PROJECTION_ROLLBACK_PATHS), len(set(PROJECTION_ROLLBACK_PATHS)))
 
+    def test_windows_safe_file_mode_uses_pinned_attributes_without_path_stat(self) -> None:
+        from core.project_fs import _PathIdentity, _PathSnapshot
+
+        relative = Path("docs/harness/executions.md")
+
+        class PinnedAttributesFS:
+            def __init__(self, snapshot):
+                self.snapshot = snapshot
+
+            def _snapshot(self, requested, *, allow_missing):
+                self.requested = (requested, allow_missing)
+                return self.snapshot
+
+            def absolute(self, _requested):
+                raise AssertionError("pathname stat must not authorize Windows mode")
+
+        for attributes, expected_mode in ((0x00000001, 0o444), (0x00000080, 0o666)):
+            with self.subTest(attributes=attributes):
+                snapshot = _PathSnapshot(
+                    True,
+                    _PathIdentity(
+                        volume=7,
+                        file_id=b"projection",
+                        kind="file",
+                        mode_or_attributes=attributes,
+                        nlink=1,
+                    ),
+                )
+                project_fs = PinnedAttributesFS(snapshot)
+                with patch.object(local_core_migration.os, "name", "nt"):
+                    actual_mode = local_core_migration._safe_file_mode(
+                        project_fs,
+                        relative,
+                        expected=snapshot,
+                    )
+                self.assertEqual(actual_mode, expected_mode)
+                self.assertEqual(project_fs.requested, (relative, False))
+
 
 class Schema30ActivationRollbackTests(unittest.TestCase):
     def _prepare_source(self, root: Path) -> Path:
