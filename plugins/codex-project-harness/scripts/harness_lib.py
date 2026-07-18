@@ -51,12 +51,19 @@ def ensure_parent(path: Path) -> None:
 
 
 def read_state(root: Path) -> dict[str, str]:
-    path = root / STATE_PATH
     state: dict[str, str] = {}
-    if not path.exists():
-        return state
+    from core.project_fs import ProjectFS
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    with ProjectFS.open(root) as project_fs:
+        snapshot = project_fs._snapshot(STATE_PATH, allow_missing=True)
+        if not snapshot.exists:
+            return state
+        content = project_fs.read_bytes(STATE_PATH).decode(
+            "utf-8",
+            errors="strict",
+        )
+
+    for raw_line in content.splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
         if ":" not in raw_line:
@@ -85,8 +92,6 @@ def write_state(
     if "updated_at" not in normalized_updates:
         state["updated_at"] = now_iso()
 
-    path = root / STATE_PATH
-    ensure_parent(path)
     ordered_keys = [
         "status",
         "phase",
@@ -98,7 +103,14 @@ def write_state(
     lines = [f"{key}: {state[key]}" for key in ordered_keys if key in state]
     for key in sorted(k for k in state if k not in ordered_keys):
         lines.append(f"{key}: {state[key]}")
-    path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+    from core.project_fs import ProjectFS
+
+    with ProjectFS.open(root) as project_fs:
+        project_fs.atomic_write(
+            STATE_PATH,
+            ("\n".join(lines) + "\n").encode("utf-8"),
+            mode=0o644,
+        )
     return state
 
 

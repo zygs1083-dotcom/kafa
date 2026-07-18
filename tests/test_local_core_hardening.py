@@ -330,18 +330,27 @@ def _open_baseexception_probe(
     result: multiprocessing.queues.Queue,
 ) -> None:
     lock_path = Path(lock_path_value)
-    real_open = os.open
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    real_open_lock_fd = store_module.ProjectFS.open_lock_fd
     real_close = os.close
     opened: list[int] = []
 
-    def tracked_open(*args: object, **kwargs: object) -> int:
-        descriptor = real_open(*args, **kwargs)
+    def tracked_open_lock_fd(
+        project_fs: object,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        descriptor = real_open_lock_fd(project_fs, *args, **kwargs)
         opened.append(descriptor)
         return descriptor
 
     try:
         with (
-            mock.patch.object(store_module.os, "open", side_effect=tracked_open),
+            mock.patch.object(
+                store_module.ProjectFS,
+                "open_lock_fd",
+                new=tracked_open_lock_fd,
+            ),
             mock.patch.object(
                 store_module.os,
                 "fsync",
@@ -529,10 +538,14 @@ class MigrationOperationLockTests(unittest.TestCase):
 
     def test_open_baseexception_closes_partial_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            lock_path = (
+                Path(temp)
+                / ".ai-team/state/harness.db.operation.lock"
+            )
             result = self.context.Queue()
             process = self.context.Process(
                 target=_open_baseexception_probe,
-                args=(str(Path(temp) / "operation.lock"), result),
+                args=(str(lock_path), result),
             )
             process.start()
             _join_process(process)
@@ -749,11 +762,14 @@ class MigrationOperationLockTests(unittest.TestCase):
             writer_result = self.context.Queue()
             original_remove_sidecars = local_core_migration._remove_empty_active_sidecars
 
-            def pause_after_fingerprint(active_path: Path) -> None:
+            def pause_after_fingerprint(
+                active_path: Path,
+                **kwargs: object,
+            ) -> None:
                 replace_window.set()
                 if not writer_finished.wait(10):
                     raise RuntimeError("writer did not finish inside replace-window probe")
-                original_remove_sidecars(active_path)
+                original_remove_sidecars(active_path, **kwargs)
 
             writer = self.context.Process(
                 target=_late_writer,
@@ -856,8 +872,8 @@ class MigrationOperationLockTests(unittest.TestCase):
             operation_lock = root / ".ai-team/state/harness.db.operation.lock"
 
             with mock.patch.object(
-                local_core_migration.os,
-                "write",
+                local_core_migration.ProjectFS,
+                "create_exclusive",
                 side_effect=OSError("injected sentinel write failure"),
             ):
                 with self.assertRaisesRegex(OSError, "injected sentinel write failure"):

@@ -196,6 +196,109 @@ class ImmutableExecutionTests(unittest.TestCase):
                 self.assertNotEqual(verified.returncode, 0, name)
             self.assertEqual(execution_fact_counts(root), (0, 0, 0))
 
+    def test_stale_structured_result_never_creates_passing_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_candidate(root)
+            command = "python3 -B -m unittest test_candidate.py"
+            for args in (
+                ("init",),
+                (
+                    "acceptance",
+                    "add",
+                    "--id",
+                    "AC1",
+                    "--criterion",
+                    "fresh structured result",
+                ),
+                (
+                    "test-target",
+                    "add",
+                    "--id",
+                    "STRUCTURED",
+                    "--kind",
+                    "unit",
+                    "--command-template",
+                    command,
+                    "--result-format",
+                    "pytest-json",
+                    "--result-path",
+                    ".ai-team/runtime/stale-result.json",
+                ),
+            ):
+                configured = run_harness(root, *args)
+                self.assertEqual(
+                    configured.returncode,
+                    0,
+                    configured.stdout + configured.stderr,
+                )
+            stale = root / ".ai-team/runtime/stale-result.json"
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_text(
+                '{"summary":{"total":1,"passed":1,"failed":0,"errors":0}}',
+                encoding="utf-8",
+            )
+            before = (stale.read_bytes(), stale.stat().st_mtime_ns)
+
+            verified = run_harness(
+                root,
+                "verify",
+                "run",
+                "--target",
+                "STRUCTURED",
+                "--acceptance",
+                "AC1",
+            )
+
+            self.assertNotEqual(verified.returncode, 0)
+            self.assertIn(
+                "structured-result-stale",
+                verified.stdout + verified.stderr,
+            )
+            self.assertEqual(
+                (stale.read_bytes(), stale.stat().st_mtime_ns),
+                before,
+            )
+            self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
+    def test_regex_all_skipped_unittest_never_creates_passing_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            create_candidate(root)
+            (root / "test_candidate.py").write_bytes(
+                b"import unittest\n\n"
+                b"class CandidateTest(unittest.TestCase):\n"
+                b"    @unittest.skip('not executed')\n"
+                b"    def test_candidate(self):\n"
+                b"        self.fail('must stay skipped')\n"
+            )
+            subprocess.run(
+                ["git", "add", "test_candidate.py"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "all skipped candidate"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            initialize_target(root)
+
+            verified = run_harness(
+                root,
+                "verify",
+                "run",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+            )
+
+            self.assertNotEqual(verified.returncode, 0)
+            self.assertIn("executed_count=0", verified.stdout + verified.stderr)
+            self.assertEqual(execution_fact_counts(root), (0, 0, 0))
+
     def test_stale_candidate_discards_completed_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

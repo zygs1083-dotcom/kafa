@@ -6,7 +6,6 @@ import json
 import hashlib
 import os
 import sqlite3
-from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,13 @@ from pathlib import Path
 from harness_lib import now_iso
 from . import RUNTIME_VERSION, SCHEMA_VERSION
 from .errors import HarnessError
-from .store import project_db_operation
+from .project_fs import ProjectFS
+from .store import (
+    _apply_sqlite_teardown_errors,
+    _temporary_sqlite_family_cleanup_errors,
+    _verified_sqlite_connection,
+    project_db_operation,
+)
 
 
 class SchemaLifecycleError(HarnessError):
@@ -577,15 +582,22 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _unique_backup_directory(backups_root: Path, source_version: int, timestamp: str) -> Path:
+def _unique_backup_directory(
+    project_fs: ProjectFS,
+    backups_root: Path,
+    source_version: int,
+    timestamp: str,
+) -> Path:
     stem = f"schema-{source_version}-before-local-core-{timestamp}"
     candidate = backups_root / stem
     suffix = 0
-    while candidate.exists():
-        suffix += 1
-        candidate = backups_root / f"{stem}-{suffix}"
-    candidate.mkdir(parents=True, mode=0o700)
-    return candidate
+    while True:
+        try:
+            project_fs.create_directory_exclusive(candidate, mode=0o700)
+            return candidate
+        except FileExistsError:
+            suffix += 1
+            candidate = backups_root / f"{stem}-{suffix}"
 
 
 def backup_sqlite_database(
@@ -594,12 +606,17 @@ def backup_sqlite_database(
     source_path: Path | None = None,
     expected_source_version: int | None = None,
     created_at: str | None = None,
+    project_fs: ProjectFS | None = None,
 ) -> SQLiteBackupManifest:
     """Create a consistent, digested recovery backup without exporting row payloads."""
 
-    with project_db_operation(root):
+    with project_db_operation(
+        root,
+        project_fs=project_fs,
+    ) as active_project_fs:
         return _backup_sqlite_database_locked(
             root,
+            project_fs=active_project_fs,
             source_path=source_path,
             expected_source_version=expected_source_version,
             created_at=created_at,
@@ -609,16 +626,29 @@ def backup_sqlite_database(
 def _backup_sqlite_database_locked(
     root: Path,
     *,
+    project_fs: ProjectFS,
     source_path: Path | None = None,
     expected_source_version: int | None = None,
     created_at: str | None = None,
 ) -> SQLiteBackupManifest:
     """Implement backup while the caller owns the project operation lock."""
 
-    root = root.resolve()
-    source = (source_path or (root / ".ai-team/state/harness.db")).resolve()
-    if not source.is_file():
-        raise SchemaLifecycleError(f"runtime database is missing: {source}")
+    root = project_fs.root
+    source_relative = project_fs.relative_to_root(
+        source_path or (root / ".ai-team/state/harness.db")
+    )
+    source = project_fs.absolute(source_relative)
+    source_snapshot = project_fs._snapshot(
+        source_relative,
+        allow_missing=False,
+    )
+    source_family = (
+        source_relative,
+        Path(f"{source_relative.as_posix()}-wal"),
+        Path(f"{source_relative.as_posix()}-shm"),
+        Path(f"{source_relative.as_posix()}-journal"),
+    )
+    project_fs.audit(source_family, allow_missing=True)
 
     created_at_value = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     timestamp = (
@@ -628,14 +658,19 @@ def _backup_sqlite_database_locked(
         .removesuffix("Z")
         + "Z"
     )
-    backups_root = root / ".ai-team/backups"
-    backups_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backups_root = Path(".ai-team/backups")
+    project_fs.ensure_directory(backups_root)
     backup_dir: Path | None = None
     partial_path: Path | None = None
+    partial_snapshot = None
     try:
-        source_uri = f"file:{source.as_posix()}?mode=ro"
-        with closing(sqlite3.connect(source_uri, uri=True, timeout=5.0)) as source_conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            source_relative,
+            access="ro",
+        ) as source_conn:
             source_conn.execute("pragma query_only = on")
+            project_fs._assert_unchanged(source_relative, source_snapshot)
             source_version = _schema_version(source_conn)
             if expected_source_version is not None and source_version != expected_source_version:
                 raise SchemaLifecycleError(
@@ -648,24 +683,53 @@ def _backup_sqlite_database_locked(
                     f"integrity={list(source_integrity)} foreign_key_issues={source_fk_issues}"
                 )
             source_counts = _database_row_counts(source_conn)
-            backup_dir = _unique_backup_directory(backups_root, source_version, timestamp)
+            backup_dir = _unique_backup_directory(
+                project_fs,
+                backups_root,
+                source_version,
+                timestamp,
+            )
+            final_path = backup_dir / "harness.db"
+            final_destination_snapshot = project_fs._snapshot(
+                final_path,
+                allow_missing=True,
+            )
             partial_path = backup_dir / "harness.db.partial"
-            with closing(sqlite3.connect(partial_path)) as destination_conn:
+            project_fs.create_exclusive(partial_path, b"", mode=0o600)
+            partial_snapshot = project_fs._snapshot(
+                partial_path,
+                allow_missing=False,
+            )
+            with _verified_sqlite_connection(
+                project_fs,
+                partial_path,
+                access="rw",
+                journal_mode="memory",
+            ) as destination_conn:
                 source_conn.backup(destination_conn)
                 destination_conn.execute("pragma journal_mode = delete")
                 destination_conn.commit()
+                project_fs._assert_unchanged(partial_path, partial_snapshot)
+            project_fs._assert_unchanged(source_relative, source_snapshot)
 
-        final_path = backup_dir / "harness.db"
-        os.replace(partial_path, final_path)
+        project_fs.replace_file(
+            partial_path,
+            final_path,
+            expected_source=partial_snapshot,
+            expected_destination=final_destination_snapshot,
+        )
         partial_path = None
-        os.chmod(final_path, 0o600)
-        _fsync_file(final_path)
+        final_snapshot = project_fs._snapshot(final_path, allow_missing=False)
 
-        backup_uri = f"file:{final_path.as_posix()}?mode=ro"
-        with closing(sqlite3.connect(backup_uri, uri=True, timeout=5.0)) as backup_conn:
+        with _verified_sqlite_connection(
+            project_fs,
+            final_path,
+            access="ro",
+        ) as backup_conn:
             backup_integrity, backup_fk_issues = _database_integrity(backup_conn)
             backup_counts = _database_row_counts(backup_conn)
             backup_version = _schema_version(backup_conn)
+            project_fs._assert_unchanged(final_path, final_snapshot)
         if backup_integrity != ("ok",) or backup_fk_issues:
             raise SchemaLifecycleError(
                 "backup database failed validation: "
@@ -678,33 +742,54 @@ def _backup_sqlite_database_locked(
             )
 
         manifest_path = backup_dir / "backup-manifest.json"
+        backup_bytes = project_fs.read_bytes(final_path)
         manifest = SQLiteBackupManifest(
             source_version=source_version,
             target_version=SCHEMA30_VERSION,
             created_at=created_at_value,
-            backup_path=str(final_path),
-            sha256=_sha256_file(final_path),
+            backup_path=str(project_fs.absolute(final_path)),
+            sha256=hashlib.sha256(backup_bytes).hexdigest(),
             row_counts=source_counts,
             source_integrity_check=source_integrity,
             source_foreign_key_issue_count=source_fk_issues,
             backup_integrity_check=backup_integrity,
             backup_foreign_key_issue_count=backup_fk_issues,
-            manifest_path=str(manifest_path),
+            manifest_path=str(project_fs.absolute(manifest_path)),
         )
-        manifest_path.write_text(
-            json.dumps(manifest.safe_payload(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        project_fs.atomic_write(
+            manifest_path,
+            (
+                json.dumps(
+                    manifest.safe_payload(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+            mode=0o600,
         )
-        os.chmod(manifest_path, 0o600)
-        _fsync_file(manifest_path)
-        _fsync_directory(backup_dir)
-        _fsync_directory(backups_root)
+        project_fs._assert_unchanged(source_relative, source_snapshot)
         return manifest
-    except Exception:
-        if partial_path is not None:
-            partial_path.unlink(missing_ok=True)
-        if backup_dir is not None and backup_dir.exists() and not any(backup_dir.iterdir()):
-            backup_dir.rmdir()
+    except BaseException as exc:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if partial_path is not None and partial_snapshot is not None:
+            cleanup_errors.extend(
+                _temporary_sqlite_family_cleanup_errors(
+                    project_fs,
+                    partial_path,
+                    partial_snapshot,
+                    published=False,
+                )
+            )
+        if backup_dir is not None:
+            try:
+                project_fs.remove_empty_directory(backup_dir, missing_ok=True)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(
+                    ("temporary SQLite backup directory cleanup failed", cleanup_exc)
+                )
+        _apply_sqlite_teardown_errors(exc, cleanup_errors)
         raise
 
 

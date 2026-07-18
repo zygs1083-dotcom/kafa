@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -151,6 +151,16 @@ def add_retired_schema29_fixture_surface(conn: sqlite3.Connection) -> None:
 
 
 class Schema30BackupTests(unittest.TestCase):
+    def test_exception_text_preserves_manual_review_notes(self) -> None:
+        error = LocalCoreMigrationError("unsafe-project-path: target.txt")
+        error.add_note("complete metadata rollback requires manual review")
+
+        self.assertEqual(
+            local_core_migration._exception_text(error),
+            "unsafe-project-path: target.txt\n"
+            "NOTE: complete metadata rollback requires manual review",
+        )
+
     def test_backup_records_safe_recovery_metadata_and_preserves_complete_database(self) -> None:
         secret = "connector-token-must-not-enter-manifest"
         with tempfile.TemporaryDirectory() as temp:
@@ -1105,6 +1115,44 @@ class ProjectionPathContractTests(unittest.TestCase):
         )
         self.assertEqual(len(PROJECTION_ROLLBACK_PATHS), len(set(PROJECTION_ROLLBACK_PATHS)))
 
+    def test_windows_safe_file_mode_uses_pinned_attributes_without_path_stat(self) -> None:
+        from core.project_fs import _PathIdentity, _PathSnapshot
+
+        relative = Path("docs/harness/executions.md")
+
+        class PinnedAttributesFS:
+            def __init__(self, snapshot):
+                self.snapshot = snapshot
+
+            def _snapshot(self, requested, *, allow_missing):
+                self.requested = (requested, allow_missing)
+                return self.snapshot
+
+            def absolute(self, _requested):
+                raise AssertionError("pathname stat must not authorize Windows mode")
+
+        for attributes, expected_mode in ((0x00000001, 0o444), (0x00000080, 0o666)):
+            with self.subTest(attributes=attributes):
+                snapshot = _PathSnapshot(
+                    True,
+                    _PathIdentity(
+                        volume=7,
+                        file_id=b"projection",
+                        kind="file",
+                        mode_or_attributes=attributes,
+                        nlink=1,
+                    ),
+                )
+                project_fs = PinnedAttributesFS(snapshot)
+                with patch.object(local_core_migration.os, "name", "nt"):
+                    actual_mode = local_core_migration._safe_file_mode(
+                        project_fs,
+                        relative,
+                        expected=snapshot,
+                    )
+                self.assertEqual(actual_mode, expected_mode)
+                self.assertEqual(project_fs.requested, (relative, False))
+
 
 class Schema30ActivationRollbackTests(unittest.TestCase):
     def _prepare_source(self, root: Path) -> Path:
@@ -1116,6 +1164,1227 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             )
             conn.commit()
         return source
+
+    def test_manifest_rewrite_race_uses_fallback_without_overwriting_replacement(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_atomic_write = ProjectFS.atomic_write
+            raced = False
+            attacker_payload = b'{"attacker":"must-remain"}\n'
+            raced_manifest: Path | None = None
+            parked_manifest: Path | None = None
+
+            def race_manifest_then_write(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced, raced_manifest, parked_manifest
+                relative = Path(relative)
+                if (
+                    relative.name == "migration-manifest.json"
+                    and expected_destination is not None
+                    and not raced
+                ):
+                    raced_manifest = active_fs.absolute(relative)
+                    parked_manifest = raced_manifest.with_name(
+                        "migration-manifest.before-race.json"
+                    )
+                    replacement = raced_manifest.with_name(
+                        "migration-manifest.attacker.json"
+                    )
+                    replacement.write_bytes(attacker_payload)
+                    raced_manifest.rename(parked_manifest)
+                    replacement.rename(raced_manifest)
+                    raced = True
+                return original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=race_manifest_then_write,
+            ):
+                with self.assertRaisesRegex(
+                    Exception,
+                    "path-identity-changed",
+                ):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(raced)
+            assert raced_manifest is not None
+            assert parked_manifest is not None
+            self.assertEqual(raced_manifest.read_bytes(), attacker_payload)
+            self.assertTrue(parked_manifest.is_file())
+            fallback_manifests = tuple(
+                (root / ".ai-team/state").glob(
+                    "migration-recovery-*.json"
+                )
+            )
+            self.assertEqual(len(fallback_manifests), 1)
+            fallback = json.loads(
+                fallback_manifests[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(fallback["status"], "rollback-incomplete")
+            self.assertEqual(
+                fallback["failed_manifest_path"],
+                str(raced_manifest),
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+
+    def test_final_manifest_receipt_is_held_until_success_cleanup(self) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_atomic_write = ProjectFS.atomic_write
+            attacker_payload = b'{"attacker":"must-remain"}\n'
+            raced = False
+            raced_manifest: Path | None = None
+            parked_manifest: Path | None = None
+
+            def replace_final_manifest_after_write(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced, raced_manifest, parked_manifest
+                written = original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "activated"' in bytes(data)
+                    and not raced
+                ):
+                    raced_manifest = active_fs.absolute(Path(relative))
+                    parked_manifest = raced_manifest.with_name(
+                        "migration-manifest.verified-before-final-race.json"
+                    )
+                    replacement = raced_manifest.with_name(
+                        "migration-manifest.final-attacker.json"
+                    )
+                    replacement.write_bytes(attacker_payload)
+                    raced_manifest.rename(parked_manifest)
+                    replacement.rename(raced_manifest)
+                    raced = True
+                return written
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=replace_final_manifest_after_write,
+            ):
+                with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(raced)
+            assert raced_manifest is not None
+            assert parked_manifest is not None
+            self.assertEqual(raced_manifest.read_bytes(), attacker_payload)
+            self.assertTrue(parked_manifest.is_file())
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+
+    def test_success_projection_receipts_survive_final_manifest_write(self) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / PROJECTION_PATHS[0]
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            original_projection = b"schema_version: 29\nstate: original\n"
+            projection.write_bytes(original_projection)
+            original_atomic_write = ProjectFS.atomic_write
+            raced = False
+
+            def replace_projection_after_final_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced
+                written = original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "activated"' in bytes(data)
+                    and not raced
+                ):
+                    parked = projection.with_name(
+                        "project-state.published-before-final-race.yaml"
+                    )
+                    replacement = projection.with_name(
+                        "project-state.success-attacker.yaml"
+                    )
+                    replacement.write_bytes(b"attacker-projection\n")
+                    projection.rename(parked)
+                    replacement.rename(projection)
+                    raced = True
+                return written
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=replace_projection_after_final_manifest,
+            ):
+                with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(raced)
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+            self.assertEqual(projection.read_bytes(), original_projection)
+
+    def test_operation_lock_remains_held_through_sentinel_cleanup(self) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._prepare_source(root)
+            original_operation = local_core_migration.project_db_operation
+            original_unlink = ProjectFS.unlink_regular
+            operation_active = False
+            cleanup_observed = False
+
+            @contextmanager
+            def tracked_operation(*args, **kwargs):
+                nonlocal operation_active
+                with original_operation(*args, **kwargs) as project_fs:
+                    operation_active = True
+                    try:
+                        yield project_fs
+                    finally:
+                        operation_active = False
+
+            def assert_lock_during_cleanup(
+                active_fs,
+                relative,
+                *,
+                missing_ok=False,
+                expected=None,
+            ):
+                nonlocal cleanup_observed
+                if Path(relative).name == "local-core-migration.lock":
+                    cleanup_observed = True
+                    self.assertTrue(
+                        operation_active,
+                        "operation lock released before migration sentinel cleanup",
+                    )
+                return original_unlink(
+                    active_fs,
+                    relative,
+                    missing_ok=missing_ok,
+                    expected=expected,
+                )
+
+            with (
+                patch.object(
+                    local_core_migration,
+                    "project_db_operation",
+                    side_effect=tracked_operation,
+                ),
+                patch.object(
+                    ProjectFS,
+                    "unlink_regular",
+                    autospec=True,
+                    side_effect=assert_lock_during_cleanup,
+                ),
+            ):
+                migrate_project_to_schema30(root)
+
+            self.assertTrue(cleanup_observed)
+
+    def test_guard_only_failure_publishes_consistent_recovery_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._prepare_source(root)
+            original_result_type = local_core_migration.LocalCoreMigrationResult
+            projection = root / PROJECTION_PATHS[0]
+            raced = False
+
+            def replace_projection_during_result_construction(*args, **kwargs):
+                nonlocal raced
+                parked = projection.with_name(
+                    "project-state.before-guard-only-race.yaml"
+                )
+                replacement = projection.with_name(
+                    "project-state.guard-only-attacker.yaml"
+                )
+                replacement.write_bytes(b"guard-only-attacker\n")
+                projection.rename(parked)
+                replacement.rename(projection)
+                raced = True
+                return original_result_type(*args, **kwargs)
+
+            with patch.object(
+                local_core_migration,
+                "LocalCoreMigrationResult",
+                side_effect=replace_projection_during_result_construction,
+            ):
+                with self.assertRaises(Exception):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(raced)
+            sentinel_path = root / ".ai-team/state/local-core-migration.lock"
+            sentinel = json.loads(
+                sentinel_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(sentinel["status"], "rollback-incomplete")
+            recovery_manifest = Path(str(sentinel["manifest_path"]))
+            manifest = json.loads(
+                recovery_manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(
+                manifest["previous_terminal_status"],
+                "activated",
+            )
+            self.assertIn(
+                "path-identity-changed",
+                manifest["terminal_authority_error"],
+            )
+
+    def test_success_pins_absent_retired_projection_and_database_sidecars(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        scenarios = (
+            Path("docs/harness/evidence.md"),
+            Path(".ai-team/state/harness.db-journal"),
+        )
+        for raced_relative in scenarios:
+            with self.subTest(path=raced_relative), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                active = self._prepare_source(root)
+                original_atomic_write = ProjectFS.atomic_write
+                raced = False
+
+                def create_absent_authority_after_final_manifest(
+                    active_fs,
+                    relative,
+                    data,
+                    *,
+                    mode=0o600,
+                    expected_destination=None,
+                ):
+                    nonlocal raced
+                    written = original_atomic_write(
+                        active_fs,
+                        relative,
+                        data,
+                        mode=mode,
+                        expected_destination=expected_destination,
+                    )
+                    if (
+                        Path(relative).name == "migration-manifest.json"
+                        and b'"status": "activated"' in bytes(data)
+                        and not raced
+                    ):
+                        target = root / raced_relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(b"unexpected-terminal-authority\n")
+                        raced = True
+                    return written
+
+                with patch.object(
+                    ProjectFS,
+                    "atomic_write",
+                    autospec=True,
+                    side_effect=create_absent_authority_after_final_manifest,
+                ):
+                    with self.assertRaises(Exception):
+                        migrate_project_to_schema30(root)
+
+                self.assertTrue(raced)
+                self.assertFalse((root / raced_relative).exists())
+                with closing(sqlite3.connect(active)) as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "select schema_version from project where id=1"
+                        ).fetchone()[0],
+                        29,
+                    )
+
+    def test_rollback_pins_absent_database_sidecars_through_manifest_write(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            journal = active.with_name(active.name + "-journal")
+            original_atomic_write = ProjectFS.atomic_write
+            raced = False
+
+            def fail_validation(_active_path: Path) -> None:
+                raise RuntimeError("validator-failed-before-sidecar-race")
+
+            def create_sidecar_after_rollback_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced
+                written = original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "rolled-back"' in bytes(data)
+                    and not raced
+                ):
+                    journal.write_bytes(b"unexpected-rollback-journal\n")
+                    raced = True
+                return written
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=create_sidecar_after_rollback_manifest,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validator-failed-before-sidecar-race",
+                ):
+                    _core_migrate_project_to_schema30(
+                        root,
+                        active_validator=fail_validation,
+                    )
+
+            self.assertTrue(raced)
+            self.assertTrue(journal.is_file())
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "failed")
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    def test_success_pins_complete_recovery_bundle(self) -> None:
+        from core.project_fs import ProjectFS
+
+        for target_kind in ("database", "projection"):
+            with self.subTest(target=target_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self._prepare_source(root)
+                original_projection = root / PROJECTION_PATHS[0]
+                original_projection.parent.mkdir(parents=True, exist_ok=True)
+                original_projection.write_bytes(b"pre-migration-projection\n")
+                original_atomic_write = ProjectFS.atomic_write
+                raced = False
+                raced_target: Path | None = None
+                parked: Path | None = None
+
+                def replace_recovery_file_after_final_manifest(
+                    active_fs,
+                    relative,
+                    data,
+                    *,
+                    mode=0o600,
+                    expected_destination=None,
+                ):
+                    nonlocal raced, raced_target, parked
+                    written = original_atomic_write(
+                        active_fs,
+                        relative,
+                        data,
+                        mode=mode,
+                        expected_destination=expected_destination,
+                    )
+                    if (
+                        Path(relative).name == "migration-manifest.json"
+                        and b'"status": "activated"' in bytes(data)
+                        and not raced
+                    ):
+                        backup_dir = active_fs.absolute(Path(relative)).parent
+                        raced_target = (
+                            backup_dir / "harness.db"
+                            if target_kind == "database"
+                            else backup_dir
+                            / "projections/00-project-state.yaml.bin"
+                        )
+                        parked = raced_target.with_name(
+                            raced_target.name + ".verified-before-race"
+                        )
+                        replacement = raced_target.with_name(
+                            raced_target.name + ".attacker"
+                        )
+                        replacement.write_bytes(b"attacker-recovery-file\n")
+                        raced_target.rename(parked)
+                        replacement.rename(raced_target)
+                        raced = True
+                    return written
+
+                with patch.object(
+                    ProjectFS,
+                    "atomic_write",
+                    autospec=True,
+                    side_effect=replace_recovery_file_after_final_manifest,
+                ):
+                    with self.assertRaises(Exception):
+                        migrate_project_to_schema30(root)
+
+                self.assertTrue(raced)
+                assert raced_target is not None
+                assert parked is not None
+                self.assertEqual(
+                    raced_target.read_bytes(),
+                    b"attacker-recovery-file\n",
+                )
+                self.assertTrue(parked.is_file())
+                self.assertTrue(
+                    (root / ".ai-team/state/local-core-migration.lock").is_file()
+                )
+
+    def test_raced_fallback_manifest_is_not_published_as_diagnostic_authority(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._prepare_source(root)
+            original_atomic_write = ProjectFS.atomic_write
+            original_create_exclusive = ProjectFS.create_exclusive
+            canonical_raced = False
+            fallback_raced = False
+            raced_fallback: Path | None = None
+
+            def race_canonical_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal canonical_raced
+                relative = Path(relative)
+                if (
+                    relative.name == "migration-manifest.json"
+                    and expected_destination is not None
+                    and not canonical_raced
+                ):
+                    canonical = active_fs.absolute(relative)
+                    parked = canonical.with_name(
+                        "migration-manifest.canonical-verified.json"
+                    )
+                    attacker = canonical.with_name(
+                        "migration-manifest.canonical-attacker.json"
+                    )
+                    attacker.write_bytes(b'{"attacker":"canonical"}\n')
+                    canonical.rename(parked)
+                    attacker.rename(canonical)
+                    canonical_raced = True
+                return original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+
+            def race_first_fallback(
+                active_fs,
+                relative,
+                data=b"",
+                *,
+                mode=0o600,
+            ):
+                nonlocal fallback_raced, raced_fallback
+                snapshot = original_create_exclusive(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                )
+                relative = Path(relative)
+                if (
+                    relative.name.startswith("migration-recovery-")
+                    and not fallback_raced
+                ):
+                    raced_fallback = active_fs.absolute(relative)
+                    parked = raced_fallback.with_name(
+                        raced_fallback.name + ".verified"
+                    )
+                    attacker = raced_fallback.with_name(
+                        raced_fallback.name + ".attacker"
+                    )
+                    attacker.write_bytes(b'{"attacker":"fallback"}\n')
+                    raced_fallback.rename(parked)
+                    attacker.rename(raced_fallback)
+                    fallback_raced = True
+                return snapshot
+
+            with (
+                patch.object(
+                    ProjectFS,
+                    "atomic_write",
+                    autospec=True,
+                    side_effect=race_canonical_manifest,
+                ),
+                patch.object(
+                    ProjectFS,
+                    "create_exclusive",
+                    autospec=True,
+                    side_effect=race_first_fallback,
+                ),
+            ):
+                with self.assertRaises(Exception):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(canonical_raced)
+            self.assertTrue(fallback_raced)
+            assert raced_fallback is not None
+            self.assertEqual(
+                raced_fallback.read_bytes(),
+                b'{"attacker":"fallback"}\n',
+            )
+            sentinel = json.loads(
+                (
+                    root / ".ai-team/state/local-core-migration.lock"
+                ).read_text(encoding="utf-8")
+            )
+            trusted_fallback = Path(str(sentinel["manifest_path"]))
+            self.assertNotEqual(trusted_fallback, raced_fallback)
+            trusted_payload = json.loads(
+                trusted_fallback.read_text(encoding="utf-8")
+            )
+            self.assertEqual(trusted_payload["status"], "rollback-incomplete")
+
+    @unittest.skipIf(os.name == "nt", "POSIX cleanup divergence detection")
+    def test_cleanup_compensation_divergence_is_recovery_required(self) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._prepare_source(root)
+            real_noreplace = project_fs_module._posix_rename_noreplace
+            injected = False
+            attacker_payload = b"cleanup-divergence-attacker\n"
+
+            def replace_cleanup_source(*args):
+                nonlocal injected
+                if (
+                    not injected
+                    and args[1] == "harness.schema30.new.db"
+                    and ".kafa-delete-" in args[3]
+                ):
+                    staging = next(
+                        (root / ".ai-team/backups").glob(
+                            "schema-29-before-local-core-*/harness.schema30.new.db"
+                        )
+                    )
+                    parked = staging.with_name("harness.schema29.parked.db")
+                    attacker = staging.with_name("harness.staging.attacker.db")
+                    attacker.write_bytes(attacker_payload)
+                    staging.rename(parked)
+                    attacker.rename(staging)
+                    injected = True
+                return real_noreplace(*args)
+
+            with patch.object(
+                project_fs_module,
+                "_posix_rename_noreplace",
+                side_effect=replace_cleanup_source,
+            ):
+                with self.assertRaises(Exception):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(injected)
+            active = root / ".ai-team/state/harness.db"
+            self.assertEqual(active.read_bytes(), attacker_payload)
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["activation_detection_status"],
+                "activation-state-diverged-recovery-required",
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(
+                manifest["database_restore_status"],
+                "unknown-active-preserved",
+            )
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    def test_missing_active_after_publication_is_recovery_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            parked = active.with_name("harness.published-before-unlink.db")
+            original_activate = local_core_migration._activate_staging_database
+
+            def remove_active_after_publication(
+                project_fs,
+                source,
+                destination,
+                *,
+                staging_snapshot,
+                active_snapshot,
+            ):
+                original_activate(
+                    project_fs,
+                    source,
+                    destination,
+                    staging_snapshot=staging_snapshot,
+                    active_snapshot=active_snapshot,
+                )
+                active.rename(parked)
+                raise KeyboardInterrupt("active-removed-after-publication")
+
+            with patch.object(
+                local_core_migration,
+                "_activate_staging_database",
+                side_effect=remove_active_after_publication,
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "activation state diverged",
+                ):
+                    migrate_project_to_schema30(root)
+
+            self.assertFalse(active.exists())
+            self.assertTrue(parked.is_file())
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["activation_detection_status"],
+                "activation-state-diverged-recovery-required",
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    def test_projection_restore_holds_exact_receipt_through_final_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target_relative = PROJECTION_ROLLBACK_PATHS[0]
+            target = root / target_relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"mutated-projection\n")
+
+            backup_directory = root / ".ai-team/backups/projection-receipt"
+            backup_directory.mkdir(parents=True)
+            backup_path = backup_directory / "project-state.yaml"
+            expected_content = b"original-projection\n"
+            expected_mode = 0o666 if os.name == "nt" else 0o640
+            backup_path.write_bytes(expected_content)
+            backup_path.chmod(expected_mode)
+            expected_digest = hashlib.sha256(expected_content).hexdigest()
+            entries: list[dict[str, object]] = []
+            for relative in PROJECTION_ROLLBACK_PATHS:
+                if relative == target_relative:
+                    entries.append(
+                        {
+                            "path": relative.as_posix(),
+                            "existed": True,
+                            "mode": expected_mode,
+                            "sha256": expected_digest,
+                            "backup_path": str(backup_path),
+                        }
+                    )
+                else:
+                    entries.append(
+                        {
+                            "path": relative.as_posix(),
+                            "existed": False,
+                        }
+                    )
+            projection_backup: dict[str, object] = {
+                "directory": str(backup_directory),
+                "entries": entries,
+            }
+            original_safe_mode = local_core_migration._safe_file_mode
+            raced = False
+            parked = target.with_name("project-state.restored-before-race.yaml")
+
+            def replace_after_immediate_verification(
+                project_fs,
+                relative,
+                *,
+                expected=None,
+            ):
+                nonlocal raced
+                mode = original_safe_mode(
+                    project_fs,
+                    relative,
+                    expected=expected,
+                )
+                if (
+                    Path(relative) == target_relative
+                    and expected is not None
+                    and not raced
+                    and target.read_bytes() == expected_content
+                ):
+                    replacement = target.with_name(
+                        "project-state.same-bytes-attacker.yaml"
+                    )
+                    replacement.write_bytes(expected_content)
+                    replacement.chmod(expected_mode)
+                    target.rename(parked)
+                    replacement.rename(target)
+                    raced = True
+                return mode
+
+            with patch.object(
+                local_core_migration,
+                "_safe_file_mode",
+                side_effect=replace_after_immediate_verification,
+            ):
+                with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                    local_core_migration._restore_projection_backup(
+                        root,
+                        projection_backup,
+                    )
+
+            self.assertTrue(raced)
+            self.assertTrue(parked.is_file())
+            self.assertEqual(target.read_bytes(), expected_content)
+
+    def test_rollback_projection_receipt_survives_terminal_manifest_write(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            projection = root / PROJECTION_ROLLBACK_PATHS[0]
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            original_projection = b"schema_version: 29\nstate: original\n"
+            projection.write_bytes(original_projection)
+            original_atomic_write = ProjectFS.atomic_write
+            attacker_projection = b"attacker-projection\n"
+            parked = projection.with_name(
+                "project-state.verified-before-terminal-manifest.yaml"
+            )
+            raced = False
+
+            def fail_after_partial_projection(_active_path: Path) -> None:
+                projection.write_bytes(b"schema_version: 30\nstate: partial\n")
+                raise RuntimeError("validator-failed-after-partial-projection")
+
+            def replace_projection_during_rolled_back_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced
+                written = original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "rolled-back"' in bytes(data)
+                    and not raced
+                ):
+                    replacement = projection.with_name(
+                        "project-state.terminal-attacker.yaml"
+                    )
+                    replacement.write_bytes(attacker_projection)
+                    projection.rename(parked)
+                    replacement.rename(projection)
+                    raced = True
+                return written
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=replace_projection_during_rolled_back_manifest,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validator-failed-after-partial-projection",
+                ):
+                    _core_migrate_project_to_schema30(
+                        root,
+                        active_validator=fail_after_partial_projection,
+                    )
+
+            self.assertTrue(raced)
+            self.assertEqual(projection.read_bytes(), attacker_projection)
+            self.assertEqual(parked.read_bytes(), original_projection)
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["projection_restore_status"], "failed")
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    def test_rollback_database_receipt_survives_terminal_manifest_write(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            original_atomic_write = ProjectFS.atomic_write
+            attacker_database = b"attacker-database\n"
+            parked = active.with_name(
+                "harness.verified-before-terminal-manifest.db"
+            )
+            raced = False
+
+            def fail_validation(_active_path: Path) -> None:
+                raise RuntimeError("validator-failed-before-db-race")
+
+            def replace_database_during_rolled_back_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced
+                written = original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "rolled-back"' in bytes(data)
+                    and not raced
+                ):
+                    replacement = active.with_name(
+                        "harness.terminal-attacker.db"
+                    )
+                    replacement.write_bytes(attacker_database)
+                    active.rename(parked)
+                    replacement.rename(active)
+                    raced = True
+                return written
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=replace_database_during_rolled_back_manifest,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validator-failed-before-db-race",
+                ):
+                    _core_migrate_project_to_schema30(
+                        root,
+                        active_validator=fail_validation,
+                    )
+
+            self.assertTrue(raced)
+            self.assertEqual(active.read_bytes(), attacker_database)
+            with closing(sqlite3.connect(parked)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "failed")
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    def test_active_replacement_during_final_manifest_cannot_report_success(
+        self,
+    ) -> None:
+        from core.project_fs import ProjectFS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            parked = active.with_name("harness.before-final-manifest.db")
+            replacement = active.with_name("harness.raced-final.db")
+            original_atomic_write = ProjectFS.atomic_write
+            raced = False
+
+            def race_active_then_write_manifest(
+                active_fs,
+                relative,
+                data,
+                *,
+                mode=0o600,
+                expected_destination=None,
+            ):
+                nonlocal raced
+                if (
+                    Path(relative).name == "migration-manifest.json"
+                    and b'"status": "activated"' in bytes(data)
+                    and not raced
+                ):
+                    replacement.write_bytes(active.read_bytes())
+                    active.rename(parked)
+                    replacement.rename(active)
+                    raced = True
+                return original_atomic_write(
+                    active_fs,
+                    relative,
+                    data,
+                    mode=mode,
+                    expected_destination=expected_destination,
+                )
+
+            with patch.object(
+                ProjectFS,
+                "atomic_write",
+                autospec=True,
+                side_effect=race_active_then_write_manifest,
+            ):
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "rollback failed",
+                ):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(raced)
+            self.assertTrue(active.is_file())
+            self.assertTrue(parked.is_file())
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    30,
+                )
+            backup_dir = next(
+                (root / ".ai-team/backups").glob(
+                    "schema-29-before-local-core-*"
+                )
+            )
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "rollback-incomplete")
+            self.assertEqual(manifest["database_restore_status"], "failed")
+            self.assertTrue(
+                (root / ".ai-team/state/local-core-migration.lock").is_file()
+            )
+
+    @unittest.skipIf(os.name == "nt", "POSIX cleanup rollback detection")
+    def test_cleanup_rollback_failure_detects_activated_candidate_by_receipt(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            active = self._prepare_source(root)
+            real_exchange = project_fs_module._posix_rename_exchange
+            real_noreplace = project_fs_module._posix_rename_noreplace
+            exchange_calls = 0
+            injected = False
+            parked: Path | None = None
+
+            def fail_publication_rollback_exchange(*args):
+                nonlocal exchange_calls
+                if {
+                    args[1],
+                    args[3],
+                } == {"harness.schema30.new.db", "harness.db"}:
+                    exchange_calls += 1
+                    if exchange_calls == 2:
+                        raise OSError(
+                            5,
+                            "injected publication rollback failure",
+                        )
+                return real_exchange(*args)
+
+            def replace_cleanup_source(*args):
+                nonlocal injected, parked
+                source_name = args[1]
+                destination_name = args[3]
+                if (
+                    not injected
+                    and source_name == "harness.schema30.new.db"
+                    and ".kafa-delete-" in destination_name
+                ):
+                    staging = next(
+                        (root / ".ai-team/backups").glob(
+                            "schema-29-before-local-core-*/harness.schema30.new.db"
+                        )
+                    )
+                    parked = staging.with_name("harness.schema29.parked.db")
+                    attacker = staging.with_name("harness.staging.attacker.db")
+                    attacker.write_bytes(b"attacker-staging\n")
+                    staging.rename(parked)
+                    attacker.rename(staging)
+                    injected = True
+                return real_noreplace(*args)
+
+            with (
+                patch.object(
+                    project_fs_module,
+                    "_posix_rename_exchange",
+                    side_effect=fail_publication_rollback_exchange,
+                ),
+                patch.object(
+                    project_fs_module,
+                    "_posix_rename_noreplace",
+                    side_effect=replace_cleanup_source,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    Exception,
+                    "path-identity-changed",
+                ):
+                    migrate_project_to_schema30(root)
+
+            self.assertTrue(injected)
+            self.assertEqual(exchange_calls, 2)
+            assert parked is not None
+            self.assertTrue(parked.is_file())
+            backup_dir = parked.parent
+            manifest = json.loads(
+                (backup_dir / "migration-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["activation_detection_status"],
+                "matched-staging-identity",
+            )
+            self.assertEqual(manifest["status"], "rolled-back")
+            self.assertEqual(sha256(active), manifest["backup"]["sha256"])
+            with closing(sqlite3.connect(active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
 
     def test_hard_exit_after_activation_leaves_durable_recovery_required_sentinel(
         self,
@@ -1183,6 +2452,93 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             self.assertEqual(
                 projection.read_text(encoding="utf-8"),
                 "schema_version: 29\n",
+            )
+
+    def test_migration_root_replacement_fails_closed_without_writing_new_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            active = self._prepare_source(root)
+            source_digest = sha256(active)
+            detached = base / "detached-project"
+            replacement_marker = b"replacement-root-must-remain-untouched\n"
+            original_checkpoint = local_core_migration._checkpoint_active_database
+            blocked_replacements: list[OSError] = []
+
+            def replace_root_then_checkpoint(
+                active_path: Path,
+                *,
+                pinned_fs=None,
+            ) -> None:
+                try:
+                    root.rename(detached)
+                except OSError as exc:
+                    if os.name != "nt":
+                        raise
+                    if not isinstance(exc, PermissionError) or getattr(
+                        exc,
+                        "winerror",
+                        None,
+                    ) not in {5, 32}:
+                        raise
+                    blocked_replacements.append(exc)
+                    original_checkpoint(active_path, pinned_fs=pinned_fs)
+                    return
+                root.mkdir()
+                (root / "replacement-marker.txt").write_bytes(replacement_marker)
+                original_checkpoint(active_path, pinned_fs=pinned_fs)
+
+            if os.name == "nt":
+                with patch.object(
+                    local_core_migration,
+                    "_checkpoint_active_database",
+                    side_effect=replace_root_then_checkpoint,
+                ):
+                    migrate_project_to_schema30(root)
+
+                self.assertEqual(len(blocked_replacements), 1)
+                self.assertTrue(root.is_dir())
+                self.assertFalse(detached.exists())
+                self.assertFalse((root / "replacement-marker.txt").exists())
+                self.assertFalse(
+                    (root / ".ai-team/state/local-core-migration.lock").exists()
+                )
+                with closing(sqlite3.connect(active)) as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "select schema_version from project where id=1"
+                        ).fetchone()[0],
+                        30,
+                    )
+                return
+
+            with patch.object(
+                local_core_migration,
+                "_checkpoint_active_database",
+                side_effect=replace_root_then_checkpoint,
+            ):
+                with self.assertRaisesRegex(Exception, "path-identity-changed"):
+                    migrate_project_to_schema30(root)
+
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["replacement-marker.txt"],
+            )
+            self.assertEqual(
+                (root / "replacement-marker.txt").read_bytes(),
+                replacement_marker,
+            )
+            detached_active = detached / ".ai-team/state/harness.db"
+            self.assertEqual(sha256(detached_active), source_digest)
+            with closing(sqlite3.connect(detached_active)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select schema_version from project where id=1"
+                    ).fetchone()[0],
+                    29,
+                )
+            self.assertTrue(
+                (detached / ".ai-team/state/local-core-migration.lock").is_file()
             )
 
     def test_failure_injection_preserves_or_restores_active_database(self) -> None:
@@ -1337,26 +2693,43 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             projection = root / ".ai-team/control/project-state.yaml"
             projection.parent.mkdir(parents=True, exist_ok=True)
             projection.write_bytes(b"schema_version: 29\nstate: before-replace\n")
-            original_replace = local_core_migration.os.replace
+            original_activate = (
+                local_core_migration._activate_staging_database
+            )
             interrupted = False
 
-            def interrupt_after_replace(source: Path, destination: Path) -> None:
+            def interrupt_after_replace(
+                project_fs,
+                source: Path,
+                destination: Path,
+                *,
+                staging_snapshot,
+                active_snapshot,
+            ) -> None:
                 nonlocal interrupted
-                if (
-                    not interrupted
-                    and Path(source).name == "harness.schema30.new.db"
-                    and Path(destination).resolve() == active.resolve()
-                ):
-                    original_replace(source, destination)
+                if not interrupted:
+                    original_activate(
+                        project_fs,
+                        source,
+                        destination,
+                        staging_snapshot=staging_snapshot,
+                        active_snapshot=active_snapshot,
+                    )
                     interrupted = True
                     raise KeyboardInterrupt(
                         "interrupt-between-replace-and-activated-flag"
                     )
-                original_replace(source, destination)
+                original_activate(
+                    project_fs,
+                    source,
+                    destination,
+                    staging_snapshot=staging_snapshot,
+                    active_snapshot=active_snapshot,
+                )
 
             with patch.object(
-                local_core_migration.os,
-                "replace",
+                local_core_migration,
+                "_activate_staging_database",
                 side_effect=interrupt_after_replace,
             ):
                 with self.assertRaisesRegex(
@@ -1390,7 +2763,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             self.assertEqual(manifest["projection_restore_status"], "restored")
             self.assertEqual(
                 manifest["activation_detection_status"],
-                "matched-staging-digest",
+                "matched-staging-identity",
             )
             self.assertIn(
                 "interrupt-between-replace-and-activated-flag",
@@ -1514,13 +2887,17 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             active = self._prepare_source(root)
             original_write_json = local_core_migration._write_json_atomic
 
-            def fail_terminal_manifest(path: Path, payload: dict[str, object]) -> None:
+            def fail_terminal_manifest(
+                path: Path,
+                payload: dict[str, object],
+                **kwargs: object,
+            ):
                 if (
                     Path(path).name == "migration-manifest.json"
                     and payload.get("status") == "rollback-incomplete"
                 ):
                     raise OSError("manifest-write-failed-during-rollback")
-                original_write_json(path, payload)
+                return original_write_json(path, payload, **kwargs)
 
             with (
                 patch.object(
@@ -1535,8 +2912,8 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(
-                    OSError,
-                    "manifest-write-failed-during-rollback",
+                    LocalCoreMigrationError,
+                    "cancel-during-db-restore.*migration-recovery-",
                 ):
                     migrate_project_to_schema30(
                         root,
@@ -1544,8 +2921,30 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                     )
 
             sentinel = root / ".ai-team/state/local-core-migration.lock"
+            fallback_paths = tuple(
+                (root / ".ai-team/state").glob(
+                    "migration-recovery-*.json"
+                )
+            )
+            self.assertEqual(len(fallback_paths), 1)
+            fallback_payload = json.loads(
+                fallback_paths[0].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                fallback_payload["database_restore_error"],
+                "cancel-during-db-restore",
+            )
+            self.assertIn(
+                "manifest-write-failed-during-rollback",
+                fallback_payload["manifest_write_error"],
+            )
             self.assertFalse(active.exists())
             self.assertTrue(sentinel.is_file())
+            sentinel_payload = json.loads(sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(
+                Path(sentinel_payload["manifest_path"]).resolve(),
+                fallback_paths[0].resolve(),
+            )
             with self.assertRaisesRegex(
                 ProjectOperationLockError,
                 "rollback-incomplete",
@@ -1563,8 +2962,9 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             def preserve_then_interrupt(
                 active_path: Path,
                 failed_path: Path,
+                **kwargs: object,
             ) -> tuple[str, str]:
-                original_preserve(active_path, failed_path)
+                original_preserve(active_path, failed_path, **kwargs)
                 raise KeyboardInterrupt("cancel-after-schema30-preservation")
 
             with patch.object(
@@ -1748,16 +3148,19 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+                **_kwargs,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
             with patch.object(
-                local_core_migration.os,
-                "replace",
+                local_core_migration,
+                "_move_failed_schema30",
                 side_effect=reject_failed_database_move,
             ):
                 with self.assertRaises(InjectedLocalCoreMigrationFailure):
@@ -1785,28 +3188,35 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-            original_copyfile = local_core_migration.shutil.copyfile
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+                **_kwargs,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
-
-            def reject_failed_database_copy(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 copy denial")
-                original_copyfile(source, destination)
+            def reject_failed_database_copy(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+                **_kwargs,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 copy denial"
+                )
 
             with (
                 patch.object(
-                    local_core_migration.os,
-                    "replace",
+                    local_core_migration,
+                    "_move_failed_schema30",
                     side_effect=reject_failed_database_move,
                 ),
                 patch.object(
-                    local_core_migration.shutil,
-                    "copyfile",
+                    local_core_migration,
+                    "_copy_failed_schema30",
                     side_effect=reject_failed_database_copy,
                 ),
             ):
@@ -1834,11 +3244,16 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_sha256 = local_core_migration._sha256_file
+            original_digest = (
+                local_core_migration._diagnostic_database_digest
+            )
 
-            def reject_failed_active_digest(path: Path) -> str:
-                resolved = Path(path)
-                if resolved.resolve() == active.resolve():
+            def reject_failed_active_digest(
+                project_fs,
+                relative: Path,
+            ) -> str:
+                resolved = project_fs.absolute(relative)
+                if resolved == active.resolve():
                     with closing(sqlite3.connect(resolved)) as conn:
                         version = int(
                             conn.execute(
@@ -1847,11 +3262,11 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                         )
                     if version == 30:
                         raise PermissionError("injected active-schema30 read denial")
-                return original_sha256(resolved)
+                return original_digest(project_fs, relative)
 
             with patch.object(
                 local_core_migration,
-                "_sha256_file",
+                "_diagnostic_database_digest",
                 side_effect=reject_failed_active_digest,
             ):
                 with self.assertRaisesRegex(
@@ -1886,11 +3301,16 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_sha256 = local_core_migration._sha256_file
+            original_digest = (
+                local_core_migration._diagnostic_database_digest
+            )
 
-            def interrupt_failed_active_digest(path: Path) -> str:
-                resolved = Path(path)
-                if resolved.resolve() == active.resolve() and resolved.is_file():
+            def interrupt_failed_active_digest(
+                project_fs,
+                relative: Path,
+            ) -> str:
+                resolved = project_fs.absolute(relative)
+                if resolved == active.resolve() and resolved.is_file():
                     with closing(sqlite3.connect(resolved)) as conn:
                         version = int(
                             conn.execute(
@@ -1899,11 +3319,11 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                         )
                     if version == 30:
                         raise KeyboardInterrupt()
-                return original_sha256(resolved)
+                return original_digest(project_fs, relative)
 
             with patch.object(
                 local_core_migration,
-                "_sha256_file",
+                "_diagnostic_database_digest",
                 side_effect=interrupt_failed_active_digest,
             ):
                 with self.assertRaisesRegex(
@@ -1948,38 +3368,49 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
-            original_replace = local_core_migration.os.replace
-            original_copyfile = local_core_migration.shutil.copyfile
-            path_type = type(active)
-            original_unlink = path_type.unlink
+            def reject_failed_database_move(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 move denial"
+                )
 
-            def reject_failed_database_move(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 move denial")
-                original_replace(source, destination)
+            def reject_failed_database_copy(
+                _project_fs,
+                _source: Path,
+                _destination: Path,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 copy denial"
+                )
 
-            def reject_failed_database_copy(source: Path, destination: Path) -> None:
-                if Path(destination).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 copy denial")
-                original_copyfile(source, destination)
-
-            def reject_failed_database_cleanup(path: Path, *args: object, **kwargs: object) -> None:
-                if Path(path).name.startswith("harness.schema30.failed-after-activation"):
-                    raise PermissionError("injected failed-schema30 cleanup denial")
-                original_unlink(path, *args, **kwargs)
+            def reject_failed_database_cleanup(
+                _project_fs,
+                _relative: Path,
+                _expected,
+            ) -> None:
+                raise PermissionError(
+                    "injected failed-schema30 cleanup denial"
+                )
 
             with (
                 patch.object(
-                    local_core_migration.os,
-                    "replace",
+                    local_core_migration,
+                    "_move_failed_schema30",
                     side_effect=reject_failed_database_move,
                 ),
                 patch.object(
-                    local_core_migration.shutil,
-                    "copyfile",
+                    local_core_migration,
+                    "_copy_failed_schema30",
                     side_effect=reject_failed_database_copy,
                 ),
-                patch.object(path_type, "unlink", new=reject_failed_database_cleanup),
+                patch.object(
+                    local_core_migration,
+                    "_cleanup_failed_schema30",
+                    side_effect=reject_failed_database_cleanup,
+                ),
             ):
                 with self.assertRaisesRegex(
                     LocalCoreMigrationError,

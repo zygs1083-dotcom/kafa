@@ -661,6 +661,87 @@ class InstallReleaseTest(unittest.TestCase):
         self.assertIn("do not remove", initialized["details"])
         self.assertEqual(report["next_commands"], [])
 
+    def test_project_doctor_rejects_linked_sentinel_via_runtime_audit(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink primitive unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            state = root / ".ai-team/state"
+            state.mkdir(parents=True)
+            external = base / "outside-sentinel.json"
+            external.write_text(
+                json.dumps({"pid": 999999, "created_at": "outside"}) + "\n",
+                encoding="utf-8",
+            )
+            before = external.read_bytes()
+            (state / "local-core-migration.lock").symlink_to(external)
+
+            with patch(
+                "sqlite3.connect",
+                side_effect=AssertionError("SQLite must stay closed"),
+            ):
+                report = kafa_cli.project_doctor_report(root)
+            self.assertEqual(external.read_bytes(), before)
+
+        initialized = next(
+            check for check in report["checks"] if check["name"] == "harness initialized"
+        )
+        self.assertFalse(report["ok"])
+        self.assertFalse(initialized["ok"])
+        self.assertIn(
+            "unsafe-project-path: .ai-team/state/local-core-migration.lock",
+            initialized["details"],
+        )
+        self.assertEqual(report["next_commands"], [])
+
+    def test_project_doctor_uses_single_gitignore_probe_without_reopening_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            initialized = run_kafa(
+                "project",
+                "init",
+                "--repo",
+                str(root),
+                check=False,
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stdout + initialized.stderr,
+            )
+            gitignore = root / ".gitignore"
+            gitignore.write_text(".ai-team/state/\n", encoding="utf-8")
+            replacement = root / ".gitignore.replacement"
+            replacement.write_text(
+                ".ai-team/state/\n.ai-team/backups/\n.ai-team/runtime/\n"
+                "__pycache__/\n*.pyc\n",
+                encoding="utf-8",
+            )
+            exchange_called = False
+
+            def exchange_after_probe(_repo: Path, _probe: dict[str, object]) -> None:
+                nonlocal exchange_called
+                exchange_called = True
+                os.replace(replacement, gitignore)
+
+            with patch.object(
+                kafa_cli,
+                "_after_project_doctor_probe",
+                side_effect=exchange_after_probe,
+                create=True,
+            ):
+                report = kafa_cli.project_doctor_report(root)
+
+            runtime_gitignore = next(
+                check
+                for check in report["checks"]
+                if check["name"] == "runtime gitignore"
+            )
+            self.assertTrue(exchange_called)
+            self.assertFalse(runtime_gitignore["ok"])
+            self.assertIn(".ai-team/runtime/", runtime_gitignore["details"])
+
     def test_project_launcher_initializes_business_project_without_vendored_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "business"

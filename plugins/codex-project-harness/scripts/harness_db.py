@@ -8,7 +8,6 @@ import hashlib
 import os
 import re
 import shlex
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -52,12 +51,15 @@ from core.schema_guard import (
 )
 from core.store import (
     DB_PATH,
+    MIGRATION_SENTINEL_PATH,
+    OPERATION_LOCK_PATH,
     InMemoryStore,
     SqliteStore,
     Store,
     project_db_operation,
     raise_if_project_migration_announced,
 )
+from core.project_fs import ProjectFS, pin_project_filesystem
 from core.schema_lifecycle import (
     SCHEMA30_CATALOG_TABLES,
     SCHEMA30_TABLES,
@@ -78,6 +80,13 @@ STACK_PROFILE_IMAGES = {
     "browser-e2e": "mcr.microsoft.com/playwright:v1.49.0-noble",
     "data-integration": DEFAULT_CONTAINER_IMAGE,
 }
+
+
+def _before_staging_validation_snapshot_read(
+    _project_fs: ProjectFS,
+    _relative: Path,
+) -> None:
+    """Deterministic test seam before copying the pinned staging authority."""
 RUNTIME_GITIGNORE_PATTERNS = [
     ".ai-team/state/",
     ".ai-team/backups/",
@@ -150,10 +159,39 @@ def _project_mutation(function: Callable[..., Any]) -> Callable[..., Any]:
     def locked(root: Path, *args: Any, **kwargs: Any) -> Any:
         if isinstance(get_store(root), InMemoryStore):
             return function(root, *args, **kwargs)
+        if function.__name__ == "init_runtime":
+            _preflight_init_paths(root)
         with project_db_operation(root):
+            from core.projections import preflight_projection_paths
+
+            preflight_projection_paths(root)
             return function(root, *args, **kwargs)
 
     return locked
+
+
+def _preflight_init_paths(root: Path) -> None:
+    """Audit every canonical init destination before the operation lock writes."""
+
+    from core.projections import PROJECTION_ROLLBACK_PATHS
+
+    database_family = SqliteStore._db_family()
+    templates = tuple(
+        Path(".codex/agents") / name
+        for name in sorted(CODEX_AGENT_TEMPLATE_NAMES)
+    )
+    with ProjectFS.open(root) as project_fs:
+        project_fs.audit(
+            (
+                *database_family,
+                OPERATION_LOCK_PATH,
+                MIGRATION_SENTINEL_PATH,
+                Path(".gitignore"),
+                *PROJECTION_ROLLBACK_PATHS,
+                *templates,
+            ),
+            allow_missing=True,
+        )
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -202,18 +240,135 @@ def db_file(root: Path) -> Path:
 
 def runtime_initialized(root: Path) -> bool:
     store = get_store(root)
+    with runtime_path_audit(root, store=store) as project_fs:
+        return _runtime_initialized_in_audit(
+            root,
+            store,
+            project_fs,
+        )
+
+
+def _runtime_initialized_in_audit(
+    root: Path,
+    store: Store,
+    project_fs: ProjectFS | None,
+) -> bool:
     if isinstance(store, SqliteStore):
-        raise_if_project_migration_announced(root)
-        if not db_file(root).exists():
+        if project_fs is None:
+            return False
+        if not project_fs._snapshot(
+            DB_PATH,
+            allow_missing=True,
+        ).exists:
             return False
     try:
         with store.connection() as conn:
-            exists = conn.execute("select 1 from sqlite_master where type='table' and name = 'project'").fetchone()
+            exists = conn.execute(
+                "select 1 from sqlite_master where type='table' and name = 'project'"
+            ).fetchone()
             if not exists:
                 return False
-            return conn.execute("select 1 from project where id = 1").fetchone() is not None
+            return (
+                conn.execute(
+                    "select 1 from project where id = 1"
+                ).fetchone()
+                is not None
+            )
     except sqlite3.Error:
         return False
+
+
+def project_doctor_probe(root: Path) -> dict[str, object]:
+    """Capture initialization and gitignore facts under one pinned audit."""
+
+    store = get_store(root)
+    with runtime_path_audit(root, store=store) as project_fs:
+        initialized = _runtime_initialized_in_audit(
+            root,
+            store,
+            project_fs,
+        )
+        gitignore_issues = (
+            _gitignore_runtime_issues(project_fs)
+            if project_fs is not None
+            else [
+                f"missing .gitignore runtime pattern: {pattern}"
+                for pattern in RUNTIME_GITIGNORE_PATTERNS
+            ]
+        )
+        return {
+            "initialized": initialized,
+            "gitignore_issues": gitignore_issues,
+        }
+
+
+def _runtime_audit_inventory() -> tuple[Path, ...]:
+    from core.projections import PROJECTION_ROLLBACK_PATHS
+
+    templates = tuple(
+        Path(".codex/agents") / name
+        for name in sorted(CODEX_AGENT_TEMPLATE_NAMES)
+    )
+    return (
+        *SqliteStore._db_family(),
+        OPERATION_LOCK_PATH,
+        MIGRATION_SENTINEL_PATH,
+        Path(".gitignore"),
+        *PROJECTION_ROLLBACK_PATHS,
+        *templates,
+    )
+
+
+@contextmanager
+def runtime_path_audit(
+    root: Path,
+    *,
+    store: Store | None = None,
+) -> Iterator[ProjectFS | None]:
+    """Pin and audit bounded runtime paths for a complete SQLite lifecycle."""
+
+    active_store = store or get_store(root)
+    if isinstance(active_store, InMemoryStore):
+        yield None
+        return
+
+    expanded_root = Path(root).expanduser()
+    if not expanded_root.exists() and not expanded_root.is_symlink():
+        # Read-only status and doctor probes must not materialize a root.
+        yield None
+        return
+
+    inventory = _runtime_audit_inventory()
+    with ProjectFS.open(root) as project_fs:
+        with pin_project_filesystem(project_fs):
+            project_fs.audit(inventory, allow_missing=True)
+            database_exists = project_fs._snapshot(
+                DB_PATH,
+                allow_missing=True,
+            ).exists
+            if not database_exists:
+                # Preserve migration guidance without creating an operation-lock
+                # file in an otherwise uninitialized project.
+                raise_if_project_migration_announced(root)
+                yield project_fs
+                return
+
+            # A migration callback re-enters the operation already held by the
+            # same thread. Normal callers acquire the lock and re-check the
+            # sentinel before this context permits SQLite to open.
+            with project_db_operation(
+                root,
+                project_fs=project_fs,
+            ) as locked_project_fs:
+                locked_project_fs.audit(inventory, allow_missing=True)
+                yield locked_project_fs
+
+
+def audit_runtime_paths(root: Path) -> None:
+    """Fail closed on the bounded canonical inventory before SQLite opens."""
+
+    with runtime_path_audit(root):
+        pass
 
 
 def uninitialized_lines(root: Path) -> list[str]:
@@ -256,8 +411,16 @@ def require_full_invariants(conn: sqlite3.Connection, root: Path, label: str) ->
 
 
 @contextmanager
-def transaction(root: Path, *, validate_invariants: bool = True, touched: list[tuple[str, str]] | None = None) -> Iterator[sqlite3.Connection]:
+def transaction(
+    root: Path,
+    *,
+    validate_invariants: bool = True,
+    touched: list[tuple[str, str]] | None = None,
+    before_commit_check: Callable[[sqlite3.Connection], None] | None = None,
+) -> Iterator[sqlite3.Connection]:
     def before_commit(conn: sqlite3.Connection) -> None:
+        if before_commit_check is not None:
+            before_commit_check(conn)
         if validate_invariants:
             issues = transaction_invariant_issues(conn, root, touched)
             if issues:
@@ -272,19 +435,32 @@ def transaction(root: Path, *, validate_invariants: bool = True, touched: list[t
 
 
 def ensure_runtime_gitignore(root: Path) -> None:
-    path = root / ".gitignore"
-    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    normalized = {line.strip() for line in existing}
-    missing = [pattern for pattern in RUNTIME_GITIGNORE_PATTERNS if pattern not in normalized]
-    if not missing:
-        return
-    ensure_parent(path)
-    lines = existing[:]
-    if lines and lines[-1].strip():
-        lines.append("")
-    lines.append("# Codex Project Harness runtime state")
-    lines.extend(missing)
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    relative = Path(".gitignore")
+    with ProjectFS.open(root) as project_fs:
+        snapshot = project_fs._snapshot(relative, allow_missing=True)
+        existing = (
+            project_fs.read_bytes(relative).decode("utf-8").splitlines()
+            if snapshot.exists
+            else []
+        )
+        normalized = {line.strip() for line in existing}
+        missing = [
+            pattern
+            for pattern in RUNTIME_GITIGNORE_PATTERNS
+            if pattern not in normalized
+        ]
+        if not missing:
+            return
+        lines = existing[:]
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("# Codex Project Harness runtime state")
+        lines.extend(missing)
+        project_fs.atomic_write(
+            relative,
+            ("\n".join(lines).rstrip() + "\n").encode("utf-8"),
+            mode=0o644,
+        )
 
 
 def git_tracked_runtime_paths(root: Path) -> list[str]:
@@ -301,14 +477,26 @@ def git_tracked_runtime_paths(root: Path) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def gitignore_runtime_issues(root: Path) -> list[str]:
+def _gitignore_runtime_issues(project_fs: ProjectFS) -> list[str]:
     issues: list[str] = []
-    path = root / ".gitignore"
-    lines = {line.strip() for line in path.read_text(encoding="utf-8").splitlines()} if path.exists() else set()
+    snapshot = project_fs._snapshot(
+        Path(".gitignore"),
+        allow_missing=True,
+    )
+    lines = (
+        {
+            line.strip()
+            for line in project_fs.read_bytes(Path(".gitignore"))
+            .decode("utf-8")
+            .splitlines()
+        }
+        if snapshot.exists
+        else set()
+    )
+    tracked = git_tracked_runtime_paths(project_fs.root)
     for pattern in RUNTIME_GITIGNORE_PATTERNS:
         if pattern not in lines:
             issues.append(f"missing .gitignore runtime pattern: {pattern}")
-    tracked = git_tracked_runtime_paths(root)
     if tracked:
         issues.append(
             "runtime state is tracked by git: "
@@ -318,6 +506,11 @@ def gitignore_runtime_issues(root: Path) -> list[str]:
             + ")"
         )
     return issues
+
+
+def gitignore_runtime_issues(root: Path) -> list[str]:
+    with ProjectFS.open(root) as project_fs:
+        return _gitignore_runtime_issues(project_fs)
 
 
 
@@ -601,17 +794,28 @@ def install_project_agent_templates(root: Path) -> int:
             "agent template inventory mismatch: "
             f"actual={sorted(actual)} expected={sorted(CODEX_AGENT_TEMPLATE_NAMES)}"
         )
-    target_dir = root / ".codex" / "agents"
-    target_dir.mkdir(parents=True, exist_ok=True)
     installed = 0
-    for name in sorted(CODEX_AGENT_TEMPLATE_NAMES):
-        source = template_dir / name
-        validate_codex_agent_template(source)
-        target = target_dir / name
-        if target.exists():
-            continue
-        shutil.copyfile(source, target)
-        installed += 1
+    with ProjectFS.open(root) as project_fs:
+        destinations = tuple(
+            Path(".codex/agents") / name
+            for name in sorted(CODEX_AGENT_TEMPLATE_NAMES)
+        )
+        project_fs.audit(destinations, allow_missing=True)
+        for name, destination in zip(
+            sorted(CODEX_AGENT_TEMPLATE_NAMES),
+            destinations,
+            strict=True,
+        ):
+            source = template_dir / name
+            validate_codex_agent_template(source)
+            if project_fs._snapshot(destination, allow_missing=True).exists:
+                continue
+            project_fs.copy_from_external(
+                source,
+                destination,
+                mode=0o644,
+            )
+            installed += 1
     return installed
 
 
@@ -1503,9 +1707,21 @@ def verify_run(
     execution_id = f"EX-{uuid.uuid4().hex}"
     validation_id = f"VAL-{uuid.uuid4().hex}"
     surface = f"test-target:{target_id}"
+
+    def revalidate_execution_before_commit(_conn: sqlite3.Connection) -> None:
+        try:
+            validate_execution_result(root, policy, result, runner=runner)
+        except ExecutionPolicyError as exc:
+            raise HarnessError(str(exc)) from exc
+        if current_candidate_sha(root) != candidate_sha:
+            raise HarnessError(
+                "stale candidate: project source changed before verification commit"
+            )
+
     with transaction(
         root,
         touched=[("execution", execution_id), ("validation", validation_id)],
+        before_commit_check=revalidate_execution_before_commit,
     ) as conn:
         if current_cycle_id(conn) != cycle_id:
             raise HarnessError(
@@ -2428,22 +2644,27 @@ def validated_migration_path(root: Path, from_version: str, to_version: int) -> 
         requested_from = int(from_version)
     except ValueError as exc:
         raise HarnessError(f"invalid migration source version: {from_version}") from exc
-    if not db_file(root).exists():
-        raise HarnessError("migration requires an initialized runtime")
     current_schema_issues: list[str] = []
-    with connection(root) as conn:
-        project_exists = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'project'").fetchone()
-        if not project_exists:
+    store = get_store(root)
+    with runtime_path_audit(root, store=store) as project_fs:
+        if isinstance(store, SqliteStore) and (
+            project_fs is None
+            or not project_fs._snapshot(DB_PATH, allow_missing=True).exists
+        ):
             raise HarnessError("migration requires an initialized runtime")
-        row = conn.execute("select schema_version from project where id = 1").fetchone()
-        if not row:
-            raise HarnessError("migration requires project state")
-        actual = int(row["schema_version"])
-        if actual == SCHEMA_VERSION:
-            try:
-                current_schema_issues = runtime_schema_issues(conn)
-            except sqlite3.Error as exc:
-                current_schema_issues = [f"schema inspection failed: {exc}"]
+        with store.connection() as conn:
+            project_exists = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'project'").fetchone()
+            if not project_exists:
+                raise HarnessError("migration requires an initialized runtime")
+            row = conn.execute("select schema_version from project where id = 1").fetchone()
+            if not row:
+                raise HarnessError("migration requires project state")
+            actual = int(row["schema_version"])
+            if actual == SCHEMA_VERSION:
+                try:
+                    current_schema_issues = runtime_schema_issues(conn)
+                except sqlite3.Error as exc:
+                    current_schema_issues = [f"schema inspection failed: {exc}"]
     if requested_from != actual:
         raise HarnessError(f"migration source mismatch: expected database schema {actual}, received {requested_from}")
     if to_version < actual:
@@ -2475,11 +2696,32 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
     from core.local_core_migration import migrate_project_to_schema30
 
     def validate_staging(staging_path: Path) -> None:
-        with tempfile.TemporaryDirectory(prefix="kafa-projection-dry-run-", dir=staging_path.parent) as temp:
+        with ProjectFS.open(root) as active_project_fs:
+            staging_relative = active_project_fs.relative_to_root(
+                staging_path
+            )
+            staging_snapshot = active_project_fs._snapshot(
+                staging_relative,
+                allow_missing=False,
+            )
+            _before_staging_validation_snapshot_read(
+                active_project_fs,
+                staging_relative,
+            )
+            staging_payload = active_project_fs.read_bytes(
+                staging_relative
+            )
+            active_project_fs._assert_unchanged(
+                staging_relative,
+                staging_snapshot,
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="kafa-projection-dry-run-"
+        ) as temp:
             staging_root = Path(temp)
             staging_db = staging_root / DB_PATH
             ensure_parent(staging_db)
-            shutil.copyfile(staging_path, staging_db)
+            staging_db.write_bytes(staging_payload)
             with connection(staging_root) as conn:
                 issues = runtime_schema_issues(conn) + [
                     str(issue) for issue in full_invariant_issues(conn, staging_root)
@@ -2510,37 +2752,44 @@ def doctor(
     require_views: bool = True,
     require_project_files: bool = True,
 ) -> list[str]:
-    issues: list[str] = []
-    if require_project_files:
-        issues.extend(gitignore_runtime_issues(root))
-    path = db_file(root)
-    if not path.exists():
-        return ["missing sqlite state: .ai-team/state/harness.db"]
-    with connection(root) as conn:
-        try:
-            project = project_row(conn)
-        except HarnessError as exc:
-            issues.append(str(exc))
-        else:
-            if int(project["schema_version"]) != SCHEMA_VERSION:
-                issues.append(f"schema version mismatch: expected {SCHEMA_VERSION}, actual {project['schema_version']}")
-            if project["runtime_version"] != RUNTIME_VERSION:
-                issues.append(f"runtime version mismatch: expected {RUNTIME_VERSION}, actual {project['runtime_version']}")
-        integrity = conn.execute("pragma integrity_check").fetchone()[0]
-        if integrity != "ok":
-            issues.append(f"sqlite integrity check failed: {integrity}")
-        foreign_key_errors = conn.execute("pragma foreign_key_check").fetchall()
-        if foreign_key_errors:
-            issues.append(f"sqlite foreign key check failed: {len(foreign_key_errors)} issue(s)")
-        issues.extend(runtime_schema_issues(conn))
-        from core.invariant_checker import check_runtime_invariants
+    store = get_store(root)
+    with runtime_path_audit(root, store=store) as project_fs:
+        issues: list[str] = []
+        if isinstance(store, SqliteStore):
+            if project_fs is None:
+                return ["missing sqlite state: .ai-team/state/harness.db"]
+            if not project_fs._snapshot(
+                DB_PATH,
+                allow_missing=True,
+            ).exists:
+                return ["missing sqlite state: .ai-team/state/harness.db"]
+        if require_project_files:
+            issues.extend(gitignore_runtime_issues(root))
+        with store.connection() as conn:
+            try:
+                project = project_row(conn)
+            except HarnessError as exc:
+                issues.append(str(exc))
+            else:
+                if int(project["schema_version"]) != SCHEMA_VERSION:
+                    issues.append(f"schema version mismatch: expected {SCHEMA_VERSION}, actual {project['schema_version']}")
+                if project["runtime_version"] != RUNTIME_VERSION:
+                    issues.append(f"runtime version mismatch: expected {RUNTIME_VERSION}, actual {project['runtime_version']}")
+            integrity = conn.execute("pragma integrity_check").fetchone()[0]
+            if integrity != "ok":
+                issues.append(f"sqlite integrity check failed: {integrity}")
+            foreign_key_errors = conn.execute("pragma foreign_key_check").fetchall()
+            if foreign_key_errors:
+                issues.append(f"sqlite foreign key check failed: {len(foreign_key_errors)} issue(s)")
+            issues.extend(runtime_schema_issues(conn))
+            from core.invariant_checker import check_runtime_invariants
 
-        issues.extend(check_runtime_invariants(conn, root))
-        if require_views:
-            from core.projections import projection_content_issues
+            issues.extend(check_runtime_invariants(conn, root))
+            if require_views:
+                from core.projections import projection_content_issues
 
-            issues.extend(projection_content_issues(root))
-    return issues
+                issues.extend(projection_content_issues(root))
+        return issues
 
 
 def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
@@ -3119,11 +3368,20 @@ def transition_if_needed(root: Path, phase: str) -> None:
 
 
 def status_lines(root: Path) -> list[str]:
-    with connection(root) as conn:
-        row = project_row(conn)
-        task_count = conn.execute("select count(*) from tasks").fetchone()[0]
-        planned_count = conn.execute("select count(*) from tasks where status = 'planned'").fetchone()[0]
-        event_count = conn.execute("select count(*) from events").fetchone()[0]
+    store = get_store(root)
+    with runtime_path_audit(root, store=store) as project_fs:
+        if isinstance(store, SqliteStore) and (
+            project_fs is None
+            or not project_fs._snapshot(DB_PATH, allow_missing=True).exists
+        ):
+            raise HarnessError(
+                f"harness is not initialized in this project: {root}"
+            )
+        with store.connection() as conn:
+            row = project_row(conn)
+            task_count = conn.execute("select count(*) from tasks").fetchone()[0]
+            planned_count = conn.execute("select count(*) from tasks where status = 'planned'").fetchone()[0]
+            event_count = conn.execute("select count(*) from events").fetchone()[0]
     return [
         "# Harness Status",
         f"status: {row['status']}",

@@ -1,13 +1,12 @@
 """Markdown projection builder for SQLite runtime state."""
 from __future__ import annotations
 
-import os
-import stat
 import tempfile
 from pathlib import Path
 from typing import Callable, Iterable
 
 from harness_lib import ensure_parent, markdown_row, write_state
+from .project_fs import ProjectFS
 
 
 def _runtime():
@@ -45,19 +44,19 @@ def render_project_state(root: Path) -> None:
 
 
 def write_view(root: Path, relpath: str, content: str) -> None:
-    path = root / relpath
-    ensure_parent(path)
-    path.write_bytes((content.rstrip() + "\n").encode("utf-8"))
+    with ProjectFS.open(root) as project_fs:
+        project_fs.atomic_write(
+            Path(relpath),
+            (content.rstrip() + "\n").encode("utf-8"),
+            mode=0o644,
+        )
 
 
-def _remove_retired_projection(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except PermissionError:
-        if path.is_symlink() or not path.is_file():
-            raise
-        os.chmod(path, stat.S_IMODE(path.stat().st_mode) | stat.S_IWUSR)
-        path.unlink()
+def _remove_retired_projection(root: Path, relative: Path) -> None:
+    with ProjectFS.open(root) as project_fs:
+        snapshot = project_fs._snapshot(relative, allow_missing=True)
+        if snapshot.exists:
+            project_fs.unlink_regular(relative, expected=snapshot)
 
 
 def render_requirements(root: Path) -> None:
@@ -288,7 +287,7 @@ def render_executions(root: Path) -> None:
         for row in rows
     )
     write_view(root, "docs/harness/executions.md", "\n".join(lines))
-    _remove_retired_projection(root / "docs/harness/evidence.md")
+    _remove_retired_projection(root, Path("docs/harness/evidence.md"))
 
 
 def render_findings(root: Path) -> None:
@@ -410,6 +409,13 @@ PROJECTION_RENDERERS: tuple[tuple[str, Callable[[Path], None]], ...] = (
 PROJECTION_NAMES = tuple(name for name, _ in PROJECTION_RENDERERS)
 
 
+def preflight_projection_paths(root: Path) -> None:
+    """Reject every unsafe live or retired projection before publication."""
+
+    with ProjectFS.open(root) as project_fs:
+        project_fs.audit(PROJECTION_ROLLBACK_PATHS, allow_missing=True)
+
+
 def render_affected(root: Path, projections: Iterable[str]) -> None:
     """Rebuild only explicitly affected generated views in stable order."""
 
@@ -417,6 +423,7 @@ def render_affected(root: Path, projections: Iterable[str]) -> None:
     unknown = sorted(selected - set(PROJECTION_NAMES))
     if unknown:
         raise ValueError(f"unknown projection(s): {', '.join(unknown)}")
+    preflight_projection_paths(root)
     for name, renderer in PROJECTION_RENDERERS:
         if name in selected:
             renderer(root)
@@ -435,31 +442,39 @@ def projection_content_issues(root: Path) -> list[str]:
             render_all(expected_root)
 
             issues: list[str] = []
-            for relative_path in PROJECTION_PATHS:
-                actual = root / relative_path
-                expected = expected_root / relative_path
-                if actual.is_symlink() or not actual.is_file():
-                    issues.append(
-                        f"missing or unsafe view: {relative_path.as_posix()}"
-                    )
-                    continue
-                if expected.is_symlink() or not expected.is_file():
-                    issues.append(
-                        "projection verifier did not generate expected view: "
-                        f"{relative_path.as_posix()}"
-                    )
-                    continue
-                if actual.read_bytes() != expected.read_bytes():
-                    issues.append(
-                        f"stale or invalid view content: {relative_path.as_posix()}"
-                    )
+            with ProjectFS.open(root) as actual_fs, ProjectFS.open(
+                expected_root
+            ) as expected_fs:
+                for relative_path in PROJECTION_PATHS:
+                    try:
+                        actual = actual_fs.read_bytes(relative_path)
+                    except Exception:
+                        issues.append(
+                            f"missing or unsafe view: {relative_path.as_posix()}"
+                        )
+                        continue
+                    try:
+                        expected = expected_fs.read_bytes(relative_path)
+                    except Exception:
+                        issues.append(
+                            "projection verifier did not generate expected view: "
+                            f"{relative_path.as_posix()}"
+                        )
+                        continue
+                    if actual != expected:
+                        issues.append(
+                            f"stale or invalid view content: {relative_path.as_posix()}"
+                        )
 
-            retired = root / PROJECTION_ROLLBACK_PATHS[-1]
-            if retired.exists() or retired.is_symlink():
-                issues.append(
-                    "retired projection is still present: "
-                    f"{PROJECTION_ROLLBACK_PATHS[-1].as_posix()}"
-                )
+                retired_path = PROJECTION_ROLLBACK_PATHS[-1]
+                if actual_fs._snapshot(
+                    retired_path,
+                    allow_missing=True,
+                ).exists:
+                    issues.append(
+                        "retired projection is still present: "
+                        f"{retired_path.as_posix()}"
+                    )
             return issues
     except Exception as exc:
         return [f"projection content verification failed: {exc}"]
