@@ -4717,7 +4717,13 @@ class ProjectFSFoundationTests(unittest.TestCase):
 
             self.assertFalse((root / "state/copy.txt").exists())
             self.assertEqual((root / "state/source.txt").read_bytes(), b"source\n")
-            self.assertEqual(stat.S_IMODE((root / "state/source.txt").stat().st_mode), 0o640)
+            source_mode = stat.S_IMODE(
+                (root / "state/source.txt").stat().st_mode
+            )
+            if os.name == "nt":
+                self.assertTrue(source_mode & stat.S_IWUSR)
+            else:
+                self.assertEqual(source_mode, 0o640)
 
     def test_unique_directory_rejects_prefixes_that_form_unsafe_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
