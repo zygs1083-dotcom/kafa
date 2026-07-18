@@ -4861,7 +4861,9 @@ class ProjectFSContractRedTests(unittest.TestCase):
                 self.assertEqual(tuple(parked.iterdir()), ())
 
     @unittest.skipUnless(os.name == "nt", "Windows final-leaf pin contract")
-    def test_windows_final_leaf_stays_pinned_through_backup_cleanup(self) -> None:
+    def test_windows_final_leaf_blocks_move_and_write_through_backup_cleanup(
+        self,
+    ) -> None:
         from core import project_fs as project_fs_module
 
         with tempfile.TemporaryDirectory() as temp:
@@ -4869,10 +4871,8 @@ class ProjectFSContractRedTests(unittest.TestCase):
             root = base / "project"
             target = root / "target.txt"
             parked = base / "parked-target.txt"
-            outside_alias = base / "target-alias.txt"
             blocked_moves: list[OSError] = []
             blocked_writes: list[OSError] = []
-            blocked_links: list[OSError] = []
             original_hook = project_fs_module._before_windows_backup_cleanup
 
             def require_sharing_denial(
@@ -4918,10 +4918,6 @@ class ProjectFSContractRedTests(unittest.TestCase):
                     blocked_writes,
                     allow_crt_eacces=True,
                 )
-                require_sharing_denial(
-                    lambda: os.link(target, outside_alias),
-                    blocked_links,
-                )
 
             project_fs_module._before_windows_backup_cleanup = attempt_final_move
             self.addCleanup(
@@ -4937,15 +4933,58 @@ class ProjectFSContractRedTests(unittest.TestCase):
 
             self.assertEqual(len(blocked_moves), 1)
             self.assertEqual(len(blocked_writes), 1)
-            self.assertEqual(len(blocked_links), 1)
             self.assertEqual(target.read_bytes(), b"new\n")
             self.assertFalse(parked.exists())
-            self.assertFalse(outside_alias.exists())
             target.write_bytes(b"after-close\n")
             target.rename(parked)
             parked.rename(target)
-            os.link(target, outside_alias)
-            outside_alias.unlink()
+            self.assertEqual(target.read_bytes(), b"after-close\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows final-leaf hardlink contract")
+    def test_windows_final_leaf_hardlink_race_rolls_back_and_fails_closed(
+        self,
+    ) -> None:
+        from core import project_fs as project_fs_module
+        from core.project_fs import ProjectPathSafetyError
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            target = root / "target.txt"
+            outside_alias = base / "target-alias.txt"
+            original_hook = project_fs_module._before_windows_backup_cleanup
+
+            def hardlink_final_leaf(
+                _backend,
+                destination: Path,
+                _backup: Path,
+            ) -> None:
+                if destination == Path("target.txt"):
+                    os.link(target, outside_alias)
+
+            project_fs_module._before_windows_backup_cleanup = hardlink_final_leaf
+            self.addCleanup(
+                setattr,
+                project_fs_module,
+                "_before_windows_backup_cleanup",
+                original_hook,
+            )
+            self.addCleanup(outside_alias.unlink, missing_ok=True)
+
+            with project_fs(root) as fs:
+                fs.atomic_write(Path("target.txt"), b"old\n", mode=0o600)
+                with self.assertRaisesRegex(
+                    ProjectPathSafetyError,
+                    "hard-linked-target",
+                ):
+                    fs.atomic_write(Path("target.txt"), b"new\n", mode=0o600)
+
+            self.assertEqual(target.read_bytes(), b"old\n")
+            self.assertEqual(outside_alias.read_bytes(), b"new\n")
+            parked = base / "parked-target.txt"
+            target.write_bytes(b"after-close\n")
+            target.rename(parked)
+            parked.rename(target)
             self.assertEqual(target.read_bytes(), b"after-close\n")
 
 
