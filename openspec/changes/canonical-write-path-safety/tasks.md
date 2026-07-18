@@ -66,12 +66,12 @@
 
 ## 10. Independent QA And Full Delivery Evidence
 
-- [ ] 10.1 Run complete unittest discovery with `ResourceWarning` as error; report exact count and keep skip/expected-failure/not-run distinct.
-- [ ] 10.2 Run runtime smoke, fixture/stability E2E, Skill eval, isolated wheel/sdist installation, cache/discovery/doctor/hook/uninstall, and artifact checksum validation.
-- [ ] 10.3 Regenerate real Native single and parallel reports for the exact source candidate; validate source/status/binary/token/scope/timing consistency and do not infer token savings.
-- [ ] 10.4 Independent read-only QA A reviews POSIX/Windows filesystem and SQLite/store safety; QA B reviews migration/recovery and execution-evidence safety. Main/deep applies every fix, then reruns and re-reviews.
+- [x] 10.1 Run complete unittest discovery with `ResourceWarning` as error; report exact count and keep skip/expected-failure/not-run distinct.
+- [x] 10.2 Run runtime smoke, fixture/stability E2E, Skill eval, isolated wheel/sdist installation, cache/discovery/doctor/hook/uninstall, and artifact checksum validation.
+- [x] 10.3 Regenerate real Native single and parallel reports for the exact source candidate; validate source/status/binary/token/scope/timing consistency and do not infer token savings.
+- [x] 10.4 Independent read-only QA A reviews POSIX/Windows filesystem and SQLite/store safety; QA B reviews migration/recovery and execution-evidence safety. Main/deep applies every fix, then reruns and re-reviews.
 - [ ] 10.5 Push only after local gates pass, require both push and pull-request Ubuntu/macOS/Windows matrices for the exact implementation head, and record annotations separately from failures.
-- [ ] 10.6 Complete adversarial review for logic gaps, incorrect facts, simpler alternatives, same-user threat overclaims, data loss, stale candidate, and missing evidence; resolve every Critical/High/Medium finding.
+- [x] 10.6 Complete adversarial review for logic gaps, incorrect facts, simpler alternatives, same-user threat overclaims, data loss, stale candidate, and missing evidence; resolve every Critical/High/Medium finding.
 
 ## 11. Archive And Merge
 
