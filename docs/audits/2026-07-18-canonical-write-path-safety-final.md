@@ -220,8 +220,9 @@ Host Hook turn (`host_hook_execution_observed=false`).
 The active user installation was not replaced. Pre-merge machine truth is
 `kafa 2.0.0-beta.1` and `codex-project-harness@personal 2.0.0-beta.1`
 installed/enabled. The installed-plugin digest, excluding bytecode caches, is
-`813ab6d183e180149eef4adc57af8412d5994e8fcac728edc120515a837c0a90`
-and must remain equal after merge.
+`e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed`.
+The official user-scope doctor reports the deployment source, installed tree,
+and Codex cache at that same digest; it must remain equal after merge.
 
 ## Independent QA and adversarial review
 
