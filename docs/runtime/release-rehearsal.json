@@ -5,28 +5,28 @@
       "kind": "wheel",
       "name": "kafa-2.0.0b1-py3-none-any.whl",
       "sbom": "kafa-2.0.0b1-py3-none-any.whl.cdx.json",
-      "sbom_sha256": "f2341b251f5bd4f83662038accc255232a2758ecb88ba684d548d0eae59c0835",
-      "sha256": "4fd976b2680f6950e2e69de464df184c98a34cb5e92e17617e57bfda4b5080bb"
+      "sbom_sha256": "fa4192af15a328930286c576573e6bf3ccf66d644ec7c2032e037353116bc9da",
+      "sha256": "f5b2f10ae2746d0a513f1761f0eadae59be321ae2ea32cd0a9a11c1a1d0668dd"
     },
     {
       "kind": "sdist",
       "name": "kafa-2.0.0b1.tar.gz",
       "sbom": "kafa-2.0.0b1.tar.gz.cdx.json",
-      "sbom_sha256": "abaeb531efac38617d3c4608a18d326c44c8c1d3289d3b51ca9354ee8ce007b9",
-      "sha256": "0538b66c88b4f8423e66534052459c66b54cbad1f77c4e7381cefc8ca3bf2912"
+      "sbom_sha256": "4771a9e2d381cc0b1ff46c8007dde55e251ba4e9fc6c31d2c1e1d60b2080a950",
+      "sha256": "9e6fa48a3a9853d2e67f6de6a782a8e4e301a045fed7e4108b64abc17de0d5eb"
     }
   ],
   "build": {
     "backend": "83.0.0",
-    "finished_at": "2026-07-21T15:43:03Z",
+    "finished_at": "2026-07-21T16:23:19Z",
     "frontend": "1.5.0",
     "python": "3.14.6",
-    "source_date_epoch": 1784648575,
-    "started_at": "2026-07-21T15:43:02Z"
+    "source_date_epoch": 1784650991,
+    "started_at": "2026-07-21T16:23:18Z"
   },
   "commands": [
-    "python -m build --no-isolation --wheel --sdist --outdir /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-2wdqc7tn/dist",
-    "python /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-2wdqc7tn/source/tests/run_isolated_install_smoke.py --repo /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-2wdqc7tn/source --codex-bin /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js --wheel /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-2wdqc7tn/dist/kafa-2.0.0b1-py3-none-any.whl --source-archive /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-2wdqc7tn/dist/kafa-2.0.0b1.tar.gz --json"
+    "python -m build --no-isolation --wheel --sdist --outdir /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist",
+    "python /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/source/tests/run_isolated_install_smoke.py --repo /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/source --codex-bin /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js --wheel /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist/kafa-2.0.0b1-py3-none-any.whl --source-archive /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist/kafa-2.0.0b1.tar.gz --json"
   ],
   "evidence_mode": "local-no-publish-rehearsal",
   "external_effects": {
@@ -36,7 +36,7 @@
     "upload": false,
     "user_installation_change": false
   },
-  "generated_at": "2026-07-21T15:43:16Z",
+  "generated_at": "2026-07-21T16:23:34Z",
   "invariants": {
     "artifact_bytes_unchanged": true,
     "isolated_home": true,
@@ -75,7 +75,7 @@
     ],
     "artifact_mode": true,
     "cache_hook_ok": true,
-    "cache_plugin_path": "/private/var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/tmpedd7lwe_/codex-home/plugins/cache/kafa-local/codex-project-harness/2.0.0-beta.1",
+    "cache_plugin_path": "/private/var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/tmppw0d_1ei/codex-home/plugins/cache/kafa-local/codex-project-harness/2.0.0-beta.1",
     "cache_plugin_tree_sha256": "1178b7d7d62b23b438a28819895689840a0780dc4a91f01257b21c8fba7bfc48",
     "codex_cache_removed": true,
     "codex_unregister_ok": true,
@@ -87,11 +87,11 @@
     "host_hook_execution_reason": "deterministic install smoke proves app-server discovery; host execution requires a live authenticated turn",
     "imported_from_venv": true,
     "installed_migration_backup_ok": true,
-    "installed_migration_backup_sha256": "653f3e6c4e907c3cde8ade24a3cf265dabd8e37ea8705196a7b6bde46a12d2b0",
+    "installed_migration_backup_sha256": "9eb25d2499d4152b7ae33f575700f85bd142784a7241bac6ac7888cc09919a2c",
     "installed_migration_doctor_ok": true,
     "installed_migration_dry_run_ok": true,
     "installed_migration_invented_authority_count": 0,
-    "installed_migration_manifest_sha256": "b538e124971c366b987a57941dd9824e866264c609acc92e130bebf8c3c60887",
+    "installed_migration_manifest_sha256": "ed93b5bdfeaaff8e239a7b4a2dee86fb579bc6d12469d2276e76aae121b97be5",
     "installed_migration_normalized_failure_modes": 1,
     "installed_migration_ok": true,
     "installed_migration_source_version": 30,
@@ -115,21 +115,21 @@
     "remove_ok": true,
     "retired_runtime_absent": true,
     "source_archive_name": "kafa-2.0.0b1.tar.gz",
-    "source_archive_sha256": "0538b66c88b4f8423e66534052459c66b54cbad1f77c4e7381cefc8ca3bf2912",
+    "source_archive_sha256": "9e6fa48a3a9853d2e67f6de6a782a8e4e301a045fed7e4108b64abc17de0d5eb",
     "version": "2.0.0-beta.1",
     "wheel": "kafa-2.0.0b1-py3-none-any.whl",
     "wheel_name": "kafa-2.0.0b1-py3-none-any.whl",
-    "wheel_sha256": "4fd976b2680f6950e2e69de464df184c98a34cb5e92e17617e57bfda4b5080bb"
+    "wheel_sha256": "f5b2f10ae2746d0a513f1761f0eadae59be321ae2ea32cd0a9a11c1a1d0668dd"
   },
   "ok": true,
   "report_version": "kafa-release-rehearsal-v1",
   "sbom_count": 2,
   "source": {
     "dirty": false,
-    "git_commit": "21c542e8c016923a9ae8067050f22584f4e207de",
+    "git_commit": "f759237fa9d1e034b0a7e8e730581cf8afaf4d7a",
     "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "source_file_count": 207,
-    "source_tree_sha256": "8a7ff7e3de4671760a20e84b4108fd541fa2823b17b2b77e96b17be094a1c359"
+    "source_tree_sha256": "ec6f98758a0e866bab0280057e1b268365ae1a08c9d584db5a85b3e41c1f2b34"
   },
   "steps": [
     "snapshot",
