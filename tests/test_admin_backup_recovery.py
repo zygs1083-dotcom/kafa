@@ -31,7 +31,7 @@ def sha256(path: Path) -> str:
 
 
 class AdminBackupRecoveryTests(unittest.TestCase):
-    def test_schema30_admin_backup_is_consistent_digested_and_non_mutating(self) -> None:
+    def test_schema31_admin_backup_is_consistent_digested_and_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             harness_db.init_runtime(root)
@@ -43,7 +43,7 @@ class AdminBackupRecoveryTests(unittest.TestCase):
 
             manifest = backup_sqlite_database(
                 root,
-                expected_source_version=30,
+                expected_source_version=31,
                 created_at="2026-07-11T03:04:05Z",
             )
 
@@ -56,7 +56,7 @@ class AdminBackupRecoveryTests(unittest.TestCase):
             with closing(sqlite3.connect(active)) as conn:
                 event_count_after = int(conn.execute("select count(*) from events").fetchone()[0])
 
-            self.assertEqual(manifest.source_version, 30)
+            self.assertEqual(manifest.source_version, 31)
             self.assertEqual(manifest.sha256, sha256(backup))
             self.assertEqual(payload["sha256"], manifest.sha256)
             self.assertGreaterEqual(payload["row_counts"]["requirements"], 1)
@@ -78,7 +78,7 @@ class AdminBackupRecoveryTests(unittest.TestCase):
 
             manifests = sorted(
                 (root / ".ai-team/backups").glob(
-                    "schema-30-before-local-core-*/backup-manifest.json"
+                    "schema-31-before-local-core-*/backup-manifest.json"
                 )
             )
             self.assertEqual(len(manifests), 1)
@@ -88,7 +88,7 @@ class AdminBackupRecoveryTests(unittest.TestCase):
                 sentinel = conn.execute("select body from requirements where id='R1'").fetchone()[0]
                 integrity = conn.execute("pragma integrity_check").fetchone()[0]
 
-            self.assertEqual(payload["source_version"], 30)
+            self.assertEqual(payload["source_version"], 31)
             self.assertEqual(payload["sha256"], sha256(backup))
             self.assertEqual(payload["backup_integrity_check"], ["ok"])
             self.assertEqual(sentinel, "repair sentinel")
@@ -110,7 +110,7 @@ class AdminBackupRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(SchemaLifecycleError, r"foreign_key_issues=[1-9]"):
                 backup_sqlite_database(
                     root,
-                    expected_source_version=30,
+                    expected_source_version=31,
                     created_at="2026-07-11T03:04:06Z",
                 )
 

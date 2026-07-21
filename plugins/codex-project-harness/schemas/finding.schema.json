@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:finding",
   "title": "Codex Project Harness Finding",
   "type": "object",
   "required": ["id", "surface", "severity", "status", "summary", "created_at"],

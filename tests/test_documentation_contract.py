@@ -121,7 +121,7 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("OpenSpec", readme)
         self.assertIn("verified code handoff", readme)
         self.assertIn("human-review-required", readme)
-        self.assertIn("schema 30", readme)
+        self.assertIn("schema 31", readme)
 
     def test_canonical_path_safety_and_remediation_are_documented(self) -> None:
         guidance = self.read("README.md") + "\n" + self.read("INSTALL.md")
@@ -185,6 +185,69 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("test-target", quality)
         self.assertIn("verify run", quality)
         self.assertIn("human-review-required", quality)
+
+    def test_schema31_provenance_and_legal_manual_journey_are_documented(self) -> None:
+        guidance = "\n".join(
+            self.read(relative)
+            for relative in (
+                "README.md",
+                "INSTALL.md",
+                "QUICKSTART.md",
+                "examples/full-project-flow.md",
+                "plugins/codex-project-harness/skills/project-harness/SKILL.md",
+                "plugins/codex-project-harness/skills/test-first-delivery/SKILL.md",
+                "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md",
+                "plugins/codex-project-harness/skills/harness-audit/SKILL.md",
+            )
+        )
+        for marker in (
+            "target_definition_sha256",
+            "runtime_executable_sha256",
+            "container_image_digest",
+            "provenance_status",
+            "legacy-incomplete",
+            "--pull=never",
+        ):
+            self.assertIn(marker, guidance, marker)
+
+        flow = self.read("examples/full-project-flow.md")
+        for command in (
+            "baseline confirm",
+            "test-target qualify",
+            "--qualification",
+            "delivery ready",
+        ):
+            self.assertIn(command, flow, command)
+        self.assertNotIn("harness baseline freeze", flow)
+        self.assertIn("schema 31", flow)
+
+        quickstart = self.read("QUICKSTART.md")
+        self.assertLess(
+            quickstart.index("task accept T1"),
+            quickstart.index("gate record"),
+            "task acceptance must precede the revision-bound gate",
+        )
+
+        eval_prompts = self.read("docs/runtime/fresh-skill-eval-prompts.md")
+        for command in (
+            "baseline confirm",
+            "test-target add/link/qualify",
+            "delivery ready",
+        ):
+            self.assertIn(command, eval_prompts, command)
+        self.assertNotIn("baseline freeze", eval_prompts)
+        self.assertLess(
+            eval_prompts.index("task add/start/submit/accept"),
+            eval_prompts.index("gate record"),
+        )
+        self.assertLess(
+            eval_prompts.index("delivery record"),
+            eval_prompts.index("validate --delivery"),
+        )
+
+        commands = self.documented_commands()
+        self.assertNotIn("harness phase ", commands)
+        self.assertNotIn("harness.py --root . phase ", commands)
 
     def test_high_risk_acceptance_cannot_waive_review_prerequisites(self) -> None:
         for relative in [
@@ -379,7 +442,7 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertNotIn("retry_count", report["summary"])
         self.assertEqual(len(report["evaluation_source"]["workspace_sha256"]), 64)
         self.assertIn("high_risk_requires_human_review", names)
-        self.assertIn("schema27_29_migration_and_rollback", names)
+        self.assertIn("schema27_to_active_migration_and_rollback", names)
         self.assertFalse(categories & {"connector", "provider", "host-codex"})
 
     def test_migration_recovery_guidance_distinguishes_safe_and_incomplete_cleanup(

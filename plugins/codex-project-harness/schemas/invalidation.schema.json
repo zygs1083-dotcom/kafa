@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:invalidation",
   "title": "Codex Project Harness Invalidation",
   "type": "object",
   "required": ["id", "source_type", "source_id", "target_type", "target_id", "reason", "created_at"],
@@ -14,5 +15,5 @@
     "resolved_at": { "type": ["string", "null"] },
     "created_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

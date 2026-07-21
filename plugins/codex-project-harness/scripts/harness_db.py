@@ -26,7 +26,17 @@ if str(PLUGIN_ROOT) not in sys.path:
 from harness_lib import ensure_parent, git_dirty, markdown_row, now_iso
 from core import RUNTIME_VERSION, SCHEMA_VERSION
 from core.errors import HarnessError
+from core.execution import (
+    latest_acceptance_target_qualification,
+    recorded_execution_provenance_issues,
+    target_definition_digest,
+)
 from core.lock_manager import parse_time
+from core.outcome_metrics import (
+    OUTCOME_EVIDENCE_MODE,
+    OUTCOME_METRICS_VERSION,
+    build_outcome_metrics,
+)
 from core.cycle_ledger import (
     DEFAULT_CYCLE_ID,
     LEGACY_CYCLE_ID,
@@ -36,18 +46,22 @@ from core.cycle_ledger import (
     current_cycle_id,
     current_cycle_row,
     ensure_delivery_cycles,
+    latest_baseline,
     project_row,
     trace_rows,
     trace_snapshot,
     traceability_issues,
 )
 from core.schema_guard import (
+    ACCEPTANCE_STATUSES,
     FAILURE_MODE_STATUSES,
+    REQUIREMENT_STATUSES,
     RESULT_FORMATS,
     SANDBOX_STATUSES,
     STACK_PROFILES,
     TASK_STATUSES,
     TEST_TARGET_KINDS,
+    normalize_outcome_timestamp,
 )
 from core.store import (
     DB_PATH,
@@ -56,20 +70,21 @@ from core.store import (
     InMemoryStore,
     SqliteStore,
     Store,
+    _verified_sqlite_connection,
     project_db_operation,
     raise_if_project_migration_announced,
 )
 from core.project_fs import ProjectFS, pin_project_filesystem
 from core.schema_lifecycle import (
-    SCHEMA30_CATALOG_TABLES,
-    SCHEMA30_TABLES,
+    ACTIVE_SCHEMA_CATALOG_TABLES,
+    ACTIVE_SCHEMA_TABLES,
     backup_sqlite_database,
     create_schema as create_schema29,
-    create_schema30,
+    create_active_schema,
 )
 
 
-REGISTERED_SCHEMA_SOURCES = frozenset({27, 28, 29})
+REGISTERED_SCHEMA_SOURCES = frozenset({27, 28, 29, 30})
 DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
 STACK_PROFILE_IMAGES = {
     "python": DEFAULT_CONTAINER_IMAGE,
@@ -152,12 +167,40 @@ DUMB_COMMAND_PREFIXES = ["echo", "true", "false", "cat", "pwd", "ls", "printf"]
 _store_factory: Callable[[Path], Store] = SqliteStore
 
 
+_CLOSED_CYCLE_MUTATION_ALLOWLIST = frozenset(
+    {
+        "init_runtime",
+        "cycle_start",
+        "record_outcome_observation",
+        "record_decision",
+        "render_all",
+        "render_affected",
+    }
+)
+
+
+def _require_active_cycle_for_mutation(root: Path, operation: str) -> None:
+    """Prevent public delivery facts from changing after the cycle is closed."""
+
+    if operation in _CLOSED_CYCLE_MUTATION_ALLOWLIST:
+        return
+    with connection(root) as conn:
+        cycle = current_cycle_row(conn)
+    if str(cycle["status"]) != "active":
+        raise HarnessError(
+            "current cycle is closed for mutation: "
+            f"{cycle['id']} status={cycle['status']}; "
+            f"start a new cycle before {operation}"
+        )
+
+
 def _project_mutation(function: Callable[..., Any]) -> Callable[..., Any]:
     """Keep each DB mutation and its synchronous projections in one operation lock."""
 
     @wraps(function)
     def locked(root: Path, *args: Any, **kwargs: Any) -> Any:
         if isinstance(get_store(root), InMemoryStore):
+            _require_active_cycle_for_mutation(root, function.__name__)
             return function(root, *args, **kwargs)
         if function.__name__ == "init_runtime":
             _preflight_init_paths(root)
@@ -165,6 +208,7 @@ def _project_mutation(function: Callable[..., Any]) -> Callable[..., Any]:
             from core.projections import preflight_projection_paths
 
             preflight_projection_paths(root)
+            _require_active_cycle_for_mutation(root, function.__name__)
             return function(root, *args, **kwargs)
 
     return locked
@@ -195,7 +239,7 @@ def _preflight_init_paths(root: Path) -> None:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
-    """Create or validate the active schema 30 local-only Kernel."""
+    """Create or validate the generation-neutral active local-only Kernel."""
 
     tables = {
         str(row[0])
@@ -204,9 +248,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
         )
     }
     if not tables:
-        create_schema30(conn)
+        create_active_schema(conn)
         return
-    if tables == SCHEMA30_CATALOG_TABLES:
+    if tables == ACTIVE_SCHEMA_CATALOG_TABLES:
         return
     project_version = None
     if "project" in tables:
@@ -218,9 +262,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             f"--from-version {project_version} --to-version {SCHEMA_VERSION}"
         )
     raise HarnessError(
-        "active schema 30 table inventory mismatch: "
-        f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
-        f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
+        f"active schema {SCHEMA_VERSION} table inventory mismatch: "
+        f"missing={sorted(ACTIVE_SCHEMA_CATALOG_TABLES - tables)} "
+        f"extra={sorted(tables - ACTIVE_SCHEMA_CATALOG_TABLES)}"
     )
 
 
@@ -587,19 +631,76 @@ def emit_audit_event(
     command: str = "",
     extra: dict[str, Any] | None = None,
 ) -> None:
-    from core.event_bus import emit_audit
+    from core.event_bus import compact_summary, emit_audit
 
-    emit_audit(
-        conn,
-        SCHEMA_VERSION,
-        event_type,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        before=before,
-        after=after,
-        actor=actor,
-        command=command,
-        extra=extra,
+    project = conn.execute(
+        "select schema_version from project where id = 1"
+    ).fetchone()
+    event_schema_version = (
+        int(project["schema_version"])
+        if project is not None
+        else SCHEMA_VERSION
+    )
+
+    event_columns = {
+        str(row[1]) for row in conn.execute("pragma table_info(events)")
+    }
+    if "event_type" in event_columns:
+        emit_audit(
+            conn,
+            event_schema_version,
+            event_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            before=before,
+            after=after,
+            actor=actor,
+            command=command,
+            extra=extra,
+        )
+        return
+    legacy_columns = {
+        "id",
+        "schema_version",
+        "type",
+        "source",
+        "target",
+        "correlation_id",
+        "payload_json",
+        "created_at",
+    }
+    if not legacy_columns.issubset(event_columns):
+        raise HarnessError(
+            "unsupported legacy audit event schema: "
+            f"columns={sorted(event_columns)}"
+        )
+    after_summary = dict(after or {})
+    if extra:
+        after_summary.update(extra)
+    conn.execute(
+        """
+        insert into events
+        (id, schema_version, type, source, target, correlation_id,
+         payload_json, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            event_schema_version,
+            event_type,
+            entity_type or "runtime",
+            f"{entity_type or 'entity'}:{entity_id}",
+            str(uuid.uuid4()),
+            stable_json(
+                {
+                    "actor": actor or "root-controller",
+                    "command": command or event_type,
+                    "before": compact_summary(before),
+                    "after": compact_summary(after_summary),
+                }
+            ),
+            now_iso(),
+        ),
     )
 
 
@@ -819,10 +920,123 @@ def install_project_agent_templates(root: Path) -> int:
     return installed
 
 
-def cycle_status(root: Path) -> dict[str, Any]:
+def cycle_status(root: Path, cycle_id: str = "") -> dict[str, Any]:
     with connection(root) as conn:
-        cycle = current_cycle_row(conn)
+        cycle = (
+            conn.execute(
+                "select * from delivery_cycles where id = ?",
+                (cycle_id,),
+            ).fetchone()
+            if cycle_id
+            else current_cycle_row(conn)
+        )
+        if cycle is None:
+            raise HarnessError(f"missing delivery cycle: {cycle_id}")
         return row_snapshot(cycle) or {}
+
+
+def cycle_audit(root: Path, cycle_id: str) -> dict[str, Any]:
+    """Return a read-only, cycle-selected consistency and fact snapshot."""
+
+    normalized_id = cycle_id.strip()
+    if not normalized_id:
+        raise HarnessError("cycle audit requires a non-empty cycle id")
+    from core.delivery import (
+        evaluate_historical_cycle_prerequisites,
+        historical_cycle_event_facts,
+    )
+
+    with connection(root) as conn:
+        cycle = conn.execute(
+            "select * from delivery_cycles where id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if cycle is None:
+            raise HarnessError(f"missing delivery cycle: {normalized_id}")
+        direct_tables = (
+            "requirements",
+            "acceptance",
+            "failure_modes",
+            "baselines",
+            "tasks",
+            "acceptance_target_qualifications",
+            "executions",
+            "validations",
+            "findings",
+            "quality_gates",
+            "deliveries",
+            "invalidations",
+            "outcome_observations",
+            "decisions",
+        )
+        relation_tables = (
+            "requirement_acceptance",
+            "failure_mode_acceptance",
+            "task_acceptance",
+            "task_failure_modes",
+            "task_dependencies",
+            "task_test_targets",
+            "validation_executions",
+            "validation_failure_modes",
+            "quality_gate_qualifications",
+            "delivery_acceptance",
+        )
+        facts: dict[str, list[dict[str, Any]]] = {}
+        for table in (*direct_tables, *relation_tables):
+            facts[table] = [
+                row_snapshot(row) or {}
+                for row in conn.execute(
+                    f"select * from {table} where cycle_id = ? order by rowid",
+                    (normalized_id,),
+                ).fetchall()
+            ]
+        facts["quality_gate_findings"] = [
+            row_snapshot(row) or {}
+            for row in conn.execute(
+                """
+                select link.* from quality_gate_findings link
+                join quality_gates g on g.id = link.gate_id
+                where g.cycle_id = ?
+                order by link.gate_id, link.finding_id
+                """,
+                (normalized_id,),
+            ).fetchall()
+        ]
+        target_ids = {
+            str(row["target_id"])
+            for table in (
+                "task_test_targets",
+                "acceptance_target_qualifications",
+                "executions",
+            )
+            for row in facts[table]
+            if str(row.get("target_id") or "")
+        }
+        facts["test_targets"] = [
+            row_snapshot(row) or {}
+            for target_id in sorted(target_ids)
+            for row in conn.execute(
+                "select * from test_targets where id = ?",
+                (target_id,),
+            ).fetchall()
+        ]
+        facts["events"] = list(
+            historical_cycle_event_facts(conn, normalized_id)
+        )
+        blockers = evaluate_historical_cycle_prerequisites(
+            conn,
+            root,
+            normalized_id,
+        )
+        cycle_snapshot = row_snapshot(cycle) or {}
+        fact_snapshot = {"cycle": cycle_snapshot, "facts": facts}
+        return {
+            "cycle": cycle_snapshot,
+            "consistent": not blockers,
+            "blockers": [blocker.as_dict() for blocker in blockers],
+            "counts": {table: len(rows) for table, rows in facts.items()},
+            "facts_sha256": stable_digest(fact_snapshot),
+        }
 
 
 @_project_mutation
@@ -844,7 +1058,14 @@ def cycle_start(root: Path, cycle_id: str, name: str, goal: str, *, base_ref: st
             """,
             (cycle_id, name, goal, base_ref, now, now, now),
         )
-        bump_project(conn, current_cycle_id=cycle_id, phase="intake", status="draft")
+        bump_project(
+            conn,
+            current_cycle_id=cycle_id,
+            phase="intake",
+            status="draft",
+            scope_status="unconfirmed",
+            current_owner="project-manager",
+        )
         created = conn.execute("select * from delivery_cycles where id = ?", (cycle_id,)).fetchone()
         emit_audit_event(
             conn,
@@ -871,8 +1092,13 @@ def cycle_start(root: Path, cycle_id: str, name: str, goal: str, *, base_ref: st
 
 @_project_mutation
 def cycle_close(root: Path, status: str) -> None:
-    if status not in {"delivered", "archived"}:
-        raise HarnessError("cycle close status must be delivered or archived")
+    if status == "delivered":
+        raise HarnessError(
+            "cycle close cannot mark a cycle delivered; use delivery record so "
+            "the canonical delivery prerequisites and delivery row are applied"
+        )
+    if status != "archived":
+        raise HarnessError("cycle close status must be archived")
     with transaction(root, touched=[("project", "1")]) as conn:
         cycle = current_cycle_row(conn)
         if cycle["status"] != "active":
@@ -900,11 +1126,136 @@ def cycle_close(root: Path, status: str) -> None:
             after=row_snapshot(closed),
             command="cycle close",
         )
-    render_affected(root, "project-state")
+
+
+@_project_mutation
+def record_outcome_observation(
+    root: Path,
+    observation_id: str,
+    kind: str,
+    value: int,
+    details: str,
+    recorded_by: str,
+    observed_at: str,
+    *,
+    cycle_id: str = "",
+) -> dict[str, Any]:
+    guard_schema(
+        "validate_outcome_observation",
+        observation_id,
+        kind,
+        value,
+        details,
+        recorded_by,
+        observed_at,
+    )
+    normalized_id = observation_id.strip()
+    normalized_details = details.strip()
+    normalized_actor = recorded_by.strip()
+    try:
+        normalized_observed_at = normalize_outcome_timestamp(
+            observed_at,
+            label="outcome observation observed_at",
+        )
+        created_at = normalize_outcome_timestamp(
+            now_iso(),
+            label="outcome observation created_at",
+        )
+    except ValueError as exc:
+        raise HarnessError(str(exc)) from exc
+    with transaction(
+        root,
+        touched=[("outcome_observation", normalized_id)],
+    ) as conn:
+        selected_cycle = cycle_id.strip() or current_cycle_id(conn)
+        if not conn.execute(
+            "select 1 from delivery_cycles where id = ?",
+            (selected_cycle,),
+        ).fetchone():
+            raise HarnessError(f"missing delivery cycle: {selected_cycle}")
+        if conn.execute(
+            "select 1 from outcome_observations where id = ?",
+            (normalized_id,),
+        ).fetchone():
+            raise HarnessError(f"duplicate outcome observation id: {normalized_id}")
+        conn.execute(
+            """
+            insert into outcome_observations
+            (id, cycle_id, kind, value, details, recorded_by, observed_at, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_id,
+                selected_cycle,
+                kind,
+                value,
+                normalized_details,
+                normalized_actor,
+                normalized_observed_at,
+                created_at,
+            ),
+        )
+        row = conn.execute(
+            "select * from outcome_observations where id = ?",
+            (normalized_id,),
+        ).fetchone()
+        emit_audit_event(
+            conn,
+            "outcome_observation_recorded",
+            entity_type="outcome_observation",
+            entity_id=normalized_id,
+            before=None,
+            after=row_snapshot(row),
+            actor=normalized_actor,
+            command="cycle outcome-record",
+            extra={"kind": kind, "value": value},
+        )
+    return row_snapshot(row) or {}
+
+
+def outcome_report(root: Path) -> dict[str, Any]:
+    with connection(root) as conn:
+        cycle = current_cycle_row(conn)
+        generated_at = normalize_outcome_timestamp(
+            now_iso(),
+            label="outcome report generated_at",
+        )
+        rows = [
+            row_snapshot(row) or {}
+            for row in conn.execute(
+                """
+                select * from outcome_observations
+                where cycle_id = ?
+                order by observed_at, created_at, id
+                """,
+                (cycle["id"],),
+            )
+        ]
+        cycle_snapshot = row_snapshot(cycle) or {}
+        metrics = build_outcome_metrics(
+            conn,
+            cycle=cycle_snapshot,
+            observations=rows,
+            generated_at=generated_at,
+        )
+    return {
+        "report_version": "kafa-outcome-v1",
+        "metrics_version": OUTCOME_METRICS_VERSION,
+        "evidence_scope": "local-only",
+        "evidence_mode": OUTCOME_EVIDENCE_MODE,
+        "generated_at": generated_at,
+        "cycle_id": str(cycle["id"]),
+        "observation_count": len(rows),
+        "observations": rows,
+        "metrics": metrics,
+    }
 
 
 @_project_mutation
 def transition_phase(root: Path, phase: str, *, status: str | None = None, owner: str | None = None) -> None:
+    if phase == "delivery_readiness":
+        enter_delivery_readiness(root)
+        return
     with transaction(root, touched=[("project", "1")]) as conn:
         row = project_row(conn)
         cycle = current_cycle_row(conn)
@@ -920,10 +1271,6 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
         issues = phase_prerequisite_issues(conn, phase)
         if issues:
             raise HarnessError(f"phase prerequisites blocked: {'; '.join(issues)}")
-        if phase == "delivery_readiness":
-            delivery_issues = validate_delivery(conn, root, require_phase=False)
-            if delivery_issues:
-                raise HarnessError("delivery readiness blocked: " + "; ".join(delivery_issues))
         assignments = ["phase = ?", "updated_at = ?"]
         values: list[object] = [phase, now_iso()]
         if status:
@@ -949,6 +1296,63 @@ def transition_phase(root: Path, phase: str, *, status: str | None = None, owner
             actor=owner or "",
             command="phase",
             extra={"from": current, "to": phase},
+        )
+    render_affected(root, "project-state")
+
+
+@_project_mutation
+def enter_delivery_readiness(root: Path) -> None:
+    """Atomically enter readiness through the canonical prerequisite evaluator."""
+
+    from core.delivery import evaluate_delivery_prerequisites
+
+    with transaction(root, touched=[("project", "1")]) as conn:
+        project = project_row(conn)
+        cycle = current_cycle_row(conn)
+        blockers = evaluate_delivery_prerequisites(
+            conn,
+            root,
+            mode="enter-readiness",
+            is_expired=is_expired,
+        )
+        if blockers:
+            raise HarnessError(
+                "delivery readiness blocked: "
+                + "; ".join(blocker.render() for blocker in blockers)
+            )
+        if str(cycle["status"]) != "active":
+            raise HarnessError(
+                f"delivery readiness requires active cycle: {cycle['id']} status={cycle['status']}"
+            )
+        now = now_iso()
+        conn.execute(
+            """
+            update project
+            set phase = 'delivery_readiness', status = 'ready-for-delivery',
+                updated_at = ?
+            where id = 1
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            update delivery_cycles
+            set phase = 'delivery_readiness', updated_at = ?
+            where id = ?
+            """,
+            (now, cycle["id"]),
+        )
+        after = project_row(conn)
+        emit_audit_event(
+            conn,
+            "delivery_readiness_entered",
+            entity_type="project",
+            entity_id=str(project["project_id"]),
+            before=row_snapshot(project),
+            after=row_snapshot(after),
+            actor="root-controller",
+            command="delivery ready",
+            extra={"from": project["phase"], "to": "delivery_readiness"},
         )
     render_affected(root, "project-state")
 
@@ -982,10 +1386,41 @@ def phase_prerequisite_issues(conn: sqlite3.Connection, phase: str) -> list[str]
 
 @_project_mutation
 def confirm_scope(root: Path, by: str, summary: str) -> None:
+    normalized_actor = by.strip()
+    normalized_summary = summary.strip()
+    if not normalized_actor or not normalized_summary:
+        raise HarnessError("scope confirmation requires non-empty actor and summary")
     with transaction(root, touched=[("project", "1")]) as conn:
+        cycle_id = current_cycle_id(conn)
+        baseline = latest_baseline(conn)
+        if baseline is None:
+            raise HarnessError("scope confirmation requires a current frozen baseline")
+        if str(baseline["digest"]) != stable_digest(baseline_snapshot(conn)):
+            raise HarnessError(f"scope confirmation requires a current baseline: {baseline['id']}")
         before = project_row(conn)
-        bump_project(conn, scope_status="confirmed", current_owner=by, status="scope-confirmed")
+        bump_project(
+            conn,
+            scope_status="confirmed",
+            current_owner=normalized_actor,
+            status="scope-confirmed",
+        )
         after = project_row(conn)
+        emit_audit_event(
+            conn,
+            "baseline_confirmed",
+            entity_type="baseline",
+            entity_id=str(baseline["id"]),
+            before=None,
+            after={
+                "id": baseline["id"],
+                "cycle_id": cycle_id,
+                "digest": baseline["digest"],
+                "summary": normalized_summary,
+                "project_revision": after["revision"],
+            },
+            actor=normalized_actor,
+            command="baseline confirm",
+        )
         emit_audit_event(
             conn,
             "scope_confirmed",
@@ -993,38 +1428,236 @@ def confirm_scope(root: Path, by: str, summary: str) -> None:
             entity_id=str(before["project_id"]),
             before=row_snapshot(before),
             after=row_snapshot(after),
-            actor=by,
+            actor=normalized_actor,
             command="scope confirm",
-            extra={"summary": summary},
+            extra={"summary": normalized_summary},
         )
     render_affected(root, "project-state")
 
 
+def _write_baseline(
+    conn: sqlite3.Connection,
+    baseline_id: str,
+    summary: str,
+    *,
+    by: str,
+) -> sqlite3.Row:
+    snapshot = baseline_snapshot(conn)
+    digest = stable_digest(snapshot)
+    cycle_id = current_cycle_id(conn)
+    existing = conn.execute(
+        "select id, cycle_id from baselines where id = ?",
+        (baseline_id,),
+    ).fetchone()
+    if existing is not None and str(existing["cycle_id"]) != cycle_id:
+        raise HarnessError(
+            f"baseline ID {baseline_id} belongs to closed/history cycle "
+            f"{existing['cycle_id']}; use a new baseline ID for cycle {cycle_id}"
+        )
+    if existing is not None:
+        # Baseline IDs may be intentionally rewritten within one active cycle.
+        # Reinsert so SQLite rowid remains the deterministic write-order tie
+        # breaker when timestamps share one-second precision.
+        conn.execute("delete from baselines where id = ?", (baseline_id,))
+    conn.execute(
+        """
+        insert into baselines
+        (id, cycle_id, summary, snapshot_json, digest, project_revision,
+         created_by, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            baseline_id,
+            cycle_id,
+            summary,
+            stable_json(snapshot),
+            digest,
+            int(project_row(conn)["revision"]),
+            by,
+            now_iso(),
+        ),
+    )
+    row = conn.execute(
+        "select * from baselines where id = ?",
+        (baseline_id,),
+    ).fetchone()
+    if row is None:  # pragma: no cover - SQLite insert contract
+        raise HarnessError(f"baseline was not persisted: {baseline_id}")
+    return row
+
+
+@_project_mutation
 def freeze_baseline(root: Path, baseline_id: str, summary: str, *, by: str = "") -> None:
-    with transaction(root, touched=[("baseline", baseline_id)]) as conn:
-        snapshot = baseline_snapshot(conn)
-        digest = stable_digest(snapshot)
-        cycle_id = current_cycle_id(conn)
-        conn.execute(
-            """
-            insert into baselines (id, cycle_id, summary, snapshot_json, digest, project_revision, created_by, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(id) do update set cycle_id=excluded.cycle_id, summary=excluded.summary, snapshot_json=excluded.snapshot_json,
-              digest=excluded.digest, project_revision=excluded.project_revision, created_by=excluded.created_by,
-              created_at=excluded.created_at
-            """,
-            (baseline_id, cycle_id, summary, stable_json(snapshot), digest, int(project_row(conn)["revision"]), by, now_iso()),
+    normalized_id = baseline_id.strip()
+    normalized_summary = summary.strip()
+    normalized_actor = by.strip()
+    if not normalized_id or not normalized_summary:
+        raise HarnessError("baseline freeze requires non-empty id and summary")
+    with transaction(
+        root,
+        touched=[("baseline", normalized_id), ("project", "1")],
+    ) as conn:
+        before = project_row(conn)
+        bump_project(
+            conn,
+            scope_status="unconfirmed",
+            status="baseline-frozen",
+            **({"current_owner": normalized_actor} if normalized_actor else {}),
+        )
+        baseline = _write_baseline(
+            conn,
+            normalized_id,
+            normalized_summary,
+            by=normalized_actor,
         )
         emit_audit_event(
             conn,
             "baseline_frozen",
             entity_type="baseline",
-            entity_id=baseline_id,
+            entity_id=normalized_id,
             before=None,
-            after={"id": baseline_id, "summary": summary, "digest": digest},
-            actor=by,
+            after={
+                "id": normalized_id,
+                "cycle_id": baseline["cycle_id"],
+                "summary": normalized_summary,
+                "digest": baseline["digest"],
+            },
+            actor=normalized_actor,
             command="baseline freeze",
         )
+        emit_audit_event(
+            conn,
+            "scope_unconfirmed",
+            entity_type="project",
+            entity_id=str(before["project_id"]),
+            before=row_snapshot(before),
+            after=row_snapshot(project_row(conn)),
+            actor=normalized_actor,
+            command="baseline freeze",
+            extra={"reason": "new baseline requires explicit confirmation"},
+        )
+    render_affected(root, "project-state")
+
+
+@_project_mutation
+def confirm_baseline(
+    root: Path,
+    baseline_id: str,
+    summary: str,
+    *,
+    by: str,
+) -> None:
+    normalized_id = baseline_id.strip()
+    normalized_summary = summary.strip()
+    normalized_actor = by.strip()
+    if not normalized_id or not normalized_summary or not normalized_actor:
+        raise HarnessError(
+            "baseline confirm requires non-empty id, summary, and actor"
+        )
+    with transaction(
+        root,
+        touched=[("baseline", normalized_id), ("project", "1")],
+    ) as conn:
+        accepted_risks = conn.execute(
+            """
+            select id, accepted_by, acceptance_reason, acceptance_scope,
+                   accepted_revision, expires_at
+            from failure_modes
+            where cycle_id = ? and status in ('accepted', 'exempt')
+            order by id
+            """,
+            (current_cycle_id(conn),),
+        ).fetchall()
+        for risk in accepted_risks:
+            missing = [
+                field
+                for field in (
+                    "accepted_by",
+                    "acceptance_reason",
+                    "acceptance_scope",
+                    "expires_at",
+                )
+                if not str(risk[field] or "").strip()
+            ]
+            if missing:
+                raise HarnessError(
+                    "baseline confirm cannot bind incomplete accepted/exempt "
+                    f"failure mode {risk['id']}: missing={','.join(missing)}"
+                )
+            if parse_time(str(risk["expires_at"])) is None:
+                raise HarnessError(
+                    "baseline confirm cannot bind accepted/exempt failure mode "
+                    f"with invalid expiry: {risk['id']}"
+                )
+        before = project_row(conn)
+        bump_project(
+            conn,
+            scope_status="confirmed",
+            current_owner=normalized_actor,
+            status="scope-confirmed",
+        )
+        after = project_row(conn)
+        if accepted_risks:
+            conn.execute(
+                """
+                update failure_modes
+                set accepted_revision = ?
+                where cycle_id = ? and status in ('accepted', 'exempt')
+                """,
+                (int(after["revision"]), current_cycle_id(conn)),
+            )
+            for risk in accepted_risks:
+                rebound = conn.execute(
+                    "select * from failure_modes where cycle_id = ? and id = ?",
+                    (current_cycle_id(conn), risk["id"]),
+                ).fetchone()
+                emit_audit_event(
+                    conn,
+                    "risk_acceptance_rebound",
+                    entity_type="failure_mode",
+                    entity_id=str(risk["id"]),
+                    before={"accepted_revision": risk["accepted_revision"]},
+                    after={
+                        "accepted_revision": rebound["accepted_revision"],
+                        "baseline_id": normalized_id,
+                    },
+                    actor=normalized_actor,
+                    command="baseline confirm",
+                )
+        baseline = _write_baseline(
+            conn,
+            normalized_id,
+            normalized_summary,
+            by=normalized_actor,
+        )
+        emit_audit_event(
+            conn,
+            "baseline_confirmed",
+            entity_type="baseline",
+            entity_id=normalized_id,
+            before=None,
+            after={
+                "id": normalized_id,
+                "cycle_id": baseline["cycle_id"],
+                "summary": normalized_summary,
+                "digest": baseline["digest"],
+                "project_revision": after["revision"],
+            },
+            actor=normalized_actor,
+            command="baseline confirm",
+        )
+        emit_audit_event(
+            conn,
+            "scope_confirmed",
+            entity_type="project",
+            entity_id=str(before["project_id"]),
+            before=row_snapshot(before),
+            after=row_snapshot(after),
+            actor=normalized_actor,
+            command="baseline confirm",
+            extra={"summary": normalized_summary},
+        )
+    render_affected(root, "project-state", "failure-modes")
 
 
 def baseline_validate(root: Path) -> list[str]:
@@ -1420,7 +2053,7 @@ def accept_task(root: Path, task_id: str, evidence: str) -> None:
             actor="root-controller",
             command="task accept",
         )
-    render_affected(root, "tasks")
+    render_affected(root, "tasks", "traceability")
 
 
 @_project_mutation
@@ -1480,17 +2113,39 @@ def cancel_task(root: Path, task_id: str, reason: str = "") -> None:
             command="task cancel",
             extra={"reason": reason.strip()},
         )
-    render_affected(root, "tasks")
+    render_affected(root, "tasks", "traceability")
 
 
 @_project_mutation
 def record_decision(root: Path, decision: str, reason: str) -> None:
     with transaction(root) as conn:
         decision_id = str(uuid.uuid4())
-        conn.execute(
-            "insert into decisions (id, decision, reason, created_at) values (?, ?, ?, ?)",
-            (decision_id, decision, reason, now_iso()),
-        )
+        decision_columns = {
+            str(row[1]) for row in conn.execute("pragma table_info(decisions)")
+        }
+        if {"cycle_id", "candidate_sha"}.issubset(decision_columns):
+            conn.execute(
+                "insert into decisions "
+                "(id, cycle_id, candidate_sha, decision, reason, created_at) "
+                "values (?, ?, ?, ?, ?, ?)",
+                (
+                    decision_id,
+                    current_cycle_id(conn),
+                    current_candidate_sha(root),
+                    decision,
+                    reason,
+                    now_iso(),
+                ),
+            )
+        else:
+            # Schema 27-30 projects remain writable until the side-by-side
+            # migration obtains the operation lock and snapshots their final
+            # committed state.
+            conn.execute(
+                "insert into decisions (id, decision, reason, created_at) "
+                "values (?, ?, ?, ?)",
+                (decision_id, decision, reason, now_iso()),
+            )
         created = conn.execute("select * from decisions where id = ?", (decision_id,)).fetchone()
         emit_audit_event(
             conn,
@@ -1523,6 +2178,55 @@ def add_test_target(
     gateable, gate_block_reason = target_gateability(kind, command_template)
     with transaction(root, touched=[("test_target", target_id)]) as conn:
         before = conn.execute("select * from test_targets where id = ?", (target_id,)).fetchone()
+        requested = {
+            "kind": kind,
+            "command_template": command_template,
+            "description": description,
+            "gateable": gateable,
+            "gate_block_reason": gate_block_reason,
+            "stack_profile": stack_profile,
+            "container_image": container_image,
+            "requires_sandbox": bool_int(requires_sandbox),
+            "requires_no_network": bool_int(requires_no_network),
+            "result_format": result_format,
+            "result_path": result_path,
+        }
+        if before is not None and all(
+            before[field] == value for field, value in requested.items()
+        ):
+            return
+        if before is not None:
+            closed_cycles = [
+                str(row["cycle_id"])
+                for row in conn.execute(
+                    """
+                    select distinct refs.cycle_id
+                    from (
+                        select cycle_id from acceptance_target_qualifications
+                        where target_id = ?
+                        union
+                        select cycle_id from task_test_targets where target_id = ?
+                        union
+                        select cycle_id from executions where target_id = ?
+                    ) refs
+                    join delivery_cycles c on c.id = refs.cycle_id
+                    where c.status in ('delivered', 'archived')
+                    order by refs.cycle_id
+                    """,
+                    (target_id, target_id, target_id),
+                ).fetchall()
+            ]
+            if closed_cycles:
+                changed = sorted(
+                    field
+                    for field, value in requested.items()
+                    if before[field] != value
+                )
+                raise HarnessError(
+                    f"test target {target_id} is referenced by closed cycle "
+                    f"{','.join(closed_cycles)}; changed={','.join(changed)}; "
+                    "use a new target ID"
+                )
         conn.execute(
             """
             insert into test_targets
@@ -1566,6 +2270,7 @@ def add_test_target(
     render_affected(root, "test-targets")
 
 
+@_project_mutation
 def link_task_test_target(root: Path, task_id: str, target_id: str) -> None:
     with transaction(root, touched=[("task", task_id)]) as conn:
         cycle_id = current_cycle_id(conn)
@@ -1615,6 +2320,193 @@ def list_test_targets(root: Path) -> list[str]:
     ]
 
 
+def _require_current_qualification(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: str,
+    acceptance_id: str,
+    target_id: str,
+    target_digest: str,
+) -> sqlite3.Row:
+    acceptance = conn.execute(
+        "select * from acceptance where cycle_id = ? and id = ?",
+        (cycle_id, acceptance_id),
+    ).fetchone()
+    if acceptance is None:
+        raise HarnessError(f"missing acceptance: {acceptance_id}")
+    if str(acceptance["status"]) != "active":
+        raise HarnessError(
+            f"acceptance is not active: {acceptance_id} status={acceptance['status']}"
+        )
+    latest = latest_acceptance_target_qualification(
+        conn,
+        cycle_id=cycle_id,
+        acceptance_id=acceptance_id,
+        target_id=target_id,
+    )
+    if latest is None:
+        raise HarnessError(
+            "[qualification-missing] "
+            f"acceptance {acceptance_id} has no qualification for target {target_id}"
+        )
+    if (
+        int(latest["acceptance_revision"]) == int(acceptance["revision"])
+        and str(latest["target_definition_sha256"]) == target_digest
+    ):
+        return latest
+    if int(latest["acceptance_revision"]) != int(acceptance["revision"]):
+        detail = (
+            f"acceptance {acceptance_id} revision changed from "
+            f"{latest['acceptance_revision']} to {acceptance['revision']}"
+        )
+    else:
+        detail = f"target {target_id} definition digest changed"
+    raise HarnessError(
+        "[qualification-stale] "
+        f"qualification {latest['id']} is stale: {detail}"
+    )
+
+
+@_project_mutation
+def qualify_test_target(
+    root: Path,
+    qualification_id: str,
+    target_id: str,
+    acceptance_id: str,
+    rationale: str,
+    qualified_by: str,
+) -> str:
+    """Record an immutable procedural acceptance-to-target qualification."""
+
+    normalized_id = qualification_id.strip()
+    normalized_target = target_id.strip()
+    normalized_acceptance = acceptance_id.strip()
+    normalized_rationale = rationale.strip()
+    normalized_actor = qualified_by.strip()
+    missing = [
+        name
+        for name, value in (
+            ("id", normalized_id),
+            ("target", normalized_target),
+            ("acceptance", normalized_acceptance),
+            ("rationale", normalized_rationale),
+            ("by", normalized_actor),
+        )
+        if not value
+    ]
+    if missing:
+        raise HarnessError(
+            "test-target qualification requires non-empty " + ", ".join(missing)
+        )
+
+    created = False
+    with transaction(
+        root,
+        touched=[("acceptance_target_qualification", normalized_id)],
+    ) as conn:
+        cycle_id = current_cycle_id(conn)
+        acceptance = conn.execute(
+            "select * from acceptance where cycle_id = ? and id = ?",
+            (cycle_id, normalized_acceptance),
+        ).fetchone()
+        if acceptance is None:
+            another_cycle = conn.execute(
+                "select cycle_id from acceptance where id = ? order by cycle_id limit 1",
+                (normalized_acceptance,),
+            ).fetchone()
+            if another_cycle:
+                raise HarnessError(
+                    "cross-cycle qualification is not allowed: "
+                    f"acceptance {normalized_acceptance} belongs to "
+                    f"{another_cycle['cycle_id']}, current={cycle_id}"
+                )
+            raise HarnessError(f"missing acceptance: {normalized_acceptance}")
+        if str(acceptance["status"]) != "active":
+            raise HarnessError(
+                "qualification requires an active acceptance: "
+                f"{normalized_acceptance} status={acceptance['status']}"
+            )
+        target = conn.execute(
+            "select * from test_targets where id = ?",
+            (normalized_target,),
+        ).fetchone()
+        if target is None:
+            raise HarnessError(f"missing test target: {normalized_target}")
+        digest = target_definition_digest(dict(target))
+        values = (
+            normalized_id,
+            cycle_id,
+            normalized_acceptance,
+            int(acceptance["revision"]),
+            normalized_target,
+            digest,
+            normalized_rationale,
+            normalized_actor,
+        )
+        existing = conn.execute(
+            "select * from acceptance_target_qualifications where id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["cycle_id"]) != cycle_id:
+                raise HarnessError(
+                    f"qualification ID {normalized_id} belongs to cycle "
+                    f"{existing['cycle_id']}; use a new qualification ID for "
+                    f"cycle {cycle_id}"
+                )
+            existing_values = tuple(
+                existing[field]
+                for field in (
+                    "id",
+                    "cycle_id",
+                    "acceptance_id",
+                    "acceptance_revision",
+                    "target_id",
+                    "target_definition_sha256",
+                    "rationale",
+                    "qualified_by",
+                )
+            )
+            if existing_values != values:
+                raise HarnessError(
+                    "conflicting immutable qualification already exists: "
+                    f"{normalized_id}"
+                )
+        else:
+            conn.execute(
+                """
+                insert into acceptance_target_qualifications
+                (id, cycle_id, acceptance_id, acceptance_revision, target_id,
+                 target_definition_sha256, rationale, qualified_by, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*values, now_iso()),
+            )
+            created = True
+            created_row = conn.execute(
+                "select * from acceptance_target_qualifications where id = ?",
+                (normalized_id,),
+            ).fetchone()
+            emit_audit_event(
+                conn,
+                "acceptance_target_qualified",
+                entity_type="acceptance_target_qualification",
+                entity_id=normalized_id,
+                before=None,
+                after=row_snapshot(created_row),
+                actor=normalized_actor,
+                command="test-target qualify",
+                extra={
+                    "acceptance_id": normalized_acceptance,
+                    "target_id": normalized_target,
+                    "digest": digest,
+                },
+            )
+    if created:
+        render_affected(root, "test-targets")
+    return normalized_id
+
+
 @_project_mutation
 def verify_run(
     root: Path,
@@ -1640,6 +2532,10 @@ def verify_run(
     requested_failure_modes = sorted(
         {value.strip() for value in (failure_modes or []) if value.strip()}
     )
+    if requested_failure_modes and not acceptance.strip():
+        raise HarnessError(
+            "failure-mode coverage requires an acceptance-bound qualified target"
+        )
     with connection(root) as conn:
         cycle_id = current_cycle_id(conn)
         candidate_sha = current_candidate_sha(root)
@@ -1649,22 +2545,49 @@ def verify_run(
         if not target_row:
             raise HarnessError(f"missing test target: {target_id}")
         target_data = dict(target_row)
+        target_digest = target_definition_digest(target_data)
         if int(target_data.get("gateable") or 0) != 1:
             reason = str(target_data.get("gate_block_reason") or "not gateable")
             raise HarnessError(f"test target is not gateable: {target_id}: {reason}")
-        if acceptance and not conn.execute(
-            "select 1 from acceptance where cycle_id = ? and id = ?",
-            (cycle_id, acceptance),
-        ).fetchone():
-            raise HarnessError(f"missing acceptance: {acceptance}")
+        qualification_data: dict[str, object] | None = None
+        if acceptance:
+            qualification_data = dict(
+                _require_current_qualification(
+                    conn,
+                    cycle_id=cycle_id,
+                    acceptance_id=acceptance,
+                    target_id=target_id,
+                    target_digest=target_digest,
+                )
+            )
         for failure_mode_id in requested_failure_modes:
             if not conn.execute(
                 "select 1 from failure_modes where cycle_id = ? and id = ?",
                 (cycle_id, failure_mode_id),
             ).fetchone():
                 raise HarnessError(f"missing failure mode: {failure_mode_id}")
+            if not conn.execute(
+                """
+                select 1 from failure_mode_acceptance
+                where cycle_id = ? and failure_mode_id = ? and acceptance_id = ?
+                """,
+                (cycle_id, failure_mode_id, acceptance),
+            ).fetchone():
+                raise HarnessError(
+                    "failure-mode coverage acceptance is not linked: "
+                    f"{failure_mode_id}->{acceptance}"
+                )
 
     policy = target_policy_from_row(target_data)
+    if (
+        acceptance
+        and container_image.strip()
+        and container_image.strip() != policy.container_image.strip()
+    ):
+        raise HarnessError(
+            "acceptance-bound verification cannot override the qualified "
+            f"container image for target {target_id}"
+        )
     if runner == "local" and (policy.requires_sandbox or policy.requires_no_network):
         requirements = []
         if policy.requires_sandbox:
@@ -1691,6 +2614,7 @@ def verify_run(
                 container_image=image,
                 result_format=policy.result_format,
                 result_path=policy.result_path,
+                target_definition_sha256=target_digest,
             )
         else:
             result = LocalExecutor(root).run(
@@ -1699,6 +2623,7 @@ def verify_run(
                 target_command_template=policy.command_template,
                 result_format=policy.result_format,
                 result_path=policy.result_path,
+                target_definition_sha256=target_digest,
             )
         validate_execution_result(root, policy, result, runner=runner)
     except ExecutionPolicyError as exc:
@@ -1708,7 +2633,7 @@ def verify_run(
     validation_id = f"VAL-{uuid.uuid4().hex}"
     surface = f"test-target:{target_id}"
 
-    def revalidate_execution_before_commit(_conn: sqlite3.Connection) -> None:
+    def revalidate_execution_before_commit(commit_conn: sqlite3.Connection) -> None:
         try:
             validate_execution_result(root, policy, result, runner=runner)
         except ExecutionPolicyError as exc:
@@ -1717,6 +2642,33 @@ def verify_run(
             raise HarnessError(
                 "stale candidate: project source changed before verification commit"
             )
+        commit_target = commit_conn.execute(
+            "select * from test_targets where id = ?",
+            (target_id,),
+        ).fetchone()
+        if (
+            commit_target is None
+            or target_definition_digest(dict(commit_target)) != target_digest
+        ):
+            raise HarnessError(
+                f"stale target: registered target changed before commit: {target_id}"
+            )
+        if acceptance:
+            commit_qualification = _require_current_qualification(
+                commit_conn,
+                cycle_id=cycle_id,
+                acceptance_id=acceptance,
+                target_id=target_id,
+                target_digest=target_digest,
+            )
+            if (
+                qualification_data is None
+                or dict(commit_qualification) != qualification_data
+            ):
+                raise HarnessError(
+                    "stale qualification: acceptance-target mapping changed before commit: "
+                    f"{acceptance}->{target_id}"
+                )
 
     with transaction(
         root,
@@ -1736,21 +2688,46 @@ def verify_run(
         live_target = conn.execute(
             "select * from test_targets where id = ?", (target_id,)
         ).fetchone()
-        if not live_target or dict(live_target) != target_data:
+        if (
+            not live_target
+            or target_definition_digest(dict(live_target)) != target_digest
+        ):
             raise HarnessError(
                 f"stale target: registered target changed during verification: {target_id}"
             )
-        if acceptance and not conn.execute(
-            "select 1 from acceptance where cycle_id = ? and id = ?",
-            (cycle_id, acceptance),
-        ).fetchone():
-            raise HarnessError(f"stale acceptance: {acceptance}")
+        if acceptance:
+            live_qualification = _require_current_qualification(
+                conn,
+                cycle_id=cycle_id,
+                acceptance_id=acceptance,
+                target_id=target_id,
+                target_digest=target_digest,
+            )
+            if (
+                qualification_data is None
+                or dict(live_qualification) != qualification_data
+            ):
+                raise HarnessError(
+                    "stale qualification: acceptance-target mapping changed "
+                    f"during verification: {acceptance}->{target_id}"
+                )
         for failure_mode_id in requested_failure_modes:
             if not conn.execute(
                 "select 1 from failure_modes where cycle_id = ? and id = ?",
                 (cycle_id, failure_mode_id),
             ).fetchone():
                 raise HarnessError(f"stale failure mode: {failure_mode_id}")
+            if not conn.execute(
+                """
+                select 1 from failure_mode_acceptance
+                where cycle_id = ? and failure_mode_id = ? and acceptance_id = ?
+                """,
+                (cycle_id, failure_mode_id, acceptance),
+            ).fetchone():
+                raise HarnessError(
+                    "stale failure-mode coverage acceptance link: "
+                    f"{failure_mode_id}->{acceptance}"
+                )
         try:
             validate_execution_result(root, policy, result, runner=runner)
         except ExecutionPolicyError as exc:
@@ -1759,17 +2736,25 @@ def verify_run(
         conn.execute(
             """
             insert into executions
-            (id, cycle_id, candidate_sha, target_id, command, exit_code,
+            (id, cycle_id, candidate_sha, target_id, target_definition_sha256,
+             command, exit_code,
              stdout_sha256, artifact_path, executed_count, result_format,
              semantic_status, runner, sandbox_status, no_network, policy_status,
+             platform, runtime_executable, runtime_version,
+             runtime_executable_sha256, policy_version, container_engine,
+             container_engine_version, container_engine_endpoint,
+             container_image_requested,
+             container_image_digest, provenance_status,
              created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 execution_id,
                 cycle_id,
                 candidate_sha,
                 target_id,
+                target_digest,
                 result.command,
                 result.exit_code,
                 result.stdout_sha256,
@@ -1781,15 +2766,27 @@ def verify_run(
                 result.sandbox_status,
                 bool_int(result.no_network),
                 result.policy_status,
+                result.platform,
+                result.runtime_executable,
+                result.runtime_version,
+                result.runtime_executable_sha256,
+                result.policy_version,
+                result.container_engine,
+                result.container_engine_version,
+                result.container_engine_endpoint,
+                result.container_image_requested,
+                result.container_image_digest,
+                result.provenance_status,
                 created_at,
             ),
         )
         conn.execute(
             """
             insert into validations
-            (id, cycle_id, candidate_sha, acceptance_id, surface, result,
+            (id, cycle_id, candidate_sha, acceptance_id, qualification_id,
+             surface, result,
              validation_status, superseded_by, findings, residual_risk, created_at)
-            values (?, ?, ?, ?, ?, 'pass', 'active', null,
+            values (?, ?, ?, ?, ?, ?, 'pass', 'active', null,
                     'controller execution passed', '', ?)
             """,
             (
@@ -1797,6 +2794,11 @@ def verify_run(
                 cycle_id,
                 candidate_sha,
                 acceptance or None,
+                (
+                    str(qualification_data["id"])
+                    if qualification_data is not None
+                    else None
+                ),
                 surface,
                 created_at,
             ),
@@ -1982,6 +2984,11 @@ def record_finding(
         cycle_id = current_cycle_id(conn)
         candidate_sha = current_candidate_sha(root)
         before = conn.execute("select * from findings where id = ?", (finding_id,)).fetchone()
+        if before is not None and str(before["cycle_id"]) != cycle_id:
+            raise HarnessError(
+                f"finding ID {finding_id} belongs to cycle {before['cycle_id']}; "
+                f"use a new finding ID for cycle {cycle_id}"
+            )
         conn.execute(
             """
             insert into findings
@@ -2023,15 +3030,79 @@ def record_gate(
     residual_risk: str = "",
     findings: str = "",
     reviewer_context_id: str = "",
+    qualifications: list[str] | None = None,
 ) -> None:
     guard_schema("validate_gate", reviewer_context, result, gate)
     if reviewer_context == "fresh" and not reviewer_context_id:
         raise HarnessError("fresh reviewer context requires reviewer context metadata")
+    if (
+        reviewer_context == "same-context-degraded"
+        and result == "pass"
+        and not residual_risk.strip()
+    ):
+        raise HarnessError(
+            "same-context-degraded passing gate requires non-empty residual-risk text"
+        )
     if result == "pass" and git_dirty(root):
         raise HarnessError("cannot record a passing quality gate with a dirty git worktree")
-    with transaction(root) as conn:
+    if qualifications is not None and any(
+        not isinstance(value, str) or not value.strip()
+        for value in qualifications
+    ):
+        raise HarnessError("gate qualification IDs must be non-empty")
+    qualification_ids = sorted(
+        {value.strip() for value in (qualifications or []) if value.strip()}
+    )
+    captured_candidate = ""
+
+    def revalidate_gate_before_commit(commit_conn: sqlite3.Connection) -> None:
+        if not captured_candidate:
+            return
+        if current_candidate_sha(root) != captured_candidate:
+            raise HarnessError(
+                "stale candidate: project source changed before quality gate commit"
+            )
+        from core.delivery import qualified_validation_execution_issues
+
+        for qualification_id in qualification_ids:
+            qualification = commit_conn.execute(
+                "select * from acceptance_target_qualifications where id = ?",
+                (qualification_id,),
+            ).fetchone()
+            validation = commit_conn.execute(
+                """
+                select * from validations
+                where qualification_id = ? and candidate_sha = ?
+                  and validation_status = 'active' and result = 'pass'
+                order by created_at desc, id desc limit 1
+                """,
+                (qualification_id, captured_candidate),
+            ).fetchone()
+            if qualification is None or validation is None:
+                raise HarnessError(
+                    "qualification evidence changed before quality gate commit: "
+                    f"{qualification_id}"
+                )
+            issues = qualified_validation_execution_issues(
+                commit_conn,
+                root,
+                validation,
+                qualification,
+                captured_candidate,
+            )
+            if issues:
+                raise HarnessError(
+                    "qualification evidence became ineligible before quality gate commit: "
+                    f"{qualification_id}: {'; '.join(issues)}"
+                )
+
+    with transaction(
+        root,
+        before_commit_check=revalidate_gate_before_commit,
+    ) as conn:
         cycle_id = current_cycle_id(conn)
         candidate_sha = current_candidate_sha(root)
+        captured_candidate = candidate_sha
         project_revision = int(project_row(conn)["revision"])
         producer_contexts = [
             str(row["submitted_context_id"])
@@ -2053,7 +3124,157 @@ def record_gate(
             review_status = "reviewed-local" if producer_contexts else "same-context-degraded"
         else:
             review_status = "same-context-degraded"
+        if (
+            review_status == "same-context-degraded"
+            and result == "pass"
+            and not residual_risk.strip()
+        ):
+            raise HarnessError(
+                "same-context-degraded passing gate requires non-empty residual-risk text"
+            )
         producer_context_id = ",".join(producer_contexts)
+        finding_rows: list[sqlite3.Row] = []
+        for finding_id in parse_ids(findings):
+            finding = conn.execute(
+                "select * from findings where id = ?",
+                (finding_id,),
+            ).fetchone()
+            if finding is None:
+                raise HarnessError(f"missing finding: {finding_id}")
+            if str(finding["cycle_id"]) != cycle_id:
+                raise HarnessError(
+                    "cross-cycle gate finding is not allowed: "
+                    f"{finding_id} cycle={finding['cycle_id']} current={cycle_id}"
+                )
+            if str(finding["candidate_sha"] or "") != candidate_sha:
+                raise HarnessError(
+                    "stale-candidate gate finding is not allowed: "
+                    f"{finding_id} candidate={finding['candidate_sha'] or 'empty'} "
+                    f"current={candidate_sha}"
+                )
+            finding_rows.append(finding)
+        qualification_rows: list[sqlite3.Row] = []
+        for qualification_id in qualification_ids:
+            qualification = conn.execute(
+                """
+                select q.*, a.revision as current_acceptance_revision,
+                       a.status as acceptance_status,
+                       t.kind, t.command_template, t.stack_profile,
+                       t.container_image, t.requires_sandbox,
+                       t.requires_no_network, t.result_format, t.result_path
+                from acceptance_target_qualifications q
+                join acceptance a
+                  on a.cycle_id = q.cycle_id and a.id = q.acceptance_id
+                join test_targets t on t.id = q.target_id
+                where q.id = ?
+                """,
+                (qualification_id,),
+            ).fetchone()
+            if qualification is None:
+                raise HarnessError(f"missing qualification: {qualification_id}")
+            if str(qualification["cycle_id"]) != cycle_id:
+                raise HarnessError(
+                    "cross-cycle gate qualification is not allowed: "
+                    f"{qualification_id} cycle={qualification['cycle_id']} "
+                    f"current={cycle_id}"
+                )
+            latest_qualification = latest_acceptance_target_qualification(
+                conn,
+                cycle_id=cycle_id,
+                acceptance_id=str(qualification["acceptance_id"]),
+                target_id=str(qualification["target_id"]),
+            )
+            if (
+                latest_qualification is None
+                or str(latest_qualification["id"]) != qualification_id
+            ):
+                raise HarnessError(
+                    "[qualification-stale] qualification is superseded: "
+                    f"{qualification_id} latest="
+                    f"{latest_qualification['id'] if latest_qualification else 'missing'}"
+                )
+            if str(qualification["acceptance_status"]) != "active":
+                raise HarnessError(
+                    f"qualification acceptance is not active: {qualification_id}"
+                )
+            if int(qualification["acceptance_revision"]) != int(
+                qualification["current_acceptance_revision"]
+            ):
+                raise HarnessError(
+                    "[qualification-stale] "
+                    f"qualification {qualification_id} acceptance revision is stale"
+                )
+            live_target = {
+                field: qualification[field]
+                for field in (
+                    "kind",
+                    "command_template",
+                    "stack_profile",
+                    "container_image",
+                    "requires_sandbox",
+                    "requires_no_network",
+                    "result_format",
+                    "result_path",
+                )
+            }
+            if target_definition_digest(live_target) != str(
+                qualification["target_definition_sha256"]
+            ):
+                raise HarnessError(
+                    "[qualification-stale] "
+                    f"qualification {qualification_id} target definition is stale"
+                )
+            evidence = conn.execute(
+                """
+                select v.*
+                from validations v
+                join validation_executions ve
+                  on ve.validation_id = v.id
+                 and ve.cycle_id = v.cycle_id
+                 and ve.candidate_sha = v.candidate_sha
+                join executions e
+                  on e.id = ve.execution_id
+                 and e.cycle_id = ve.cycle_id
+                 and e.candidate_sha = ve.candidate_sha
+                where v.qualification_id = ?
+                  and v.cycle_id = ? and v.candidate_sha = ?
+                  and v.acceptance_id = ?
+                  and v.validation_status = 'active' and v.result = 'pass'
+                  and e.target_id = ?
+                  and e.target_definition_sha256 = ?
+                  and e.exit_code = 0 and e.executed_count > 0
+                  and e.semantic_status = 'pass'
+                limit 1
+                """,
+                (
+                    qualification_id,
+                    cycle_id,
+                    candidate_sha,
+                    qualification["acceptance_id"],
+                    qualification["target_id"],
+                    qualification["target_definition_sha256"],
+                ),
+            ).fetchone()
+            if evidence is None:
+                raise HarnessError(
+                    "qualification has no passing current-candidate execution evidence: "
+                    f"{qualification_id}"
+                )
+            from core.delivery import qualified_validation_execution_issues
+
+            evidence_issues = qualified_validation_execution_issues(
+                conn,
+                root,
+                evidence,
+                qualification,
+                candidate_sha,
+            )
+            if evidence_issues:
+                raise HarnessError(
+                    "qualification has ineligible current-candidate execution evidence: "
+                    f"{qualification_id}: {'; '.join(evidence_issues)}"
+                )
+            qualification_rows.append(qualification)
         gate_id = f"GATE-{uuid.uuid4().hex}"
         sequence = int(conn.execute("select coalesce(max(sequence), 0) + 1 from quality_gates").fetchone()[0])
         previous_gate = conn.execute(
@@ -2093,10 +3314,26 @@ def record_gate(
                 "update quality_gates set gate_status = 'superseded', superseded_by = ? where id = ? and gate_status = 'active'",
                 (gate_id, previous_gate["id"]),
             )
-        for finding_id in parse_ids(findings):
-            if not conn.execute("select id from findings where id = ?", (finding_id,)).fetchone():
-                raise HarnessError(f"missing finding: {finding_id}")
-            conn.execute("insert or ignore into quality_gate_findings (gate_id, finding_id) values (?, ?)", (gate_id, finding_id))
+        for finding in finding_rows:
+            conn.execute(
+                "insert or ignore into quality_gate_findings (gate_id, finding_id) "
+                "values (?, ?)",
+                (gate_id, finding["id"]),
+            )
+        for qualification in qualification_rows:
+            conn.execute(
+                """
+                insert into quality_gate_qualifications
+                (gate_id, qualification_id, cycle_id, candidate_sha)
+                values (?, ?, ?, ?)
+                """,
+                (
+                    gate_id,
+                    qualification["id"],
+                    cycle_id,
+                    candidate_sha,
+                ),
+            )
         if result == "pass":
             resolve_invalidations(conn, target_type="quality_gate")
         after = conn.execute("select * from quality_gates where id = ?", (gate_id,)).fetchone()
@@ -2113,9 +3350,10 @@ def record_gate(
                 "gate": gate,
                 "result": result,
                 "review_status": review_status,
+                "qualification_id": ",".join(qualification_ids),
             },
         )
-    render_affected(root, "gates")
+    render_affected(root, "gates", "test-targets")
 
 
 @_project_mutation
@@ -2134,21 +3372,67 @@ def record_delivery(
     handoff: str = "",
 ) -> None:
     guard_schema("validate_delivery", scope)
-    with transaction(root) as conn:
-        from core.delivery import evaluate_schema30_delivery
+    captured_candidate = ""
 
-        project = project_row(conn)
-        cycle = current_cycle_row(conn)
-        if cycle["status"] not in {"active", "delivered"}:
-            raise HarnessError(f"delivery record requires active current cycle, current={cycle['status']}")
-        candidate_sha = current_candidate_sha(root)
-        issues, trust = evaluate_schema30_delivery(
-            conn,
+    def revalidate_delivery_before_commit(
+        commit_conn: sqlite3.Connection,
+    ) -> None:
+        if not captured_candidate:
+            return
+        if current_candidate_sha(root) != captured_candidate:
+            raise HarnessError(
+                "delivery record blocked: stale candidate: project source changed "
+                "before delivery commit"
+            )
+        from core.delivery import evaluate_delivery_prerequisites
+
+        consistency = evaluate_delivery_prerequisites(
+            commit_conn,
             root,
+            mode="delivered-consistency",
             is_expired=is_expired,
         )
-        if issues:
-            raise HarnessError("delivery record blocked: " + "; ".join(issues))
+        if consistency:
+            raise HarnessError(
+                "delivery record consistency blocked before commit: "
+                + "; ".join(blocker.render() for blocker in consistency)
+            )
+
+    with transaction(
+        root,
+        before_commit_check=revalidate_delivery_before_commit,
+    ) as conn:
+        active_project = project_row(conn)
+        if int(active_project["schema_version"]) != SCHEMA_VERSION:
+            raise HarnessError(
+                "delivery record requires active schema "
+                f"{SCHEMA_VERSION}; current={active_project['schema_version']}; "
+                "run the supported side-by-side migration first"
+            )
+        from core.delivery import (
+            evaluate_delivery_prerequisites,
+            evaluate_delivery_report,
+        )
+
+        cycle = current_cycle_row(conn)
+        report = evaluate_delivery_report(
+            conn,
+            root,
+            mode="record-delivery",
+            is_expired=is_expired,
+        )
+        if report.blockers:
+            raise HarnessError(
+                "delivery record blocked: "
+                + "; ".join(blocker.render() for blocker in report.blockers)
+            )
+        if str(cycle["status"]) != "active":
+            raise HarnessError(
+                f"delivery record requires active current cycle, current={cycle['status']}"
+            )
+        candidate_sha = report.candidate_sha
+        captured_candidate = candidate_sha
+        trust = report.trust
         if current_candidate_sha(root) != candidate_sha:
             raise HarnessError(
                 "delivery record blocked: stale candidate: project source changed during delivery validation"
@@ -2213,6 +3497,19 @@ def record_delivery(
         if current_candidate_sha(root) != candidate_sha:
             raise HarnessError(
                 "delivery record blocked: stale candidate: project source changed while recording delivery"
+            )
+        consistency_blockers = evaluate_delivery_prerequisites(
+            conn,
+            root,
+            mode="delivered-consistency",
+            is_expired=is_expired,
+        )
+        if consistency_blockers:
+            raise HarnessError(
+                "delivery record consistency blocked: "
+                + "; ".join(
+                    blocker.render() for blocker in consistency_blockers
+                )
             )
     render_affected(root, "deliveries", *(["traceability"] if acceptance else []))
 
@@ -2646,13 +3943,9 @@ def validated_migration_path(root: Path, from_version: str, to_version: int) -> 
         raise HarnessError(f"invalid migration source version: {from_version}") from exc
     current_schema_issues: list[str] = []
     store = get_store(root)
-    with runtime_path_audit(root, store=store) as project_fs:
-        if isinstance(store, SqliteStore) and (
-            project_fs is None
-            or not project_fs._snapshot(DB_PATH, allow_missing=True).exists
-        ):
-            raise HarnessError("migration requires an initialized runtime")
-        with store.connection() as conn:
+    if isinstance(store, InMemoryStore):
+        connection_scope = store.connection()
+        with connection_scope as conn:
             project_exists = conn.execute("select 1 from sqlite_master where type = 'table' and name = 'project'").fetchone()
             if not project_exists:
                 raise HarnessError("migration requires an initialized runtime")
@@ -2665,6 +3958,42 @@ def validated_migration_path(root: Path, from_version: str, to_version: int) -> 
                     current_schema_issues = runtime_schema_issues(conn)
                 except sqlite3.Error as exc:
                     current_schema_issues = [f"schema inspection failed: {exc}"]
+    else:
+        raise_if_project_migration_announced(root)
+        with ProjectFS.open(root) as project_fs:
+            project_fs.audit(
+                (*SqliteStore._db_family(), MIGRATION_SENTINEL_PATH),
+                allow_missing=True,
+            )
+            snapshot = project_fs._snapshot(DB_PATH, allow_missing=True)
+            if not snapshot.exists:
+                raise HarnessError("migration requires an initialized runtime")
+            with _verified_sqlite_connection(
+                project_fs,
+                DB_PATH,
+                access="ro",
+                immutable=True,
+            ) as conn:
+                conn.row_factory = sqlite3.Row
+                project_exists = conn.execute(
+                    "select 1 from sqlite_master where type='table' and name='project'"
+                ).fetchone()
+                if not project_exists:
+                    raise HarnessError("migration requires an initialized runtime")
+                row = conn.execute(
+                    "select schema_version from project where id=1"
+                ).fetchone()
+                if not row:
+                    raise HarnessError("migration requires project state")
+                actual = int(row["schema_version"])
+                if actual == SCHEMA_VERSION:
+                    try:
+                        current_schema_issues = runtime_schema_issues(conn)
+                    except sqlite3.Error as exc:
+                        current_schema_issues = [
+                            f"schema inspection failed: {exc}"
+                        ]
+                project_fs._assert_unchanged(DB_PATH, snapshot)
     if requested_from != actual:
         raise HarnessError(f"migration source mismatch: expected database schema {actual}, received {requested_from}")
     if to_version < actual:
@@ -2682,18 +4011,21 @@ def validated_migration_path(root: Path, from_version: str, to_version: int) -> 
 
 def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = False) -> dict[str, Any] | None:
     _, path = validated_migration_path(root, from_version, to_version)
-    if dry_run:
-        return {
-            "dry_run": True,
-            "imported": {"schema_migration": len(path)},
-            "skipped": {},
-            "unrecognized": [],
-        }
     if not path:
+        if dry_run:
+            return {
+                "dry_run": True,
+                "imported": {"schema_migration": 0},
+                "skipped": {},
+                "unrecognized": [],
+            }
         render_all(root)
         return None
 
-    from core.local_core_migration import migrate_project_to_schema30
+    from core.local_core_migration import (
+        dry_run_project_to_active_schema,
+        migrate_project_to_active_schema,
+    )
 
     def validate_staging(staging_path: Path) -> None:
         with ProjectFS.open(root) as active_project_fs:
@@ -2739,7 +4071,33 @@ def migrate(root: Path, from_version: str, to_version: int, *, dry_run: bool = F
         if issues:
             raise HarnessError("post-activation projection verification failed: " + "; ".join(issues))
 
-    migrate_project_to_schema30(
+    if dry_run:
+        report = dry_run_project_to_active_schema(
+            root,
+            staging_validator=validate_staging,
+        )
+        imported = {
+            "schema_migration": 1,
+            **{
+                f"table:{table}": int(count)
+                for table, count in sorted(report.staging_row_counts.items())
+            },
+            "normalized_failure_modes": int(
+                report.normalized_failure_mode_count
+            ),
+        }
+        return {
+            "dry_run": True,
+            "source_version": report.source_version,
+            "target_version": report.target_version,
+            "source_sha256": report.source_sha256,
+            "staging_sha256": report.staging_sha256,
+            "imported": imported,
+            "skipped": dict(report.retired_row_counts),
+            "unrecognized": [],
+        }
+
+    migrate_project_to_active_schema(
         root,
         staging_validator=validate_staging,
         active_validator=validate_active,
@@ -2800,22 +4158,31 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
             "select name from sqlite_master where type='table'"
         )
     }
-    if tables != SCHEMA30_CATALOG_TABLES:
+    if tables != ACTIVE_SCHEMA_CATALOG_TABLES:
         issues.append(
-            "schema 30 table inventory mismatch: "
-            f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
-            f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
+            f"schema {SCHEMA_VERSION} table inventory mismatch: "
+            f"missing={sorted(ACTIVE_SCHEMA_CATALOG_TABLES - tables)} "
+            f"extra={sorted(tables - ACTIVE_SCHEMA_CATALOG_TABLES)}"
         )
         return issues
     enum_checks = [
         ("delivery_cycles", "status", DELIVERY_CYCLE_STATUSES, "delivery cycle status"),
         ("delivery_cycles", "phase", set(PHASES), "delivery cycle phase"),
+        ("requirements", "status", REQUIREMENT_STATUSES, "requirement status"),
+        ("acceptance", "status", ACCEPTANCE_STATUSES, "acceptance status"),
         ("tasks", "status", TASK_STATUSES, "task status"),
         ("failure_modes", "risk", {"low", "medium", "high", "critical"}, "failure mode risk"),
-        ("failure_modes", "status", FAILURE_MODE_STATUSES | {"active"}, "failure mode status"),
+        ("failure_modes", "status", FAILURE_MODE_STATUSES, "failure mode status"),
         ("validations", "result", {"pass", "fail", "blocked", "partial"}, "validation result"),
         ("validations", "validation_status", VALIDATION_STATUSES, "validation status"),
+        ("findings", "severity", {"low", "medium", "high", "critical"}, "finding severity"),
+        ("findings", "status", {"open", "resolved", "accepted", "false-positive"}, "finding status"),
+        ("quality_gates", "gate_status", {"active", "superseded", "legacy-ambiguous"}, "quality gate status"),
+        ("quality_gates", "review_status", {"reviewed-local", "same-context-degraded"}, "quality gate review status"),
         ("quality_gates", "result", {"pass", "fail", "conditional", "blocked"}, "quality gate result"),
+        ("deliveries", "decision_status", {"delivered", "accepted-risk", "same-context-degraded", "historical-migrated"}, "delivery decision status"),
+        ("migrations", "status", {"legacy-history", "staged", "activated", "rolled-back", "failed", "rollback-incomplete", "recovery-required"}, "migration status"),
+        ("outcome_observations", "kind", {"false-green-prevented", "escaped-defect", "rework"}, "outcome kind"),
         ("test_targets", "kind", TEST_TARGET_KINDS, "test target kind"),
         ("test_targets", "stack_profile", STACK_PROFILES, "test target stack profile"),
         ("test_targets", "result_format", RESULT_FORMATS, "test target result format"),
@@ -2824,6 +4191,7 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
         ("executions", "runner", {"local", "container"}, "execution runner"),
         ("executions", "sandbox_status", SANDBOX_STATUSES, "execution sandbox status"),
         ("executions", "policy_status", {"allowed", "rejected"}, "execution policy status"),
+        ("executions", "provenance_status", {"complete", "legacy-incomplete"}, "execution provenance status"),
     ]
     for table, column, allowed, label in enum_checks:
         placeholders = ",".join("?" for _ in allowed)
@@ -2832,6 +4200,63 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
             tuple(allowed),
         ):
             issues.append(f"invalid {label}: {table}.{row['id']}={row['value']}")
+    required_columns = {
+        "acceptance_target_qualifications": {
+            "id", "cycle_id", "acceptance_id", "acceptance_revision",
+            "target_id", "target_definition_sha256", "rationale",
+            "qualified_by", "created_at",
+        },
+        "quality_gate_qualifications": {
+            "gate_id", "qualification_id", "cycle_id", "candidate_sha",
+        },
+        "outcome_observations": {
+            "id", "cycle_id", "kind", "value", "details", "recorded_by",
+            "observed_at", "created_at",
+        },
+        "executions": {
+            "target_definition_sha256", "platform", "runtime_executable",
+            "runtime_version", "runtime_executable_sha256", "policy_version",
+            "container_engine", "container_engine_version",
+            "container_engine_endpoint",
+            "container_image_requested", "container_image_digest",
+            "provenance_status",
+        },
+        "validations": {"qualification_id"},
+    }
+    for table, expected in required_columns.items():
+        actual = {
+            str(row[1])
+            for row in conn.execute(f"pragma table_info({table})")
+        }
+        missing = expected - actual
+        if missing:
+            issues.append(
+                f"schema {SCHEMA_VERSION} column contract incomplete: "
+                f"{table} missing={sorted(missing)}"
+            )
+    required_triggers = {
+        "acceptance_target_qualifications_no_update",
+        "acceptance_target_qualifications_no_delete",
+        "quality_gate_qualifications_no_update",
+        "quality_gate_qualifications_no_delete",
+        "outcome_observations_no_update",
+        "outcome_observations_no_delete",
+        "executions_no_update",
+        "executions_no_delete",
+        "events_no_update",
+        "events_no_delete",
+    }
+    actual_triggers = {
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type='trigger'"
+        )
+    }
+    if missing_triggers := required_triggers - actual_triggers:
+        issues.append(
+            f"schema {SCHEMA_VERSION} immutable trigger contract incomplete: "
+            f"missing={sorted(missing_triggers)}"
+        )
     for row in conn.execute("select id, before_json, after_json from events"):
         for field in ("before_json", "after_json"):
             try:
@@ -2841,6 +4266,13 @@ def runtime_schema_issues(conn: sqlite3.Connection) -> list[str]:
                 continue
             if not isinstance(value, dict):
                 issues.append(f"invalid event {field}: {row['id']} expected object")
+    for row in conn.execute(
+        "select * from executions where provenance_status = 'complete'"
+    ):
+        issues.extend(
+            f"invalid execution provenance: executions.{row['id']}: {issue}"
+            for issue in recorded_execution_provenance_issues(row)
+        )
     issues.extend(schema_contract_issues(conn))
     return issues
 
@@ -2854,50 +4286,15 @@ def load_schema(name: str) -> dict[str, Any]:
 
 
 def json_type_matches(value: Any, expected: str | list[str]) -> bool:
-    options = expected if isinstance(expected, list) else [expected]
-    for option in options:
-        if option == "null" and value is None:
-            return True
-        if option == "string" and isinstance(value, str):
-            return True
-        if option == "integer" and isinstance(value, int) and not isinstance(value, bool):
-            return True
-        if option == "array" and isinstance(value, list):
-            return True
-        if option == "object" and isinstance(value, dict):
-            return True
-        if option == "boolean" and isinstance(value, bool):
-            return True
-    return False
+    from core.json_schema_contract import json_type_matches as matches
+
+    return matches(value, expected)
 
 
 def validate_object_against_schema(label: str, data: dict[str, Any], schema: dict[str, Any]) -> list[str]:
-    issues: list[str] = []
-    for field in schema.get("required", []):
-        if field not in data or data[field] is None:
-            issues.append(f"schema contract failed: {label}.{field} is required")
-    properties = schema.get("properties", {})
-    if schema.get("additionalProperties") is False:
-        for field in data:
-            if field not in properties:
-                issues.append(f"schema contract failed: {label}.{field} is not declared")
-    for field, definition in properties.items():
-        if field not in data:
-            continue
-        value = data[field]
-        expected_type = definition.get("type")
-        if expected_type is not None and not json_type_matches(value, expected_type):
-            issues.append(f"schema contract failed: {label}.{field} expected {expected_type}, got {type(value).__name__}")
-            continue
-        if "enum" in definition and value not in definition["enum"]:
-            issues.append(f"schema contract failed: {label}.{field}={value} not in {definition['enum']}")
-        if definition.get("type") == "array" and isinstance(value, list):
-            item_type = definition.get("items", {}).get("type")
-            if item_type:
-                for index, item in enumerate(value):
-                    if not json_type_matches(item, item_type):
-                        issues.append(f"schema contract failed: {label}.{field}[{index}] expected {item_type}")
-    return issues
+    from core.json_schema_contract import validate_instance
+
+    return validate_instance(label, data, schema)
 
 
 def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[dict[str, Any]]]]:
@@ -2956,6 +4353,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("task.schema.json", "tasks", tasks),
         ("task-test-target.schema.json", "task_test_targets", [row_snapshot(row) or {} for row in conn.execute("select * from task_test_targets")]),
         ("test-target.schema.json", "test_targets", [row_snapshot(row) or {} for row in conn.execute("select * from test_targets")]),
+        ("acceptance-target-qualification.schema.json", "acceptance_target_qualifications", [row_snapshot(row) or {} for row in conn.execute("select * from acceptance_target_qualifications")]),
         ("execution.schema.json", "executions", [row_snapshot(row) or {} for row in conn.execute("select * from executions")]),
         ("validation.schema.json", "validations", validations),
         ("finding.schema.json", "findings", [row_snapshot(row) or {} for row in conn.execute("select * from findings")]),
@@ -2964,6 +4362,7 @@ def schema_entity_rows(conn: sqlite3.Connection) -> list[tuple[str, str, list[di
         ("baseline.schema.json", "baselines", [row_snapshot(row) or {} for row in conn.execute("select * from baselines")]),
         ("invalidation.schema.json", "invalidations", [row_snapshot(row) or {} for row in conn.execute("select * from invalidations")]),
         ("event.schema.json", "events", [row_snapshot(row) or {} for row in conn.execute("select * from events")]),
+        ("outcome-observation.schema.json", "outcome_observations", [row_snapshot(row) or {} for row in conn.execute("select * from outcome_observations")]),
     ]
 
 
@@ -2981,10 +4380,27 @@ def schema_contract_issues(conn: sqlite3.Connection) -> list[str]:
 
 
 
-def trace_show(root: Path, requirement_id: str | None = None) -> list[str]:
+def trace_show(
+    root: Path,
+    requirement_id: str | None = None,
+    *,
+    evidence_root: Path | None = None,
+    candidate_override: str | None = None,
+) -> list[str]:
+    eligibility_root = evidence_root or root
     with connection(root) as conn:
-        rows = trace_rows(conn, requirement_id)
-        issues = traceability_issues(conn, requirement_id)
+        rows = trace_rows(
+            conn,
+            requirement_id,
+            root=eligibility_root,
+            candidate_override=candidate_override,
+        )
+        issues = traceability_issues(
+            conn,
+            requirement_id,
+            root=eligibility_root,
+            candidate_override=candidate_override,
+        )
     lines = ["# Traceability", "", "| Requirement | Kind | Acceptance | Tasks | Validations | Failure Modes | Deliveries |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         lines.append(
@@ -3007,17 +4423,31 @@ def trace_show(root: Path, requirement_id: str | None = None) -> list[str]:
 
 def trace_validate(root: Path) -> list[str]:
     with connection(root) as conn:
-        return traceability_issues(conn)
+        return traceability_issues(conn, root=root)
 
 
-def validate_delivery(conn: sqlite3.Connection, root: Path, *, require_phase: bool = False) -> list[str]:
-    from core.delivery import evaluate_schema30_delivery_readiness
+def validate_delivery(
+    conn: sqlite3.Connection,
+    root: Path,
+    *,
+    mode: str | None = None,
+) -> list[str]:
+    from core.delivery import evaluate_delivery_prerequisites
 
-    return evaluate_schema30_delivery_readiness(
+    if mode is None:
+        cycle = current_cycle_row(conn)
+        mode = (
+            "delivered-consistency"
+            if str(cycle["status"]) == "delivered"
+            else "record-delivery"
+        )
+    blockers = evaluate_delivery_prerequisites(
         conn,
         root,
+        mode=mode,  # type: ignore[arg-type]
         is_expired=is_expired,
     )
+    return [blocker.render() for blocker in blockers]
 
 
 def validate_runtime(root: Path, *, delivery: bool = False) -> list[str]:
@@ -3036,13 +4466,18 @@ def _render_harness_command(root: Path, *args: str) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
 
-def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
+def _quickstart_status_active(root: Path) -> dict[str, Any]:
     missing: list[str] = []
     next_commands: list[str] = []
     with connection(root) as conn:
         project = project_row(conn)
         cycle = current_cycle_row(conn)
         cycle_id = str(cycle["id"])
+        cycle_token = re.sub(r"[^A-Za-z0-9._-]+", "-", cycle_id).strip("-._")
+        cycle_token = cycle_token or "cycle"
+        suggested_baseline_id = (
+            "BL1" if cycle_id == DEFAULT_CYCLE_ID else f"BL-{cycle_token}-1"
+        )
         candidate_sha = current_candidate_sha(root)
         requirement_count = int(
             conn.execute(
@@ -3063,6 +4498,17 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
         task_rows = conn.execute(
             "select id, status from tasks where cycle_id=? order by id", (cycle_id,)
         ).fetchall()
+        task_acceptance_rows = conn.execute(
+            """
+            select ta.acceptance_id, t.id, t.status
+            from task_acceptance ta
+            join tasks t
+              on t.cycle_id = ta.cycle_id and t.id = ta.task_id
+            where ta.cycle_id = ?
+            order by ta.acceptance_id, t.id
+            """,
+            (cycle_id,),
+        ).fetchall()
         target_rows = conn.execute(
             "select id from test_targets order by id"
         ).fetchall()
@@ -3072,16 +4518,77 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
                 (cycle_id,),
             ).fetchone()[0]
         )
+        qualification_pairs = conn.execute(
+            """
+            select distinct q.acceptance_id, q.target_id
+            from acceptance_target_qualifications q
+            join acceptance a
+              on a.cycle_id = q.cycle_id and a.id = q.acceptance_id
+            join test_targets t on t.id = q.target_id
+            where q.cycle_id = ? and a.status = 'active'
+            order by q.acceptance_id, q.target_id
+            """,
+            (cycle_id,),
+        ).fetchall()
+        active_acceptance_ids = [str(row["id"]) for row in acceptance_rows]
+        current_qualifications_by_acceptance: dict[str, list[str]] = {
+            acceptance_id: [] for acceptance_id in active_acceptance_ids
+        }
+        for pair_row in qualification_pairs:
+            pair = (str(pair_row["acceptance_id"]), str(pair_row["target_id"]))
+            qualification = latest_acceptance_target_qualification(
+                conn,
+                cycle_id=cycle_id,
+                acceptance_id=pair[0],
+                target_id=pair[1],
+            )
+            if qualification is None:
+                continue
+            acceptance_row = conn.execute(
+                "select revision from acceptance where cycle_id=? and id=?",
+                (cycle_id, qualification["acceptance_id"]),
+            ).fetchone()
+            target_row = conn.execute(
+                "select * from test_targets where id=?",
+                (qualification["target_id"],),
+            ).fetchone()
+            if (
+                acceptance_row is not None
+                and target_row is not None
+                and int(qualification["acceptance_revision"])
+                == int(acceptance_row["revision"])
+                and str(qualification["target_definition_sha256"])
+                == target_definition_digest(dict(target_row))
+            ):
+                current_qualifications_by_acceptance.setdefault(pair[0], []).append(
+                    str(qualification["id"])
+                )
+        current_qualification_ids = [
+            qualification_id
+            for acceptance_id in active_acceptance_ids
+            for qualification_id in current_qualifications_by_acceptance.get(
+                acceptance_id, []
+            )
+        ]
+        missing_qualification_acceptance_ids = [
+            acceptance_id
+            for acceptance_id in active_acceptance_ids
+            if not current_qualifications_by_acceptance.get(acceptance_id)
+        ]
         execution_count = int(
             conn.execute(
                 """
                 select count(distinct e.id) from executions e
                 join validation_executions ve on ve.execution_id=e.id
                 join validations v on v.id=ve.validation_id
+                join acceptance_target_qualifications q
+                  on q.id=v.qualification_id and q.cycle_id=v.cycle_id
                 where e.cycle_id=? and e.candidate_sha=? and e.exit_code=0
                   and e.executed_count>0 and e.semantic_status='pass'
                   and e.policy_status='allowed' and v.validation_status='active'
                   and v.result='pass'
+                  and e.target_id=q.target_id
+                  and e.target_definition_sha256=q.target_definition_sha256
                 """,
                 (cycle_id, candidate_sha),
             ).fetchone()[0]
@@ -3090,8 +4597,12 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 select count(*) from quality_gates
-                where cycle_id=? and candidate_sha=? and gate_status='active'
-                  and result='pass'
+                join quality_gate_qualifications qg
+                  on qg.gate_id=quality_gates.id
+                where quality_gates.cycle_id=?
+                  and quality_gates.candidate_sha=?
+                  and quality_gates.gate_status='active'
+                  and quality_gates.result='pass'
                 """,
                 (cycle_id, candidate_sha),
             ).fetchone()[0]
@@ -3103,7 +4614,27 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
             ).fetchone()[0]
         )
         baseline_missing = baseline_issues(conn)
-        delivery_issues = validate_delivery(conn, root)
+        if str(cycle["status"]) == "delivered":
+            evaluation_mode = "delivered-consistency"
+        elif str(project["phase"]) == "delivery_readiness":
+            evaluation_mode = "record-delivery"
+        else:
+            evaluation_mode = "enter-readiness"
+        from core.delivery import evaluate_delivery_prerequisites
+
+        delivery_blockers = evaluate_delivery_prerequisites(
+            conn,
+            root,
+            mode=evaluation_mode,  # type: ignore[arg-type]
+            is_expired=is_expired,
+        )
+        delivery_issues = [blocker.render() for blocker in delivery_blockers]
+        accepted_task_blocker_ids = [
+            blocker.entity_id
+            for blocker in delivery_blockers
+            if blocker.code == "accepted-task-missing"
+            and blocker.entity_type == "acceptance"
+        ]
 
     if requirement_count == 0:
         missing.append("requirement")
@@ -3185,11 +4716,45 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
                     target_id,
                 )
             )
-    if baseline_missing:
+    if acceptance_rows and target_rows and missing_qualification_acceptance_ids:
+        missing.append("qualification")
+        for acceptance_id in missing_qualification_acceptance_ids:
+            next_commands.append(
+                _render_harness_command(
+                    root,
+                    "test-target",
+                    "qualify",
+                    "--id",
+                    (
+                        f"Q-{acceptance_id}-{target_id}"
+                        if cycle_id == DEFAULT_CYCLE_ID
+                        else f"Q-{cycle_token}-{acceptance_id}-{target_id}"
+                    ),
+                    "--target",
+                    target_id,
+                    "--acceptance",
+                    acceptance_id,
+                    "--rationale",
+                    "explicit acceptance-to-target mapping",
+                    "--by",
+                    "root-controller",
+                )
+            )
+    if baseline_missing or any(
+        blocker.code == "scope-unconfirmed" for blocker in delivery_blockers
+    ):
         missing.append("baseline")
         next_commands.append(
             _render_harness_command(
-                root, "baseline", "freeze", "--id", "BL1", "--summary", "current scope"
+                root,
+                "baseline",
+                "confirm",
+                "--id",
+                suggested_baseline_id,
+                "--summary",
+                "current confirmed scope",
+                "--by",
+                "root-controller",
             )
         )
     if execution_count == 0:
@@ -3197,47 +4762,104 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
         verify_args = ["verify", "run", "--target", target_id]
         if acceptance_rows:
             verify_args.extend(["--acceptance", str(acceptance_rows[0]["id"])])
-        next_commands.append(_render_harness_command(root, *verify_args))
+        if not acceptance_rows or current_qualification_ids:
+            next_commands.append(_render_harness_command(root, *verify_args))
     unresolved_tasks = [
         row for row in task_rows if row["status"] not in {"accepted", "cancelled"}
     ]
-    if unresolved_tasks:
+    if accepted_task_blocker_ids:
         missing.append("accepted_task")
-        for row in unresolved_tasks:
-            if row["status"] == "planned":
-                next_commands.append(
-                    _render_harness_command(root, "task", "start", str(row["id"]))
-                )
-            elif row["status"] == "active" and execution_count:
+        existing_task_ids = {str(row["id"]) for row in task_rows}
+        for acceptance_id in accepted_task_blocker_ids:
+            linked = [
+                row
+                for row in task_acceptance_rows
+                if str(row["acceptance_id"]) == acceptance_id
+                and str(row["status"]) not in {"accepted", "cancelled"}
+            ]
+            if not linked:
+                stem = re.sub(r"[^A-Za-z0-9._-]+", "-", acceptance_id).strip("-._")
+                stem = stem or "AC"
+                replacement_id = f"{stem}-T2"
+                suffix = 2
+                while replacement_id in existing_task_ids:
+                    suffix += 1
+                    replacement_id = f"{stem}-T{suffix}"
+                existing_task_ids.add(replacement_id)
                 next_commands.append(
                     _render_harness_command(
                         root,
                         "task",
-                        "submit",
-                        str(row["id"]),
-                        "--context-id",
-                        "producer-context",
-                        "--evidence",
-                        "verified immutable execution",
+                        "add",
+                        "--id",
+                        replacement_id,
+                        "--task",
+                        f"replace cancelled or missing work for {acceptance_id}",
+                        "--acceptance",
+                        acceptance_id,
                     )
                 )
+                continue
+            for row in linked:
+                if row["status"] == "planned":
+                    next_commands.append(
+                        _render_harness_command(root, "task", "start", str(row["id"]))
+                    )
+                elif row["status"] == "active" and execution_count:
+                    next_commands.append(
+                        _render_harness_command(
+                            root,
+                            "task",
+                            "submit",
+                            str(row["id"]),
+                            "--context-id",
+                            "producer-context",
+                            "--evidence",
+                            "verified immutable execution",
+                        )
+                    )
     if quality_gate_count == 0:
         missing.append("quality_gate")
-        if execution_count and not unresolved_tasks:
+        if (
+            execution_count
+            and not accepted_task_blocker_ids
+            and not unresolved_tasks
+            and not missing_qualification_acceptance_ids
+        ):
             next_commands.append(
                 _render_harness_command(
                     root,
                     "gate",
                     "record",
-                    "--reviewer-context",
-                    "same-context-degraded",
-                    "--result",
-                    "pass",
+                "--reviewer-context",
+                "same-context-degraded",
+                "--result",
+                "pass",
+                "--residual-risk",
+                "same-context local review; independent review not claimed",
+                *sum(
+                        (
+                            ["--qualification", qualification]
+                            for qualification in current_qualification_ids
+                        ),
+                        [],
+                    ),
                 )
             )
     if delivery_count == 0:
         missing.append("delivery")
-        if not delivery_issues:
+        blocker_codes = {blocker.code for blocker in delivery_blockers}
+        if evaluation_mode == "enter-readiness" and not delivery_blockers:
+            next_commands.append(
+                _render_harness_command(root, "delivery", "ready")
+            )
+        elif "phase-not-ready" in blocker_codes and not (
+            blocker_codes - {"phase-not-ready"}
+        ):
+            next_commands.append(
+                _render_harness_command(root, "delivery", "ready")
+            )
+        elif evaluation_mode == "record-delivery" and not delivery_issues:
             next_commands.append(
                 _render_harness_command(
                     root,
@@ -3247,17 +4869,26 @@ def _quickstart_status_schema30(root: Path) -> dict[str, Any]:
                     "verified local handoff",
                 )
             )
+    if evaluation_mode == "delivered-consistency":
+        # A closed cycle cannot legally execute graph mutation commands. Its
+        # structured blockers are the actionable corruption diagnosis; repair
+        # or a separately started cycle must be an explicit operator decision.
+        next_commands = []
     return {
         "initialized": True,
         "ready_for_delivery": bool(
             not delivery_issues
-            and cycle["status"] in {"active", "delivered"}
+            and evaluation_mode in {"record-delivery", "delivered-consistency"}
         ),
         "missing": missing,
         "phase": project["phase"],
         "cycle_id": cycle_id,
         "cycle_status": cycle["status"],
         "delivery_issues": delivery_issues,
+        "delivery_blockers": [
+            blocker.as_dict() for blocker in delivery_blockers
+        ],
+        "delivery_evaluation_mode": evaluation_mode,
         "next_commands": next_commands,
     }
 
@@ -3276,7 +4907,7 @@ def quickstart_status(root: Path) -> dict[str, Any]:
                 _render_harness_command(root, "quickstart", "status"),
             ],
         }
-    return _quickstart_status_schema30(root)
+    return _quickstart_status_active(root)
 
 def quickstart_status_lines(root: Path) -> list[str]:
     report = quickstart_status(root)
@@ -3308,10 +4939,12 @@ def quickstart_minimal(root: Path, quickstart_id: str, goal: str, acceptance: st
     ac_id = f"{normalized_id}-AC1"
     task_id = f"{normalized_id}-T1"
     target_id = f"{normalized_id}-UNIT"
+    qualification_id = f"{normalized_id}-Q1"
+    baseline_id = f"{normalized_id}-BL1"
     if not execute:
         return [
             f"DRY-RUN: would initialize runtime if needed for {normalized_id}",
-            f"DRY-RUN: would record {req_id}, {ac_id}, {task_id}, {target_id}",
+            f"DRY-RUN: would record {req_id}, {ac_id}, {task_id}, {target_id}, {qualification_id}",
             "DRY-RUN: would run the controller-local test command and stop before independent review",
             f"NEXT: add --execute to run: {test_command}",
         ]
@@ -3319,19 +4952,50 @@ def quickstart_minimal(root: Path, quickstart_id: str, goal: str, acceptance: st
     if not runtime_initialized(root):
         init_runtime(root)
         lines.append("OK: project harness initialized")
+    with connection(root) as conn:
+        active_cycle_id = current_cycle_id(conn)
+    if active_cycle_id != DEFAULT_CYCLE_ID:
+        cycle_token = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", active_cycle_id
+        ).strip("-._")
+        cycle_token = cycle_token or "cycle"
+        global_stem = f"{normalized_id}-{cycle_token}"
+        target_id = f"{global_stem}-UNIT"
+        qualification_id = f"{global_stem}-Q1"
+        baseline_id = f"{global_stem}-BL1"
     add_requirement(root, req_id, "functional", goal, priority="must")
     add_acceptance(root, ac_id, acceptance, priority="must")
     link_requirement_acceptance(root, req_id, ac_id)
     add_test_target(root, target_id, "unit", test_command, "quickstart minimal executable target")
     add_task(root, task_id, task, owner="developer", acceptance=ac_id)
     link_task_test_target(root, task_id, target_id)
-    lines.extend([f"OK: requirement added {req_id}", f"OK: acceptance added {ac_id}", f"OK: task added {task_id}", f"OK: test target recorded {target_id}"])
+    qualify_test_target(
+        root,
+        qualification_id,
+        target_id,
+        ac_id,
+        "procedural user-input mapping supplied through quickstart minimal",
+        "quickstart-user-input",
+    )
+    lines.extend(
+        [
+            f"OK: requirement added {req_id}",
+            f"OK: acceptance added {ac_id}",
+            f"OK: task added {task_id}",
+            f"OK: test target recorded {target_id}",
+            f"OK: procedural user-input qualification recorded {qualification_id}",
+        ]
+    )
 
     for phase in ["project_bootstrap", "requirement_baseline"]:
         transition_if_needed(root, phase)
-    freeze_baseline(root, f"{normalized_id}-BL1", "quickstart minimal baseline", by="quickstart")
     transition_if_needed(root, "confirmation")
-    confirm_scope(root, "quickstart", f"{normalized_id}: {goal}")
+    confirm_baseline(
+        root,
+        baseline_id,
+        f"{normalized_id}: {goal}",
+        by="quickstart",
+    )
     transition_if_needed(root, "planning")
     transition_if_needed(root, "implementation")
 
@@ -3353,8 +5017,9 @@ def quickstart_minimal(root: Path, quickstart_id: str, goal: str, acceptance: st
     lines.append(f"OK: task submitted {task_id}")
     lines.append(f"OK: quickstart minimal verified setup {normalized_id}")
     lines.append(
-        f"NEXT: stop for independent review of {task_id}; do not accept the task or "
-        "record a passing quality gate until reviewer findings are returned to the root controller"
+        f"NEXT: stop for independent review of {task_id} and qualification "
+        f"{qualification_id}; do not accept the task or record a passing quality gate "
+        "until reviewer findings are returned to the root controller"
     )
     lines.append(f"NEXT: {_render_harness_command(root, 'quickstart', 'status')}")
     return lines

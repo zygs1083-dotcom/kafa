@@ -44,6 +44,13 @@ The root controller records material command proof by registering an exact
 current candidate. Use `validation record` only for reviewer judgment,
 `finding record` for unresolved issues, and `gate record` for the decision.
 Free-form validation cannot substitute for immutable execution provenance.
+For schema 31 evidence, inspect the exact qualification, target digest,
+`runtime_executable_sha256`, `policy_version`, and `provenance_status=complete`.
+Container evidence also requires a recorded engine/version, frozen local
+`container_engine_endpoint`, and immutable `container_image_digest`; every daemon
+operation is endpoint-pinned and the run uses `--pull=never`. Treat remote or
+ambiguous routing, `legacy-incomplete`, missing fields, mutable-image drift, a
+truncated streaming result, or a mismatched target as blocked, not passing evidence.
 
 Use this output shape for each QA subagent:
 
@@ -67,7 +74,10 @@ The reviewer should not rubber-stamp their own implementation. If you produced t
 
 - Critical or high findings fail the gate.
 - Missing required validation fails or blocks the gate.
-- Medium findings require explicit residual-risk acceptance.
+- An open medium finding blocks until it is resolved, marked false-positive,
+  or has complete current unexpired accepted-risk metadata. An identified
+  medium failure mode requires qualified structured current-candidate coverage
+  or complete current unexpired accepted/exempt metadata.
 - Same-context review can pass only with `reviewer_context: same-context-degraded`, a real context ID, and clear residual-risk notes.
 - High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata.
 - If any high/critical prerequisite is missing, the result is `human-review-required`.
@@ -80,4 +90,7 @@ Lead with findings ordered by severity. If no issues are found, say that clearly
 
 Include the local execution artifacts and record IDs used during review.
 
-Before passing delivery readiness, run `scripts/harness.py --root . validate --delivery` and report any warnings or errors.
+After recording a gate linked with `--qualification`, the root controller enters
+`delivery ready`; after delivery recording, run
+`scripts/harness.py --root . validate --delivery` and report any warnings or
+errors.

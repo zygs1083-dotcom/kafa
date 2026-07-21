@@ -10,10 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform as runtime_platform
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -22,10 +25,62 @@ from typing import Mapping
 from xml.etree import ElementTree
 
 from .project_fs import ProjectFS, _PathSnapshot
+from .schema_guard import EXECUTION_POLICY_VERSION
 
 
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_STDOUT_BYTES = 1024 * 1024
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_CONTAINER_IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LOCAL_DOCKER_UNIX_ENDPOINT = re.compile(r"^unix:///[^\x00]+$")
+_LOCAL_DOCKER_NPIPE_ENDPOINT = re.compile(
+    r"^npipe:////\./pipe/[^\x00/\\]+$",
+    flags=re.IGNORECASE,
+)
+_CONTAINER_ROUTING_ENV = (
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+)
+
+TARGET_DEFINITION_DIGEST_FIELDS = (
+    "kind",
+    "command_template",
+    "stack_profile",
+    "container_image",
+    "requires_sandbox",
+    "requires_no_network",
+    "result_format",
+    "result_path",
+)
+
+
+def latest_acceptance_target_qualification(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: str,
+    acceptance_id: str,
+    target_id: str,
+) -> sqlite3.Row | None:
+    """Return the one newest immutable qualification for an acceptance/target.
+
+    Runtime timestamps historically had one-second precision. SQLite rowid is
+    therefore the deterministic local tie-breaker for insert-only qualification
+    rows created within the same second; the public ID never determines age.
+    """
+
+    return conn.execute(
+        """
+        select q.* from acceptance_target_qualifications q
+        where q.cycle_id = ? and q.acceptance_id = ? and q.target_id = ?
+        order by q.created_at desc, q.rowid desc
+        limit 1
+        """,
+        (cycle_id, acceptance_id, target_id),
+    ).fetchone()
 
 
 @dataclass(frozen=True)
@@ -48,6 +103,37 @@ class CommandResult:
     allow_unlisted_reason: str = ""
     policy_status: str = "allowed"
     policy_reason: str = ""
+    target_definition_sha256: str = ""
+    platform: str = ""
+    runtime_executable: str = ""
+    runtime_version: str = ""
+    runtime_executable_sha256: str = ""
+    policy_version: str = ""
+    container_engine: str = ""
+    container_engine_version: str = ""
+    container_engine_endpoint: str = ""
+    container_image_requested: str = ""
+    container_image_digest: str = ""
+    provenance_status: str = "legacy-incomplete"
+
+
+@dataclass(frozen=True)
+class ControllerRuntimeProvenance:
+    target_definition_sha256: str
+    platform: str
+    runtime_executable: str
+    runtime_version: str
+    runtime_executable_sha256: str
+    policy_version: str
+
+
+@dataclass(frozen=True)
+class ContainerImageProvenance:
+    engine: str
+    engine_version: str
+    requested_image: str
+    image_digest: str
+    engine_endpoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,10 +161,335 @@ class TargetExecutionPolicy:
     requires_sandbox: bool = False
     requires_no_network: bool = False
     container_image: str = "python:3.12-slim"
+    target_definition_sha256: str = ""
 
 
 class ExecutionPolicyError(ValueError):
     """Raised when execution output cannot become a trusted execution fact."""
+
+
+def _regular_file_sha256(path: Path) -> str:
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_file():
+        raise ExecutionPolicyError(
+            f"runtime-executable-unavailable: not a regular file: {resolved}"
+        )
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def controller_runtime_provenance(
+    target_definition_sha256: str,
+) -> ControllerRuntimeProvenance:
+    """Capture the exact controller runtime before command execution."""
+
+    executable = Path(sys.executable).expanduser().resolve(strict=True)
+    return ControllerRuntimeProvenance(
+        target_definition_sha256=str(target_definition_sha256).strip(),
+        platform=f"{sys.platform}:{os.name}:{runtime_platform.machine()}",
+        runtime_executable=str(executable),
+        runtime_version=runtime_platform.python_version(),
+        runtime_executable_sha256=_regular_file_sha256(executable),
+        policy_version=EXECUTION_POLICY_VERSION,
+    )
+
+
+def _engine_command(
+    engine: str,
+    *args: str,
+    endpoint: str = "",
+) -> list[str]:
+    if _container_engine_kind(engine) == "podman":
+        return [engine, "--remote=false", *args]
+    if endpoint:
+        return [engine, "--host", endpoint, *args]
+    return [engine, *args]
+
+
+def _container_engine_kind(engine: str) -> str:
+    name = str(engine).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name in {"docker", "docker.exe"}:
+        return "docker"
+    if name in {"podman", "podman.exe"}:
+        return "podman"
+    return ""
+
+
+def _engine_version_command(engine: str, endpoint: str) -> list[str]:
+    if _container_engine_kind(engine) == "podman":
+        return _engine_command(
+            engine,
+            "version",
+            "--format",
+            "{{.Version}}",
+            endpoint=endpoint,
+        )
+    return _engine_command(
+        engine,
+        "version",
+        "--format",
+        "{{.Server.Version}}",
+        endpoint=endpoint,
+    )
+
+
+def _clean_container_engine_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in _CONTAINER_ROUTING_ENV:
+        env.pop(key, None)
+    return env
+
+
+def _container_engine_env() -> dict[str, str]:
+    return _clean_container_engine_env()
+
+
+def _docker_context_endpoint(engine: str, context: str) -> str:
+    try:
+        result = subprocess.run(
+            [engine, "context", "inspect", context],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=_clean_container_engine_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: cannot inspect Docker context: "
+            f"{exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = str(result.stderr or "").strip()
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: cannot inspect Docker context "
+            f"{context}" + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(str(result.stdout or ""))
+        record = payload[0] if isinstance(payload, list) and payload else None
+        endpoints = record.get("Endpoints") if isinstance(record, dict) else None
+        docker_endpoint = (
+            endpoints.get("docker") if isinstance(endpoints, dict) else None
+        )
+        endpoint = (
+            str(docker_endpoint.get("Host") or "").strip()
+            if isinstance(docker_endpoint, dict)
+            else ""
+        )
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: malformed Docker context inspection"
+        ) from exc
+    if not endpoint:
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: Docker context has no daemon endpoint"
+        )
+    return endpoint
+
+
+def _local_container_engine_endpoint(engine: str) -> str:
+    engine_kind = _container_engine_kind(engine)
+    if not engine_kind:
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: only Docker or Podman is supported"
+        )
+    if engine_kind == "podman":
+        if not sys.platform.startswith("linux"):
+            raise ExecutionPolicyError(
+                "container-engine-endpoint-unverified: Podman machine/remote "
+                "routing is not eligible for local provenance on this platform"
+            )
+        remote_override = next(
+            (
+                key
+                for key in ("CONTAINER_HOST", "CONTAINER_CONNECTION")
+                if str(os.environ.get(key) or "").strip()
+            ),
+            "",
+        )
+        if remote_override:
+            raise ExecutionPolicyError(
+                "container-engine-non-local: Podman remote routing is not eligible "
+                f"for local provenance ({remote_override})"
+            )
+        return "local-process"
+
+    docker_host = str(os.environ.get("DOCKER_HOST") or "").strip()
+    docker_context = str(os.environ.get("DOCKER_CONTEXT") or "").strip()
+    if docker_host and docker_context:
+        raise ExecutionPolicyError(
+            "container-engine-routing-ambiguous: DOCKER_HOST and DOCKER_CONTEXT "
+            "cannot both select container provenance"
+        )
+    if docker_context:
+        endpoint = _docker_context_endpoint(engine, docker_context)
+    elif docker_host:
+        endpoint = docker_host
+    else:
+        try:
+            result = subprocess.run(
+                [engine, "context", "show"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+                env=_clean_container_engine_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ExecutionPolicyError(
+                "container-engine-unavailable: cannot resolve active Docker context: "
+                f"{exc}"
+            ) from exc
+        context = str(result.stdout or "").strip()
+        if result.returncode != 0 or not context:
+            detail = str(result.stderr or "").strip()
+            raise ExecutionPolicyError(
+                "container-engine-unavailable: cannot resolve active Docker context"
+                + (f": {detail}" if detail else "")
+            )
+        endpoint = _docker_context_endpoint(engine, context)
+    if _LOCAL_DOCKER_UNIX_ENDPOINT.fullmatch(endpoint):
+        return endpoint
+    if os.name == "nt" and _LOCAL_DOCKER_NPIPE_ENDPOINT.fullmatch(endpoint):
+        return endpoint
+    raise ExecutionPolicyError(
+        "container-engine-non-local: Docker daemon endpoint must be a local "
+        f"Unix socket or Windows named pipe; actual={endpoint}"
+    )
+
+
+def resolve_container_image_provenance(
+    requested_image: str,
+    *,
+    expected_engine: str = "",
+    expected_endpoint: str = "",
+) -> ContainerImageProvenance:
+    """Resolve one already-local image without pulling or mutating engine state."""
+
+    requested = str(requested_image).strip()
+    if not requested:
+        raise ExecutionPolicyError("container-image-unavailable: image is required")
+    discovered = shutil.which("docker") or shutil.which("podman")
+    if not discovered:
+        raise ExecutionPolicyError(
+            "sandbox-unavailable: Docker or Podman is required for container verification"
+        )
+    engine = str(Path(discovered).expanduser().absolute())
+    if expected_engine:
+        expected = str(Path(expected_engine).expanduser().absolute())
+        if engine != expected:
+            raise ExecutionPolicyError(
+                "container-engine-changed: "
+                f"recorded={expected} current={engine}"
+            )
+    endpoint = _local_container_engine_endpoint(engine)
+    if expected_endpoint and endpoint != expected_endpoint:
+        raise ExecutionPolicyError(
+            "container-engine-endpoint-changed: "
+            f"recorded={expected_endpoint} current={endpoint}"
+        )
+    engine_env = _container_engine_env()
+    try:
+        version_result = subprocess.run(
+            _engine_version_command(engine, endpoint),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=engine_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ExecutionPolicyError(
+            f"container-engine-unavailable: cannot inspect engine version: {exc}"
+        ) from exc
+    engine_version = str(version_result.stdout or "").strip()
+    if version_result.returncode != 0 or not engine_version:
+        detail = str(version_result.stderr or "").strip()
+        raise ExecutionPolicyError(
+            "container-engine-unavailable: cannot inspect engine version"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        inspect_result = subprocess.run(
+            _engine_command(
+                engine,
+                "image",
+                "inspect",
+                requested,
+                endpoint=endpoint,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=engine_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ExecutionPolicyError(
+            f"container-image-unavailable: cannot inspect local image {requested}: {exc}"
+        ) from exc
+    if inspect_result.returncode != 0:
+        detail = str(inspect_result.stderr or "").strip()
+        raise ExecutionPolicyError(
+            f"container-image-unavailable: local image not found: {requested}"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(str(inspect_result.stdout or ""))
+        record = payload[0] if isinstance(payload, list) and payload else None
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ExecutionPolicyError(
+            f"container-image-unavailable: malformed image inspection for {requested}"
+        ) from exc
+    if not isinstance(record, dict):
+        raise ExecutionPolicyError(
+            f"container-image-unavailable: malformed image inspection for {requested}"
+        )
+    image_digest = str(record.get("Id") or "").strip().lower()
+    if _SHA256_HEX.fullmatch(image_digest):
+        image_digest = f"sha256:{image_digest}"
+    if not _CONTAINER_IMAGE_DIGEST.fullmatch(image_digest):
+        for repo_digest in record.get("RepoDigests") or []:
+            candidate = str(repo_digest).rsplit("@", 1)[-1].strip().lower()
+            if _CONTAINER_IMAGE_DIGEST.fullmatch(candidate):
+                image_digest = candidate
+                break
+    if not _CONTAINER_IMAGE_DIGEST.fullmatch(image_digest):
+        raise ExecutionPolicyError(
+            f"container-image-unavailable: no immutable local identity for {requested}"
+        )
+    return ContainerImageProvenance(
+        engine=engine,
+        engine_version=engine_version,
+        requested_image=requested,
+        image_digest=image_digest,
+        engine_endpoint=endpoint,
+    )
+
+
+def target_definition_digest(target: Mapping[str, object]) -> str:
+    """Return the stable digest of execution-relevant target policy fields.
+
+    Identity, timestamps, descriptions, and presentation fields are excluded so
+    they cannot create false staleness.  Every field capable of changing what is
+    run or how its result is interpreted is included.
+    """
+
+    payload = {
+        field: target[field]
+        for field in TARGET_DEFINITION_DIGEST_FIELDS
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def normalize_command(command: str) -> str:
@@ -693,78 +1104,257 @@ def parse_structured_result(result_format: str, payload: str | bytes) -> Structu
             )
         if result_format == "go-json":
             events = _json_lines(payload, result_format)
-            passed_tests = {str(event["Test"]) for event in events if event.get("Action") == "pass" and event.get("Test")}
-            failed = any(event.get("Action") == "fail" for event in events)
-            return _structured_pass(len(passed_tests), 1 if failed else 0, "go test failed")
+            active_tests: set[tuple[str, str]] = set()
+            packages_with_tests: set[str] = set()
+            passed_count = 0
+            failed_count = 0
+            failed_packages_from_tests: set[str] = set()
+            package_terminals: dict[str, str] = {}
+            for event in events:
+                action = event.get("Action")
+                package = str(event.get("Package") or "").strip()
+                test_name = str(event.get("Test") or "").strip()
+                if test_name:
+                    if not package:
+                        raise ValueError(
+                            "malformed go-json: test event is missing Package"
+                        )
+                    if package in package_terminals:
+                        raise ValueError(
+                            "malformed go-json: event order places test after "
+                            f"terminal package event for {package}"
+                        )
+                    key = (package, test_name)
+                    if action == "run":
+                        if key in active_tests:
+                            raise ValueError(
+                                "malformed go-json: duplicate run event before "
+                                f"terminal outcome for {package}:{test_name}"
+                            )
+                        active_tests.add(key)
+                        packages_with_tests.add(package)
+                        continue
+                    if action not in {"pass", "fail", "skip"}:
+                        continue
+                    if key not in active_tests:
+                        raise ValueError(
+                            "malformed go-json: terminal test outcome has no "
+                            "preceding run event; event order is invalid for "
+                            f"{package}:{test_name}"
+                        )
+                    active_tests.remove(key)
+                    if action == "pass":
+                        passed_count += 1
+                    elif action == "fail":
+                        failed_count += 1
+                        failed_packages_from_tests.add(package)
+                    continue
+                if package and action in {"pass", "fail"}:
+                    if package in package_terminals:
+                        raise ValueError(
+                            "malformed go-json: duplicate terminal package event "
+                            f"for {package}"
+                        )
+                    if any(key[0] == package for key in active_tests):
+                        raise ValueError(
+                            "malformed go-json: event order closes package before "
+                            f"active tests have terminal outcomes for {package}"
+                        )
+                    package_terminals[package] = str(action)
+            if active_tests:
+                raise ValueError(
+                    "malformed go-json: started test is missing terminal outcome"
+                )
+            if passed_count + failed_count <= 0:
+                raise ValueError(
+                    "malformed go-json: no executed terminal test outcomes"
+                )
+            missing_packages = sorted(
+                packages_with_tests - set(package_terminals)
+            )
+            if missing_packages:
+                raise ValueError(
+                    "malformed go-json: missing terminal package event for "
+                    + ", ".join(missing_packages)
+                )
+            contradictory_packages = sorted(
+                package
+                for package in failed_packages_from_tests
+                if package_terminals.get(package) == "pass"
+            )
+            if contradictory_packages:
+                raise ValueError(
+                    "malformed go-json: passing package terminal contradicts "
+                    "failed test outcome"
+                )
+            failed = failed_count > 0 or any(
+                action == "fail" for action in package_terminals.values()
+            )
+            return _structured_pass(
+                passed_count + failed_count,
+                1 if failed else 0,
+                "go test failed",
+            )
         if result_format == "cargo-nextest-json":
             events = _json_lines(payload, result_format)
-            outcomes: dict[str, str] = {}
+            current: dict[str, object] | None = None
+            suite_count = 0
+            total_executed = 0
+            total_failed = 0
             for event in events:
+                event_type = event.get("type")
                 event_status = event.get("event")
-                name_value = (
-                    event.get("name")
-                    or event.get("test")
-                    or event.get("test_name")
-                )
-                if event_status not in {
-                    "passed",
-                    "ok",
-                    "failed",
-                    "failure",
-                    "skipped",
-                } or not name_value:
+                if event_type == "suite" and event_status == "started":
+                    if current is not None:
+                        raise ValueError(
+                            f"malformed {result_format}: event order starts a new "
+                            "suite before the prior suite terminal"
+                        )
+                    current = {
+                        "test_count": _json_count(
+                            event,
+                            "test_count",
+                            result_format,
+                        ),
+                        "active": set(),
+                        "outcomes": {},
+                        "measured": set(),
+                    }
                     continue
-                name = str(name_value)
-                outcome = (
-                    "passed"
-                    if event_status in {"passed", "ok"}
-                    else "failed"
-                    if event_status in {"failed", "failure"}
-                    else "skipped"
-                )
-                previous = outcomes.get(name)
-                if previous is not None and previous != outcome:
-                    raise ValueError(
-                        f"malformed {result_format}: contradictory outcomes for {name}"
-                    )
-                outcomes[name] = outcome
-            passed = {
-                name for name, outcome in outcomes.items() if outcome == "passed"
-            }
-            failed_names = {
-                name for name, outcome in outcomes.items() if outcome == "failed"
-            }
-            skipped_names = {
-                name for name, outcome in outcomes.items() if outcome == "skipped"
-            }
-            failed = bool(failed_names)
-            for event in events:
-                if event.get("event") == "finished":
-                    finished_failed = _json_count(
-                        event,
-                        "failed",
-                        result_format,
-                    )
-                    _json_count(event, "passed", result_format)
-                    _json_count(event, "skipped", result_format)
-                    _json_count(event, "test_count", result_format)
+                if event_type == "suite" and event_status in {"ok", "failed"}:
+                    if current is None:
+                        raise ValueError(
+                            f"malformed {result_format}: event order has terminal "
+                            "suite before suite started"
+                        )
+                    active = current["active"]
+                    assert isinstance(active, set)
+                    if active:
+                        raise ValueError(
+                            f"malformed {result_format}: event order closes suite "
+                            "with active tests missing terminal outcomes"
+                        )
+                    outcomes = current["outcomes"]
+                    measured = current["measured"]
+                    assert isinstance(outcomes, dict)
+                    assert isinstance(measured, set)
                     comparisons = {
-                        "passed": len(passed),
-                        "failed": len(failed_names),
-                        "skipped": len(skipped_names),
-                        "test_count": len(outcomes),
+                        "passed": sum(
+                            1 for outcome in outcomes.values() if outcome == "passed"
+                        ),
+                        "failed": sum(
+                            1 for outcome in outcomes.values() if outcome == "failed"
+                        ),
+                        "ignored": sum(
+                            1 for outcome in outcomes.values() if outcome == "ignored"
+                        ),
+                        "measured": len(measured),
                     }
                     for key, actual in comparisons.items():
-                        if (
-                            key in event
-                            and _json_count(event, key, result_format) != actual
-                        ):
+                        if key not in event:
                             raise ValueError(
-                                f"malformed {result_format}: finished {key} contradicts test outcomes"
+                                f"malformed {result_format}: terminal suite event "
+                                f"is missing {key}"
                             )
-                    if finished_failed > 0:
-                        failed = True
-            return _structured_pass(len(passed), 1 if failed else 0, "nextest failed")
+                        if _json_count(event, key, result_format) != actual:
+                            raise ValueError(
+                                f"malformed {result_format}: terminal {key} "
+                                "contradicts test outcomes"
+                            )
+                    if "filtered_out" not in event:
+                        raise ValueError(
+                            f"malformed {result_format}: terminal suite event "
+                            "is missing filtered_out"
+                        )
+                    _json_count(event, "filtered_out", result_format)
+                    reconciled_count = sum(comparisons.values())
+                    if current["test_count"] != reconciled_count:
+                        raise ValueError(
+                            f"malformed {result_format}: suite test_count "
+                            "contradicts terminal outcomes"
+                        )
+                    expected_terminal = (
+                        "failed" if comparisons["failed"] else "ok"
+                    )
+                    if event_status != expected_terminal:
+                        raise ValueError(
+                            f"malformed {result_format}: suite terminal status "
+                            "contradicts failures"
+                        )
+                    total_executed += (
+                        comparisons["passed"]
+                        + comparisons["failed"]
+                        + comparisons["measured"]
+                    )
+                    total_failed += comparisons["failed"]
+                    suite_count += 1
+                    current = None
+                    continue
+                if event_type not in {"test", "bench"}:
+                    continue
+                if current is None:
+                    raise ValueError(
+                        f"malformed {result_format}: event order has test outside "
+                        "an active suite"
+                    )
+                name_value = event.get("name")
+                if not name_value:
+                    raise ValueError(
+                        f"malformed {result_format}: test event is missing name"
+                    )
+                name = str(name_value)
+                active = current["active"]
+                outcomes = current["outcomes"]
+                measured = current["measured"]
+                assert isinstance(active, set)
+                assert isinstance(outcomes, dict)
+                assert isinstance(measured, set)
+                if event_type == "test" and event_status == "started":
+                    if name in active or name in outcomes or name in measured:
+                        raise ValueError(
+                            f"malformed {result_format}: duplicate test started "
+                            f"event for {name}"
+                        )
+                    active.add(name)
+                    continue
+                if event_type == "test" and event_status in {
+                    "ok",
+                    "failed",
+                    "ignored",
+                }:
+                    if name not in active:
+                        raise ValueError(
+                            f"malformed {result_format}: terminal test outcome "
+                            "has no preceding started event; event order is "
+                            f"invalid for {name}"
+                        )
+                    active.remove(name)
+                    outcomes[name] = (
+                        "passed" if event_status == "ok" else str(event_status)
+                    )
+                    continue
+                if event_type == "bench":
+                    if name not in active:
+                        raise ValueError(
+                            f"malformed {result_format}: benchmark outcome has "
+                            "no preceding started event"
+                        )
+                    active.remove(name)
+                    measured.add(name)
+            if current is not None:
+                raise ValueError(
+                    f"malformed {result_format}: started suite is missing "
+                    "terminal suite event"
+                )
+            if suite_count <= 0:
+                raise ValueError(
+                    f"malformed {result_format}: no complete suite events"
+                )
+            return _structured_pass(
+                total_executed,
+                total_failed,
+                "nextest failed",
+            )
         if result_format == "playwright-json":
             data = _json_loads(payload, result_format)
             if not isinstance(data, dict):
@@ -873,9 +1463,13 @@ class LocalExecutor:
         executed_count: int | None = None,
         result_format: str = "regex",
         result_path: str = "",
+        target_definition_sha256: str = "",
     ) -> CommandResult:
         if not command.strip():
             raise ValueError("command is required")
+        runtime_provenance = controller_runtime_provenance(
+            target_definition_sha256
+        )
         normalized_result_path = _safe_result_path(result_path)
         execution_id = uuid.uuid4().hex
         artifact_relative = Path(
@@ -942,6 +1536,7 @@ class LocalExecutor:
                 execution_id=execution_id,
                 artifact_expected=artifact_snapshot,
                 structured_expected=structured_snapshot,
+                runtime_provenance=runtime_provenance,
             )
         args = shlex.split(command)
         if not args:
@@ -965,10 +1560,16 @@ class LocalExecutor:
         except OSError as exc:
             exit_code = 127
             stdout = str(exc).encode("utf-8", errors="replace")
+        stdout_truncated = len(stdout) > self.max_stdout_bytes
         stdout = stdout[: self.max_stdout_bytes]
         semantic_status = ""
         structured_payload_for_artifact: bytes | None = None
         if result_format != "regex":
+            if stdout_truncated and not normalized_result_path:
+                raise ExecutionPolicyError(
+                    "structured-result-truncated: captured stdout exceeded "
+                    f"{self.max_stdout_bytes} bytes"
+                )
             structured_payload = stdout
             if normalized_result_path:
                 assert structured_baseline is not None
@@ -1014,6 +1615,7 @@ class LocalExecutor:
             execution_id=execution_id,
             artifact_expected=artifact_snapshot,
             structured_expected=structured_snapshot,
+            runtime_provenance=runtime_provenance,
         )
 
     def _policy(
@@ -1064,6 +1666,7 @@ class LocalExecutor:
         execution_id: str = "",
         artifact_expected: _PathSnapshot | None = None,
         structured_expected: _PathSnapshot | None = None,
+        runtime_provenance: ControllerRuntimeProvenance,
     ) -> CommandResult:
         if not execution_id:
             execution_id = uuid.uuid4().hex
@@ -1107,6 +1710,23 @@ class LocalExecutor:
             allow_unlisted_reason=allow_unlisted_reason,
             policy_status=policy_status,
             policy_reason=policy_reason,
+            target_definition_sha256=(
+                runtime_provenance.target_definition_sha256
+            ),
+            platform=runtime_provenance.platform,
+            runtime_executable=runtime_provenance.runtime_executable,
+            runtime_version=runtime_provenance.runtime_version,
+            runtime_executable_sha256=(
+                runtime_provenance.runtime_executable_sha256
+            ),
+            policy_version=runtime_provenance.policy_version,
+            provenance_status=(
+                "complete"
+                if _SHA256_HEX.fullmatch(
+                    runtime_provenance.target_definition_sha256
+                )
+                else "legacy-incomplete"
+            ),
         )
 
 
@@ -1127,12 +1747,8 @@ class ContainerExecutor:
         container_image: str = "python:3.12-slim",
         result_format: str = "regex",
         result_path: str = "",
+        target_definition_sha256: str = "",
     ) -> CommandResult:
-        engine = shutil.which("docker") or shutil.which("podman")
-        if not engine:
-            raise ExecutionPolicyError(
-                "sandbox-unavailable: Docker or Podman is required for container verification"
-            )
         policy_status, policy_reason = LocalExecutor(self.root)._policy(
             command,
             target_id,
@@ -1174,6 +1790,13 @@ class ContainerExecutor:
                     (Path(normalized_result_path),),
                     allow_missing=True,
                 )
+        runtime_provenance = controller_runtime_provenance(
+            target_definition_sha256
+        )
+        container_provenance = resolve_container_image_provenance(
+            container_image
+        )
+        engine = container_provenance.engine
         container_name = f"kafa-verify-{execution_id[:12]}"
         result_reset = ""
         result_copy = ""
@@ -1184,15 +1807,24 @@ class ContainerExecutor:
             # declared structured result; the host project is never mutated.
             result_reset = f"rm -f -- {quoted_result}; "
             result_copy = (
-                f"; if [ -f {quoted_result} ]; then "
+                "; rm -f -- /artifacts/structured-result; "
+                f"if [ -f {quoted_result} ]; then "
                 f"cp -a {quoted_result} /artifacts/structured-result; fi"
             )
+        else:
+            result_copy = (
+                "; if [ -e /artifacts/structured-result ] "
+                "|| [ -L /artifacts/structured-result ]; then exit 125; fi"
+            )
         script = (
+            "set -eu; "
             "rm -rf /workspace/* /workspace/.[!.]* /workspace/..?* 2>/dev/null || true; "
             "cp -a /src/. /workspace/; "
-            f"cd /workspace && {result_reset}"
+            f"cd /workspace; {result_reset}"
+            "set +e; "
             f"({command}) > /artifacts/stdout.txt 2>&1; "
-            f"rc=$?{result_copy}; exit $rc"
+            "rc=$?; set -e"
+            f"{result_copy}; exit \"$rc\""
         )
         timed_out = False
         structured_payload: bytes | None = None
@@ -1200,10 +1832,11 @@ class ContainerExecutor:
             prefix="kafa-container-artifacts-"
         ) as artifact_temp:
             artifact_directory = Path(artifact_temp).resolve()
-            argv = [
+            argv = _engine_command(
                 engine,
                 "run",
                 "--rm",
+                "--pull=never",
                 "--name",
                 container_name,
                 "--network",
@@ -1215,6 +1848,8 @@ class ContainerExecutor:
                 "--pids-limit",
                 "256",
                 "--read-only",
+                "--entrypoint",
+                "/bin/sh",
                 "--tmpfs",
                 "/tmp:rw,noexec,nosuid,size=64m",
                 "--tmpfs",
@@ -1225,12 +1860,11 @@ class ContainerExecutor:
                 f"{artifact_directory}:/artifacts:rw",
                 "-w",
                 "/workspace",
-                container_image,
-                "/bin/sh",
+                container_provenance.image_digest,
                 "-lc",
                 script,
-            ]
-            fallback_stdout = b""
+                endpoint=container_provenance.engine_endpoint,
+            )
             try:
                 completed = subprocess.run(
                     argv,
@@ -1238,54 +1872,67 @@ class ContainerExecutor:
                     capture_output=True,
                     check=False,
                     timeout=timeout,
+                    env=_container_engine_env(),
                 )
                 exit_code = completed.returncode
-                fallback_stdout = (
-                    (completed.stdout or "") + (completed.stderr or "")
-                ).encode("utf-8")
-            except subprocess.TimeoutExpired as exc:
+            except subprocess.TimeoutExpired:
                 timed_out = True
                 exit_code = 124
                 subprocess.run(
-                    [engine, "rm", "-f", container_name],
+                    _engine_command(
+                        engine,
+                        "rm",
+                        "-f",
+                        container_name,
+                        endpoint=container_provenance.engine_endpoint,
+                    ),
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=_container_engine_env(),
                 )
-                stdout = exc.stdout or b""
-                stderr = exc.stderr or b""
-                stdout_value = (
-                    stdout if isinstance(stdout, bytes) else stdout.encode("utf-8")
-                )
-                stderr_value = (
-                    stderr if isinstance(stderr, bytes) else stderr.encode("utf-8")
-                )
-                fallback_stdout = stdout_value + stderr_value
 
             with ProjectFS.open(artifact_directory) as artifact_fs:
                 stdout_snapshot = artifact_fs._snapshot(
                     Path("stdout.txt"),
                     allow_missing=True,
                 )
-                complete_stdout = (
-                    artifact_fs.read_bytes(
-                        Path("stdout.txt"),
-                        expected=stdout_snapshot,
+                if not stdout_snapshot.exists:
+                    raise ExecutionPolicyError(
+                        "container-execution-artifact-missing: controlled "
+                        "entrypoint did not create /artifacts/stdout.txt"
                     )
-                    if stdout_snapshot.exists
-                    else fallback_stdout
+                complete_stdout = artifact_fs.read_bytes(
+                    Path("stdout.txt"),
+                    expected=stdout_snapshot,
                 )
                 structured_snapshot = artifact_fs._snapshot(
                     Path("structured-result"),
                     allow_missing=True,
                 )
                 if structured_snapshot.exists:
+                    if not normalized_result_path:
+                        raise ExecutionPolicyError(
+                            "container-structured-artifact-unexpected: target "
+                            "created an undeclared structured-result artifact"
+                        )
                     structured_payload = artifact_fs.read_bytes(
                         Path("structured-result"),
                         expected=structured_snapshot,
                     )
 
+            stdout_truncated = len(complete_stdout) > self.max_stdout_bytes
             stdout_bytes = complete_stdout[: self.max_stdout_bytes]
+            if (
+                result_format != "regex"
+                and structured_payload is None
+                and not normalized_result_path
+                and stdout_truncated
+            ):
+                raise ExecutionPolicyError(
+                    "structured-result-truncated: captured container stdout "
+                    f"exceeded {self.max_stdout_bytes} bytes"
+                )
             with ProjectFS.open(self.root) as project_fs:
                 project_fs.atomic_write(
                     artifact_relative,
@@ -1307,7 +1954,11 @@ class ContainerExecutor:
         else:
             parsed = parse_structured_result(
                 result_format,
-                structured_payload or b"",
+                (
+                    structured_payload
+                    if structured_payload is not None
+                    else (b"" if normalized_result_path else stdout_bytes)
+                ),
             )
             executed_count = parsed.executed_count
             executed_count_source = parsed.executed_count_source
@@ -1333,6 +1984,28 @@ class ContainerExecutor:
             sandbox_status="available",
             policy_status=policy_status,
             policy_reason=policy_reason,
+            target_definition_sha256=(
+                runtime_provenance.target_definition_sha256
+            ),
+            platform=runtime_provenance.platform,
+            runtime_executable=runtime_provenance.runtime_executable,
+            runtime_version=runtime_provenance.runtime_version,
+            runtime_executable_sha256=(
+                runtime_provenance.runtime_executable_sha256
+            ),
+            policy_version=runtime_provenance.policy_version,
+            container_engine=container_provenance.engine,
+            container_engine_version=container_provenance.engine_version,
+            container_engine_endpoint=container_provenance.engine_endpoint,
+            container_image_requested=container_provenance.requested_image,
+            container_image_digest=container_provenance.image_digest,
+            provenance_status=(
+                "complete"
+                if _SHA256_HEX.fullmatch(
+                    runtime_provenance.target_definition_sha256
+                )
+                else "legacy-incomplete"
+            ),
         )
 
 
@@ -1356,7 +2029,185 @@ def target_policy_from_row(row: Mapping[str, object]) -> TargetExecutionPolicy:
         requires_sandbox=bool(int(row.get("requires_sandbox") or 0)),
         requires_no_network=bool(int(row.get("requires_no_network") or 0)),
         container_image=str(row.get("container_image") or ""),
+        target_definition_sha256=target_definition_digest(row),
     )
+
+
+def recorded_execution_provenance_issues(
+    execution: Mapping[str, object] | sqlite3.Row,
+) -> list[str]:
+    """Validate persisted provenance without consulting mutable host state."""
+
+    def value(field: str) -> str:
+        try:
+            raw = execution[field]
+        except (KeyError, IndexError):
+            return ""
+        return str(raw or "").strip()
+
+    issues: list[str] = []
+    status = value("provenance_status")
+    if status != "complete":
+        issues.append(
+            "execution provenance_status must be complete; "
+            f"actual={status or 'empty'}"
+        )
+    target_digest = value("target_definition_sha256")
+    if not _SHA256_HEX.fullmatch(target_digest):
+        issues.append("execution provenance target_definition_sha256 is missing or invalid")
+    runtime_digest = value("runtime_executable_sha256")
+    if not _SHA256_HEX.fullmatch(runtime_digest):
+        issues.append(
+            "execution provenance runtime_executable_sha256 is missing or invalid"
+        )
+    for field in (
+        "platform",
+        "runtime_executable",
+        "runtime_version",
+        "policy_version",
+    ):
+        if not value(field):
+            issues.append(f"execution provenance {field} is missing")
+    if value("policy_version") and value("policy_version") != EXECUTION_POLICY_VERSION:
+        issues.append(
+            "execution provenance policy_version is stale: "
+            f"recorded={value('policy_version')} current={EXECUTION_POLICY_VERSION}"
+        )
+    runner = value("runner")
+    container_fields = (
+        "container_engine",
+        "container_engine_version",
+        "container_engine_endpoint",
+        "container_image_requested",
+        "container_image_digest",
+    )
+    if runner == "local":
+        for field in container_fields:
+            if value(field):
+                issues.append(
+                    f"local execution provenance {field} must be empty"
+                )
+    elif runner == "container":
+        for field in container_fields[:-1]:
+            if not value(field):
+                issues.append(f"container execution provenance {field} is missing")
+        engine = value("container_engine")
+        endpoint = value("container_engine_endpoint")
+        engine_kind = _container_engine_kind(engine)
+        engine_has_path = "/" in engine or "\\" in engine
+        endpoint_matches_engine = engine_has_path and (
+            (engine_kind == "podman" and endpoint == "local-process")
+            or (
+                engine_kind == "docker"
+                and bool(
+                    _LOCAL_DOCKER_UNIX_ENDPOINT.fullmatch(endpoint)
+                    or _LOCAL_DOCKER_NPIPE_ENDPOINT.fullmatch(endpoint)
+                )
+            )
+        )
+        if engine and endpoint and not endpoint_matches_engine:
+            issues.append(
+                "container execution provenance engine/endpoint pair is "
+                f"unsupported: engine={engine} endpoint={endpoint}"
+            )
+        if not _CONTAINER_IMAGE_DIGEST.fullmatch(
+            value("container_image_digest")
+        ):
+            issues.append(
+                "container execution provenance container_image_digest is missing or invalid"
+            )
+    return issues
+
+
+def _command_result_provenance_issues(
+    target: TargetExecutionPolicy,
+    result: CommandResult,
+    *,
+    runner: str,
+) -> list[str]:
+    if not target.target_definition_sha256:
+        return []
+    issues = recorded_execution_provenance_issues(
+        {
+            "target_definition_sha256": result.target_definition_sha256,
+            "platform": result.platform,
+            "runtime_executable": result.runtime_executable,
+            "runtime_version": result.runtime_version,
+            "runtime_executable_sha256": result.runtime_executable_sha256,
+            "policy_version": result.policy_version,
+            "container_engine": result.container_engine,
+            "container_engine_version": result.container_engine_version,
+            "container_engine_endpoint": result.container_engine_endpoint,
+            "container_image_requested": result.container_image_requested,
+            "container_image_digest": result.container_image_digest,
+            "provenance_status": result.provenance_status,
+            "runner": runner,
+        }
+    )
+    if result.target_definition_sha256 != target.target_definition_sha256:
+        issues.append(
+            "execution provenance target definition changed during execution"
+        )
+    if issues:
+        return issues
+
+    try:
+        current_runtime = controller_runtime_provenance(
+            target.target_definition_sha256
+        )
+    except (OSError, ExecutionPolicyError) as exc:
+        return [f"stale runtime provenance: {exc}"]
+    for field in (
+        "target_definition_sha256",
+        "platform",
+        "runtime_executable",
+        "runtime_version",
+        "runtime_executable_sha256",
+        "policy_version",
+    ):
+        if getattr(result, field) != getattr(current_runtime, field):
+            issues.append(
+                f"stale runtime provenance: {field} changed before commit"
+            )
+    if runner == "container" and not issues:
+        try:
+            current_container = resolve_container_image_provenance(
+                result.container_image_requested,
+                expected_engine=result.container_engine,
+                expected_endpoint=result.container_engine_endpoint,
+            )
+        except ExecutionPolicyError as exc:
+            issues.append(f"stale container provenance: {exc}")
+        else:
+            comparisons = (
+                ("container_engine", result.container_engine, current_container.engine),
+                (
+                    "container_engine_version",
+                    result.container_engine_version,
+                    current_container.engine_version,
+                ),
+                (
+                    "container_engine_endpoint",
+                    result.container_engine_endpoint,
+                    current_container.engine_endpoint,
+                ),
+                (
+                    "container_image_requested",
+                    result.container_image_requested,
+                    current_container.requested_image,
+                ),
+                (
+                    "container_image_digest",
+                    result.container_image_digest,
+                    current_container.image_digest,
+                ),
+            )
+            for field, recorded, current in comparisons:
+                if recorded != current:
+                    issues.append(
+                        f"stale container provenance: {field} changed before commit"
+                    )
+    return issues
 
 
 def validate_execution_result(
@@ -1395,6 +2246,13 @@ def validate_execution_result(
         or not result.no_network
     ):
         issues.append("target requires an available no-network container sandbox")
+    issues.extend(
+        _command_result_provenance_issues(
+            target,
+            result,
+            runner=runner,
+        )
+    )
     try:
         artifact_relative = Path(_safe_result_path(result.artifact_path))
     except ExecutionPolicyError:

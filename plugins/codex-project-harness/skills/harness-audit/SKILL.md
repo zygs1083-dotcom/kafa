@@ -17,6 +17,9 @@ Check whether the project operating system still matches reality.
 - task board and decision log
 - acceptance criteria and traceability
 - current candidate, local runtime records, and evidence
+- schema 31 execution provenance: target definition, controller runtime digest,
+  policy version, optional frozen local container endpoint/image digest, and
+  `provenance_status`
 - recent code changes and local tests
 - `scripts/harness.py status`
 - `scripts/harness.py validate --delivery`
@@ -30,6 +33,9 @@ Check whether the project operating system still matches reality.
 - skills that no longer trigger correctly,
 - task state that disagrees with code reality,
 - runtime records that disagree with the current candidate or evidence,
+- complete provenance with missing `target_definition_sha256` or
+  `runtime_executable_sha256`, and `legacy-incomplete` history incorrectly used
+  for current delivery,
 - missing escalation points,
 - uncontrolled growth of logs or generated artifacts.
 

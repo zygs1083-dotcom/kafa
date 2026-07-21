@@ -47,6 +47,7 @@ EXPECTED_TABLES = {
     "task_failure_modes",
     "task_dependencies",
     "test_targets",
+    "acceptance_target_qualifications",
     "task_test_targets",
     "executions",
     "validations",
@@ -55,12 +56,14 @@ EXPECTED_TABLES = {
     "findings",
     "quality_gates",
     "quality_gate_findings",
+    "quality_gate_qualifications",
     "deliveries",
     "delivery_acceptance",
     "decisions",
     "invalidations",
     "migrations",
     "events",
+    "outcome_observations",
 }
 
 EXPECTED_CLI_SURFACE = {
@@ -69,15 +72,20 @@ EXPECTED_CLI_SURFACE = {
     "baseline",
     "baseline.diff",
     "baseline.freeze",
+    "baseline.confirm",
     "baseline.validate",
     "cycle",
+    "cycle.audit",
     "cycle.close",
+    "cycle.outcome-record",
+    "cycle.outcome-report",
     "cycle.start",
     "cycle.status",
     "decision",
     "decision.record",
     "delivery",
     "delivery.record",
+    "delivery.ready",
     "doctor",
     "failure-mode",
     "failure-mode.add",
@@ -108,6 +116,7 @@ EXPECTED_CLI_SURFACE = {
     "test-target",
     "test-target.add",
     "test-target.link",
+    "test-target.qualify",
     "test-target.list",
     "trace",
     "trace.show",
@@ -161,11 +170,11 @@ class FeatureFreezeTest(unittest.TestCase):
                     )
                 }
 
-        self.assertEqual(len(EXPECTED_TABLES), 27)
+        self.assertEqual(len(EXPECTED_TABLES), 30)
         self.assertEqual(tables, EXPECTED_TABLES)
 
     def test_feature_freeze_rejects_cli_surface_growth(self) -> None:
-        self.assertEqual(len(EXPECTED_CLI_SURFACE), 53)
+        self.assertEqual(len(EXPECTED_CLI_SURFACE), 59)
         self.assertEqual(_cli_surface(harness.build_parser()), EXPECTED_CLI_SURFACE)
 
     def test_feature_freeze_protects_public_files(self) -> None:

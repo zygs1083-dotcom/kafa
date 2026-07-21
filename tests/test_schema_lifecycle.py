@@ -20,8 +20,10 @@ for path in (PLUGIN_ROOT, SCRIPTS):
 import harness_db  # noqa: E402
 from core import schema_lifecycle  # noqa: E402
 from core.schema_lifecycle import (  # noqa: E402
+    ACTIVE_SCHEMA_VERSION,
     SCHEMA30_TABLES,
     SCHEMA30_VERSION,
+    SCHEMA31_VERSION,
     SchemaLifecycleError,
     create_schema30,
 )
@@ -97,15 +99,15 @@ class SchemaLifecycleTest(unittest.TestCase):
                 root,
                 "migrate",
                 "--from-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
                 "--to-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
             )
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 version = int(conn.execute("select schema_version from project").fetchone()[0])
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(version, SCHEMA30_VERSION)
+        self.assertEqual(version, ACTIVE_SCHEMA_VERSION)
 
     def test_current_schema_dry_run_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -117,9 +119,9 @@ class SchemaLifecycleTest(unittest.TestCase):
                 root,
                 "migrate",
                 "--from-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
                 "--to-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
                 "--dry-run",
             )
             after = db_path.read_bytes()
@@ -133,13 +135,13 @@ class SchemaLifecycleTest(unittest.TestCase):
             root = Path(temp)
             self.assertEqual(run_harness(root, "init").returncode, 0)
             wrong_source = run_harness(
-                root, "migrate", "--from-version", "29", "--to-version", "30"
+                root, "migrate", "--from-version", "30", "--to-version", "31"
             )
             downgrade = run_harness(
-                root, "migrate", "--from-version", "30", "--to-version", "29"
+                root, "migrate", "--from-version", "31", "--to-version", "30"
             )
             unknown = run_harness(
-                root, "migrate", "--from-version", "30", "--to-version", "31"
+                root, "migrate", "--from-version", "31", "--to-version", "32"
             )
 
         self.assertNotEqual(wrong_source.returncode, 0)
@@ -161,9 +163,9 @@ class SchemaLifecycleTest(unittest.TestCase):
                 root,
                 "migrate",
                 "--from-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
                 "--to-version",
-                str(SCHEMA30_VERSION),
+                str(ACTIVE_SCHEMA_VERSION),
             )
 
         self.assertNotEqual(result.returncode, 0)
@@ -183,8 +185,10 @@ class SchemaLifecycleTest(unittest.TestCase):
         self.assertNotEqual(event.returncode, 0)
         self.assertEqual(before, after)
 
-    def test_schema30_version_matches_runtime_constant(self) -> None:
-        self.assertEqual(SCHEMA30_VERSION, harness_db.SCHEMA_VERSION)
+    def test_active_version_matches_runtime_constant_without_rewriting_schema30(self) -> None:
+        self.assertEqual(SCHEMA30_VERSION, 30)
+        self.assertEqual(SCHEMA31_VERSION, ACTIVE_SCHEMA_VERSION)
+        self.assertEqual(ACTIVE_SCHEMA_VERSION, harness_db.SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:outcome-observation",
+  "title": "Kafa Local Outcome Observation",
+  "description": "Bounded local retrospective observation; it is not remote telemetry or adoption proof.",
+  "type": "object",
+  "required": [
+    "id",
+    "kind",
+    "value",
+    "details",
+    "recorded_by",
+    "observed_at",
+    "created_at"
+  ],
+  "properties": {
+    "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "cycle_id": { "type": ["string", "null"], "minLength": 1, "pattern": "\\S" },
+    "kind": {
+      "type": "string",
+      "enum": ["false-green-prevented", "escaped-defect", "rework"]
+    },
+    "value": { "type": "integer", "minimum": 0 },
+    "details": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "recorded_by": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "observed_at": { "type": "string", "minLength": 1, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "format": "date-time" },
+    "created_at": { "type": "string", "minLength": 1, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:quality-gate",
   "title": "Kafa Local Quality Gate",
   "type": "object",
   "required": [
@@ -20,7 +21,7 @@
   ],
   "properties": {
     "id": { "type": "string" },
-    "sequence": { "type": "integer" },
+    "sequence": { "type": "integer", "minimum": 1 },
     "cycle_id": { "type": "string" },
     "candidate_sha": { "type": "string" },
     "gate_status": { "type": "string", "enum": ["active", "superseded", "legacy-ambiguous"] },

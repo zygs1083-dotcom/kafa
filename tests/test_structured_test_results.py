@@ -50,8 +50,8 @@ class StructuredResultParserTest(unittest.TestCase):
             "junit": b'<testsuite tests="2" failures="0" errors="0"><testcase name="a"/><testcase name="b"/></testsuite>',
             "pytest-json": b'{"summary":{"total":2,"passed":2,"failed":0,"errors":0}}',
             "jest-json": b'{"success":true,"numTotalTests":2,"numPassedTests":2,"numFailedTests":0}',
-            "go-json": b'{"Action":"run","Test":"TestA"}\n{"Action":"pass","Test":"TestA"}\n{"Action":"pass","Package":"example"}\n',
-            "cargo-nextest-json": b'{"type":"test","event":"passed","name":"test_a"}\n{"type":"run","event":"finished","test_count":1,"failed":0}\n',
+            "go-json": b'{"Action":"run","Package":"example","Test":"TestA"}\n{"Action":"pass","Package":"example","Test":"TestA"}\n{"Action":"pass","Package":"example"}\n',
+            "cargo-nextest-json": b'{"type":"suite","event":"started","test_count":1}\n{"type":"test","event":"started","name":"test_a"}\n{"type":"test","event":"ok","name":"test_a"}\n{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n',
             "playwright-json": b'{"stats":{"expected":2,"unexpected":0,"flaky":0,"skipped":0}}',
         }
         for result_format, payload in samples.items():
@@ -77,7 +77,7 @@ class StructuredResultParserTest(unittest.TestCase):
             "junit": b'<testsuite tests="1" failures="0" errors="0" skipped="1"><testcase name="a"><skipped/></testcase></testsuite>',
             "pytest-json": b'{"summary":{"total":1,"passed":0,"failed":0,"errors":0,"skipped":1}}',
             "jest-json": b'{"success":true,"numTotalTests":1,"numPassedTests":0,"numFailedTests":0,"numPendingTests":1}',
-            "cargo-nextest-json": b'{"type":"test","event":"skipped","name":"test_a"}\n{"type":"run","event":"finished","test_count":1,"passed":0,"failed":0,"skipped":1}\n',
+            "cargo-nextest-json": b'{"type":"suite","event":"started","test_count":1}\n{"type":"test","event":"started","name":"test_a"}\n{"type":"test","event":"ignored","name":"test_a"}\n{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":1,"measured":0,"filtered_out":0}\n',
         }
         for result_format, payload in samples.items():
             with self.subTest(result_format=result_format):
@@ -125,7 +125,7 @@ class StructuredResultParserTest(unittest.TestCase):
             ),
             "nextest-negative": (
                 "cargo-nextest-json",
-                b'{"type":"run","event":"finished","test_count":1,"failed":-1}\n',
+                b'{"type":"suite","event":"started","test_count":1}\n{"type":"suite","event":"ok","passed":1,"failed":-1,"ignored":0,"measured":0,"filtered_out":0}\n',
             ),
             "pytest-string-count": (
                 "pytest-json",
@@ -145,7 +145,7 @@ class StructuredResultParserTest(unittest.TestCase):
             ),
             "nextest-nonobject-event": (
                 "cargo-nextest-json",
-                b'null\n{"event":"passed","name":"test_a"}\n',
+                b'null\n{"type":"test","event":"ok","name":"test_a"}\n',
             ),
         }
         for name, (result_format, payload) in samples.items():
@@ -154,6 +154,128 @@ class StructuredResultParserTest(unittest.TestCase):
                 self.assertEqual(parsed.semantic_status, "fail")
                 self.assertEqual(parsed.executed_count, 0)
                 self.assertIn("malformed", parsed.reason)
+
+    def test_streaming_structured_results_require_terminal_reconciliation(self) -> None:
+        from core.execution import parse_structured_result
+
+        incomplete = {
+            "go-json": (
+                b'{"Action":"run","Package":"example","Test":"TestA"}\n'
+                b'{"Action":"pass","Package":"example","Test":"TestA"}\n'
+            ),
+            "cargo-nextest-json": (
+                b'{"type":"suite","event":"started","test_count":1}\n'
+                b'{"type":"test","event":"started","name":"test_a"}\n'
+                b'{"type":"test","event":"ok","name":"test_a"}\n'
+            ),
+        }
+        for result_format, payload in incomplete.items():
+            with self.subTest(result_format=result_format):
+                parsed = parse_structured_result(result_format, payload)
+                self.assertEqual(parsed.semantic_status, "fail")
+                self.assertEqual(parsed.executed_count, 0)
+                self.assertIn("terminal", parsed.reason)
+
+    def test_streaming_structured_results_reject_unfinished_started_tests(self) -> None:
+        from core.execution import parse_structured_result
+
+        incomplete = {
+            "go-json": (
+                b'{"Action":"run","Package":"example","Test":"TestA"}\n'
+                b'{"Action":"pass","Package":"example","Test":"TestA"}\n'
+                b'{"Action":"run","Package":"example","Test":"TestB"}\n'
+                b'{"Action":"pass","Package":"example"}\n'
+            ),
+            "cargo-nextest-json": (
+                b'{"type":"suite","event":"started","test_count":1}\n'
+                b'{"type":"test","event":"started","name":"test_a"}\n'
+                b'{"type":"test","event":"ok","name":"test_a"}\n'
+                b'{"type":"test","event":"started","name":"test_b"}\n'
+                b'{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n'
+            ),
+        }
+        for result_format, payload in incomplete.items():
+            with self.subTest(result_format=result_format):
+                parsed = parse_structured_result(result_format, payload)
+                self.assertEqual(parsed.semantic_status, "fail")
+                self.assertEqual(parsed.executed_count, 0)
+                self.assertIn("terminal", parsed.reason)
+
+    def test_streaming_structured_results_reject_impossible_event_order(self) -> None:
+        from core.execution import parse_structured_result
+
+        impossible = {
+            "go-json": (
+                b'{"Action":"pass","Package":"example"}\n'
+                b'{"Action":"pass","Package":"example","Test":"TestA"}\n'
+                b'{"Action":"run","Package":"example","Test":"TestA"}\n'
+            ),
+            "cargo-nextest-json": (
+                b'{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n'
+                b'{"type":"test","event":"ok","name":"test_a"}\n'
+                b'{"type":"test","event":"started","name":"test_a"}\n'
+                b'{"type":"suite","event":"started","test_count":1}\n'
+            ),
+        }
+        for result_format, payload in impossible.items():
+            with self.subTest(result_format=result_format):
+                parsed = parse_structured_result(result_format, payload)
+                self.assertEqual(parsed.semantic_status, "fail")
+                self.assertEqual(parsed.executed_count, 0)
+                self.assertIn("order", parsed.reason)
+
+    def test_nextest_stress_stream_reconciles_each_complete_suite(self) -> None:
+        from core.execution import parse_structured_result
+
+        payload = (
+            b'{"type":"suite","event":"started","test_count":2}\n'
+            b'{"type":"test","event":"started","name":"pkg@stress-0$test_a"}\n'
+            b'{"type":"test","event":"started","name":"pkg@stress-0$test_b"}\n'
+            b'{"type":"test","event":"ok","name":"pkg@stress-0$test_a"}\n'
+            b'{"type":"test","event":"ok","name":"pkg@stress-0$test_b"}\n'
+            b'{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n'
+            b'{"type":"suite","event":"started","test_count":2}\n'
+            b'{"type":"test","event":"started","name":"pkg@stress-1$test_a"}\n'
+            b'{"type":"test","event":"started","name":"pkg@stress-1$test_b"}\n'
+            b'{"type":"test","event":"ok","name":"pkg@stress-1$test_a"}\n'
+            b'{"type":"test","event":"ok","name":"pkg@stress-1$test_b"}\n'
+            b'{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n'
+        )
+        parsed = parse_structured_result("cargo-nextest-json", payload)
+        self.assertEqual(parsed.semantic_status, "pass")
+        self.assertEqual(parsed.executed_count, 4)
+
+    def test_local_structured_stdout_cannot_pass_from_a_truncated_prefix(self) -> None:
+        from core.execution import ExecutionPolicyError, LocalExecutor
+
+        prefix = (
+            b'{"type":"suite","event":"started","test_count":1}\n'
+            b'{"type":"test","event":"started","name":"test_a"}\n'
+            b'{"type":"test","event":"ok","name":"test_a"}\n'
+            b'{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0}\n'
+        )
+        later_failure = (
+            b'{"type":"suite","event":"started","test_count":1}\n'
+            b'{"type":"test","event":"started","name":"test_b"}\n'
+            b'{"type":"test","event":"failed","name":"test_b"}\n'
+            b'{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":0}\n'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "emit.py").write_text(
+                "import sys\nsys.stdout.buffer.write(" + repr(prefix + later_failure) + ")\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ExecutionPolicyError,
+                "structured-result-truncated",
+            ):
+                LocalExecutor(root, max_stdout_bytes=len(prefix)).run(
+                    "python3 emit.py",
+                    target_id="STREAM",
+                    target_command_template="python3 emit.py",
+                    result_format="cargo-nextest-json",
+                )
 
     def test_junit_child_outcomes_cannot_be_hidden_by_missing_aggregates(self) -> None:
         from core.execution import parse_structured_result
@@ -248,7 +370,7 @@ class StructuredResultParserTest(unittest.TestCase):
             "pytest-json": b'{"summary":{"total":1,"passed":1,"failed":0,"errors":0,"skipped":0},"tests":[{"nodeid":"test_a","outcome":"failed"}]}',
             "jest-json": b'{"success":true,"numTotalTests":1,"numPassedTests":1,"numFailedTests":0,"numPendingTests":0,"testResults":[{"status":"passed","assertionResults":[{"title":"a","status":"failed"}]}]}',
             "playwright-json": b'{"stats":{"expected":1,"unexpected":0,"flaky":0,"skipped":0},"suites":[{"specs":[{"tests":[{"status":"expected","results":[{"status":"failed"}]}]}]}]}',
-            "cargo-nextest-json": b'{"type":"test","event":"passed","name":"test_a"}\n{"type":"run","event":"finished","test_count":1,"passed":0,"failed":0,"skipped":1}\n',
+            "cargo-nextest-json": b'{"type":"suite","event":"started","test_count":1}\n{"type":"test","event":"started","name":"test_a"}\n{"type":"test","event":"ok","name":"test_a"}\n{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":1,"measured":0,"filtered_out":0}\n',
         }
         for result_format, payload in samples.items():
             with self.subTest(result_format=result_format):
@@ -342,6 +464,111 @@ class StructuredResultParserTest(unittest.TestCase):
 
 
 class StructuredResultGateTest(unittest.TestCase):
+    def test_public_medium_streaming_result_rejects_truncated_success(self) -> None:
+        payloads = {
+            "go-json": (
+                '{"Action":"run","Package":"example","Test":"TestA"}\\n'
+                '{"Action":"pass","Package":"example","Test":"TestA"}\\n'
+            ),
+            "cargo-nextest-json": (
+                '{"type":"suite","event":"started","test_count":1}\\n'
+                '{"type":"test","event":"started","name":"test_a"}\\n'
+                '{"type":"test","event":"ok","name":"test_a"}\\n'
+            ),
+        }
+        for result_format, payload in payloads.items():
+            with self.subTest(result_format=result_format), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "emit.py").write_text(
+                    f"import sys\nsys.stdout.write({payload!r})\n",
+                    encoding="utf-8",
+                )
+                run_harness(root, "init")
+                run_harness(
+                    root,
+                    "acceptance",
+                    "add",
+                    "--id",
+                    "AC1",
+                    "--criterion",
+                    "stream is complete",
+                )
+                run_harness(
+                    root,
+                    "failure-mode",
+                    "add",
+                    "--id",
+                    "FM1",
+                    "--feature",
+                    "streaming verification",
+                    "--scenario",
+                    "producer output is truncated",
+                    "--trigger",
+                    "terminal event is missing",
+                    "--expected",
+                    "verification fails closed",
+                    "--risk",
+                    "medium",
+                    "--acceptance",
+                    "AC1",
+                )
+                run_harness(
+                    root,
+                    "test-target",
+                    "add",
+                    "--id",
+                    "STREAM",
+                    "--kind",
+                    "build",
+                    "--command-template",
+                    "python3 emit.py",
+                    "--result-format",
+                    result_format,
+                )
+                run_harness(
+                    root,
+                    "test-target",
+                    "qualify",
+                    "--id",
+                    "Q1",
+                    "--target",
+                    "STREAM",
+                    "--acceptance",
+                    "AC1",
+                    "--rationale",
+                    "STREAM directly exercises AC1",
+                    "--by",
+                    "test-controller",
+                )
+
+                result = run_harness(
+                    root,
+                    "verify",
+                    "run",
+                    "--target",
+                    "STREAM",
+                    "--acceptance",
+                    "AC1",
+                    "--failure-mode",
+                    "FM1",
+                    check=False,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("verification failed", result.stdout + result.stderr)
+                with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
+                    self.assertEqual(
+                        tuple(
+                            conn.execute(f"select count(*) from {table}").fetchone()[0]
+                            for table in (
+                                "executions",
+                                "validations",
+                                "validation_executions",
+                            )
+                        ),
+                        (0, 0, 0),
+                    )
+
     def test_structured_cli_verify_records_semantic_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -373,6 +600,21 @@ class StructuredResultGateTest(unittest.TestCase):
                 "pytest-json",
                 "--result-path",
                 ".ai-team/runtime/pytest.json",
+            )
+            run_harness(
+                root,
+                "test-target",
+                "qualify",
+                "--id",
+                "UNIT-Q1",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "UNIT produces the structured result required by AC1",
+                "--by",
+                "test-fixture",
             )
             run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
 

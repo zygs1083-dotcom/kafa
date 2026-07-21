@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:event",
   "title": "Kafa Compact Audit Event",
   "type": "object",
   "required": [
@@ -17,9 +18,9 @@
     "created_at"
   ],
   "properties": {
-    "sequence": { "type": "integer" },
+    "sequence": { "type": "integer", "minimum": 1 },
     "id": { "type": "string" },
-    "schema_version": { "type": "integer" },
+    "schema_version": { "type": "integer", "const": 31 },
     "event_type": { "type": "string" },
     "entity_type": { "type": "string" },
     "entity_id": { "type": "string" },

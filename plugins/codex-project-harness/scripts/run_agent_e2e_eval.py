@@ -48,12 +48,12 @@ from harness_lib import (  # noqa: E402
 )
 from core.local_core_migration import (  # noqa: E402
     InjectedLocalCoreMigrationFailure,
-    migrate_project_to_schema30,
+    migrate_project_to_active_schema,
 )
 from core.schema_lifecycle import (  # noqa: E402
-    SCHEMA30_CATALOG_TABLES,
-    SCHEMA30_TABLES,
-    SCHEMA30_VERSION,
+    ACTIVE_SCHEMA_CATALOG_TABLES,
+    ACTIVE_SCHEMA_TABLES,
+    ACTIVE_SCHEMA_VERSION,
 )
 from kafa.codex_app_server import (  # noqa: E402
     APPROVED_AGENT_TEMPLATES,
@@ -100,7 +100,7 @@ def db_rows(root: Path, query: str, params: tuple[object, ...] = ()) -> list[sql
 
 
 def active_table_contract(root: Path) -> tuple[list[str], bool]:
-    """Return unexpected tables and exact schema-30 inventory status."""
+    """Return unexpected tables and exact active-schema inventory status."""
 
     tables = {
         str(row[0])
@@ -109,7 +109,7 @@ def active_table_contract(root: Path) -> tuple[list[str], bool]:
             "select name from sqlite_master where type='table'",
         )
     }
-    expected = set(SCHEMA30_CATALOG_TABLES)
+    expected = set(ACTIVE_SCHEMA_CATALOG_TABLES)
     return sorted(tables - expected), tables == expected
 
 
@@ -159,7 +159,7 @@ LOCAL_SCENARIO_CONTRACT: dict[str, tuple[str, str]] = {
     "structured_and_no_network_policy_fail_closed": ("execution-policy", "local"),
     "cycle_isolation": ("cycle", "local"),
     "sqlite_contention_stress": ("sqlite", "local"),
-    "schema27_29_migration_and_rollback": ("migration", "local"),
+    "schema27_to_active_migration_and_rollback": ("migration", "local"),
     "installed_plugin_surface": ("installation", "local"),
 }
 EXPECTED_CODEX_CLI_VERSION = (
@@ -1072,8 +1072,8 @@ def scenario_fresh_local_install_and_init() -> dict[str, Any]:
         ok = (
             initialized.returncode == 0
             and status.returncode == 0
-            and f"schema_version: {SCHEMA30_VERSION}" in status.stdout
-            and tables == set(SCHEMA30_TABLES)
+            and f"schema_version: {ACTIVE_SCHEMA_VERSION}" in status.stdout
+            and tables == set(ACTIVE_SCHEMA_TABLES)
             and templates == APPROVED_AGENT_TEMPLATES
             and not retired_views
         )
@@ -1082,7 +1082,7 @@ def scenario_fresh_local_install_and_init() -> dict[str, Any]:
             started,
             ok,
             {
-                "schema_version": SCHEMA30_VERSION,
+                "schema_version": ACTIVE_SCHEMA_VERSION,
                 "table_count": len(tables),
                 "template_names": sorted(templates),
                 "retired_views": retired_views,
@@ -1161,6 +1161,20 @@ def scenario_current_candidate_supersedes_stale_validation() -> dict[str, Any]:
                 "--command-template",
                 "python3 -B -m unittest test_candidate.py",
             ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "UNIT-Q1",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "candidate unit target directly verifies AC1",
+                "--by",
+                "fixture-controller",
+            ),
         ):
             _require_ok(run_harness(root, *args, check=False))
         _require_ok(run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1", check=False))
@@ -1199,10 +1213,46 @@ def scenario_manual_evidence_cannot_satisfy_delivery() -> dict[str, Any]:
             ("requirement", "add", "--id", "R1", "--kind", "functional", "--body", "local requirement"),
             ("acceptance", "add", "--id", "AC1", "--criterion", "local acceptance"),
             ("requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),
-            ("baseline", "freeze", "--id", "B1", "--summary", "locked baseline"),
+            (
+                "baseline",
+                "confirm",
+                "--id",
+                "B1",
+                "--summary",
+                "locked baseline",
+                "--by",
+                "root-controller",
+            ),
             ("task", "add", "--id", "T1", "--task", "implement", "--acceptance", "AC1"),
             ("task", "start", "T1"),
             ("task", "submit", "T1", "--context-id", "producer", "--evidence", "claimed complete"),
+            (
+                "test-target",
+                "add",
+                "--id",
+                "UNIT",
+                "--kind",
+                "unit",
+                "--command-template",
+                "python3 -m unittest",
+                "--result-format",
+                "regex",
+            ),
+            ("test-target", "link", "--task", "T1", "--target", "UNIT"),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "Q1",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "UNIT directly exercises AC1",
+                "--by",
+                "root-controller",
+            ),
             ("task", "accept", "T1", "--evidence", "manual review"),
             (
                 "validation",
@@ -1216,7 +1266,16 @@ def scenario_manual_evidence_cannot_satisfy_delivery() -> dict[str, Any]:
                 "--result",
                 "pass",
             ),
-            ("gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass"),
+            (
+                "gate",
+                "record",
+                "--reviewer-context",
+                "fresh",
+                "--reviewer-context-id",
+                "reviewer",
+                "--result",
+                "pass",
+            ),
         )
         for args in commands:
             _require_ok(run_harness(root, *args, check=False))
@@ -1224,7 +1283,11 @@ def scenario_manual_evidence_cannot_satisfy_delivery() -> dict[str, Any]:
         delivery_count = int(_scalar(root, "select count(*) from deliveries"))
         execution_count = int(_scalar(root, "select count(*) from executions"))
         output = (delivery.stdout + delivery.stderr).lower()
-        blocked = delivery.returncode != 0 and "no linked immutable execution" in output
+        blocked = (
+            delivery.returncode != 0
+            and "[current-execution-missing]" in output
+            and "[current-validation-missing]" in output
+        )
         return scenario_result(
             "manual_evidence_cannot_satisfy_delivery",
             started,
@@ -1295,20 +1358,25 @@ def scenario_open_high_finding_blocks_delivery() -> dict[str, Any]:
                 "reviewer",
                 "--result",
                 "pass",
+                "--qualification",
+                "FINDING-Q1",
                 check=False,
             )
         )
-        delivery = run_harness(root, "delivery", "record", "--scope", "finding", check=False)
-        output = (delivery.stdout + delivery.stderr).lower()
-        blocked = delivery.returncode != 0 and "high finding blocks delivery" in output
+        readiness = run_harness(root, "delivery", "ready", check=False)
+        output = (readiness.stdout + readiness.stderr).lower()
+        blocked = (
+            readiness.returncode != 0
+            and "high finding blocks delivery: f1" in output
+        )
         return scenario_result(
             "open_high_finding_blocks_delivery",
             started,
             blocked and int(_scalar(root, "select count(*) from deliveries")) == 0,
             {
-                "delivery_returncode": delivery.returncode,
+                "readiness_returncode": readiness.returncode,
                 "finding_block_count": int(blocked),
-                "false_pass_count": int(delivery.returncode == 0),
+                "false_pass_count": int(readiness.returncode == 0),
             },
             category="findings",
             mode="local",
@@ -1323,7 +1391,8 @@ def scenario_high_risk_requires_human_review() -> dict[str, Any]:
             "from pathlib import Path\n"
             "Path('.ai-team/runtime/eval-result.json').parent.mkdir(parents=True, exist_ok=True)\n"
             "Path('.ai-team/runtime/eval-result.json').write_text("
-            "'{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}', encoding='utf-8')\n",
+            "'{\"summary\":{\"total\":1,\"passed\":1,\"failed\":0,\"errors\":0}}', encoding='utf-8')\n"
+            "print('structured result emitted')\n",
             encoding="utf-8",
         )
         commands = (
@@ -1349,7 +1418,16 @@ def scenario_high_risk_requires_human_review() -> dict[str, Any]:
                 "--acceptance",
                 "AC1",
             ),
-            ("baseline", "freeze", "--id", "B1", "--summary", "high risk baseline"),
+            (
+                "baseline",
+                "confirm",
+                "--id",
+                "B1",
+                "--summary",
+                "high risk baseline",
+                "--by",
+                "fixture-controller",
+            ),
             ("task", "add", "--id", "T1", "--task", "implement", "--acceptance", "AC1", "--failure-mode", "FM1"),
             (
                 "test-target",
@@ -1365,6 +1443,20 @@ def scenario_high_risk_requires_human_review() -> dict[str, Any]:
                 "--result-path",
                 ".ai-team/runtime/eval-result.json",
             ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "STRUCTURED-Q1",
+                "--target",
+                "STRUCTURED",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "structured target directly verifies high-risk AC1",
+                "--by",
+                "fixture-controller",
+            ),
             ("test-target", "link", "--task", "T1", "--target", "STRUCTURED"),
             ("task", "start", "T1"),
             ("verify", "run", "--target", "STRUCTURED", "--acceptance", "AC1", "--failure-mode", "FM1"),
@@ -1379,22 +1471,26 @@ def scenario_high_risk_requires_human_review() -> dict[str, Any]:
                 "reviewer",
                 "--result",
                 "pass",
+                "--qualification",
+                "STRUCTURED-Q1",
             ),
         )
         for args in commands:
             _require_ok(run_harness(root, *args, check=False))
-        delivery = run_harness(root, "delivery", "record", "--scope", "high-risk", check=False)
-        output = (delivery.stdout + delivery.stderr).lower()
-        human_review = delivery.returncode != 0 and "human-review-required" in output
+        readiness = run_harness(root, "delivery", "ready", check=False)
+        output = (readiness.stdout + readiness.stderr).lower()
+        human_review = (
+            readiness.returncode != 0 and "human-review-required" in output
+        )
         return scenario_result(
             "high_risk_requires_human_review",
             started,
             human_review and int(_scalar(root, "select count(*) from deliveries")) == 0,
             {
-                "delivery_returncode": delivery.returncode,
+                "readiness_returncode": readiness.returncode,
                 "expected_human_review_required_count": int(human_review),
                 "human_intervention_count": 0,
-                "false_pass_count": int(delivery.returncode == 0),
+                "false_pass_count": int(readiness.returncode == 0),
             },
             category="trust",
             mode="local",
@@ -1431,6 +1527,20 @@ def scenario_structured_and_no_network_policy_fail_closed() -> dict[str, Any]:
                 "--result-path",
                 ".ai-team/runtime/zero.json",
             ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "ZERO-Q1",
+                "--target",
+                "ZERO",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "structured result target directly verifies positive-count AC1",
+                "--by",
+                "fixture-controller",
+            ),
         ):
             _require_ok(run_harness(structured_root, *args, check=False))
         zero = run_harness(structured_root, "verify", "run", "--target", "ZERO", "--acceptance", "AC1", check=False)
@@ -1451,6 +1561,20 @@ def scenario_structured_and_no_network_policy_fail_closed() -> dict[str, Any]:
                 "--command-template",
                 "python3 -B -m unittest test_candidate.py",
                 "--requires-no-network",
+            ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "NO-NET-Q1",
+                "--target",
+                "NO-NET",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "no-network target directly verifies AC1",
+                "--by",
+                "fixture-controller",
             ),
         ):
             _require_ok(run_harness(network_root, *args, check=False))
@@ -1582,18 +1706,21 @@ def _migration_projection_validator(root: Path) -> Callable[[Path], None]:
         harness_db.render_all(root)
         issues = harness_db.doctor(root, require_project_files=False)
         if issues:
-            raise AssertionError("migration projection validation failed: " + "; ".join(issues))
+            raise AssertionError(
+                "migration projection validation failed: "
+                + "; ".join(map(str, issues))
+            )
 
     return validate
 
 
-def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
+def scenario_schema27_to_active_migration_and_rollback() -> dict[str, Any]:
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp:
         base = Path(temp)
         success_root = base / "schema27-success"
         _create_schema27_fixture(success_root)
-        success = migrate_project_to_schema30(
+        success = migrate_project_to_active_schema(
             success_root,
             active_validator=_migration_projection_validator(success_root),
         )
@@ -1605,7 +1732,7 @@ def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
         rollback_source = _create_schema27_fixture(rollback_root)
         rolled_back = False
         try:
-            migrate_project_to_schema30(
+            migrate_project_to_active_schema(
                 rollback_root,
                 fail_at="after_atomic_replace",
                 active_validator=_migration_projection_validator(rollback_root),
@@ -1617,8 +1744,8 @@ def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
         backup_dirs = list((rollback_root / ".ai-team/backups").glob("schema-27-before-local-core-*"))
         ok = (
             success.source_version == 27
-            and success.target_version == SCHEMA30_VERSION
-            and success_version == SCHEMA30_VERSION
+            and success.target_version == ACTIVE_SCHEMA_VERSION
+            and success_version == ACTIVE_SCHEMA_VERSION
             and preserved == (1, 2, 1, 1, 1)
             and retired_tables == 0
             and Path(success.migration_manifest_path).is_file()
@@ -1629,7 +1756,7 @@ def scenario_schema27_29_migration_and_rollback() -> dict[str, Any]:
             and len(backup_dirs) == 1
         )
         return scenario_result(
-            "schema27_29_migration_and_rollback",
+            "schema27_to_active_migration_and_rollback",
             started,
             ok,
             {
@@ -1722,7 +1849,7 @@ STABILITY_SCENARIOS: list[Callable[[], dict[str, Any]]] = [
     scenario_structured_and_no_network_policy_fail_closed,
     scenario_cycle_isolation,
     scenario_sqlite_contention_stress,
-    scenario_schema27_29_migration_and_rollback,
+    scenario_schema27_to_active_migration_and_rollback,
     scenario_installed_plugin_surface,
 ]
 
@@ -2140,6 +2267,20 @@ def _run_live_codex_unpinned() -> dict[str, Any]:
                 "unit",
                 "--command-template",
                 "python3 -B -m unittest test_candidate.py",
+            ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "LIVE-UNIT-Q1",
+                "--target",
+                "LIVE-UNIT",
+                "--acceptance",
+                "LIVE-AC1",
+                "--rationale",
+                "live unit target directly verifies the candidate-value acceptance",
+                "--by",
+                "native-controller",
             ),
             ("test-target", "link", "--task", "LIVE-T1", "--target", "LIVE-UNIT"),
             ("task", "start", "LIVE-T1"),
@@ -2627,6 +2768,48 @@ def _run_live_codex_parallel_unpinned() -> dict[str, Any]:
                 "integration",
                 "--command-template",
                 "python3 -B -m unittest test_integration.py",
+            ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "LIVE-ALPHA-Q1",
+                "--target",
+                "LIVE-ALPHA",
+                "--acceptance",
+                "LIVE-AC-A",
+                "--rationale",
+                "alpha unit target directly verifies alpha acceptance",
+                "--by",
+                "native-controller",
+            ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "LIVE-BETA-Q1",
+                "--target",
+                "LIVE-BETA",
+                "--acceptance",
+                "LIVE-AC-B",
+                "--rationale",
+                "beta unit target directly verifies beta acceptance",
+                "--by",
+                "native-controller",
+            ),
+            (
+                "test-target",
+                "qualify",
+                "--id",
+                "LIVE-COMBINED-Q1",
+                "--target",
+                "LIVE-COMBINED",
+                "--acceptance",
+                "LIVE-AC-I",
+                "--rationale",
+                "combined target directly verifies integration acceptance",
+                "--by",
+                "native-controller",
             ),
             ("test-target", "link", "--task", "LIVE-P1", "--target", "LIVE-ALPHA"),
             ("test-target", "link", "--task", "LIVE-P2", "--target", "LIVE-BETA"),
@@ -3870,6 +4053,7 @@ def main() -> int:
     }
     report = runners[args.mode]()
     evidence_report = compact_evidence_report(report)
+    profile_failed = should_fail(report)
     persistent_errors = (
         persistent_report_consistency_errors(
             evidence_report,
@@ -3886,7 +4070,12 @@ def main() -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     if args.evidence_out:
-        if persistent_errors:
+        if profile_failed:
+            print(
+                "ERROR: refusing failed persistent evidence",
+                file=sys.stderr,
+            )
+        elif persistent_errors:
             print(
                 "ERROR: refusing persistent evidence: " + "; ".join(persistent_errors),
                 file=sys.stderr,
@@ -3901,7 +4090,7 @@ def main() -> int:
         debug_text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         debug_out.write_text(debug_text, encoding="utf-8")
     print(text, end="")
-    return 1 if should_fail(report) or persistent_errors else 0
+    return 1 if profile_failed or persistent_errors else 0
 
 
 if __name__ == "__main__":

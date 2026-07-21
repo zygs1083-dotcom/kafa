@@ -22,7 +22,16 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import harness  # noqa: E402
-from core.execution import CommandResult, ContainerExecutor  # noqa: E402
+from core.execution import (  # noqa: E402
+    CommandResult,
+    ContainerExecutor,
+    ContainerImageProvenance,
+    controller_runtime_provenance,
+)
+
+
+TEST_CONTAINER_DIGEST = "sha256:" + "d" * 64
+TEST_CONTAINER_ENDPOINT = "unix:///var/run/docker.sock"
 
 
 def run_harness(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -81,6 +90,21 @@ def register_target(
     if container_image:
         args.extend(["--container-image", container_image])
     run_harness(root, *args)
+    run_harness(
+        root,
+        "test-target",
+        "qualify",
+        "--id",
+        "UNIT-Q1",
+        "--target",
+        "UNIT",
+        "--acceptance",
+        "AC1",
+        "--rationale",
+        "UNIT is the procedural verification target for AC1",
+        "--by",
+        "test-fixture",
+    )
 
 
 def fact_counts(root: Path) -> tuple[int, int, int]:
@@ -98,6 +122,8 @@ def successful_container_result(
     target_id: str,
     result_format: str,
     ordinal: int,
+    target_definition_sha256: str,
+    container_image: str,
 ) -> CommandResult:
     payload = b"Ran 1 test in 0.001s\n\nOK\n"
     artifact = (
@@ -110,6 +136,7 @@ def successful_container_result(
     )
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(payload)
+    runtime = controller_runtime_provenance(target_definition_sha256)
     return CommandResult(
         command=command,
         exit_code=0,
@@ -125,6 +152,37 @@ def successful_container_result(
         sandbox_status="available",
         policy_status="allowed",
         policy_reason=f"target {target_id}",
+        target_definition_sha256=runtime.target_definition_sha256,
+        platform=runtime.platform,
+        runtime_executable=runtime.runtime_executable,
+        runtime_version=runtime.runtime_version,
+        runtime_executable_sha256=runtime.runtime_executable_sha256,
+        policy_version=runtime.policy_version,
+        container_engine="/usr/bin/docker",
+        container_engine_version="25.0.0",
+        container_engine_endpoint=TEST_CONTAINER_ENDPOINT,
+        container_image_requested=container_image,
+        container_image_digest=TEST_CONTAINER_DIGEST,
+        provenance_status="complete",
+    )
+
+
+def fixed_container_provenance(
+    requested_image: str,
+    *,
+    expected_engine: str = "",
+    expected_endpoint: str = "",
+) -> ContainerImageProvenance:
+    if expected_engine and expected_engine != "/usr/bin/docker":
+        raise AssertionError(expected_engine)
+    if expected_endpoint and expected_endpoint != TEST_CONTAINER_ENDPOINT:
+        raise AssertionError(expected_endpoint)
+    return ContainerImageProvenance(
+        engine="/usr/bin/docker",
+        engine_version="25.0.0",
+        requested_image=requested_image,
+        image_digest=TEST_CONTAINER_DIGEST,
+        engine_endpoint=TEST_CONTAINER_ENDPOINT,
     )
 
 
@@ -193,6 +251,7 @@ class SandboxExecutionTest(unittest.TestCase):
                 container_image: str,
                 result_format: str,
                 result_path: str,
+                target_definition_sha256: str,
                 **_kwargs: object,
             ) -> CommandResult:
                 self.assertEqual(command, target_command_template)
@@ -204,9 +263,22 @@ class SandboxExecutionTest(unittest.TestCase):
                     target_id=target_id,
                     result_format=result_format,
                     ordinal=len(observed_images),
+                    target_definition_sha256=target_definition_sha256,
+                    container_image=container_image,
                 )
 
-            with mock.patch.object(ContainerExecutor, "run", autospec=True, side_effect=fake_run):
+            with (
+                mock.patch.object(
+                    ContainerExecutor,
+                    "run",
+                    autospec=True,
+                    side_effect=fake_run,
+                ),
+                mock.patch(
+                    "core.execution.resolve_container_image_provenance",
+                    side_effect=fixed_container_provenance,
+                ),
+            ):
                 returncode, output = run_cli_in_process(
                     root,
                     "verify",
@@ -249,9 +321,8 @@ class SandboxExecutionTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(preserved, ("available", 1))
 
-    def test_container_image_precedence_uses_cli_then_target_then_stack_profile(self) -> None:
+    def test_container_image_precedence_uses_target_then_stack_profile_for_qualified_runs(self) -> None:
         cases = (
-            ("cli override", "python:target", "python", "python:cli", "python:cli"),
             ("target image", "python:target", "python", "", "python:target"),
             ("stack profile", "", "node", "", "node:22-bookworm-slim"),
         )
@@ -278,6 +349,7 @@ class SandboxExecutionTest(unittest.TestCase):
                     target_id: str,
                     container_image: str,
                     result_format: str,
+                    target_definition_sha256: str,
                     **_kwargs: object,
                 ) -> CommandResult:
                     observed.append(container_image)
@@ -287,6 +359,8 @@ class SandboxExecutionTest(unittest.TestCase):
                         target_id=target_id,
                         result_format=result_format,
                         ordinal=1,
+                        target_definition_sha256=target_definition_sha256,
+                        container_image=container_image,
                     )
 
                 args = [
@@ -301,16 +375,47 @@ class SandboxExecutionTest(unittest.TestCase):
                 ]
                 if cli_image:
                     args.extend(["--container-image", cli_image])
-                with mock.patch.object(
-                    ContainerExecutor,
-                    "run",
-                    autospec=True,
-                    side_effect=fake_run,
+                with (
+                    mock.patch.object(
+                        ContainerExecutor,
+                        "run",
+                        autospec=True,
+                        side_effect=fake_run,
+                    ),
+                    mock.patch(
+                        "core.execution.resolve_container_image_provenance",
+                        side_effect=fixed_container_provenance,
+                    ),
                 ):
                     returncode, output = run_cli_in_process(root, *args)
 
                 self.assertEqual(returncode, 0, output)
                 self.assertEqual(observed, [expected])
+
+    def test_qualified_container_verify_rejects_cli_image_that_differs_from_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git_repo(root)
+            register_target(root, container_image="python:target")
+
+            result = run_harness(
+                root,
+                "verify",
+                "run",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+                "--runner",
+                "container",
+                "--container-image",
+                "python:cli",
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot override the qualified container image", result.stdout + result.stderr)
+            self.assertEqual(fact_counts(root), (0, 0, 0))
 
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@ This project now uses Git tags for release points. Earlier commits remain in Git
   integrations, Connector credentials and profiles, adapter/outbox state,
   legacy Host SDK workers, provider/dispatch/worktree lifecycle, CSV/native
   receipt exchange, and synthetic provenance have been removed.
-- Runtime and Kernel are now `5.0.0`, with active schema 30 containing exactly
-  27 local delivery tables. Existing v1 database versions 27/28/29 migrate
-  side by side through a verified SQLite backup and staging database; removed
-  remote and duplicate-lifecycle facts remain available only in the backup.
+- Runtime and Kernel remain `5.0.0`, with active schema 31 containing exactly
+  30 local delivery tables. Supported legacy databases migrate side by side
+  through a verified SQLite backup and staging database; removed remote and
+  duplicate-lifecycle facts remain available only in the backup.
 - Task mutation is root-controller single-writer with
   `planned -> active -> submitted -> accepted|blocked` plus cancellation.
   Leases, heartbeats, fences, claims, stale recovery, and worker DB writes are
@@ -23,19 +23,42 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Command proof is normalized into insert-only executions linked to validation
   judgments. Manual evidence/test recording, copied command fields, database
   replay checkpoints, and whole-database mutation snapshots are removed.
-- The public product surface is reduced to 53 CLI parser nodes, seven Skills,
-  three Hooks, three Native Codex role templates, 16 JSON schemas, and 21
-  runtime scripts.
+- The public product surface is local-only: seven Skills, three Hooks, three
+  Native Codex role templates, and no Connector, Host-SDK worker, or remote
+  delivery path.
 
 ### Added
 
-- Recoverable schema 30 migration with source integrity checks, backup digest
+- Recoverable schema 31 migration with source integrity checks, backup digest
   and row-count manifest, staging validation, atomic activation, failure
   injection coverage, and automatic verified-backup restore after a failed
   activation check.
 - `verify run` for controller-owned local or no-network container execution,
   structured-result parsing, artifact digests, immutable execution facts, and
   atomic validation linkage.
+- Delivery-integrity hardening: baseline confirmation, acceptance-to-target
+  qualification, qualification-bound verification and gates, accepted-task-only
+  coverage, and an explicit `delivery ready` phase. A cancelled task, unrelated
+  passing target, or incomplete delivery graph cannot produce a delivery record.
+- Closed schema-31 requirement, acceptance, and failure-mode state domains plus
+  versioned closed JSON-schema identities; unknown legacy states fail migration
+  preflight and only schema-30 failure-mode `active` is normalized.
+- Schema-31 immutable execution provenance binds the target definition, controller
+  platform/runtime executable and digest, policy version, and optional local
+  container engine endpoint/image identity. Docker daemon operations are pinned
+  to a local Unix socket or Windows named pipe, and engine type is correlated with
+  endpoint type across runtime, SQLite DDL, and JSON schema. Remote/ambiguous
+  routing fails closed. Container verification uses an already-local immutable
+  image with `--pull=never`, overrides image entrypoint with a controlled shell,
+  and trusts only controller-owned artifacts rather than engine CLI stdout;
+  migrated execution history is explicitly `legacy-incomplete` and cannot satisfy
+  a current delivery.
+- Structured Go streams require reconciled terminal package events; the
+  `cargo-nextest-json` contract is nextest experimental libtest JSON v0.1 and
+  requires one reconciled terminal event per sequential suite while supporting
+  multiple complete stress suites. Event-order violations, unfinished started
+  tests, missing declared result artifacts, and over-limit structured stdout fail
+  closed; truncated positive events cannot create passing facts.
 - Local-only fixture, stability, and opt-in real Native Codex compatibility
   profiles that report blocked, skipped, not-run, and human-intervention states
   without converting them into passes.
@@ -51,6 +74,8 @@ This project now uses Git tags for release points. Earlier commits remain in Git
 - Audit events are compact append-only summaries and are not a recovery source.
   Migration and administrator recovery use verified SQLite backups; normal
   mutations rebuild only affected projections.
+- This section describes the current development checkout only. It does not
+  announce a tag, release, deployment, or production migration.
 
 ### Boundaries
 

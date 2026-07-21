@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:baseline",
   "type": "object",
   "required": ["id", "cycle_id", "summary", "digest", "snapshot_json", "project_revision", "created_by", "created_at"],
   "properties": {
@@ -8,7 +9,7 @@
     "summary": { "type": "string" },
     "digest": { "type": "string" },
     "snapshot_json": { "type": "string" },
-    "project_revision": { "type": "integer" },
+    "project_revision": { "type": "integer", "minimum": 1 },
     "created_by": { "type": "string" },
     "created_at": { "type": "string" }
   },

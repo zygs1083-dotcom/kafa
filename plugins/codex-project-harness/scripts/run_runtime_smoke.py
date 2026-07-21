@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run executable schema-30 runtime smoke scenarios."""
+"""Run executable active-schema runtime smoke scenarios."""
 
 from __future__ import annotations
 
@@ -78,24 +78,39 @@ def scenario_local_delivery() -> dict[str, object]:
             run(root, "requirement", "add", "--id", "R1", "--kind", "functional", "--body", "User can create a task"),
             run(root, "acceptance", "add", "--id", "AC1", "--criterion", "Create tasks"),
             run(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1"),
-            run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "medium", "--acceptance", "AC1"),
+            run(root, "failure-mode", "add", "--id", "FM1", "--feature", "Task creation", "--scenario", "Duplicate submit", "--trigger", "same form twice", "--expected", "one task", "--risk", "low", "--acceptance", "AC1"),
             run(root, "task", "add", "--id", "T1", "--task", "Implement task creation", "--acceptance", "AC1", "--failure-mode", "FM1"),
-            run(root, "baseline", "freeze", "--id", "B1", "--summary", "Task creation baseline"),
+            run(root, "baseline", "confirm", "--id", "B1", "--summary", "Task creation baseline", "--by", "smoke-controller"),
             run(root, "test-target", "add", "--id", "UNIT", "--kind", "unit", "--command-template", TEST_COMMAND),
+            run(root, "test-target", "qualify", "--id", "UNIT-Q1", "--target", "UNIT", "--acceptance", "AC1", "--rationale", "unit target directly verifies task creation acceptance", "--by", "smoke-controller"),
             run(root, "test-target", "link", "--task", "T1", "--target", "UNIT"),
             run(root, "task", "start", "T1"),
             run(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1", "--failure-mode", "FM1"),
             run(root, "task", "submit", "T1", "--context-id", "smoke-producer", "--evidence", "verified immutable execution"),
             run(root, "task", "accept", "T1", "--evidence", "independent review returned"),
-            run(root, "gate", "record", "--reviewer-context", "fresh", "--reviewer-context-id", "smoke-reviewer", "--result", "pass"),
+            run(root, "gate", "record", "--reviewer-context", "fresh", "--reviewer-context-id", "smoke-reviewer", "--result", "pass", "--qualification", "UNIT-Q1"),
+            run(root, "delivery", "ready"),
             run(root, "delivery", "record", "--scope", "Task creation"),
         ]
         with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
             counts = {
                 table: int(conn.execute(f"select count(*) from {table}").fetchone()[0])
-                for table in ("executions", "validations", "deliveries")
+                for table in (
+                    "acceptance_target_qualifications",
+                    "executions",
+                    "validations",
+                    "quality_gate_qualifications",
+                    "deliveries",
+                )
             }
             task_status = conn.execute("select status from tasks where id='T1'").fetchone()[0]
+            cycle_status, cycle_closed_at = conn.execute(
+                "select status, closed_at from delivery_cycles where id="
+                "(select current_cycle_id from project where id=1)"
+            ).fetchone()
+            project_phase = conn.execute(
+                "select phase from project where id=1"
+            ).fetchone()[0]
         required = (
             root / ".ai-team/state/harness.db",
             root / ".ai-team/planning/task-board.md",
@@ -104,15 +119,30 @@ def scenario_local_delivery() -> dict[str, object]:
         )
         passed = (
             all(command.returncode == 0 for command in commands)
-            and counts == {"executions": 1, "validations": 1, "deliveries": 1}
+            and counts
+            == {
+                "acceptance_target_qualifications": 1,
+                "executions": 1,
+                "validations": 1,
+                "quality_gate_qualifications": 1,
+                "deliveries": 1,
+            }
             and task_status == "accepted"
+            and cycle_status == "delivered"
+            and bool(cycle_closed_at)
+            and project_phase == "delivery_readiness"
             and all(path.is_file() for path in required)
         )
         return {
             "name": "local_delivery_runtime",
             "pass": passed,
             "commands": [command.returncode for command in commands],
-            "facts": counts,
+            "facts": {
+                **counts,
+                "cycle_status": cycle_status,
+                "cycle_closed": bool(cycle_closed_at),
+                "project_phase": project_phase,
+            },
         }
 
 
@@ -175,7 +205,9 @@ def scenario_directed_invariant_benchmark() -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run executable schema-30 runtime smoke scenarios")
+    parser = argparse.ArgumentParser(
+        description="Run executable active-schema runtime smoke scenarios"
+    )
     parser.add_argument(
         "--out",
         default=str(RESULT_PATH),

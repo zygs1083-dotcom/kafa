@@ -37,6 +37,7 @@ from core.local_core_migration import (  # noqa: E402
 from core.projections import (  # noqa: E402
     PROJECTION_PATHS,
     PROJECTION_ROLLBACK_PATHS,
+    projection_content_issues,
     render_executions,
 )
 from run_agent_e2e_eval import _create_schema27_fixture  # noqa: E402
@@ -77,12 +78,14 @@ def _hard_exit_active_validator(_active_path: Path) -> None:
 
 
 def _active_projection_validator(root: Path):
-    def validate(_active_path: Path) -> None:
+    def validate(active_path: Path) -> None:
+        local_core_migration._schema30_doctor(active_path)
         harness_db.render_all(root)
-        issues = harness_db.doctor(root, require_project_files=False)
+        issues = projection_content_issues(root)
         if issues:
             raise LocalCoreMigrationError(
-                "test projection activation validation failed: " + "; ".join(issues)
+                "test projection activation validation failed: "
+                + "; ".join(str(issue) for issue in issues)
             )
 
     return validate
@@ -280,7 +283,10 @@ class Schema30StagingTests(unittest.TestCase):
                 event = conn.execute(
                     "select entity_type, entity_id, actor, command, correlation_id from events where id='E-local'"
                 ).fetchone()
-                issues = validate_audit_events(conn)
+                issues = validate_audit_events(
+                    conn,
+                    expected_schema_version=30,
+                )
 
         self.assertEqual(event["entity_type"], "requirement")
         self.assertEqual(event["entity_id"], "R1")
@@ -902,6 +908,97 @@ class Schema30StagingTests(unittest.TestCase):
 
 
 class Schema30LegacyStagingTests(unittest.TestCase):
+    def _seed_schema29_finding_gate(
+        self,
+        root: Path,
+        *,
+        finding_candidate: str = "",
+        evidence_candidate: str = "",
+        gate_candidate: str = "",
+        reviewed_commit: str = "",
+    ) -> Path:
+        init_schema29_fixture(root)
+        source = root / ".ai-team/state/harness.db"
+        with closing(sqlite3.connect(source)) as conn:
+            evidence_id = ""
+            if evidence_candidate:
+                evidence_id = "EV-finding"
+                conn.execute(
+                    """
+                    insert into evidence
+                    (id, kind, summary, source_tree_hash, created_at)
+                    values (?, 'command', 'legacy finding evidence', ?, 'now')
+                    """,
+                    (evidence_id, evidence_candidate),
+                )
+            conn.execute(
+                """
+                insert into findings
+                (id, cycle_id, candidate_sha, surface, severity, status, summary,
+                 evidence_id, created_at)
+                values ('F-scope', 'CYCLE-current', ?, 'unit', 'high', 'resolved',
+                        'legacy scoped finding', ?, 'now')
+                """,
+                (finding_candidate, evidence_id),
+            )
+            conn.execute(
+                """
+                insert into quality_gates
+                (id, sequence, cycle_id, candidate_sha, gate, reviewed_commit,
+                 project_revision, reviewer_context, result, created_at)
+                values ('G-scope', 1, 'CYCLE-current', ?, 'independent_qa', ?,
+                        1, 'fresh', 'pass', 'now')
+                """,
+                (gate_candidate, reviewed_commit),
+            )
+            conn.execute(
+                "insert into quality_gate_findings values ('G-scope', 'F-scope')"
+            )
+            conn.commit()
+        return source
+
+    def test_schema29_finding_candidate_uses_gate_reviewed_commit_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate = "b" * 64
+            source = self._seed_schema29_finding_gate(
+                root,
+                reviewed_commit=candidate,
+            )
+            staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+
+            stage_schema29_to_schema30(source, staging)
+
+            with closing(sqlite3.connect(staging)) as conn:
+                finding_scope = conn.execute(
+                    "select cycle_id, candidate_sha from findings where id='F-scope'"
+                ).fetchone()
+                gate_scope = conn.execute(
+                    "select cycle_id, candidate_sha from quality_gates where id='G-scope'"
+                ).fetchone()
+            self.assertEqual(finding_scope, ("CYCLE-current", candidate))
+            self.assertEqual(gate_scope, finding_scope)
+
+    def test_schema29_finding_candidate_conflict_fails_closed(self) -> None:
+        for source_kind in ("existing", "evidence"):
+            with self.subTest(source_kind=source_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = self._seed_schema29_finding_gate(
+                    root,
+                    finding_candidate="a" * 64 if source_kind == "existing" else "",
+                    evidence_candidate="a" * 64 if source_kind == "evidence" else "",
+                    reviewed_commit="b" * 64,
+                )
+                staging = root / ".ai-team/backups/test/harness.schema30.new.db"
+
+                with self.assertRaisesRegex(
+                    LocalCoreMigrationError,
+                    "finding has conflicting candidate provenance during migration: F-scope",
+                ):
+                    stage_schema29_to_schema30(source, staging)
+
+                self.assertFalse(staging.exists())
+
     def _assert_legacy_fixture_migrates(self, source_version: int) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -930,6 +1027,19 @@ class Schema30LegacyStagingTests(unittest.TestCase):
                 ).fetchall()
                 gates = conn.execute(
                     "select id, sequence, result, review_status from quality_gates order by sequence"
+                ).fetchall()
+                finding_scopes = conn.execute(
+                    "select id, cycle_id, candidate_sha from findings order by id"
+                ).fetchall()
+                linked_gate_scopes = conn.execute(
+                    """
+                    select f.id, f.cycle_id, f.candidate_sha,
+                           g.cycle_id, g.candidate_sha
+                    from quality_gate_findings qgf
+                    join findings f on f.id = qgf.finding_id
+                    join quality_gates g on g.id = qgf.gate_id
+                    order by f.id, g.id
+                    """
                 ).fetchall()
                 migrations = conn.execute(
                     "select from_version, to_version, status from migrations order by id"
@@ -977,6 +1087,14 @@ class Schema30LegacyStagingTests(unittest.TestCase):
                 (1, 1),
             )
             self.assertEqual(report.retired_row_counts["adapter_actions"], 1)
+            self.assertEqual(
+                finding_scopes,
+                [("F1", "CYCLE-current", "a" * 64)],
+            )
+            self.assertEqual(
+                linked_gate_scopes,
+                [("F1", "CYCLE-current", "a" * 64, "CYCLE-current", "a" * 64)],
+            )
 
     def test_published_schema27_uses_isolated_legacy_stage(self) -> None:
         self._assert_legacy_fixture_migrates(27)
@@ -2793,7 +2911,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 if Path(render_root).resolve() != root.resolve():
                     return
                 projection.write_bytes(
-                    b"schema_version: 30\nstate: partial-publication\n"
+                    b"schema_version: 31\nstate: partial-publication\n"
                 )
                 raise KeyboardInterrupt("interrupt-during-live-projection")
 
@@ -2806,7 +2924,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                     KeyboardInterrupt,
                     "interrupt-during-live-projection",
                 ):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             backup_dir = next(
                 (root / ".ai-team/backups").glob("schema-29-before-local-core-*")
@@ -3005,7 +3123,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 side_effect=(None, harness_db.HarnessError("projection failed")),
             ):
                 with self.assertRaisesRegex(harness_db.HarnessError, "projection failed"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
             with closing(sqlite3.connect(active)) as conn:
@@ -3015,7 +3133,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 (29, manifest["backup"]["sha256"], "rolled-back"),
             )
 
-    def test_final_doctor_failure_does_not_publish_schema30_projections(self) -> None:
+    def test_final_doctor_failure_does_not_publish_active_projections(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             active = self._prepare_source(root)
@@ -3029,15 +3147,15 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             def render_with_visible_side_effect(render_root: Path) -> None:
                 if render_root.resolve() != root.resolve():
                     return
-                state.write_bytes(b"schema: 30\nstate: published-too-early\n")
-                delivery.write_bytes(b"# Incorrect schema 30 delivery view\n")
+                state.write_bytes(b"schema: 31\nstate: published-too-early\n")
+                delivery.write_bytes(b"# Incorrect schema 31 delivery view\n")
 
             with (
                 patch.object(harness_db, "render_all", side_effect=render_with_visible_side_effect),
                 patch.object(harness_db, "doctor", return_value=["forced final doctor failure"]),
             ):
                 with self.assertRaisesRegex(harness_db.HarnessError, "forced final doctor failure"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
@@ -3071,13 +3189,13 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             def partially_render(render_root: Path) -> None:
                 if render_root.resolve() != root.resolve():
                     return
-                original.write_bytes(b"schema: 30\npartial: true\n")
+                original.write_bytes(b"schema: 31\npartial: true\n")
                 render_executions(render_root)
                 raise harness_db.HarnessError("partial projection failure")
 
             with patch.object(harness_db, "render_all", side_effect=partially_render):
                 with self.assertRaisesRegex(harness_db.HarnessError, "partial projection failure"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
@@ -3131,7 +3249,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(Exception, "projection restore failed"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
@@ -3447,7 +3565,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                 harness_db, "render_all", side_effect=harness_db.HarnessError("projection dry-run failed")
             ):
                 with self.assertRaisesRegex(harness_db.HarnessError, "projection dry-run failed"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
             with closing(sqlite3.connect(active)) as conn:
@@ -3510,14 +3628,14 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
             retired_evidence.parent.mkdir(parents=True)
             retired_evidence.write_text("# Retired evidence view\n", encoding="utf-8")
 
-            harness_db.migrate(root, "29", 30)
+            harness_db.migrate(root, "29", 31)
 
             backup_dir = next((root / ".ai-team/backups").glob("schema-29-before-local-core-*"))
             manifest = json.loads((backup_dir / "migration-manifest.json").read_text(encoding="utf-8"))
             with closing(sqlite3.connect(active)) as conn:
                 version = conn.execute("select schema_version from project where id=1").fetchone()[0]
 
-            self.assertEqual(version, 30)
+            self.assertEqual(version, 31)
             self.assertEqual(harness_db.doctor(root), [])
             self.assertTrue(all((root / path).is_file() for path in PROJECTION_PATHS))
             self.assertFalse(retired_evidence.exists())
@@ -3550,7 +3668,7 @@ class Schema30ActivationRollbackTests(unittest.TestCase):
                     harness_db.HarnessError,
                     "projection verification",
                 ):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             with closing(sqlite3.connect(active)) as conn:
                 version = int(

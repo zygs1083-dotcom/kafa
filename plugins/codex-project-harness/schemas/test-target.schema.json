@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:test-target",
   "title": "Codex Project Harness Test Target",
   "type": "object",
   "required": ["id", "kind", "command_template", "created_at", "updated_at"],
@@ -19,5 +20,5 @@
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

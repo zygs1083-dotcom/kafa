@@ -23,10 +23,19 @@ class RuntimeSmokeContractTest(unittest.TestCase):
         result = run_runtime_smoke.scenario_local_delivery()
 
         self.assertTrue(result["pass"], result)
-        self.assertEqual(result["commands"], [0] * 15)
+        self.assertEqual(result["commands"], [0] * 17)
         self.assertEqual(
             result["facts"],
-            {"executions": 1, "validations": 1, "deliveries": 1},
+            {
+                "acceptance_target_qualifications": 1,
+                "executions": 1,
+                "validations": 1,
+                "quality_gate_qualifications": 1,
+                "deliveries": 1,
+                "cycle_status": "delivered",
+                "cycle_closed": True,
+                "project_phase": "delivery_readiness",
+            },
         )
 
     def test_benchmark_ratio_preserves_raw_decision_value_and_threshold(self) -> None:

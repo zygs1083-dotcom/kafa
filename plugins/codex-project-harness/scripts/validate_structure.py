@@ -76,6 +76,8 @@ REQUIRED_SCHEMAS = [
     "invalidation.schema.json",
     "delivery.schema.json",
     "baseline.schema.json",
+    "acceptance-target-qualification.schema.json",
+    "outcome-observation.schema.json",
 ]
 
 
@@ -313,15 +315,47 @@ def main() -> int:
         if payload.get("name") != template_name.removesuffix(".toml"):
             errors.append(f"agent template name mismatch: {template_path}")
 
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from core.json_schema_contract import schema_definition_issues
+
+    schema_ids: dict[str, str] = {}
     for schema in REQUIRED_SCHEMAS:
         schema_path = root / "schemas" / schema
         if not schema_path.exists():
             errors.append(f"missing schema file: {schema_path}")
             continue
         try:
-            json.loads(schema_path.read_text(encoding="utf-8"))
+            schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
         except Exception as exc:
             errors.append(f"invalid schema json {schema_path}: {exc}")
+            continue
+        if not isinstance(schema_payload, dict):
+            errors.append(f"invalid schema root {schema_path}: expected object")
+            continue
+        expected_id = (
+            "urn:kafa:schema:31:"
+            + schema.removesuffix(".schema.json")
+        )
+        schema_id = schema_payload.get("$id")
+        if schema_id != expected_id:
+            errors.append(
+                f"schema id mismatch: {schema_path.name} "
+                f"actual={schema_id!r} expected={expected_id!r}"
+            )
+        elif schema_id in schema_ids:
+            errors.append(
+                f"duplicate schema id: {schema_id} files="
+                f"{schema_ids[schema_id]},{schema_path.name}"
+            )
+        else:
+            schema_ids[str(schema_id)] = schema_path.name
+        if schema_payload.get("additionalProperties") is not False:
+            errors.append(
+                f"schema additionalProperties must be explicit false: {schema_path.name}"
+            )
+        for issue in schema_definition_issues(schema_payload):
+            errors.append(f"{schema_path.name}: {issue}")
     schema_files = {path.name for path in (root / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
     for schema in sorted(schema_files - set(REQUIRED_SCHEMAS)):
         errors.append(f"unexpected schema file: {root / 'schemas' / schema}")

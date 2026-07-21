@@ -122,7 +122,7 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             self.assertNotIn("gate record", result.stdout)
             self.assertNotIn("delivery record", result.stdout)
             self.assertEqual(cycle["status"], "active")
-            self.assertIn("schema_version: 30", status)
+            self.assertIn("schema_version: 31", status)
             self.assertIn("tasks: 1", status)
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select count(*) from executions").fetchone()[0], 1)

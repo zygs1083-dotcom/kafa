@@ -15,12 +15,14 @@ The local fixture is `docs/runtime/skill-eval-transcript-fixture.txt`. The eval
 requires one truthful user journey:
 
 - initialize local Kernel state;
-- freeze and link a requirement baseline;
+- link the requirement graph and explicitly confirm the current baseline/scope;
 - move a root-owned task through planned, active, submitted, and accepted;
-- register and link an exact test target;
+- register, link, and explicitly qualify an exact test target for the acceptance;
 - run controller-owned immutable verification on the current candidate;
-- record a quality gate with a distinct reviewer context;
-- validate delivery and record verified handoff;
+- accept the task, then record a qualification-bound quality gate with a
+  distinct reviewer context;
+- enter delivery readiness, record verified handoff, and validate the delivered
+  consistency facts;
 - state Native Host ownership and fail-closed `human-review-required` policy.
 
 The eval rejects retired phase, scope, session, dispatch, manual evidence/test,
@@ -41,16 +43,16 @@ handoff.
 Expected evidence:
 
 - `harness.py --root . init`
-- `harness.py --root . baseline freeze`
+- `harness.py --root . baseline confirm`
 - `harness.py --root . requirement add`
 - `harness.py --root . requirement link`
-- `harness.py --root . task add/start/submit`
-- `harness.py --root . test-target add/link`
+- `harness.py --root . task add/start/submit/accept`
+- `harness.py --root . test-target add/link/qualify`
 - `harness.py --root . verify run`
-- `harness.py --root . gate record --reviewer-context-id ...`
-- `harness.py --root . task accept`
-- `harness.py --root . validate --delivery`
+- `harness.py --root . gate record --reviewer-context-id ... --qualification ...`
+- `harness.py --root . delivery ready`
 - `harness.py --root . delivery record`
+- `harness.py --root . validate --delivery`
 
 ## Traceability Failure
 

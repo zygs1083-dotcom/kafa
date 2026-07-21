@@ -25,6 +25,7 @@ SUMMARY_FIELDS = (
     "target_id",
     "task_id",
     "acceptance_id",
+    "qualification_id",
     "execution_id",
     "schema_version",
     "runtime_version",
@@ -45,6 +46,7 @@ SUMMARY_FIELDS = (
     "validation_status",
     "gate_status",
     "review_status",
+    "reviewed_revision",
     "semantic_status",
     "policy_status",
     "sandbox_status",
@@ -138,8 +140,12 @@ def emit_audit(
     )
 
 
-def validate_audit_events(conn: sqlite3.Connection) -> list[str]:
-    """Validate the compact schema 30 audit contract without replay semantics."""
+def validate_audit_events(
+    conn: sqlite3.Connection,
+    *,
+    expected_schema_version: int = SCHEMA_VERSION,
+) -> list[str]:
+    """Validate the compact audit contract without replay semantics."""
 
     issues: list[str] = []
     columns = _event_columns(conn)
@@ -168,9 +174,11 @@ def validate_audit_events(conn: sqlite3.Connection) -> list[str]:
         """
     ):
         sequence = int(row["sequence"])
-        if int(row["schema_version"]) != SCHEMA_VERSION:
+        if int(row["schema_version"]) != expected_schema_version:
             issues.append(
-                f"event {sequence} schema_version={row['schema_version']} expected={SCHEMA_VERSION}"
+                "event "
+                f"{sequence} schema_version={row['schema_version']} "
+                f"expected={expected_schema_version}"
             )
         for field in (
             "event_type",

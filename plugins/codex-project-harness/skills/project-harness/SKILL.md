@@ -1,6 +1,6 @@
 ---
 name: "project-harness"
-description: "Use when the user wants to develop, create, build, implement, or fully deliver code for a software, data, or automation project with Codex, including 我要开发, 帮我做一个, 实现一个功能, 搭建一个系统, and 从0到代码交付. This is the single Kafa entrypoint for workspace bootstrap, OpenSpec routing, local delivery facts, implementation, controller verification, independent QA, and verified code handoff. It stops before deployment, production release, infrastructure provisioning, production migrations, secret changes, or paid-resource creation."
+description: "Use for developing or fully delivering software, data, or automation with Codex. The Kafa entrypoint for OpenSpec routing, local delivery facts, controller verification, independent QA, and verified code handoff. Stops before deployment, release, production migration, secret changes, or paid resources."
 ---
 
 # Project Harness
@@ -18,7 +18,9 @@ Use existing project instructions and mature local tooling first.
 - Native Codex/ChatGPT owns task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle. Kafa never starts a second host lifecycle.
 - Only the root controller writes Kafa delivery facts. Workers and reviewers return changed files, commands, findings, and risks through the host.
 
-This workflow ends at verified code handoff. It does not deploy, release to production, provision infrastructure, run production data migrations, change secrets, create paid resources, or perform post-release operations.
+This ends at verified code handoff: no deployment, release, infrastructure
+provisioning, production migration, secret change, paid resource, or post-release
+operation.
 
 ## Route The Request
 
@@ -55,7 +57,9 @@ python3 <project-harness-skill-dir>/scripts/harness.py --root . status
 python3 <project-harness-skill-dir>/scripts/harness.py --root . validate --delivery
 ```
 
-`kafa doctor --repo .` checks a Kafa or Plugin source repository. In an ordinary project, use `kafa project doctor --repo .` or the Plugin runtime status command.
+In an ordinary project, verify `codex-project-harness@personal installed,
+enabled` with `codex plugin list`, then use runtime `status`. The Kafa doctor
+commands validate a Kafa/Plugin source layout, not an ordinary project.
 
 ## Specification And Requirement Baseline
 
@@ -140,12 +144,12 @@ The installed or vendored `harness.py` is the executable interface:
 | Status and health | `status`, `doctor`, `validate`, `validate --delivery` |
 | Guided start | `quickstart status`, `quickstart minimal ... --execute` |
 | Delivery cycle | `cycle status`, `cycle close`, `cycle start` |
-| Baseline | `baseline freeze/diff/validate` |
+| Baseline | `baseline freeze/confirm/diff/validate` |
 | Requirements | `requirement add/link`, `acceptance add`, `failure-mode add`, `trace show/validate` |
 | Root-owned task state | `task add/list/start/submit/accept/block/cancel` |
-| Verification | `test-target add/list/link`, `verify run` |
+| Verification | `test-target add/list/link/qualify`, `verify run` |
 | Audit judgments | `validation record`, `finding record`, `decision record` |
-| Delivery decision | `gate record`, `delivery record` |
+| Delivery decision | `gate record`, `delivery ready`, `delivery record` |
 | Recovery | `migrate`, `repair`, `projection rebuild`; `doctor` validates invariants |
 
 Events are compact append-only audit facts, not a replay source. Migration and administrator recovery use verified SQLite backups. There is no Connector, adapter, provider, dispatch, host receipt, checkpoint, or event export runtime.
@@ -172,7 +176,8 @@ harness.py --root . task submit T1 --context-id producer-context \
 harness.py --root . task accept T1 --evidence "independent review accepted"
 ```
 
-There are no leases, heartbeat, fence, claim/release, stale recovery, review lease, retry budget, global request-id command log, or worker database writes. SQLite transactions, natural keys, and explicit state preconditions prevent duplicate mutation.
+There are no worker writes, leases, heartbeat, fence, claim/release, or stale
+recovery. SQLite transactions and explicit preconditions prevent duplicates.
 
 ## Immutable Verification
 
@@ -182,12 +187,22 @@ Register an exact target, then let the root controller execute it:
 harness.py --root . test-target add --id UNIT --kind unit \
   --command-template "python3 -m unittest" --result-format regex
 harness.py --root . test-target link --task T1 --target UNIT
+harness.py --root . test-target qualify --id Q1 --target UNIT \
+  --acceptance AC1 --rationale "UNIT directly exercises AC1" \
+  --by root-controller
 harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
 ```
 
-`verify run` executes outside the write transaction, then atomically records one immutable current-candidate execution, validation, links, artifact digest, structured count/semantic result, runner, sandbox/no-network status, policy status, and compact audit event. A free-form `validation record` is judgment-only and cannot create gate-eligible execution evidence.
-
-Container verification must really run with no network when the target requires it. Unavailable container capability fails closed; do not call it sandbox verification.
+Schema 31 `verify run` records immutable validation/artifact facts plus
+`target_definition_sha256`, controller `platform`/runtime/
+`runtime_executable_sha256`, `policy_version`, and `provenance_status=complete`.
+Free-form validation and `legacy-incomplete` history are ineligible. Container
+images must already be local: record engine/version, a frozen local
+`container_engine_endpoint`, and `container_image_digest`; pin every daemon call;
+run the immutable identity with `--pull=never`; and fail closed on remote routing
+or drift. Kafa never pulls. Medium/high/critical unit/integration coverage requires
+positive reconciled structured results, including streaming terminal events;
+regex remains low-risk only.
 
 High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata. Never fabricate Host, CI, HMAC, Connector, or receipt provenance.
 If any prerequisite is missing, the result is `human-review-required`.
@@ -208,12 +223,14 @@ Record review and delivery only after those checks:
 
 ```bash
 harness.py --root . gate record --reviewer-context fresh \
-  --reviewer-context-id reviewer-context --result pass
-harness.py --root . validate --delivery
+  --reviewer-context-id reviewer-context --result pass \
+  --qualification Q1
+harness.py --root . delivery ready
 harness.py --root . delivery record --scope "..." --acceptance AC1 \
   --changed-files "..." --validation "..." --qa "..." \
   --failure-mode-coverage "..." --quality-gate "pass" \
   --known-gaps "..." --handoff "..."
+harness.py --root . validate --delivery
 ```
 
 The final handoff must report:

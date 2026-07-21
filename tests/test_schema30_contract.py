@@ -19,9 +19,13 @@ for path in (PLUGIN_ROOT, SCRIPTS):
 
 import harness_db  # noqa: E402
 from core.schema_lifecycle import (  # noqa: E402
+    ACTIVE_JSON_SCHEMAS,
+    ACTIVE_SCHEMA_VERSION,
+    ACTIVE_TABLES,
     SCHEMA30_JSON_SCHEMAS,
     SCHEMA30_TABLES,
     SCHEMA30_VERSION,
+    create_active_schema,
     create_schema30,
 )
 
@@ -96,6 +100,32 @@ EXECUTION_PROPERTIES = {
 
 REQUIRED_EXECUTION_PROPERTIES = EXECUTION_PROPERTIES - {"target_id"}
 
+ACTIVE_EXECUTION_PROPERTIES = EXECUTION_PROPERTIES | {
+    "target_definition_sha256",
+    "platform",
+    "runtime_executable",
+    "runtime_version",
+    "runtime_executable_sha256",
+    "policy_version",
+    "container_engine",
+    "container_engine_version",
+    "container_engine_endpoint",
+    "container_image_requested",
+    "container_image_digest",
+    "provenance_status",
+}
+
+APPROVED_ACTIVE_TABLES = APPROVED_SCHEMA30_TABLES | {
+    "acceptance_target_qualifications",
+    "quality_gate_qualifications",
+    "outcome_observations",
+}
+
+APPROVED_ACTIVE_JSON_SCHEMAS = APPROVED_SCHEMA30_JSON_SCHEMAS | {
+    "acceptance-target-qualification.schema.json",
+    "outcome-observation.schema.json",
+}
+
 RETIRED_TABLES = {
     "adapters",
     "adapter_actions",
@@ -154,7 +184,21 @@ class Schema30ContractTests(unittest.TestCase):
             schema_guard.FAILURE_MODE_STATUSES,
         )
 
-    def test_json_schema_inventory_and_execution_contract_are_locked(self) -> None:
+    def test_schema30_inventory_and_execution_ddl_remain_locked(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn:
+            conn.execute("begin immediate")
+            create_schema30(conn)
+            conn.commit()
+            execution_columns = conn.execute("pragma table_info(executions)").fetchall()
+        ddl_properties = {row[1] for row in execution_columns}
+        ddl_required = {row[1] for row in execution_columns if row[3] or row[5]}
+
+        self.assertEqual(len(APPROVED_SCHEMA30_JSON_SCHEMAS), 16)
+        self.assertEqual(SCHEMA30_JSON_SCHEMAS, APPROVED_SCHEMA30_JSON_SCHEMAS)
+        self.assertEqual(ddl_properties, EXECUTION_PROPERTIES)
+        self.assertEqual(ddl_required, REQUIRED_EXECUTION_PROPERTIES)
+
+    def test_active_json_schema_inventory_and_execution_contract_are_locked(self) -> None:
         execution_schema = json.loads(
             (PLUGIN_ROOT / "schemas" / "execution.schema.json").read_text(encoding="utf-8")
         )
@@ -170,18 +214,20 @@ class Schema30ContractTests(unittest.TestCase):
         )
         with closing(sqlite3.connect(":memory:")) as conn:
             conn.execute("begin immediate")
-            create_schema30(conn)
+            create_active_schema(conn)
             conn.commit()
             execution_columns = conn.execute("pragma table_info(executions)").fetchall()
         ddl_properties = {row[1] for row in execution_columns}
         ddl_required = {row[1] for row in execution_columns if row[3] or row[5]}
 
-        self.assertEqual(len(APPROVED_SCHEMA30_JSON_SCHEMAS), 16)
-        self.assertEqual(SCHEMA30_JSON_SCHEMAS, APPROVED_SCHEMA30_JSON_SCHEMAS)
-        self.assertEqual(ddl_properties, EXECUTION_PROPERTIES)
-        self.assertEqual(ddl_required, REQUIRED_EXECUTION_PROPERTIES)
-        self.assertEqual(set(execution_schema["properties"]), EXECUTION_PROPERTIES)
-        self.assertEqual(set(execution_schema["required"]), REQUIRED_EXECUTION_PROPERTIES)
+        self.assertEqual(ACTIVE_JSON_SCHEMAS, APPROVED_ACTIVE_JSON_SCHEMAS)
+        self.assertEqual(ddl_properties, ACTIVE_EXECUTION_PROPERTIES)
+        self.assertEqual(ddl_required, ACTIVE_EXECUTION_PROPERTIES - {"target_id"})
+        self.assertEqual(set(execution_schema["properties"]), ACTIVE_EXECUTION_PROPERTIES)
+        self.assertEqual(
+            set(execution_schema["required"]),
+            ACTIVE_EXECUTION_PROPERTIES - {"target_id"},
+        )
         self.assertIs(execution_schema["readOnly"], True)
         self.assertIs(execution_schema["additionalProperties"], False)
         self.assertEqual(
@@ -217,15 +263,17 @@ class Schema30ContractTests(unittest.TestCase):
         self.assertEqual(tables, APPROVED_SCHEMA30_TABLES)
         self.assertEqual(foreign_key_issues, [])
 
-    def test_greenfield_has_exact_approved_27_tables(self) -> None:
+    def test_greenfield_has_exact_approved_active_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             harness_db.init_runtime(root)
             tables = runtime_tables(root)
 
-        self.assertEqual(harness_db.SCHEMA_VERSION, 30)
+        self.assertEqual(harness_db.SCHEMA_VERSION, ACTIVE_SCHEMA_VERSION)
         self.assertEqual(len(APPROVED_SCHEMA30_TABLES), 27)
-        self.assertEqual(tables, APPROVED_SCHEMA30_TABLES)
+        self.assertEqual(len(APPROVED_ACTIVE_TABLES), 30)
+        self.assertEqual(ACTIVE_TABLES, APPROVED_ACTIVE_TABLES)
+        self.assertEqual(tables, APPROVED_ACTIVE_TABLES)
 
     def test_unknown_or_retired_table_fails_structure_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -234,7 +282,7 @@ class Schema30ContractTests(unittest.TestCase):
             tables = runtime_tables(root)
 
         self.assertFalse(tables & RETIRED_TABLES, sorted(tables & RETIRED_TABLES))
-        self.assertEqual(tables - APPROVED_SCHEMA30_TABLES, set())
+        self.assertEqual(tables - APPROVED_ACTIVE_TABLES, set())
 
     def test_identified_failure_mode_uses_non_null_empty_acceptance_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

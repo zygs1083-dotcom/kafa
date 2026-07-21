@@ -39,7 +39,7 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
 kafa project doctor --repo .
 ```
 
-初始化会创建 schema 30 SQLite 事实源、local Markdown views，以及三个静态 Native Codex agent templates。它不需要远程凭证，也不会替你启动 task、subagent 或 worktree。
+初始化会创建 schema 31 SQLite 事实源、local Markdown views，以及三个静态 Native Codex agent templates。它不需要远程凭证，也不会替你启动 task、subagent 或 worktree。
 
 ## 3. 最小闭环
 
@@ -107,12 +107,13 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . failure-mode a
   --scenario "Invalid input reaches the implementation" \
   --trigger "Input violates the documented contract" \
   --expected "The implementation fails safely" \
-  --risk medium \
+  --risk low \
   --acceptance AC1
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . baseline freeze \
+python3 plugins/codex-project-harness/scripts/harness.py --root . baseline confirm \
   --id B1 \
-  --summary "R1 and AC1 are ready for implementation"
+  --summary "R1 and AC1 are the explicitly confirmed scope" \
+  --by root-controller
 ```
 
 建立 task 与 test target：
@@ -133,12 +134,32 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . test-target li
   --task T1 \
   --target UNIT
 
+python3 plugins/codex-project-harness/scripts/harness.py --root . test-target qualify \
+  --id Q1 \
+  --target UNIT \
+  --acceptance AC1 \
+  --rationale "UNIT directly exercises the AC1 behavior" \
+  --by root-controller
+
 python3 plugins/codex-project-harness/scripts/harness.py --root . task start T1
+```
+
+完成并关闭一个 cycle 后，新的 cycle 会把 scope 重置为 unconfirmed。
+`requirement`、`acceptance`、`task` 的标签可以在新 cycle 中复用；baseline、
+finding、qualification 等全局事实 ID 必须使用新值。`quickstart minimal`
+会在非默认 cycle 自动为 target、qualification 和 baseline 加入 cycle 标识。
+若要只读复核旧交付而不切换当前 cycle：
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle audit \
+  --id CYCLE-current --json
 ```
 
 此时由 Native Codex/ChatGPT 决定是否创建 task、subagent 或 worktree，以及使用什么 model、approval 和 cancel/handoff 行为。Kafa 不创建第二套生命周期。执行者只修改获准的项目文件并把 diff、测试建议、上下文标识和风险返回给根控制器；执行者不修改 `.ai-team/state/harness.db`。
 
 根控制器回到目标 workspace 后检查真实 candidate，再推进 task 并独立验证：
+
+Qualification 只是将当前 acceptance revision 与 target definition digest 绑定的可审计流程责任记录；它不会自动证明测试与业务语义相符，也不是密码学 provenance。当 acceptance 或 target 的执行相关定义改变时，必须创建新 qualification 并重新执行。
 
 ```bash
 python3 plugins/codex-project-harness/scripts/harness.py --root . task submit T1 \
@@ -162,22 +183,45 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
   --container-image python:3.12-slim
 ```
 
-记录审查 finding 和 quality gate。不同 producer/reviewer context 是流程分离元数据，不是密码学身份：
+这个示例的 `FM1` 是 low risk，因此简单 regex positive-count target 可以作为限定后的
+覆盖。Medium/high/critical 的 unit 或 integration failure-mode 覆盖必须使用受支持的
+structured result format 和正数、可对账的执行结果；不能用 regex 冒充结构化覆盖。
+
+Schema 31 execution 会记录 `target_definition_sha256`、controller `platform`、
+`runtime_executable`/`runtime_version`/`runtime_executable_sha256`、
+`policy_version` 和 `provenance_status=complete`。Container runner 还要求镜像已在
+受支持的本机 Docker 或 Linux native-local Podman，记录 engine/version、冻结的本地
+`container_engine_endpoint`、requested image 与 `container_image_digest`，并把全部
+daemon 调用固定到该 endpoint，再用 immutable identity 和 `--pull=never` 运行；Kafa
+不隐式 pull。运行时还会覆盖镜像 entrypoint 为受控 `/bin/sh`，只读取该入口生成的
+artifact，不把 engine CLI stdout 当作测试输出。Remote/ambiguous routing、engine 与
+endpoint 类型不匹配、缺字段、runtime/endpoint/image 漂移或
+`legacy-incomplete` history 都不能成为当前 delivery evidence。Go streaming result
+缺少可对账的 terminal package event 或 started test 终态时 fail closed；
+`cargo-nextest-json` 绑定 experimental libtest JSON v0.1，每个顺序 suite 必须有唯一、
+可对账的 terminal event，允许 stress 产生多个完整 suite。事件乱序、缺失结果 artifact、
+或 structured stdout 超过捕获上限时同样 fail closed。
+
+先让根控制器接受已验证的 task，再记录审查 finding 和绑定当前 revision 的 quality
+gate。不同 producer/reviewer context 是流程分离元数据，不是密码学身份：
 
 ```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 \
+  --evidence "Current-candidate execution and review completed"
+
 python3 plugins/codex-project-harness/scripts/harness.py --root . gate record \
   --reviewer-context fresh \
   --reviewer-context-id reviewer-context \
   --result pass \
-  --residual-risk "No unresolved low or medium risk"
-
-python3 plugins/codex-project-harness/scripts/harness.py --root . task accept T1 \
-  --evidence "Current-candidate execution and review completed"
+  --qualification Q1 \
+  --residual-risk "No unresolved low risk"
 ```
 
-最后尝试记录交付并再次验证：
+最后先通过同一 prerequisite evaluator 进入 readiness，再记录交付并重新验证：
 
 ```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . delivery ready
+
 python3 plugins/codex-project-harness/scripts/harness.py --root . delivery record \
   --scope "R1 local verified code handoff" \
   --acceptance AC1 \
@@ -190,6 +234,8 @@ python3 plugins/codex-project-harness/scripts/harness.py --root . status
 ```
 
 如果 candidate 在 execution 或 quality gate 之后发生变化，旧记录保留审计价值，但不再满足当前交付条件。
+
+Schema 31 不接受自由文本状态：requirement 与 acceptance 的合法值都是 `active/cancelled`，failure mode 的合法值是 `identified/accepted/exempt`。未知值会在 CLI/API 写入前或 migration preflight 中失败；只有 schema 30 的历史 failure-mode `active` 会被迁移为 `identified`。
 
 ## 6. High/critical 风险
 

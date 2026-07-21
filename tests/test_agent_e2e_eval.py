@@ -1282,13 +1282,17 @@ class AgentE2EEvalTest(unittest.TestCase):
                 "structured_and_no_network_policy_fail_closed",
                 "cycle_isolation",
                 "sqlite_contention_stress",
-                "schema27_29_migration_and_rollback",
+                "schema27_to_active_migration_and_rollback",
                 "installed_plugin_surface",
             },
         )
         self.assertTrue(scenarios["sqlite_contention_stress"]["pass"], scenarios["sqlite_contention_stress"]["details"])
         self.assertEqual(scenarios["sqlite_contention_stress"]["details"]["sqlite_lock_error_count"], 0)
-        self.assertTrue(scenarios["schema27_29_migration_and_rollback"]["details"]["rollback_observed"])
+        self.assertTrue(
+            scenarios["schema27_to_active_migration_and_rollback"]["details"][
+                "rollback_observed"
+            ]
+        )
         self.assertEqual(scenarios["installed_plugin_surface"]["details"]["skill_count"], 7)
 
     def test_eval_source_contains_no_retired_provider_or_connector_scenarios(self) -> None:
@@ -2343,10 +2347,12 @@ class AgentE2EEvalTest(unittest.TestCase):
         live_skipped = {"mode": "live-codex", "live_skipped": True, "summary": {"failed_count": 0}}
         self.assertTrue(run_agent_e2e_eval.should_fail(live_skipped))
 
-    def test_out_matches_stdout_schema(self) -> None:
+    def test_failed_profile_writes_diagnostic_out_but_preserves_persistent_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp) / "report.json"
             evidence_out = Path(temp) / "evidence.json"
+            prior_evidence = b'{"status":"historical"}\n'
+            evidence_out.write_bytes(prior_evidence)
             result = run_eval_process(
                 "--mode",
                 "live-codex",
@@ -2358,11 +2364,12 @@ class AgentE2EEvalTest(unittest.TestCase):
             )
             report = json.loads(result.stdout)
             from_file = json.loads(out.read_text(encoding="utf-8"))
-            evidence = json.loads(evidence_out.read_text(encoding="utf-8"))
+            evidence_bytes = evidence_out.read_bytes()
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(from_file, report)
-        self.assertEqual(evidence, run_agent_e2e_eval.compact_evidence_report(report))
+        self.assertEqual(evidence_bytes, prior_evidence)
+        self.assertIn("refusing failed persistent evidence", result.stderr)
         self.assertIn("matrix", from_file)
         self.assertIn("summary", from_file)
         self.assertIn("scenarios", from_file)

@@ -1,0 +1,226 @@
+{
+  "artifact_count": 2,
+  "artifacts": [
+    {
+      "kind": "wheel",
+      "name": "kafa-2.0.0b1-py3-none-any.whl",
+      "sbom": "kafa-2.0.0b1-py3-none-any.whl.cdx.json",
+      "sbom_sha256": "fa4192af15a328930286c576573e6bf3ccf66d644ec7c2032e037353116bc9da",
+      "sha256": "f5b2f10ae2746d0a513f1761f0eadae59be321ae2ea32cd0a9a11c1a1d0668dd"
+    },
+    {
+      "kind": "sdist",
+      "name": "kafa-2.0.0b1.tar.gz",
+      "sbom": "kafa-2.0.0b1.tar.gz.cdx.json",
+      "sbom_sha256": "4771a9e2d381cc0b1ff46c8007dde55e251ba4e9fc6c31d2c1e1d60b2080a950",
+      "sha256": "9e6fa48a3a9853d2e67f6de6a782a8e4e301a045fed7e4108b64abc17de0d5eb"
+    }
+  ],
+  "build": {
+    "backend": "83.0.0",
+    "finished_at": "2026-07-21T16:23:19Z",
+    "frontend": "1.5.0",
+    "python": "3.14.6",
+    "source_date_epoch": 1784650991,
+    "started_at": "2026-07-21T16:23:18Z"
+  },
+  "commands": [
+    "python -m build --no-isolation --wheel --sdist --outdir /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist",
+    "python /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/source/tests/run_isolated_install_smoke.py --repo /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/source --codex-bin /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js --wheel /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist/kafa-2.0.0b1-py3-none-any.whl --source-archive /var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/kafa-release-rehearsal-a0ln0yvt/dist/kafa-2.0.0b1.tar.gz --json"
+  ],
+  "evidence_mode": "local-no-publish-rehearsal",
+  "external_effects": {
+    "deployment": false,
+    "release": false,
+    "tag": false,
+    "upload": false,
+    "user_installation_change": false
+  },
+  "generated_at": "2026-07-21T16:23:34Z",
+  "invariants": {
+    "artifact_bytes_unchanged": true,
+    "isolated_home": true,
+    "source_unchanged": true,
+    "tag_refs_unchanged": true,
+    "user_install_unchanged": true
+  },
+  "isolated_install": {
+    "app_server_discovery_ok": true,
+    "app_server_hook_count": 3,
+    "app_server_hook_events": [
+      "sessionStart",
+      "stop",
+      "subagentStart"
+    ],
+    "app_server_plugin": "codex-project-harness@kafa-local",
+    "app_server_plugin_version": "2.0.0-beta.1",
+    "app_server_runtime_anchor_count": 9,
+    "app_server_runtime_script_count": 7,
+    "app_server_schema_count": 18,
+    "app_server_skill_count": 7,
+    "app_server_skills": [
+      "codex-project-harness:bug-fix-loop",
+      "codex-project-harness:harness-audit",
+      "codex-project-harness:independent-quality-gate",
+      "codex-project-harness:minimal-safe-change",
+      "codex-project-harness:project-harness",
+      "codex-project-harness:project-retrospective",
+      "codex-project-harness:test-first-delivery"
+    ],
+    "app_server_template_count": 3,
+    "app_server_templates": [
+      "architect.toml",
+      "developer.toml",
+      "qa-reviewer.toml"
+    ],
+    "artifact_mode": true,
+    "cache_hook_ok": true,
+    "cache_plugin_path": "/private/var/folders/5q/mvhdgpc50q9g60mdr59z_v1w0000gn/T/tmppw0d_1ei/codex-home/plugins/cache/kafa-local/codex-project-harness/2.0.0-beta.1",
+    "cache_plugin_tree_sha256": "1178b7d7d62b23b438a28819895689840a0780dc4a91f01257b21c8fba7bfc48",
+    "codex_cache_removed": true,
+    "codex_unregister_ok": true,
+    "codex_version": "codex-cli 0.143.0",
+    "direct_hook_handler_ok": true,
+    "doctor_ok": true,
+    "full_uninstall_ok": true,
+    "host_hook_execution_observed": false,
+    "host_hook_execution_reason": "deterministic install smoke proves app-server discovery; host execution requires a live authenticated turn",
+    "imported_from_venv": true,
+    "installed_migration_backup_ok": true,
+    "installed_migration_backup_sha256": "9eb25d2499d4152b7ae33f575700f85bd142784a7241bac6ac7888cc09919a2c",
+    "installed_migration_doctor_ok": true,
+    "installed_migration_dry_run_ok": true,
+    "installed_migration_invented_authority_count": 0,
+    "installed_migration_manifest_sha256": "ed93b5bdfeaaff8e239a7b4a2dee86fb579bc6d12469d2276e76aae121b97be5",
+    "installed_migration_normalized_failure_modes": 1,
+    "installed_migration_ok": true,
+    "installed_migration_source_version": 30,
+    "installed_migration_target_version": 31,
+    "installed_quickstart_ok": true,
+    "installed_quickstart_task_status": "submitted",
+    "managed_plugin_removed": true,
+    "managed_plugin_tree_sha256": "1178b7d7d62b23b438a28819895689840a0780dc4a91f01257b21c8fba7bfc48",
+    "marketplace_discovered": true,
+    "marketplace_entry_removed": true,
+    "ok": true,
+    "plugin_enabled": true,
+    "plugin_source_tree_sha256": "1178b7d7d62b23b438a28819895689840a0780dc4a91f01257b21c8fba7bfc48",
+    "project_agent_templates": [
+      "architect.toml",
+      "developer.toml",
+      "qa-reviewer.toml"
+    ],
+    "project_init_ok": true,
+    "project_status_ok": true,
+    "remove_ok": true,
+    "retired_runtime_absent": true,
+    "source_archive_name": "kafa-2.0.0b1.tar.gz",
+    "source_archive_sha256": "9e6fa48a3a9853d2e67f6de6a782a8e4e301a045fed7e4108b64abc17de0d5eb",
+    "version": "2.0.0-beta.1",
+    "wheel": "kafa-2.0.0b1-py3-none-any.whl",
+    "wheel_name": "kafa-2.0.0b1-py3-none-any.whl",
+    "wheel_sha256": "f5b2f10ae2746d0a513f1761f0eadae59be321ae2ea32cd0a9a11c1a1d0668dd"
+  },
+  "ok": true,
+  "report_version": "kafa-release-rehearsal-v1",
+  "sbom_count": 2,
+  "source": {
+    "dirty": false,
+    "git_commit": "f759237fa9d1e034b0a7e8e730581cf8afaf4d7a",
+    "git_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_file_count": 207,
+    "source_tree_sha256": "ec6f98758a0e866bab0280057e1b268365ae1a08c9d584db5a85b3e41c1f2b34"
+  },
+  "steps": [
+    "snapshot",
+    "build",
+    "generate",
+    "verify-before-install",
+    "isolated-install",
+    "verify-after-install"
+  ],
+  "supply_chain_assurance": "unsigned-local-integrity-statement",
+  "syft": {
+    "commit": "3e2bc6ed095f7ec1a415fb38cfe1c319e95dfed6",
+    "format": "cyclonedx-json@1.6",
+    "version": "1.48.0"
+  },
+  "user_installation_after": {
+    "kafa_executable": {
+      "invocation_path": "/Users/wangying/.local/bin/kafa",
+      "link_target": "/Users/wangying/AI-Codex/.local/upstream/kafa/.venv/bin/kafa",
+      "resolved_path": "/Users/wangying/AI-Codex/.local/upstream/kafa/.venv/bin/kafa",
+      "sha256": "f393fe1c640a475c8dc368d08e1b45cab696457e48757732ad4c9dbfc4fbb8f1",
+      "size": 201
+    },
+    "kafa_version": "2.0.0-beta.1",
+    "managed_plugin": {
+      "file_count": 66,
+      "path": "/Users/wangying/.agents/plugins/codex-project-harness",
+      "sha256": "e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed"
+    },
+    "plugin": {
+      "authPolicy": "ON_INSTALL",
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "installed": true,
+      "marketplaceName": "personal",
+      "marketplaceSource": {
+        "source": "/Users/wangying",
+        "sourceType": "local"
+      },
+      "name": "codex-project-harness",
+      "pluginId": "codex-project-harness@personal",
+      "source": {
+        "path": "/Users/wangying/.agents/plugins/codex-project-harness",
+        "source": "local"
+      },
+      "version": "2.0.0-beta.1"
+    },
+    "plugin_cache": {
+      "file_count": 66,
+      "path": "/Users/wangying/.codex/plugins/cache/personal/codex-project-harness/2.0.0-beta.1",
+      "sha256": "e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed"
+    },
+    "status": "observed"
+  },
+  "user_installation_before": {
+    "kafa_executable": {
+      "invocation_path": "/Users/wangying/.local/bin/kafa",
+      "link_target": "/Users/wangying/AI-Codex/.local/upstream/kafa/.venv/bin/kafa",
+      "resolved_path": "/Users/wangying/AI-Codex/.local/upstream/kafa/.venv/bin/kafa",
+      "sha256": "f393fe1c640a475c8dc368d08e1b45cab696457e48757732ad4c9dbfc4fbb8f1",
+      "size": 201
+    },
+    "kafa_version": "2.0.0-beta.1",
+    "managed_plugin": {
+      "file_count": 66,
+      "path": "/Users/wangying/.agents/plugins/codex-project-harness",
+      "sha256": "e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed"
+    },
+    "plugin": {
+      "authPolicy": "ON_INSTALL",
+      "enabled": true,
+      "installPolicy": "AVAILABLE",
+      "installed": true,
+      "marketplaceName": "personal",
+      "marketplaceSource": {
+        "source": "/Users/wangying",
+        "sourceType": "local"
+      },
+      "name": "codex-project-harness",
+      "pluginId": "codex-project-harness@personal",
+      "source": {
+        "path": "/Users/wangying/.agents/plugins/codex-project-harness",
+        "source": "local"
+      },
+      "version": "2.0.0-beta.1"
+    },
+    "plugin_cache": {
+      "file_count": 66,
+      "path": "/Users/wangying/.codex/plugins/cache/personal/codex-project-harness/2.0.0-beta.1",
+      "sha256": "e505042f69cfcf4024d4a93f5b5593edaef192965b7093061152715af63949ed"
+    },
+    "status": "observed"
+  }
+}

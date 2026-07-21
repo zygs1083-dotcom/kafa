@@ -14,6 +14,12 @@ from harness_lib import now_iso
 from . import RUNTIME_VERSION, SCHEMA_VERSION
 from .errors import HarnessError
 from .project_fs import ProjectFS
+from .schema_guard import (
+    ACCEPTANCE_STATUS_VALUES,
+    EXECUTION_POLICY_VERSION,
+    FAILURE_MODE_STATUS_VALUES,
+    REQUIREMENT_STATUS_VALUES,
+)
 from .store import (
     _apply_sqlite_teardown_errors,
     _temporary_sqlite_family_cleanup_errors,
@@ -42,8 +48,8 @@ DEFAULT_EXECUTOR_PREFIXES = [
 ]
 
 
-SCHEMA30_VERSION = SCHEMA_VERSION
-SCHEMA30_RUNTIME_VERSION = RUNTIME_VERSION
+SCHEMA30_VERSION = 30
+SCHEMA30_RUNTIME_VERSION = "5.0.0"
 SCHEMA30_TABLES = frozenset(
     {
         "project",
@@ -97,6 +103,41 @@ SCHEMA30_JSON_SCHEMAS = frozenset(
         "event.schema.json",
     }
 )
+
+SCHEMA31_VERSION = 31
+SCHEMA31_RUNTIME_VERSION = RUNTIME_VERSION
+SCHEMA31_TABLES = SCHEMA30_TABLES | frozenset(
+    {
+        "acceptance_target_qualifications",
+        "quality_gate_qualifications",
+        "outcome_observations",
+    }
+)
+SCHEMA31_SQLITE_INTERNAL_TABLES = SCHEMA30_SQLITE_INTERNAL_TABLES
+SCHEMA31_CATALOG_TABLES = SCHEMA31_TABLES | SCHEMA31_SQLITE_INTERNAL_TABLES
+SCHEMA31_JSON_SCHEMAS = SCHEMA30_JSON_SCHEMAS | frozenset(
+    {
+        "acceptance-target-qualification.schema.json",
+        "outcome-observation.schema.json",
+    }
+)
+
+if SCHEMA_VERSION != SCHEMA31_VERSION:
+    raise RuntimeError(
+        "active schema authority mismatch: "
+        f"core={SCHEMA_VERSION} lifecycle={SCHEMA31_VERSION}"
+    )
+
+ACTIVE_SCHEMA_VERSION = SCHEMA31_VERSION
+ACTIVE_RUNTIME_VERSION = SCHEMA31_RUNTIME_VERSION
+ACTIVE_TABLES = SCHEMA31_TABLES
+ACTIVE_SCHEMA_TABLES = SCHEMA31_TABLES
+ACTIVE_SQLITE_INTERNAL_TABLES = SCHEMA31_SQLITE_INTERNAL_TABLES
+ACTIVE_SCHEMA_SQLITE_INTERNAL_TABLES = SCHEMA31_SQLITE_INTERNAL_TABLES
+ACTIVE_CATALOG_TABLES = SCHEMA31_CATALOG_TABLES
+ACTIVE_SCHEMA_CATALOG_TABLES = SCHEMA31_CATALOG_TABLES
+ACTIVE_JSON_SCHEMAS = SCHEMA31_JSON_SCHEMAS
+ACTIVE_SCHEMA_JSON_SCHEMAS = SCHEMA31_JSON_SCHEMAS
 
 
 SCHEMA30_DDL = """
@@ -468,6 +509,392 @@ create index events_entity on events(entity_type, entity_id, sequence);
 """.replace("__SCHEMA_VERSION__", str(SCHEMA30_VERSION))
 
 
+def _replace_schema_fragment(
+    ddl: str,
+    old: str,
+    new: str,
+    *,
+    expected: int = 1,
+) -> str:
+    actual = ddl.count(old)
+    if actual != expected:
+        raise RuntimeError(
+            "schema 31 DDL derivation drift: "
+            f"expected {expected} occurrence(s), found {actual}: {old!r}"
+        )
+    return ddl.replace(old, new)
+
+
+def _build_schema31_ddl() -> str:
+    """Derive the active contract while keeping schema 30 byte-stable."""
+
+    ddl = _replace_schema_fragment(
+        SCHEMA30_DDL,
+        "check (schema_version = 30)",
+        "check (schema_version = 31)",
+        expected=2,
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    status text not null,
+    phase text not null,
+    base_ref text not null default '',""",
+        """    status text not null check (status in ('active', 'delivered', 'archived')),
+    phase text not null check (phase in ('intake', 'project_bootstrap', 'requirement_baseline', 'confirmation', 'team_architecture', 'planning', 'implementation', 'qa', 'delivery_readiness', 'retrospective', 'archived')),
+    base_ref text not null default '',""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    kind text not null,
+    body text not null,
+    priority text not null default '',
+    status text not null default 'active',
+    revision integer not null default 1 check (revision > 0),
+    updated_at text not null,
+    unique(cycle_id, id),""",
+        f"""    kind text not null check (kind in ('goal', 'functional', 'non-functional', 'non-goal', 'assumption', 'open-question', 'architecture')),
+    body text not null,
+    priority text not null default '',
+    status text not null default 'active' check (status in ({', '.join(repr(value) for value in REQUIREMENT_STATUS_VALUES)})),
+    revision integer not null default 1 check (revision > 0),
+    updated_at text not null,
+    unique(cycle_id, id),""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    criterion text not null,
+    priority text not null default '',
+    status text not null default 'active',
+    revision integer not null default 1 check (revision > 0),
+    unique(cycle_id, id),""",
+        f"""    criterion text not null,
+    priority text not null default '',
+    status text not null default 'active' check (status in ({', '.join(repr(value) for value in ACCEPTANCE_STATUS_VALUES)})),
+    revision integer not null default 1 check (revision > 0),
+    unique(cycle_id, id),""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    risk text not null check (risk in ('low', 'medium', 'high', 'critical')),
+    status text not null default 'active',
+    accepted_by text not null default '',""",
+        f"""    risk text not null check (risk in ('low', 'medium', 'high', 'critical')),
+    status text not null default 'identified' check (status in ({', '.join(repr(value) for value in FAILURE_MODE_STATUS_VALUES)})),
+    accepted_by text not null default '',""",
+    )
+
+    qualification_ddl = """create table acceptance_target_qualifications (
+    id text primary key check (length(trim(id)) > 0),
+    cycle_id text not null,
+    acceptance_id text not null,
+    acceptance_revision integer not null check (acceptance_revision > 0),
+    target_id text not null,
+    target_definition_sha256 text not null check (length(target_definition_sha256) = 64),
+    rationale text not null check (length(trim(rationale)) > 0),
+    qualified_by text not null check (length(trim(qualified_by)) > 0),
+    created_at text not null check (length(trim(created_at)) > 0),
+    unique (id, cycle_id),
+    unique (id, cycle_id, acceptance_id),
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete restrict,
+    foreign key (target_id) references test_targets(id) on delete restrict
+);
+create trigger acceptance_target_qualifications_no_update
+before update on acceptance_target_qualifications
+begin
+    select raise(abort, 'acceptance target qualifications are immutable');
+end;
+create trigger acceptance_target_qualifications_no_delete
+before delete on acceptance_target_qualifications
+begin
+    select raise(abort, 'acceptance target qualifications are immutable');
+end;
+"""
+    ddl = _replace_schema_fragment(
+        ddl,
+        "create table executions (",
+        qualification_ddl + "create table executions (",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    target_id text,
+    command text not null,""",
+        """    target_id text,
+    target_definition_sha256 text not null default '',
+    command text not null,""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    result_format text not null,
+    semantic_status text not null,
+    runner text not null check (runner in ('local', 'container')),
+    sandbox_status text not null,
+    no_network integer not null default 0 check (no_network in (0, 1)),
+    policy_status text not null,
+    created_at text not null,""",
+        f"""    result_format text not null check (result_format in ('regex', 'junit', 'pytest-json', 'jest-json', 'go-json', 'cargo-nextest-json', 'playwright-json')),
+    semantic_status text not null check (semantic_status in ('pass', 'fail')),
+    runner text not null check (runner in ('local', 'container')),
+    sandbox_status text not null check (sandbox_status in ('', 'available', 'unavailable')),
+    no_network integer not null default 0 check (no_network in (0, 1)),
+    policy_status text not null check (policy_status in ('allowed', 'rejected')),
+    platform text not null default '',
+    runtime_executable text not null default '',
+    runtime_version text not null default '',
+    runtime_executable_sha256 text not null default '',
+    policy_version text not null default '',
+    container_engine text not null default '',
+    container_engine_version text not null default '',
+    container_engine_endpoint text not null default '',
+    container_image_requested text not null default '',
+    container_image_digest text not null default '',
+    provenance_status text not null default 'legacy-incomplete'
+        check (provenance_status in ('complete', 'legacy-incomplete')),
+    created_at text not null,
+    check (
+        provenance_status = 'legacy-incomplete'
+        or (
+            provenance_status = 'complete'
+            and length(target_definition_sha256) = 64
+            and target_definition_sha256 not glob '*[^0-9a-f]*'
+            and trim(platform) <> ''
+            and trim(runtime_executable) <> ''
+            and trim(runtime_version) <> ''
+            and length(runtime_executable_sha256) = 64
+            and runtime_executable_sha256 not glob '*[^0-9a-f]*'
+            and policy_version = '{EXECUTION_POLICY_VERSION}'
+            and (
+                (
+                    runner = 'local'
+                    and container_engine = ''
+                    and container_engine_version = ''
+                    and container_engine_endpoint = ''
+                    and container_image_requested = ''
+                    and container_image_digest = ''
+                )
+                or (
+                    runner = 'container'
+                    and trim(container_engine) <> ''
+                    and trim(container_engine_version) <> ''
+                    and (
+                        (
+                            (
+                                lower(container_engine) like '%/docker'
+                                or lower(container_engine) like '%/docker.exe'
+                                or lower(container_engine) like '%' || char(92) || 'docker'
+                                or lower(container_engine) like '%' || char(92) || 'docker.exe'
+                            )
+                            and (
+                                (
+                                    container_engine_endpoint glob 'unix:///*'
+                                    and length(container_engine_endpoint) > length('unix:///')
+                                )
+                                or (
+                                    lower(container_engine_endpoint) glob 'npipe:////./pipe/?*'
+                                    and instr(
+                                        substr(
+                                            container_engine_endpoint,
+                                            length('npipe:////./pipe/') + 1
+                                        ),
+                                        '/'
+                                    ) = 0
+                                    and instr(
+                                        substr(
+                                            container_engine_endpoint,
+                                            length('npipe:////./pipe/') + 1
+                                        ),
+                                        char(92)
+                                    ) = 0
+                                )
+                            )
+                        )
+                        or (
+                            (
+                                lower(container_engine) like '%/podman'
+                                or lower(container_engine) like '%/podman.exe'
+                                or lower(container_engine) like '%' || char(92) || 'podman'
+                                or lower(container_engine) like '%' || char(92) || 'podman.exe'
+                            )
+                            and container_engine_endpoint = 'local-process'
+                        )
+                    )
+                    and trim(container_image_requested) <> ''
+                    and length(container_image_digest) = 71
+                    and substr(container_image_digest, 1, 7) = 'sha256:'
+                    and substr(container_image_digest, 8) not glob '*[^0-9a-f]*'
+                )
+            )
+        )
+    ),""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    acceptance_id text,
+    surface text not null,
+    result text not null,
+    validation_status text not null default 'active',""",
+        """    acceptance_id text,
+    qualification_id text,
+    surface text not null,
+    result text not null check (result in ('pass', 'fail', 'blocked', 'partial')),
+    validation_status text not null default 'active'
+        check (validation_status in ('active', 'superseded', 'invalidated')),""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete restrict,
+    foreign key (superseded_by) references validations(id) on delete set null,
+    unique (id, cycle_id, candidate_sha)
+);
+create table validation_executions""",
+        """    check (qualification_id is null or acceptance_id is not null),
+    foreign key (cycle_id, acceptance_id) references acceptance(cycle_id, id) on delete restrict,
+    foreign key (qualification_id, cycle_id, acceptance_id)
+        references acceptance_target_qualifications(id, cycle_id, acceptance_id) on delete restrict,
+    foreign key (superseded_by) references validations(id) on delete set null,
+    unique (id, cycle_id, candidate_sha)
+);
+create table validation_executions""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    severity text not null check (severity in ('low', 'medium', 'high', 'critical')),
+    status text not null,
+    summary text not null,""",
+        """    severity text not null check (severity in ('low', 'medium', 'high', 'critical')),
+    status text not null check (status in ('open', 'resolved', 'accepted', 'false-positive')),
+    summary text not null,""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    gate_status text not null default 'active',
+    superseded_by text,""",
+        """    gate_status text not null default 'active'
+        check (gate_status in ('active', 'superseded', 'legacy-ambiguous')),
+    superseded_by text,""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    review_status text not null default 'same-context-degraded',
+    result text not null,
+    blocking_findings text not null default '',""",
+        """    review_status text not null default 'same-context-degraded'
+        check (review_status in ('reviewed-local', 'same-context-degraded')),
+    result text not null check (result in ('pass', 'fail', 'conditional', 'blocked')),
+    blocking_findings text not null default '',""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    reviewed_revision integer not null default 0,
+    created_at text not null,
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade,""",
+        """    reviewed_revision integer not null default 0 check (reviewed_revision >= 0),
+    created_at text not null,
+    unique (id, cycle_id, candidate_sha),
+    foreign key (cycle_id) references delivery_cycles(id) on delete cascade,""",
+    )
+
+    gate_qualification_ddl = """create table quality_gate_qualifications (
+    gate_id text not null,
+    qualification_id text not null,
+    cycle_id text not null,
+    candidate_sha text not null,
+    primary key (gate_id, qualification_id),
+    foreign key (gate_id, cycle_id, candidate_sha)
+        references quality_gates(id, cycle_id, candidate_sha) on delete cascade,
+    foreign key (qualification_id, cycle_id)
+        references acceptance_target_qualifications(id, cycle_id) on delete restrict
+);
+create trigger quality_gate_qualifications_no_update
+before update on quality_gate_qualifications
+begin
+    select raise(abort, 'quality gate qualification links are immutable');
+end;
+create trigger quality_gate_qualifications_no_delete
+before delete on quality_gate_qualifications
+begin
+    select raise(abort, 'quality gate qualification links are immutable');
+end;
+"""
+    ddl = _replace_schema_fragment(
+        ddl,
+        "create table deliveries (",
+        gate_qualification_ddl + "create table deliveries (",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    decision_status text not null default 'delivered',
+    created_at text not null,""",
+        """    decision_status text not null default 'delivered'
+        check (decision_status in ('delivered', 'accepted-risk', 'same-context-degraded', 'historical-migrated')),
+    created_at text not null,""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        """    status text not null,
+    applied_at text not null
+);
+create table events""",
+        """    status text not null
+        check (status in ('legacy-history', 'staged', 'activated', 'rolled-back', 'failed', 'rollback-incomplete', 'recovery-required')),
+    applied_at text not null
+);
+create table outcome_observations (
+    id text primary key check (
+        length(trim(id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')) > 0
+    ),
+    cycle_id text,
+    kind text not null
+        check (kind in ('false-green-prevented', 'escaped-defect', 'rework')),
+    value blob not null check (typeof(value) = 'integer' and value >= 0),
+    details text not null check (
+        length(trim(details, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')) > 0
+    ),
+    recorded_by text not null check (
+        length(trim(recorded_by, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')) > 0
+    ),
+    observed_at text not null check (
+        strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+0 days') is not null
+        and strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+0 days') = observed_at
+    ),
+    created_at text not null check (
+        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+0 days') is not null
+        and strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+0 days') = created_at
+    ),
+    foreign key (cycle_id) references delivery_cycles(id) on delete restrict
+);
+create trigger outcome_observations_no_update
+before update on outcome_observations
+begin
+    select raise(abort, 'outcome observations are immutable');
+end;
+create trigger outcome_observations_no_delete
+before delete on outcome_observations
+begin
+    select raise(abort, 'outcome observations are immutable');
+end;
+create table events""",
+    )
+    ddl = _replace_schema_fragment(
+        ddl,
+        "create index executions_cycle_candidate on executions(cycle_id, candidate_sha, created_at);",
+        """create index acceptance_target_qualifications_cycle_acceptance
+    on acceptance_target_qualifications(cycle_id, acceptance_id, acceptance_revision, created_at);
+create index acceptance_target_qualifications_target_digest
+    on acceptance_target_qualifications(target_id, target_definition_sha256);
+create index quality_gate_qualifications_cycle_candidate
+    on quality_gate_qualifications(cycle_id, candidate_sha, qualification_id);
+create index outcome_observations_cycle_kind_observed
+    on outcome_observations(cycle_id, kind, observed_at);
+create index executions_cycle_candidate on executions(cycle_id, candidate_sha, created_at);""",
+    )
+    return ddl
+
+
+SCHEMA31_DDL = _build_schema31_ddl()
+ACTIVE_DDL = SCHEMA31_DDL
+ACTIVE_SCHEMA_DDL = SCHEMA31_DDL
+
+
 def create_schema30(conn: sqlite3.Connection) -> None:
     """Create only the schema 30 local delivery Kernel in an empty staging DB."""
 
@@ -493,6 +920,41 @@ def create_schema30(conn: sqlite3.Connection) -> None:
         missing = sorted(SCHEMA30_CATALOG_TABLES - actual)
         extra = sorted(actual - SCHEMA30_CATALOG_TABLES)
         raise SchemaLifecycleError(f"schema 30 table inventory mismatch: missing={missing} extra={extra}")
+
+
+def create_schema31(conn: sqlite3.Connection) -> None:
+    """Create only the schema 31 local delivery Kernel in an empty staging DB."""
+
+    existing = {
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table'"
+        )
+    }
+    if existing:
+        raise SchemaLifecycleError(
+            "schema 31 creation requires an empty staging database; found: "
+            + ", ".join(sorted(existing))
+        )
+    execute_transactional_script(conn, SCHEMA31_DDL)
+    actual = {
+        str(row[0])
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table'"
+        )
+    }
+    if actual != SCHEMA31_CATALOG_TABLES:
+        missing = sorted(SCHEMA31_CATALOG_TABLES - actual)
+        extra = sorted(actual - SCHEMA31_CATALOG_TABLES)
+        raise SchemaLifecycleError(
+            f"schema 31 table inventory mismatch: missing={missing} extra={extra}"
+        )
+
+
+def create_active_schema(conn: sqlite3.Connection) -> None:
+    """Create the generation-neutral active local delivery Kernel contract."""
+
+    create_schema31(conn)
 
 
 @dataclass(frozen=True)
@@ -605,6 +1067,8 @@ def backup_sqlite_database(
     *,
     source_path: Path | None = None,
     expected_source_version: int | None = None,
+    target_version: int = SCHEMA30_VERSION,
+    preserve_physical_bytes: bool = False,
     created_at: str | None = None,
     project_fs: ProjectFS | None = None,
 ) -> SQLiteBackupManifest:
@@ -619,6 +1083,8 @@ def backup_sqlite_database(
             project_fs=active_project_fs,
             source_path=source_path,
             expected_source_version=expected_source_version,
+            target_version=target_version,
+            preserve_physical_bytes=preserve_physical_bytes,
             created_at=created_at,
         )
 
@@ -629,6 +1095,8 @@ def _backup_sqlite_database_locked(
     project_fs: ProjectFS,
     source_path: Path | None = None,
     expected_source_version: int | None = None,
+    target_version: int = SCHEMA30_VERSION,
+    preserve_physical_bytes: bool = False,
     created_at: str | None = None,
 ) -> SQLiteBackupManifest:
     """Implement backup while the caller owns the project operation lock."""
@@ -695,20 +1163,61 @@ def _backup_sqlite_database_locked(
                 allow_missing=True,
             )
             partial_path = backup_dir / "harness.db.partial"
-            project_fs.create_exclusive(partial_path, b"", mode=0o600)
-            partial_snapshot = project_fs._snapshot(
-                partial_path,
-                allow_missing=False,
-            )
-            with _verified_sqlite_connection(
-                project_fs,
-                partial_path,
-                access="rw",
-                journal_mode="memory",
-            ) as destination_conn:
-                source_conn.backup(destination_conn)
-                destination_conn.execute("pragma journal_mode = delete")
-                destination_conn.commit()
+            if preserve_physical_bytes:
+                for sidecar in (source_family[1], source_family[3]):
+                    sidecar_snapshot = project_fs._snapshot(
+                        sidecar,
+                        allow_missing=True,
+                    )
+                    if (
+                        sidecar_snapshot.exists
+                        and project_fs.read_bytes(
+                            sidecar,
+                            expected=sidecar_snapshot,
+                        )
+                    ):
+                        raise SchemaLifecycleError(
+                            "exact-byte backup requires checkpointed SQLite authority; "
+                            f"non-empty sidecar: {sidecar}"
+                        )
+                source_bytes = project_fs.read_bytes(
+                    source_relative,
+                    expected=source_snapshot,
+                )
+                partial_snapshot = project_fs.create_exclusive(
+                    partial_path,
+                    source_bytes,
+                    mode=0o600,
+                )
+            else:
+                project_fs.create_exclusive(partial_path, b"", mode=0o600)
+                partial_snapshot = project_fs._snapshot(
+                    partial_path,
+                    allow_missing=False,
+                )
+                with _verified_sqlite_connection(
+                    project_fs,
+                    partial_path,
+                    access="rw",
+                    journal_mode="memory",
+                ) as destination_conn:
+                    source_conn.backup(destination_conn)
+                    destination_conn.execute("pragma journal_mode = delete")
+                    destination_conn.commit()
+                    project_fs._assert_unchanged(partial_path, partial_snapshot)
+            if preserve_physical_bytes:
+                project_fs._assert_unchanged(source_relative, source_snapshot)
+                if project_fs.read_bytes(
+                    partial_path,
+                    expected=partial_snapshot,
+                ) != project_fs.read_bytes(
+                    source_relative,
+                    expected=source_snapshot,
+                ):
+                    raise SchemaLifecycleError(
+                        "exact-byte SQLite backup changed the source authority"
+                    )
+            else:
                 project_fs._assert_unchanged(partial_path, partial_snapshot)
             project_fs._assert_unchanged(source_relative, source_snapshot)
 
@@ -745,7 +1254,7 @@ def _backup_sqlite_database_locked(
         backup_bytes = project_fs.read_bytes(final_path)
         manifest = SQLiteBackupManifest(
             source_version=source_version,
-            target_version=SCHEMA30_VERSION,
+            target_version=target_version,
             created_at=created_at_value,
             backup_path=str(project_fs.absolute(final_path)),
             sha256=hashlib.sha256(backup_bytes).hexdigest(),

@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:acceptance",
   "title": "Codex Project Harness Acceptance Criterion",
   "type": "object",
   "required": ["uid", "id", "cycle_id", "criterion", "status"],
@@ -9,8 +10,8 @@
     "cycle_id": { "type": "string" },
     "criterion": { "type": "string" },
     "priority": { "type": "string" },
-    "status": { "type": "string" },
-    "revision": { "type": "integer" }
+    "status": { "type": "string", "enum": ["active", "cancelled"] },
+    "revision": { "type": "integer", "minimum": 1 }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

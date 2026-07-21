@@ -44,6 +44,61 @@ from tests.test_local_core_hardening import _active_projection_validator  # noqa
 from tests.test_schema30_migration import init_schema29_fixture  # noqa: E402
 
 
+_FAKE_DOCKER = str(
+    (
+        Path(tempfile.gettempdir())
+        / ("docker.exe" if os.name == "nt" else "docker")
+    ).absolute()
+)
+_FAKE_DOCKER_CONTEXT = "default"
+_FAKE_DOCKER_ENDPOINT = (
+    "npipe:////./pipe/docker_engine"
+    if os.name == "nt"
+    else "unix:///var/run/docker.sock"
+)
+_FAKE_DOCKER_IMAGE_DIGEST = f"sha256:{'a' * 64}"
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+def fake_local_docker_subprocess(argv, *, run_handler=None, **kwargs):
+    """Model the local Docker control plane without invoking a real binary."""
+
+    args = [str(value) for value in argv]
+    if not args or args[0] != _FAKE_DOCKER:
+        return _REAL_SUBPROCESS_RUN(argv, **kwargs)
+    if args == [_FAKE_DOCKER, "context", "show"]:
+        return subprocess.CompletedProcess(argv, 0, f"{_FAKE_DOCKER_CONTEXT}\n", "")
+    if args == [_FAKE_DOCKER, "context", "inspect", _FAKE_DOCKER_CONTEXT]:
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            '[{"Endpoints":{"docker":{"Host":"%s"}}}]'
+            % _FAKE_DOCKER_ENDPOINT,
+            "",
+        )
+
+    endpoint_prefix = [_FAKE_DOCKER, "--host", _FAKE_DOCKER_ENDPOINT]
+    if args[:3] != endpoint_prefix:
+        raise AssertionError(f"unexpected Docker command: {args!r}")
+    command = args[3:]
+    if command[:1] == ["version"]:
+        return subprocess.CompletedProcess(argv, 0, "27.0.0\n", "")
+    if command[:2] == ["image", "inspect"]:
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            f'[{{"Id":"{_FAKE_DOCKER_IMAGE_DIGEST}"}}]',
+            "",
+        )
+    if command[:1] == ["run"]:
+        if run_handler is None:
+            raise AssertionError("unexpected Docker run command")
+        return run_handler(argv, **kwargs)
+    if command[:2] == ["rm", "-f"]:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    raise AssertionError(f"unexpected Docker command: {args!r}")
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -741,7 +796,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             with closing(sqlite3.connect(destination)) as conn:
                 self.assertEqual(
                     conn.execute("select schema_version from project where id=1").fetchone()[0],
-                    30,
+                    31,
                 )
 
     def test_backup_failure_preserves_existing_destination(self) -> None:
@@ -1750,7 +1805,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
 
             with (
                 patch("core.execution.uuid.uuid4") as mocked_uuid,
-                patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                patch("core.execution.shutil.which", return_value=_FAKE_DOCKER),
                 patch("core.execution.subprocess.run") as mocked_run,
             ):
                 mocked_uuid.return_value.hex = execution_id
@@ -1795,6 +1850,20 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                         "--requires-sandbox",
                         "--requires-no-network",
                     ),
+                    (
+                        "test-target",
+                        "qualify",
+                        "--id",
+                        "CONTAINER-STRUCTURED-Q1",
+                        "--target",
+                        "CONTAINER-STRUCTURED",
+                        "--acceptance",
+                        "AC1",
+                        "--rationale",
+                        "container structured result proves AC1",
+                        "--by",
+                        "test-fixture",
+                    ),
                 ):
                     result = run_harness(root, *args)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1811,18 +1880,16 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                     declared.parent.mkdir(parents=True, exist_ok=True)
                     declared.symlink_to(passing)
 
-                real_subprocess_run = subprocess.run
                 container_runs = 0
 
-                def fake_container_run(argv, **kwargs):
+                def handle_container_run(argv, **kwargs):
                     nonlocal container_runs
                     mounts = [
                         value
                         for value in argv
                         if str(value).endswith(":/artifacts:rw")
                     ]
-                    if not mounts:
-                        return real_subprocess_run(argv, **kwargs)
+                    self.assertEqual(len(mounts), 1)
                     container_runs += 1
                     artifact_dir = Path(mounts[0].removesuffix(":/artifacts:rw"))
                     (artifact_dir / "stdout.txt").write_text(
@@ -1840,8 +1907,15 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                         structured.write_bytes(passing.read_bytes())
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
+                def fake_container_run(argv, **kwargs):
+                    return fake_local_docker_subprocess(
+                        argv,
+                        run_handler=handle_container_run,
+                        **kwargs,
+                    )
+
                 with (
-                    patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                    patch("core.execution.shutil.which", return_value=_FAKE_DOCKER),
                     patch(
                         "core.execution.subprocess.run",
                         side_effect=fake_container_run,
@@ -1914,6 +1988,20 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                         "--result-path",
                         result_path,
                     ),
+                    (
+                        "test-target",
+                        "qualify",
+                        "--id",
+                        "STRUCTURED-Q1",
+                        "--target",
+                        "STRUCTURED",
+                        "--acceptance",
+                        "AC1",
+                        "--rationale",
+                        "structured result proves AC1",
+                        "--by",
+                        "test-fixture",
+                    ),
                 ):
                     result = run_harness(root, *args)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1971,12 +2059,9 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 uuid4=lambda: types.SimpleNamespace(hex=execution_id)
             )
 
-            original_subprocess_run = subprocess.run
-
-            def fake_container_run(argv, **kwargs):
+            def handle_container_run(argv, **kwargs):
                 mounts = [value for value in argv if str(value).endswith(":/artifacts:rw")]
-                if not mounts:
-                    return original_subprocess_run(argv, **kwargs)
+                self.assertEqual(len(mounts), 1)
                 mount = mounts[0]
                 artifact_dir = Path(mount.removesuffix(":/artifacts:rw"))
                 (artifact_dir / "stdout.txt").write_text(
@@ -1985,9 +2070,16 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 )
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
+            def fake_container_run(argv, **kwargs):
+                return fake_local_docker_subprocess(
+                    argv,
+                    run_handler=handle_container_run,
+                    **kwargs,
+                )
+
             with (
                 patch("core.execution.uuid", fake_uuid),
-                patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                patch("core.execution.shutil.which", return_value=_FAKE_DOCKER),
                 patch("core.execution.subprocess.run", side_effect=fake_container_run),
             ):
                 with self.assertRaisesRegex(Exception, "unsafe-project-path"):
@@ -2019,12 +2111,9 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             fake_uuid = types.SimpleNamespace(
                 uuid4=lambda: types.SimpleNamespace(hex=execution_id)
             )
-            original_subprocess_run = subprocess.run
-
-            def fake_container_run(argv, **kwargs):
+            def handle_container_run(argv, **kwargs):
                 mounts = [value for value in argv if str(value).endswith(":/artifacts:rw")]
-                if not mounts:
-                    return original_subprocess_run(argv, **kwargs)
+                self.assertEqual(len(mounts), 1)
                 mounted_dir = Path(mounts[0].removesuffix(":/artifacts:rw"))
                 self.assertFalse(mounted_dir.is_relative_to(root))
                 self.assertFalse(artifact_dir.exists())
@@ -2036,9 +2125,16 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 )
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
+            def fake_container_run(argv, **kwargs):
+                return fake_local_docker_subprocess(
+                    argv,
+                    run_handler=handle_container_run,
+                    **kwargs,
+                )
+
             with (
                 patch("core.execution.uuid", fake_uuid),
-                patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                patch("core.execution.shutil.which", return_value=_FAKE_DOCKER),
                 patch("core.execution.subprocess.run", side_effect=fake_container_run),
             ):
                 with self.assertRaisesRegex(
@@ -2071,20 +2167,25 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
             fake_uuid = types.SimpleNamespace(
                 uuid4=lambda: types.SimpleNamespace(hex=execution_id)
             )
-            original_subprocess_run = subprocess.run
             original_atomic_write = ProjectFS.atomic_write
             publication_attempts = 0
 
-            def fake_container_run(argv, **kwargs):
+            def handle_container_run(argv, **kwargs):
                 mounts = [value for value in argv if str(value).endswith(":/artifacts:rw")]
-                if not mounts:
-                    return original_subprocess_run(argv, **kwargs)
+                self.assertEqual(len(mounts), 1)
                 mounted_dir = Path(mounts[0].removesuffix(":/artifacts:rw"))
                 (mounted_dir / "stdout.txt").write_text(
                     "Ran 0 tests in 0.001s\nFAILED\n",
                     encoding="utf-8",
                 )
                 return subprocess.CompletedProcess(argv, 0, "", "")
+
+            def fake_container_run(argv, **kwargs):
+                return fake_local_docker_subprocess(
+                    argv,
+                    run_handler=handle_container_run,
+                    **kwargs,
+                )
 
             def create_leaf_before_publication(
                 active_fs,
@@ -2109,7 +2210,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
 
             with (
                 patch("core.execution.uuid", fake_uuid),
-                patch("core.execution.shutil.which", return_value="/usr/bin/docker"),
+                patch("core.execution.shutil.which", return_value=_FAKE_DOCKER),
                 patch("core.execution.subprocess.run", side_effect=fake_container_run),
                 patch.object(
                     ProjectFS,
@@ -2320,7 +2421,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
                 create=True,
             ):
                 with self.assertRaisesRegex(Exception, "unsafe-project-path"):
-                    harness_db.migrate(root, "29", 30)
+                    harness_db.migrate(root, "29", 31)
 
             self.assertTrue(hook_called)
             self.assertEqual(

@@ -75,6 +75,21 @@ class TargetSandboxPolicyTest(unittest.TestCase):
                 "--requires-sandbox",
                 "--requires-no-network",
             )
+            run_harness(
+                root,
+                "test-target",
+                "qualify",
+                "--id",
+                "UNIT-Q1",
+                "--target",
+                "UNIT",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "UNIT is the procedural sandbox validation for AC1",
+                "--by",
+                "test-fixture",
+            )
 
             result = run_harness(
                 root,

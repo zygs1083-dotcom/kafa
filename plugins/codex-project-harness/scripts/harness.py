@@ -24,10 +24,13 @@ from core.api import (
     baseline_validate,
     block_task,
     cancel_task,
+    confirm_baseline,
+    cycle_audit,
     cycle_close,
     cycle_start,
     cycle_status,
     doctor,
+    enter_delivery_readiness,
     freeze_baseline,
     init_runtime,
     link_requirement_acceptance,
@@ -35,15 +38,18 @@ from core.api import (
     list_tasks,
     list_test_targets,
     migrate,
+    outcome_report,
     record_decision,
     record_delivery,
     record_finding,
     record_gate,
+    record_outcome_observation,
     record_validation,
     projection_rebuild,
     quickstart_minimal,
     quickstart_status,
     quickstart_status_lines,
+    qualify_test_target,
     repair,
     start_task,
     status_lines,
@@ -56,6 +62,11 @@ from core.api import (
     uninitialized_lines,
 )
 from core.errors import exception_text
+from core.schema_guard import (
+    FAILURE_MODE_STATUS_VALUES,
+    OUTCOME_KIND_VALUES,
+    REQUIREMENT_STATUS_VALUES,
+)
 
 
 RETIRED_V2_COMMANDS = {"adapter", "connector", "dispatch", "agent", "agents", "session"}
@@ -121,9 +132,23 @@ def build_parser() -> argparse.ArgumentParser:
     cycle_start_parser.add_argument("--goal", required=True)
     cycle_start_parser.add_argument("--base-ref", default="")
     cycle_status_parser = cycle_sub.add_parser("status")
+    cycle_status_parser.add_argument("--id", default="")
     cycle_status_parser.add_argument("--json", action="store_true")
+    cycle_audit_parser = cycle_sub.add_parser("audit")
+    cycle_audit_parser.add_argument("--id", required=True)
+    cycle_audit_parser.add_argument("--json", action="store_true")
     cycle_close_parser = cycle_sub.add_parser("close")
     cycle_close_parser.add_argument("--status", required=True, choices=["delivered", "archived"])
+    outcome_record_parser = cycle_sub.add_parser("outcome-record")
+    outcome_record_parser.add_argument("--id", required=True)
+    outcome_record_parser.add_argument("--kind", required=True, choices=OUTCOME_KIND_VALUES)
+    outcome_record_parser.add_argument("--value", required=True, type=int)
+    outcome_record_parser.add_argument("--details", required=True)
+    outcome_record_parser.add_argument("--by", required=True)
+    outcome_record_parser.add_argument("--observed-at", required=True)
+    outcome_record_parser.add_argument("--cycle-id", default="")
+    outcome_report_parser = cycle_sub.add_parser("outcome-report")
+    outcome_report_parser.add_argument("--json", action="store_true")
 
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--delivery", action="store_true")
@@ -143,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_freeze.add_argument("--id", required=True)
     baseline_freeze.add_argument("--summary", required=True)
     baseline_freeze.add_argument("--by", default="")
+    baseline_confirm = baseline_sub.add_parser("confirm")
+    baseline_confirm.add_argument("--id", required=True)
+    baseline_confirm.add_argument("--summary", required=True)
+    baseline_confirm.add_argument("--by", required=True)
     baseline_diff_parser = baseline_sub.add_parser("diff")
     baseline_diff_parser.add_argument("--from", dest="from_id", required=True)
     baseline_diff_parser.add_argument("--to", default="current")
@@ -162,7 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     requirement_add.add_argument("--kind", required=True, choices=["goal", "functional", "non-functional", "non-goal", "assumption", "open-question", "architecture"])
     requirement_add.add_argument("--body", required=True)
     requirement_add.add_argument("--priority", default="")
-    requirement_add.add_argument("--status", default="active")
+    requirement_add.add_argument(
+        "--status",
+        default="active",
+        choices=REQUIREMENT_STATUS_VALUES,
+    )
     requirement_link = requirement_sub.add_parser("link")
     requirement_link.add_argument("--requirement", required=True)
     requirement_link.add_argument("--acceptance", required=True)
@@ -182,7 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
     fm_add.add_argument("--trigger", required=True)
     fm_add.add_argument("--expected", required=True)
     fm_add.add_argument("--risk", default="medium", choices=["low", "medium", "high", "critical"])
-    fm_add.add_argument("--status", default="identified", choices=["identified", "accepted", "exempt"])
+    fm_add.add_argument(
+        "--status",
+        default="identified",
+        choices=FAILURE_MODE_STATUS_VALUES,
+    )
     fm_add.add_argument("--acceptance", default="")
     fm_add.add_argument("--recovery", default="")
     fm_add.add_argument("--data-safety", default="")
@@ -249,16 +286,44 @@ def build_parser() -> argparse.ArgumentParser:
     test_target_link = test_target_sub.add_parser("link")
     test_target_link.add_argument("--task", required=True)
     test_target_link.add_argument("--target", required=True)
+    test_target_qualify = test_target_sub.add_parser("qualify")
+    test_target_qualify.add_argument("--id", required=True)
+    test_target_qualify.add_argument("--target", required=True)
+    test_target_qualify.add_argument("--acceptance", required=True)
+    test_target_qualify.add_argument("--rationale", required=True)
+    test_target_qualify.add_argument("--by", required=True)
     test_target_sub.add_parser("list")
 
-    verify = sub.add_parser("verify")
+    verify = sub.add_parser(
+        "verify",
+        help="run controller-owned immutable verification for a registered target",
+    )
     verify_sub = verify.add_subparsers(dest="verify_command", required=True)
-    verify_run_parser = verify_sub.add_parser("run")
+    verify_run_parser = verify_sub.add_parser(
+        "run",
+        description=(
+            "Execute a registered target and record schema 31 provenance. "
+            "Container images must already be local; execution uses the resolved "
+            "immutable identity with --pull=never."
+        ),
+    )
     verify_run_parser.add_argument("--target", required=True)
     verify_run_parser.add_argument("--acceptance", default="")
-    verify_run_parser.add_argument("--failure-mode", action="append", default=[])
+    verify_run_parser.add_argument(
+        "--failure-mode",
+        action="append",
+        default=[],
+        help="failure mode linked to the same acceptance; medium coverage requires a structured result",
+    )
     verify_run_parser.add_argument("--runner", choices=["local", "container"], default="local")
-    verify_run_parser.add_argument("--container-image", default="")
+    verify_run_parser.add_argument(
+        "--container-image",
+        default="",
+        help=(
+            "requested already-local Docker/Podman image; Kafa resolves and runs "
+            "its immutable identity without pulling"
+        ),
+    )
 
     decision = sub.add_parser("decision")
     decision_sub = decision.add_subparsers(dest="decision_command", required=True)
@@ -287,12 +352,18 @@ def build_parser() -> argparse.ArgumentParser:
     gate_record.add_argument("--result", required=True, choices=["pass", "fail", "conditional", "blocked"])
     gate_record.add_argument("--gate", default="independent_qa")
     gate_record.add_argument("--blocking-findings", default="")
-    gate_record.add_argument("--residual-risk", default="")
+    gate_record.add_argument(
+        "--residual-risk",
+        default="",
+        help="explicit residual-risk text; required for a passing same-context-degraded gate",
+    )
     gate_record.add_argument("--finding", action="append", default=[])
     gate_record.add_argument("--reviewer-context-id", default="")
+    gate_record.add_argument("--qualification", action="append", default=[])
 
     delivery = sub.add_parser("delivery")
     delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
+    delivery_sub.add_parser("ready")
     delivery_record = delivery_sub.add_parser("record")
     delivery_record.add_argument("--scope", required=True)
     delivery_record.add_argument("--acceptance", default="")
@@ -327,7 +398,10 @@ def main() -> int:
     try:
         needs_initialized = (
             args.command in {"status", "doctor", "validate", "verify"}
-            or (args.command == "cycle" and args.cycle_command == "status")
+            or (
+                args.command == "cycle"
+                and args.cycle_command in {"status", "audit", "outcome-report"}
+            )
         )
         if needs_initialized and not runtime_initialized(root):
             print("\n".join(uninitialized_lines(root)))
@@ -356,13 +430,59 @@ def main() -> int:
                 )[1],
             )
         elif args.command == "cycle" and args.cycle_command == "status":
-            row = cycle_status(root)
+            row = cycle_status(root, args.id)
             if args.json:
                 print(json.dumps(row, ensure_ascii=False, sort_keys=True))
             else:
                 print(f"cycle={row['id']} status={row['status']} phase={row['phase']} candidate={row.get('candidate_sha', '')}")
+        elif args.command == "cycle" and args.cycle_command == "audit":
+            report = cycle_audit(root, args.id)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            else:
+                print(
+                    f"cycle={report['cycle']['id']} "
+                    f"status={report['cycle']['status']} "
+                    f"consistent={str(report['consistent']).lower()} "
+                    f"facts_sha256={report['facts_sha256']}"
+                )
+                for blocker in report["blockers"]:
+                    print(
+                        f"[{blocker['code']}] {blocker['message']} "
+                        f"entity={blocker['entity_type']}:{blocker['entity_id']}"
+                    )
+            if not report["consistent"]:
+                return 1
         elif args.command == "cycle" and args.cycle_command == "close":
             mutate("cycle.close", lambda: (cycle_close(root, args.status), f"OK: cycle closed {args.status}")[1])
+        elif args.command == "cycle" and args.cycle_command == "outcome-record":
+            mutate(
+                "cycle.outcome-record",
+                lambda: (
+                    record_outcome_observation(
+                        root,
+                        args.id,
+                        args.kind,
+                        args.value,
+                        args.details,
+                        args.by,
+                        args.observed_at,
+                        cycle_id=args.cycle_id,
+                    ),
+                    f"OK: outcome observation recorded {args.id}",
+                )[1],
+            )
+        elif args.command == "cycle" and args.cycle_command == "outcome-report":
+            report = outcome_report(root)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            else:
+                print(
+                    "outcome-report "
+                    f"version={report['report_version']} "
+                    f"cycle={report['cycle_id']} "
+                    f"observations={report['observation_count']}"
+                )
         elif args.command == "quickstart" and args.quickstart_command == "status":
             report = quickstart_status(root)
             if args.json:
@@ -413,6 +533,19 @@ def main() -> int:
             print(f"OK: migrated {args.from_version}->{args.to_version}")
         elif args.command == "baseline" and args.baseline_command == "freeze":
             mutate("baseline.freeze", lambda: (freeze_baseline(root, args.id, args.summary, by=args.by), f"OK: baseline frozen {args.id}")[1])
+        elif args.command == "baseline" and args.baseline_command == "confirm":
+            mutate(
+                "baseline.confirm",
+                lambda: (
+                    confirm_baseline(
+                        root,
+                        args.id,
+                        args.summary,
+                        by=args.by,
+                    ),
+                    f"OK: baseline confirmed {args.id}",
+                )[1],
+            )
         elif args.command == "baseline" and args.baseline_command == "diff":
             print("\n".join(baseline_diff(root, args.from_id, args.to)))
         elif args.command == "baseline" and args.baseline_command == "validate":
@@ -550,6 +683,21 @@ def main() -> int:
             )
         elif args.command == "test-target" and args.test_target_command == "link":
             mutate("test-target.link", lambda: (link_task_test_target(root, args.task, args.target), f"OK: test target linked {args.task}->{args.target}")[1])
+        elif args.command == "test-target" and args.test_target_command == "qualify":
+            mutate(
+                "test-target.qualify",
+                lambda: (
+                    qualify_test_target(
+                        root,
+                        args.id,
+                        args.target,
+                        args.acceptance,
+                        args.rationale,
+                        args.by,
+                    ),
+                    f"OK: test target qualification recorded {args.id}",
+                )[1],
+            )
         elif args.command == "test-target" and args.test_target_command == "list":
             print("\n".join(list_test_targets(root)))
         elif args.command == "verify" and args.verify_command == "run":
@@ -587,8 +735,17 @@ def main() -> int:
                         residual_risk=args.residual_risk,
                         findings=", ".join(args.finding),
                         reviewer_context_id=args.reviewer_context_id,
+                        qualifications=args.qualification,
                     ),
                     f"OK: quality gate recorded {args.gate}={args.result}",
+                )[1],
+            )
+        elif args.command == "delivery" and args.delivery_command == "ready":
+            mutate(
+                "delivery.ready",
+                lambda: (
+                    enter_delivery_readiness(root),
+                    "OK: delivery readiness entered",
                 )[1],
             )
         elif args.command == "delivery" and args.delivery_command == "record":

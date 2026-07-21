@@ -129,13 +129,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
+  candidate:
     needs:
       - verify
       - real_host_compatibility
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../release-candidate
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@v4
@@ -152,46 +157,207 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install pinned Codex CLI
+      - name: Install pinned build and Codex tooling
         run: |
+          python -m pip install build==1.5.0 setuptools==83.0.0
           codex_version="$(python -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
           npm install --global "@openai/codex@$codex_version"
 
-      - name: Revalidate tag before artifact build
-        run: python -m kafa.release --require-tag
-
-      - name: Build final local release artifacts
-        run: |
-          mkdir -p dist
-          python -m pip wheel --no-deps . --wheel-dir dist
-          git archive --format=tar.gz --prefix="kafa-${GITHUB_REF_NAME}/" --output="dist/kafa-${GITHUB_REF_NAME}-source.tar.gz" "$GITHUB_REF_NAME"
-
-      - name: Smoke final release artifacts
-        run: |
-          python tests/run_isolated_install_smoke.py \
-            --repo . \
-            --wheel dist/*.whl \
-            --source-archive dist/*-source.tar.gz
-
-      - name: Prepare release notes and checksums
+      - name: Resolve checksum-pinned Syft asset
         run: |
           python - <<'PY'
           import json
+          import os
+          from pathlib import Path
+
+          tooling = json.loads(Path("release-tooling.json").read_text(encoding="utf-8"))
+          item = tooling["sbom"]["downloads"]["linux-amd64"]
+          version = tooling["sbom"]["version"]
+          values = {
+              "SYFT_ARCHIVE": item["filename"],
+              "SYFT_SHA256": item["sha256"],
+              "SYFT_URL": (
+                  "https://github.com/anchore/syft/releases/download/"
+                  f"v{version}/{item['filename']}"
+              ),
+              "SYFT_BIN": str(Path(os.environ["RUNNER_TEMP"]) / "syft-bin" / "syft"),
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8", newline="\n") as handle:
+              for key, value in values.items():
+                  handle.write(f"{key}={value}\n")
+          PY
+
+      - name: Download checksum-pinned Syft
+        run: |
+          mkdir -p "$RUNNER_TEMP/syft-bin"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$SYFT_ARCHIVE" "$SYFT_URL"
+          printf '%s  %s\n' "$SYFT_SHA256" "$RUNNER_TEMP/$SYFT_ARCHIVE" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$SYFT_ARCHIVE" -C "$RUNNER_TEMP/syft-bin" syft
+          chmod 0755 "$RUNNER_TEMP/syft-bin/syft"
+          "$RUNNER_TEMP/syft-bin/syft" version -o json
+
+      - name: Validate tag and build exact wheel and sdist once
+        run: |
+          python -m kafa.release --require-tag
+          mkdir -p "$RELEASE_CANDIDATE_DIR"
+          python -m build --no-isolation --wheel --sdist --outdir "$RELEASE_CANDIDATE_DIR"
+          pep440="$(python -c 'import json; print(json.load(open("release.json"))["pep440_version"])')"
+          wheel="$RELEASE_CANDIDATE_DIR/kafa-${pep440}-py3-none-any.whl"
+          sdist="$RELEASE_CANDIDATE_DIR/kafa-${pep440}.tar.gz"
+          {
+            printf 'WHEEL=%s\n' "$wheel"
+            printf 'SDIST=%s\n' "$sdist"
+            printf 'WHEEL_SBOM=%s.cdx.json\n' "$wheel"
+            printf 'SDIST_SBOM=%s.cdx.json\n' "$sdist"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate and verify local SBOM and provenance evidence
+        run: |
+          python -m kafa.supply_chain generate \
+            --repo "$GITHUB_WORKSPACE" \
+            --dist "$RELEASE_CANDIDATE_DIR" \
+            --syft "$SYFT_BIN"
+          python -m kafa.supply_chain verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --dist "$RELEASE_CANDIDATE_DIR"
+
+      - name: Smoke exact release artifacts in isolated HOME and venv
+        run: |
+          python tests/run_isolated_install_smoke.py \
+            --repo . \
+            --codex-bin "$(command -v codex)" \
+            --wheel "$WHEEL" \
+            --source-archive "$SDIST" \
+            --json
+
+      - name: Reverify artifact bytes after isolated install
+        run: |
+          python -m kafa.supply_chain verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --dist "$RELEASE_CANDIDATE_DIR"
+
+      - name: Prepare exact release notes
+        run: |
+          python - <<'PY'
+          import json
+          import os
           from pathlib import Path
           from kafa.release import changelog_section
 
           manifest = json.loads(Path("release.json").read_text(encoding="utf-8"))
           section = changelog_section(Path("CHANGELOG.md").read_text(encoding="utf-8"), manifest["tag"])
-          Path("release-notes.md").write_text(section.split("\n", 1)[1].strip() + "\n", encoding="utf-8")
+          target = Path(os.environ["RELEASE_CANDIDATE_DIR"]) / "release-notes.md"
+          target.write_text(section.split("\n", 1)[1].strip() + "\n", encoding="utf-8", newline="\n")
           PY
-          (cd dist && sha256sum ./*.whl ./*-source.tar.gz > SHA256SUMS)
+
+      - name: Generate GitHub build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-checksums: ${{ env.RELEASE_CANDIDATE_DIR }}/SHA256SUMS
+
+      - name: Generate GitHub wheel SBOM attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: ${{ env.WHEEL }}
+          sbom-path: ${{ env.WHEEL_SBOM }}
+
+      - name: Generate GitHub sdist SBOM attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: ${{ env.SDIST }}
+          sbom-path: ${{ env.SDIST_SBOM }}
+
+      - name: Preserve exact attested candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafa-release-candidate-${{ github.sha }}
+          path: ${{ env.RELEASE_CANDIDATE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs:
+      - candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../release-candidate
+    steps:
+      - name: Checkout exact tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download exact attested candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: kafa-release-candidate-${{ github.sha }}
+          path: ${{ env.RELEASE_CANDIDATE_DIR }}
+
+      - name: Revalidate tag and candidate bytes
+        run: |
+          python -m kafa.release --require-tag
+          python -m kafa.supply_chain verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --dist "$RELEASE_CANDIDATE_DIR"
+          pep440="$(python -c 'import json; print(json.load(open("release.json"))["pep440_version"])')"
+          wheel="$RELEASE_CANDIDATE_DIR/kafa-${pep440}-py3-none-any.whl"
+          sdist="$RELEASE_CANDIDATE_DIR/kafa-${pep440}.tar.gz"
+          {
+            printf 'WHEEL=%s\n' "$wheel"
+            printf 'SDIST=%s\n' "$sdist"
+            printf 'WHEEL_SBOM=%s.cdx.json\n' "$wheel"
+            printf 'SDIST_SBOM=%s.cdx.json\n' "$sdist"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify GitHub provenance and SBOM attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for artifact in "$WHEEL" "$SDIST"; do
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$GITHUB_SHA" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --predicate-type https://slsa.dev/provenance/v1
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$GITHUB_SHA" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --predicate-type https://cyclonedx.org/bom
+          done
+
+      - name: Final local verification before publication
+        run: |
+          python -m kafa.supply_chain verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --dist "$RELEASE_CANDIDATE_DIR"
 
       - name: Publish GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" \
+            "$WHEEL" \
+            "$SDIST" \
+            "$WHEEL_SBOM" \
+            "$SDIST_SBOM" \
+            "$RELEASE_CANDIDATE_DIR/SHA256SUMS" \
+            "$RELEASE_CANDIDATE_DIR/kafa-build-provenance.intoto.json" \
+            "$RELEASE_CANDIDATE_DIR/kafa-supply-chain-manifest.json" \
             --verify-tag \
             --prerelease \
             --title "$GITHUB_REF_NAME" \
-            --notes-file release-notes.md
+            --notes-file "$RELEASE_CANDIDATE_DIR/release-notes.md"
