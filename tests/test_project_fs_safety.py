@@ -44,9 +44,18 @@ from tests.test_local_core_hardening import _active_projection_validator  # noqa
 from tests.test_schema30_migration import init_schema29_fixture  # noqa: E402
 
 
-_FAKE_DOCKER = "/usr/bin/docker"
+_FAKE_DOCKER = str(
+    (
+        Path(tempfile.gettempdir())
+        / ("docker.exe" if os.name == "nt" else "docker")
+    ).absolute()
+)
 _FAKE_DOCKER_CONTEXT = "default"
-_FAKE_DOCKER_ENDPOINT = "unix:///var/run/docker.sock"
+_FAKE_DOCKER_ENDPOINT = (
+    "npipe:////./pipe/docker_engine"
+    if os.name == "nt"
+    else "unix:///var/run/docker.sock"
+)
 _FAKE_DOCKER_IMAGE_DIGEST = f"sha256:{'a' * 64}"
 _REAL_SUBPROCESS_RUN = subprocess.run
 

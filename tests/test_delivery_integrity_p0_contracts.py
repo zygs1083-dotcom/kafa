@@ -48,6 +48,19 @@ def run_harness(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_rendered_harness_command(command: str) -> subprocess.CompletedProcess[str]:
+    args: str | list[str] = (
+        command if sys.platform == "win32" else shlex.split(command)
+    )
+    return subprocess.run(
+        args,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def db_path(root: Path) -> Path:
     return root / ".ai-team/state/harness.db"
 
@@ -604,13 +617,7 @@ class CancelledTaskCoverageRedTests(unittest.TestCase):
                 for command in status["next_commands"]
                 if " task add " in f" {command} "
             )
-            result = subprocess.run(
-                shlex.split(replacement),
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result = run_rendered_harness_command(replacement)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unrelated_cancelled_task_does_not_block_accepted_graph(self) -> None:
@@ -2392,13 +2399,7 @@ class PublicJourneyAndProjectionTests(unittest.TestCase):
             self.assertTrue(parts[risk_index + 1].strip())
             self.assertIn(qualification_id, parts)
 
-            result = subprocess.run(
-                parts,
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result = run_rendered_harness_command(gate_command)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(
                 query_scalar(
