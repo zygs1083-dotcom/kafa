@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:execution",
   "title": "Codex Project Harness Immutable Execution",
   "description": "Insert-only controller execution fact. Stored properties are immutable after creation.",
   "type": "object",
@@ -8,6 +9,7 @@
     "id",
     "cycle_id",
     "candidate_sha",
+    "target_definition_sha256",
     "command",
     "exit_code",
     "stdout_sha256",
@@ -19,6 +21,17 @@
     "sandbox_status",
     "no_network",
     "policy_status",
+    "platform",
+    "runtime_executable",
+    "runtime_version",
+    "runtime_executable_sha256",
+    "policy_version",
+    "container_engine",
+    "container_engine_version",
+    "container_engine_endpoint",
+    "container_image_requested",
+    "container_image_digest",
+    "provenance_status",
     "created_at"
   ],
   "properties": {
@@ -26,18 +39,100 @@
     "cycle_id": { "type": "string" },
     "candidate_sha": { "type": "string" },
     "target_id": { "type": ["string", "null"] },
+    "target_definition_sha256": { "type": "string", "pattern": "^$|^[0-9a-f]{64}$" },
     "command": { "type": "string" },
     "exit_code": { "type": "integer" },
     "stdout_sha256": { "type": "string" },
     "artifact_path": { "type": "string" },
     "executed_count": { "type": "integer", "minimum": 0 },
-    "result_format": { "type": "string" },
-    "semantic_status": { "type": "string" },
+    "result_format": { "type": "string", "enum": ["regex", "junit", "pytest-json", "jest-json", "go-json", "cargo-nextest-json", "playwright-json"] },
+    "semantic_status": { "type": "string", "enum": ["pass", "fail"] },
     "runner": { "type": "string", "enum": ["local", "container"] },
-    "sandbox_status": { "type": "string" },
+    "sandbox_status": { "type": "string", "enum": ["", "available", "unavailable"] },
     "no_network": { "type": "integer", "enum": [0, 1] },
-    "policy_status": { "type": "string" },
+    "policy_status": { "type": "string", "enum": ["allowed", "rejected"] },
+    "platform": { "type": "string" },
+    "runtime_executable": { "type": "string" },
+    "runtime_version": { "type": "string" },
+    "runtime_executable_sha256": { "type": "string", "pattern": "^$|^[0-9a-f]{64}$" },
+    "policy_version": { "type": "string" },
+    "container_engine": { "type": "string" },
+    "container_engine_version": { "type": "string" },
+    "container_engine_endpoint": { "type": "string", "pattern": "^$|^local-process$|^unix:///.+$|^[nN][pP][iI][pP][eE]:////\\./[pP][iI][pP][eE]/[^/\\\\]+$" },
+    "container_image_requested": { "type": "string" },
+    "container_image_digest": { "type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$" },
+    "provenance_status": { "type": "string", "enum": ["complete", "legacy-incomplete"] },
     "created_at": { "type": "string" }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["provenance_status"],
+        "properties": {
+          "provenance_status": { "const": "complete" }
+        }
+      },
+      "then": {
+        "properties": {
+          "target_definition_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "platform": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "runtime_executable": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "runtime_version": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "runtime_executable_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "policy_version": { "type": "string", "const": "schema31-v2" }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["provenance_status", "runner"],
+        "properties": {
+          "provenance_status": { "const": "complete" },
+          "runner": { "const": "local" }
+        }
+      },
+      "then": {
+        "properties": {
+          "container_engine": { "type": "string", "const": "" },
+          "container_engine_version": { "type": "string", "const": "" },
+          "container_engine_endpoint": { "type": "string", "const": "" },
+          "container_image_requested": { "type": "string", "const": "" },
+          "container_image_digest": { "type": "string", "const": "" }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["provenance_status", "runner"],
+        "properties": {
+          "provenance_status": { "const": "complete" },
+          "runner": { "const": "container" }
+        }
+      },
+      "then": {
+        "properties": {
+          "container_engine_version": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "container_image_requested": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "container_image_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "oneOf": [
+          {
+            "required": ["container_engine", "container_engine_endpoint"],
+            "properties": {
+              "container_engine": { "type": "string", "pattern": "^.*[/\\\\][dD][oO][cC][kK][eE][rR](\\.[eE][xX][eE])?$" },
+              "container_engine_endpoint": { "type": "string", "pattern": "^(unix:///.+|[nN][pP][iI][pP][eE]:////\\./[pP][iI][pP][eE]/[^/\\\\]+)$" }
+            }
+          },
+          {
+            "required": ["container_engine", "container_engine_endpoint"],
+            "properties": {
+              "container_engine": { "type": "string", "pattern": "^.*[/\\\\][pP][oO][dD][mM][aA][nN](\\.[eE][xX][eE])?$" },
+              "container_engine_endpoint": { "type": "string", "const": "local-process" }
+            }
+          }
+        ]
+      }
+    }
+  ],
   "additionalProperties": false
 }

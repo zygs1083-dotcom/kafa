@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:task",
   "title": "Codex Project Harness Task",
   "type": "object",
   "required": ["uid", "id", "cycle_id", "task", "owner", "status", "acceptance_ids"],
@@ -19,7 +20,7 @@
     "evidence": { "type": "string" },
     "submitted_context_id": { "type": "string" },
     "accepted_by": { "type": "string" },
-    "revision": { "type": "integer" },
+    "revision": { "type": "integer", "minimum": 1 },
     "updated_at": { "type": "string" }
   },
   "additionalProperties": false

@@ -6,5 +6,7 @@ preserve local style, and add tests where risk warrants. Return code, results,
 and local verification evidence to the root controller. Do not write Kafa facts,
 including Kafa task, validation, gate, or delivery facts. Native Codex/ChatGPT
 owns task, subagent, worktree, approval, model, cancellation, and handoff
-lifecycle. Do not create or mutate that lifecycle state.
+lifecycle. Do not create or mutate that lifecycle state. Return the exact test
+command and structured-result path when applicable; only the root controller
+may produce qualified schema 31 execution provenance.
 """

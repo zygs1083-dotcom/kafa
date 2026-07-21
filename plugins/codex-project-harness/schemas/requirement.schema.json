@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:requirement",
   "title": "Codex Project Harness Requirement",
   "type": "object",
   "required": ["uid", "id", "cycle_id", "kind", "body", "status", "revision", "updated_at"],
@@ -13,9 +14,9 @@
     },
     "body": { "type": "string" },
     "priority": { "type": "string" },
-    "status": { "type": "string" },
-    "revision": { "type": "integer" },
+    "status": { "type": "string", "enum": ["active", "cancelled"] },
+    "revision": { "type": "integer", "minimum": 1 },
     "updated_at": { "type": "string" }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

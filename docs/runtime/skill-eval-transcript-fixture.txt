@@ -11,7 +11,7 @@ $ harness.py --root . requirement add --id R1 --kind functional --body "User can
 $ harness.py --root . acceptance add --id AC1 --criterion "Create exactly one task"
 $ harness.py --root . requirement link --requirement R1 --acceptance AC1
 $ harness.py --root . failure-mode add --id FM1 --feature "Task creation" --scenario "Duplicate submit" --trigger "same form twice" --expected "one task" --risk medium --acceptance AC1
-$ harness.py --root . baseline freeze --id B1 --summary "Confirmed task creation scope"
+$ harness.py --root . baseline confirm --id B1 --summary "Confirmed task creation scope" --by root-controller
 $ harness.py --root . task add --id T1 --task "Implement task creation" --owner developer --acceptance AC1 --failure-mode FM1
 $ harness.py --root . task start T1
 
@@ -20,18 +20,20 @@ A Native Host producer returns the changed files and commands to the root
 controller. It does not write Kafa state.
 
 $ harness.py --root . task submit T1 --context-id producer-context --evidence "Implementation and tests returned to root controller"
-$ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m unittest" --description "Unit test suite" --result-format regex
+$ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m pytest --json-report --json-report-file=.ai-team/results/unit.json" --description "Structured unit test suite" --result-format pytest-json --result-path .ai-team/results/unit.json
 $ harness.py --root . test-target link --task T1 --target UNIT
+$ harness.py --root . test-target qualify --id Q1 --target UNIT --acceptance AC1 --rationale "UNIT directly exercises task creation and duplicate-submit behavior" --by root-controller
 $ harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
 
 Assistant:
 A distinct Native Host reviewer inspects the current candidate and returns no
 blocking findings. The root controller records the review decision.
 
-$ harness.py --root . gate record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass
 $ harness.py --root . task accept T1 --evidence "Distinct reviewer accepted the current candidate"
-$ harness.py --root . validate --delivery
+$ harness.py --root . gate record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification Q1
+$ harness.py --root . delivery ready
 $ harness.py --root . delivery record --scope "Task creation" --acceptance AC1 --changed-files "src/tasks.py tests/test_tasks.py" --validation "UNIT immutable execution passed" --qa "fresh reviewer context passed" --failure-mode-coverage "FM1 covered" --quality-gate pass --known-gaps "none" --handoff "verified code only; no deployment"
+$ harness.py --root . validate --delivery
 
 Assistant:
 If this were high/critical work without verifiable current-candidate provenance

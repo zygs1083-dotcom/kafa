@@ -70,7 +70,10 @@ def prepare_verified_candidate(root: Path) -> None:
             "reviewer-context",
             "--result",
             "pass",
+            "--qualification",
+            "SMOKE-Q1",
         ),
+        ("delivery", "ready"),
     ]
     for args in commands:
         result = run_harness(root, *args)
@@ -79,7 +82,7 @@ def prepare_verified_candidate(root: Path) -> None:
 
 
 class DeliveryCyclesTest(unittest.TestCase):
-    def test_init_creates_schema30_active_current_cycle(self) -> None:
+    def test_init_creates_active_current_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             result = run_harness(root, "init")

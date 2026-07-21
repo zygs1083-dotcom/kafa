@@ -94,37 +94,55 @@ def insert_finding(
         conn.commit()
 
 
+def link_finding_to_active_gate(root: Path, finding_id: str) -> None:
+    """Link a legacy schema-30 fixture finding without invoking schema-31 CLI writes."""
+
+    with closing(sqlite3.connect(db_path(root))) as conn:
+        conn.execute(
+            "insert into quality_gate_findings (gate_id, finding_id) values ('G1', ?)",
+            (finding_id,),
+        )
+        conn.commit()
+
+
+def append_legacy_gate_result(root: Path, *, gate_id: str, result: str) -> None:
+    """Construct historical gate ordering for the schema-30 policy compatibility fixture."""
+
+    with closing(sqlite3.connect(db_path(root))) as conn:
+        candidate = conn.execute(
+            "select candidate_sha from delivery_cycles where id = 'CYCLE-current'"
+        ).fetchone()[0]
+        previous = conn.execute(
+            "select id from quality_gates where gate_status = 'active'"
+        ).fetchone()
+        if previous:
+            conn.execute(
+                "update quality_gates set gate_status = 'superseded', superseded_by = ? where id = ?",
+                (gate_id, previous[0]),
+            )
+        sequence = int(conn.execute("select coalesce(max(sequence), 0) + 1 from quality_gates").fetchone()[0])
+        conn.execute(
+            """
+            insert into quality_gates
+            (id, sequence, cycle_id, candidate_sha, gate_status, gate,
+             producer_context_id, reviewer_context_id, review_status, result,
+             blocking_findings, residual_risk, reviewed_revision, created_at)
+            values (?, ?, 'CYCLE-current', ?, 'active', 'independent_qa',
+                    'producer-context', 'reviewer-context', 'reviewed-local', ?,
+                    '', '', 1, '2026-07-11T10:00:00Z')
+            """,
+            (gate_id, sequence, candidate, result),
+        )
+        conn.commit()
+
+
 class StopShipRegressionTest(unittest.TestCase):
     def test_open_critical_finding_links_to_gate_and_blocks_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             create_schema30_delivery_fixture(root)
-            run_harness(
-                root,
-                "finding",
-                "record",
-                "--id",
-                "F-critical",
-                "--surface",
-                "delivery",
-                "--severity",
-                "critical",
-                "--status",
-                "open",
-                "--summary",
-                "Known blocker",
-            )
-            run_harness(
-                root,
-                "gate",
-                "record",
-                "--reviewer-context",
-                "same-context-degraded",
-                "--result",
-                "pass",
-                "--finding",
-                "F-critical",
-            )
+            insert_finding(root, finding_id="F-critical", status="open")
+            link_finding_to_active_gate(root, "F-critical")
             with closing(sqlite3.connect(db_path(root))) as conn:
                 linked = conn.execute(
                     """
@@ -144,8 +162,8 @@ class StopShipRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             create_schema30_delivery_fixture(root)
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass")
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "fail")
+            append_legacy_gate_result(root, gate_id="G2", result="pass")
+            append_legacy_gate_result(root, gate_id="G3", result="fail")
             with closing(sqlite3.connect(db_path(root))) as conn:
                 pass_id = conn.execute(
                     "select id from quality_gates where sequence = 2"

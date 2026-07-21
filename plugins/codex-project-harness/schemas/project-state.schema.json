@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:project-state",
   "title": "Codex Project Harness Project State",
   "type": "object",
   "required": ["id", "status", "phase", "current_cycle_id", "scope_status", "current_owner", "schema_version", "runtime_version", "project_id", "revision", "updated_at"],
@@ -25,10 +26,10 @@
     "current_cycle_id": { "type": "string" },
     "scope_status": { "type": "string" },
     "current_owner": { "type": "string" },
-    "schema_version": { "type": "integer" },
+    "schema_version": { "type": "integer", "const": 31 },
     "runtime_version": { "type": "string" },
     "project_id": { "type": "string" },
-    "revision": { "type": "integer" },
+    "revision": { "type": "integer", "minimum": 1 },
     "updated_at": { "type": "string" }
   },
   "additionalProperties": false

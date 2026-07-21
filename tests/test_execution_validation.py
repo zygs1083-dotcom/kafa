@@ -71,7 +71,18 @@ def create_candidate(root: Path) -> None:
 def initialize_target(root: Path, *, target_id: str = "UNIT", command: str = "python3 -B -m unittest test_candidate.py") -> None:
     for args in (
         ("init",),
+        (
+            "requirement",
+            "add",
+            "--id",
+            "REQ1",
+            "--kind",
+            "functional",
+            "--body",
+            "candidate requirement",
+        ),
         ("acceptance", "add", "--id", "AC1", "--criterion", "candidate passes"),
+        ("requirement", "link", "--requirement", "REQ1", "--acceptance", "AC1"),
         (
             "test-target",
             "add",
@@ -86,6 +97,23 @@ def initialize_target(root: Path, *, target_id: str = "UNIT", command: str = "py
         result = run_harness(root, *args)
         if result.returncode != 0:
             raise AssertionError(result.stdout + result.stderr)
+    qualified = run_harness(
+        root,
+        "test-target",
+        "qualify",
+        "--id",
+        f"{target_id}-Q1",
+        "--target",
+        target_id,
+        "--acceptance",
+        "AC1",
+        "--rationale",
+        f"{target_id} proves AC1",
+        "--by",
+        "test-author",
+    )
+    if qualified.returncode != 0:
+        raise AssertionError(qualified.stdout + qualified.stderr)
 
 
 def execution_fact_counts(root: Path) -> tuple[int, int, int]:
@@ -133,7 +161,7 @@ class ImmutableExecutionTests(unittest.TestCase):
                      artifact_path, executed_count, result_format, semantic_status, runner,
                      sandbox_status, no_network, policy_status, created_at)
                     values ('EX1', 'CYCLE-current', 'candidate', '', 'true', 0, ?, '', 1,
-                            'regex', 'pass', 'local', 'not-requested', 0, 'pass', 'now')
+                            'regex', 'pass', 'local', '', 0, 'allowed', 'now')
                     """,
                     ("0" * 64,),
                 )
@@ -192,6 +220,22 @@ class ImmutableExecutionTests(unittest.TestCase):
                     result_path,
                 )
                 self.assertEqual(added.returncode, 0, added.stdout + added.stderr)
+                qualified = run_harness(
+                    root,
+                    "test-target",
+                    "qualify",
+                    "--id",
+                    f"{target}-Q1",
+                    "--target",
+                    target,
+                    "--acceptance",
+                    "AC1",
+                    "--rationale",
+                    f"{target} proves structured result behavior",
+                    "--by",
+                    "test-author",
+                )
+                self.assertEqual(qualified.returncode, 0, qualified.stdout + qualified.stderr)
                 verified = run_harness(root, "verify", "run", "--target", target, "--acceptance", "AC1")
                 self.assertNotEqual(verified.returncode, 0, name)
             self.assertEqual(execution_fact_counts(root), (0, 0, 0))
@@ -239,6 +283,23 @@ class ImmutableExecutionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             before = (stale.read_bytes(), stale.stat().st_mtime_ns)
+
+            qualified = run_harness(
+                root,
+                "test-target",
+                "qualify",
+                "--id",
+                "STRUCTURED-Q1",
+                "--target",
+                "STRUCTURED",
+                "--acceptance",
+                "AC1",
+                "--rationale",
+                "STRUCTURED proves fresh result behavior",
+                "--by",
+                "test-author",
+            )
+            self.assertEqual(qualified.returncode, 0, qualified.stdout + qualified.stderr)
 
             verified = run_harness(
                 root,
@@ -377,6 +438,30 @@ class ImmutableExecutionTests(unittest.TestCase):
 
             def fake_container_run(argv, **kwargs):
                 observed.extend(argv)
+                if argv[1:] == ["context", "show"]:
+                    return subprocess.CompletedProcess(argv, 0, "default\n", "")
+                if argv[1:3] == ["context", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        '[{"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]',
+                        "",
+                    )
+                endpoint_args = ["--host", "unix:///var/run/docker.sock"]
+                if argv[1:3] != endpoint_args:
+                    raise AssertionError(f"missing explicit Docker endpoint: {argv}")
+                command = argv[3:]
+                if command and command[0] == "version":
+                    return subprocess.CompletedProcess(argv, 0, "25.0.0\n", "")
+                if command[:2] == ["image", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        '[{"Id":"sha256:' + ('d' * 64) + '","RepoDigests":[]}]',
+                        "",
+                    )
+                if not command or command[0] != "run":
+                    raise AssertionError(f"unexpected Docker command: {argv}")
                 artifact_mount = next(
                     value for value in argv if value.endswith(":/artifacts:rw")
                 )
@@ -400,6 +485,12 @@ class ImmutableExecutionTests(unittest.TestCase):
             self.assertEqual(result.semantic_status, "pass")
             self.assertTrue(result.no_network)
             self.assertEqual(result.sandbox_status, "available")
+            self.assertEqual(
+                result.container_engine_endpoint,
+                "unix:///var/run/docker.sock",
+            )
+            self.assertIn("--host", observed)
+            self.assertIn("--pull=never", observed)
             self.assertIn("--network", observed)
             self.assertEqual(observed[observed.index("--network") + 1], "none")
 
@@ -426,7 +517,7 @@ class ImmutableExecutionTests(unittest.TestCase):
             with harness_db.connection(root) as conn:
                 issues = harness_db.validate_delivery(conn, root)
             self.assertTrue(
-                any("no linked immutable execution" in issue for issue in issues),
+                any("[current-validation-missing]" in issue for issue in issues),
                 issues,
             )
 
@@ -472,7 +563,10 @@ class ImmutableExecutionTests(unittest.TestCase):
                     "reviewer-context",
                     "--result",
                     "pass",
+                    "--qualification",
+                    "SMOKE-Q1",
                 ),
+                ("delivery", "ready"),
                 ("delivery", "record", "--scope", "local", "--acceptance", "SMOKE-AC1"),
                 ("validate", "--delivery"),
             )

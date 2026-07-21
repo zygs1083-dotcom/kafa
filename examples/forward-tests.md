@@ -32,6 +32,8 @@ Expected behavior:
 - Uses OpenSpec as specification authority for the broad change.
 - Maps root-owned tasks and test targets to acceptance criteria and failure modes.
 - Runs controller-owned verification before any quality-gate or delivery decision.
+- Requires qualified schema 31 execution provenance; `legacy-incomplete` history
+  or missing target/runtime facts cannot satisfy delivery.
 - Reports `human-review-required` when high/critical provenance is insufficient.
 - Does not deploy.
 
@@ -47,6 +49,8 @@ Expected behavior:
 - Creates or updates focused tasks.
 - Uses test-first delivery when a stable export contract exists.
 - Registers an exact test target and runs `verify run` on the current candidate.
+- Uses an already-local immutable image with `--pull=never` when container
+  verification is required; missing capability remains blocked.
 - Records only truthful validation and delivery facts; skipped checks are not passes.
 
 ## Bug Fix

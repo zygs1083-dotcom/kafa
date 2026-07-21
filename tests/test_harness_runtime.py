@@ -41,7 +41,19 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         run_harness(root, "init")
+        run_harness(
+            root,
+            "requirement",
+            "add",
+            "--id",
+            "REQ1",
+            "--kind",
+            "functional",
+            "--body",
+            "Example requirement",
+        )
         run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Example acceptance")
+        run_harness(root, "requirement", "link", "--requirement", "REQ1", "--acceptance", "AC1")
         run_harness(
             root,
             "task",
@@ -72,6 +84,21 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
     def add_pass_validation(self, root: Path, *, failure_mode: bool = True) -> None:
         ensure_dummy_unittest(root)
         run_harness(root, "test-target", "add", "--id", "TARGET1", "--kind", "unit", "--command-template", DEFAULT_TEST_COMMAND)
+        run_harness(
+            root,
+            "test-target",
+            "qualify",
+            "--id",
+            "TARGET1-Q1",
+            "--target",
+            "TARGET1",
+            "--acceptance",
+            "AC1",
+            "--rationale",
+            "TARGET1 proves AC1",
+            "--by",
+            "test-author",
+        )
         command = [
             "verify",
             "run",
@@ -85,6 +112,18 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         result = run_harness(root, *command)
         self.assertIn("OK: verification recorded execution=", result.stdout)
         self.assertIn(" validation=", result.stdout)
+        confirmed = run_harness(
+            root,
+            "baseline",
+            "confirm",
+            "--id",
+            "BASE1",
+            "--summary",
+            "P0 delivery fixture",
+            "--by",
+            "test-author",
+        )
+        self.assertIn("OK: baseline confirmed", confirmed.stdout)
 
     def add_failure_mode(self, root: Path, status: str = "identified", risk: str = "low") -> None:
         run_harness(
@@ -118,6 +157,10 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             reviewer_context,
             "--result",
             result,
+            "--residual-risk",
+            "explicit low-risk degraded limitation",
+            "--qualification",
+            "TARGET1-Q1",
         )
 
     def validate(self, root: Path) -> subprocess.CompletedProcess[str]:
@@ -129,6 +172,8 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             self.add_failure_mode(root)
             self.add_pass_validation(root)
             self.add_quality_gate(root, result="pass")
+            ready = run_harness(root, "delivery", "ready")
+            self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
 
             result = self.validate(root)
 
@@ -158,10 +203,11 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("latest quality gate is not pass", result.stdout)
 
-    def test_audit_only_failed_validation_blocks_delivery(self) -> None:
+    def test_audit_only_failed_validation_does_not_block_qualified_delivery(self) -> None:
         with self.make_project() as temp:
             root = Path(temp)
             self.add_failure_mode(root)
+            self.add_pass_validation(root)
             recorded = run_harness(
                 root,
                 "validation",
@@ -179,11 +225,52 @@ class HarnessRuntimeValidationTest(unittest.TestCase):
             )
             self.assertIn("audit-only", recorded.stdout)
             self.add_quality_gate(root, result="pass")
+            ready = run_harness(root, "delivery", "ready")
+            self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+
+            result = self.validate(root)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK: harness state is valid", result.stdout)
+
+    def test_audit_only_pass_does_not_supply_qualified_coverage(self) -> None:
+        with self.make_project() as temp:
+            root = Path(temp)
+            self.add_failure_mode(root)
+            recorded = run_harness(
+                root,
+                "validation",
+                "record",
+                "--surface",
+                "manual claim",
+                "--acceptance",
+                "AC1",
+                "--findings",
+                "claimed pass",
+                "--result",
+                "pass",
+                "--failure-mode",
+                "FM1",
+            )
+            self.assertIn("audit-only", recorded.stdout)
+            confirmed = run_harness(
+                root,
+                "baseline",
+                "confirm",
+                "--id",
+                "BASE1",
+                "--summary",
+                "audit-only fixture",
+                "--by",
+                "test-author",
+            )
+            self.assertEqual(confirmed.returncode, 0, confirmed.stdout + confirmed.stderr)
 
             result = self.validate(root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("validation is not pass", result.stdout)
+        self.assertIn("[qualification-missing]", result.stdout)
+        self.assertIn("[current-execution-missing]", result.stdout)
 
     def test_open_critical_failure_mode_blocks_delivery(self) -> None:
         with self.make_project() as temp:

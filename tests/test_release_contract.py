@@ -252,17 +252,67 @@ class ReleaseContractTest(unittest.TestCase):
 
     def test_release_workflow_is_tag_gated_and_runs_real_install_smoke(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        tooling = json.loads((REPO_ROOT / "release-tooling.json").read_text(encoding="utf-8"))
 
         self.assertIn("tags:", workflow)
         self.assertIn("v*", workflow)
         self.assertIn("python -m kafa.release --require-tag", workflow)
         self.assertIn("run_isolated_install_smoke.py", workflow)
-        self.assertIn("- verify", workflow)
-        self.assertIn("- real_host_compatibility", workflow)
-        self.assertIn("--wheel dist/*.whl", workflow)
-        self.assertIn("--source-archive dist/*-source.tar.gz", workflow)
+        self.assertIn("\n  candidate:\n", workflow)
+        candidate = workflow.split("\n  candidate:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        publish = workflow.split("\n  publish:\n", 1)[1]
+
+        self.assertIn("- verify", candidate)
+        self.assertIn("- real_host_compatibility", candidate)
+        self.assertIn("id-token: write", candidate)
+        self.assertIn("attestations: write", candidate)
+        self.assertIn("artifact-metadata: write", candidate)
+        self.assertNotIn("contents: write", candidate)
+        self.assertIn("python -m build --no-isolation --wheel --sdist", candidate)
+        resolve_syft_at = candidate.index("Resolve checksum-pinned Syft asset")
+        download_syft_at = candidate.index("Download checksum-pinned Syft")
+        self.assertLess(resolve_syft_at, download_syft_at)
+        self.assertIn('SYFT_ARCHIVE', candidate[resolve_syft_at:download_syft_at])
+        self.assertIn('"$SYFT_URL"', candidate[download_syft_at:])
+        self.assertIn("python -m kafa.supply_chain generate", candidate)
+        self.assertGreaterEqual(candidate.count("python -m kafa.supply_chain verify"), 2)
+        self.assertIn("--wheel \"$WHEEL\"", candidate)
+        self.assertIn("--source-archive \"$SDIST\"", candidate)
+        attest = tooling["github_attestation"]["uses"]
+        self.assertEqual(candidate.count(f"uses: {attest}"), 3)
+        self.assertIn("subject-checksums:", candidate)
+        self.assertEqual(candidate.count("sbom-path:"), 2)
+        self.assertIn("actions/upload-artifact@v4", candidate)
+
+        build_at = candidate.index("python -m build --no-isolation --wheel --sdist")
+        generate_at = candidate.index("python -m kafa.supply_chain generate")
+        first_verify_at = candidate.index("python -m kafa.supply_chain verify")
+        smoke_at = candidate.index("run_isolated_install_smoke.py")
+        attest_at = candidate.index(f"uses: {attest}")
+        self.assertLess(build_at, generate_at)
+        self.assertLess(generate_at, first_verify_at)
+        self.assertLess(first_verify_at, smoke_at)
+        self.assertLess(smoke_at, attest_at)
+
+        self.assertIn("contents: write", publish)
+        self.assertIn("attestations: read", publish)
+        self.assertIn("actions/download-artifact@v4", publish)
+        self.assertNotIn("python -m build", publish)
+        self.assertNotIn("pip wheel", publish)
+        self.assertNotIn("git archive", publish)
+        self.assertIn("python -m kafa.supply_chain verify", publish)
+        self.assertIn("--predicate-type https://slsa.dev/provenance/v1", publish)
+        self.assertIn("--predicate-type https://cyclonedx.org/bom", publish)
         self.assertIn("gh release create", workflow)
         self.assertIn("--prerelease", workflow)
+        self.assertLess(
+            publish.index("python -m kafa.supply_chain verify"),
+            publish.index("gh release create"),
+        )
+        self.assertLess(
+            publish.rindex("gh attestation verify"),
+            publish.index("gh release create"),
+        )
         self.assertIn("-W error::ResourceWarning", workflow)
         self.assertIn("skills/project-harness/scripts/harness.py", workflow)
         self.assertNotIn("skills/project-runtime", workflow)
@@ -274,7 +324,7 @@ class ReleaseContractTest(unittest.TestCase):
 
         for runner in ["ubuntu-latest", "macos-latest", "windows-latest"]:
             self.assertIn(f"os: {runner}", workflow)
-        self.assertIn("-m pip install build", workflow)
+        self.assertIn("-m pip install build==1.5.0 setuptools==83.0.0", workflow)
         self.assertIn("-m build --outdir dist", workflow)
         self.assertIn("--wheel dist/*.whl", workflow)
         self.assertIn("--source-archive dist/*.tar.gz", workflow)
@@ -290,7 +340,8 @@ class ReleaseContractTest(unittest.TestCase):
     def test_publish_requires_a_non_optional_real_host_compatibility_profile(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         self.assertIn("\n  real_host_compatibility:", workflow)
-        compatibility = workflow.split("\n  real_host_compatibility:", 1)[1].split("\n  publish:", 1)[0]
+        compatibility = workflow.split("\n  real_host_compatibility:", 1)[1].split("\n  candidate:", 1)[0]
+        candidate = workflow.split("\n  candidate:", 1)[1].split("\n  publish:", 1)[0]
         publish = workflow.split("\n  publish:", 1)[1]
 
         self.assertIn("runs-on: [self-hosted, kafa-codex-live]", compatibility)
@@ -301,10 +352,8 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertIn("run_agent_e2e_eval.py --mode live-codex --out", compatibility)
         self.assertIn("actions/upload-artifact@v4", compatibility)
         self.assertNotIn("continue-on-error: true", compatibility)
-        self.assertRegex(
-            publish,
-            re.compile(r"\n    needs:\s*\n      - verify\s*\n      - real_host_compatibility\s*\n"),
-        )
+        self.assertRegex(candidate, re.compile(r"\n    needs:\s*\n      - verify\s*\n      - real_host_compatibility\s*\n"))
+        self.assertRegex(publish, re.compile(r"\n    needs:\s*\n      - candidate\s*\n"))
 
     def test_install_smoke_wraps_windows_npm_command_shims(self) -> None:
         command = codex_command(r"C:\npm\codex.cmd", "plugin", "list", "--json", platform_name="nt")
@@ -328,6 +377,33 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertEqual(facts, (1, 1, 0, 0))
         self.assertEqual(task_status, "submitted")
         connection.close.assert_called_once_with()
+
+    def test_install_smoke_parses_and_binds_doctor_plugin_digests(self) -> None:
+        digest = "a" * 64
+        cache_root = Path("/tmp/codex cache/codex-project-harness")
+        checks = {
+            "installed plugin content": {
+                "details": f"installed={digest} source={digest}",
+            },
+            "codex plugin cache": {
+                "details": (
+                    f"path={cache_root} cache={digest} installed={digest}"
+                ),
+            },
+        }
+
+        parsed = install_smoke.doctor_plugin_digests(checks, cache_root)
+
+        self.assertEqual(parsed["plugin_source_tree_sha256"], digest)
+        self.assertEqual(parsed["managed_plugin_tree_sha256"], digest)
+        self.assertEqual(parsed["cache_plugin_tree_sha256"], digest)
+        self.assertEqual(Path(parsed["cache_plugin_path"]), cache_root.resolve())
+
+        checks["codex plugin cache"]["details"] = (
+            f"path={cache_root} cache={'b' * 64} installed={digest}"
+        )
+        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+            install_smoke.doctor_plugin_digests(checks, cache_root)
 
 
 if __name__ == "__main__":

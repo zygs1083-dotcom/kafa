@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:validation",
   "title": "Kafa Validation Judgment",
   "type": "object",
   "required": [
@@ -18,6 +19,7 @@
     "cycle_id": { "type": "string" },
     "candidate_sha": { "type": "string" },
     "acceptance_id": { "type": ["string", "null"] },
+    "qualification_id": { "type": ["string", "null"] },
     "surface": { "type": "string" },
     "result": { "type": "string", "enum": ["pass", "fail", "blocked", "partial"] },
     "validation_status": { "type": "string", "enum": ["active", "superseded", "invalidated"] },

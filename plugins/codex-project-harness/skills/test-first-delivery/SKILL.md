@@ -17,7 +17,7 @@ Prefer evidence before implementation confidence.
 6. Implement the smallest code needed to pass.
 7. Add edge-case and regression checks proportional to risk.
 8. Run relevant tests and inspect failures.
-9. Let the root controller register the exact command with `test-target add`, link it to the task, and run it with `verify run` on the current candidate.
+9. Let the root controller register the exact command with `test-target add`, link it to the task, qualify the target for the acceptance with an explicit rationale, and run it with `verify run` on the current candidate.
 10. Ensure the final test proves behavior, not just existence.
 
 `verify run` is the only supported path from command execution to immutable,
@@ -25,6 +25,14 @@ gate-eligible execution and validation facts. Workers return commands and
 results through the Native Codex/ChatGPT host; they never mutate Kafa state.
 Free-form `validation record` is judgment-only and cannot substitute for an
 execution. Skipped, blocked, not-run, and fixture-only checks are not passes.
+Gate-eligible schema 31 execution requires complete target/controller provenance,
+including `target_definition_sha256`, `runtime_executable_sha256`,
+`policy_version`, and `provenance_status=complete`; `legacy-incomplete` history
+cannot cover a current acceptance. Medium/high/critical unit or integration
+failure-mode coverage must use a supported structured result, while regex remains
+available only for documented low-risk paths. Container evidence additionally
+requires a frozen local `container_engine_endpoint`; remote/ambiguous routing and
+truncated Go/nextest streams fail closed.
 
 ## Test Exception Rule
 

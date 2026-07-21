@@ -17,20 +17,27 @@
       0,
       0,
       0,
+      0,
+      0,
       0
     ],
     "facts": {
+      "acceptance_target_qualifications": 1,
       "executions": 1,
       "validations": 1,
-      "deliveries": 1
+      "quality_gate_qualifications": 1,
+      "deliveries": 1,
+      "cycle_status": "delivered",
+      "cycle_closed": true,
+      "project_phase": "delivery_readiness"
     }
   },
   {
     "name": "directed_invariant_benchmark",
     "pass": true,
-    "full_seconds": 0.0037851661909371614,
-    "directed_seconds": 8.941697888076305e-05,
-    "ratio": 42.33162692719305,
+    "full_seconds": 0.004075916949659586,
+    "directed_seconds": 8.32919031381607e-05,
+    "ratio": 48.93533220028177,
     "minimum_ratio": 10.0
   }
 ]

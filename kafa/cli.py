@@ -51,6 +51,8 @@ REQUIRED_SCHEMAS = (
     "test-target.schema.json", "execution.schema.json", "finding.schema.json",
     "invalidation.schema.json", "delivery.schema.json",
     "baseline.schema.json",
+    "acceptance-target-qualification.schema.json",
+    "outcome-observation.schema.json",
 )
 RETIRED_CORE_FILES = ("agent_provider.py", "agent_runner.py", "connector_trust.py")
 FORBIDDEN_RUNTIME_LITERALS = (

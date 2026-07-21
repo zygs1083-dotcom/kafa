@@ -56,7 +56,7 @@ Files under `.ai-team/` and `docs/harness/` are generated local projections for
 human review. They can be rebuilt from SQLite and are never accepted as a
 substitute for database facts.
 
-Schema 30 contains exactly these 27 active tables:
+Schema 31 contains exactly these 30 active tables:
 
 ```text
 project
@@ -73,6 +73,7 @@ task_failure_modes
 task_dependencies
 test_targets
 task_test_targets
+acceptance_target_qualifications
 executions
 validations
 validation_executions
@@ -80,16 +81,18 @@ validation_failure_modes
 findings
 quality_gates
 quality_gate_findings
+quality_gate_qualifications
 deliveries
 delivery_acceptance
 decisions
 invalidations
+outcome_observations
 migrations
 events
 ```
 
 Retired remote-integration, provider, worktree, report, snapshot, and global
-command-log tables are not created in a fresh schema 30 database.
+command-log tables are not created in a fresh schema 31 database.
 
 ## Runtime Module Contracts
 
@@ -104,11 +107,14 @@ The executable boundary lives under
   baselines, and traceability reads.
 - `execution.py` owns exact-target local/container execution and structured
   result parsing.
-- `delivery.py` owns the schema 30 **Delivery Decision** and local trust policy.
+- `delivery.py` owns the schema 31 **Delivery Decision** and local trust policy.
 - `event_bus.py` appends compact audit events.
 - `projections.py` rebuilds affected generated views.
 - `api.py` and `scripts/harness.py` expose only supported operations; the CLI
   parses arguments and formats results rather than reimplementing trust rules.
+  The public API does not export raw writable connections, transactions, Store
+  instances, or Store-factory replacement; those remain internal seams so a
+  caller cannot bypass domain guards with arbitrary SQL.
 
 Compatibility helpers may remain in the isolated migration path, but they do
 not expand the active schema or public runtime surface.
@@ -194,6 +200,9 @@ transaction records:
 - command, exit code, parsed test count, semantic result, and target identity;
 - stdout artifact path and SHA-256 digest;
 - runner, sandbox, no-network, and policy status;
+- target-definition digest, controller platform/runtime executable/version/digest,
+  policy version, optional container engine/local-endpoint/image identity, and
+  `provenance_status`;
 - one validation judgment and its execution link; and
 - one compact audit event.
 
@@ -206,11 +215,27 @@ result artifact is missing, malformed, failing, or reports zero executed tests.
 Targets that require a sandbox or no-network execution fail closed when that
 policy was not actually satisfied. An unavailable requested container is
 reported as unavailable, not silently replaced by local execution.
+Every new row requires `provenance_status=complete`. Schema-30 executions migrate
+as `legacy-incomplete` history and cannot satisfy current schema-31 delivery.
+Container images must already be local: Kafa records engine/version, a frozen
+`container_engine_endpoint`, and `container_image_digest`; pins every daemon call
+to that endpoint; correlates Docker with a local Unix/npipe endpoint and Podman
+with native-local process mode; runs the immutable identity with `--pull=never`
+and a controlled `/bin/sh` entrypoint; trusts only controller-owned artifacts;
+never pulls implicitly; and rejects remote/ambiguous routing or endpoint/engine/image drift.
 
 Generated structured-result paths should remain under `.ai-team/runtime/` or be
 emitted on stdout. Writing them to ordinary project paths changes the candidate,
 so the post-execution identity check discards the completed result rather than
 granting verification credit to a different source tree.
+Streaming Go results require reconciled terminal package events.
+`cargo-nextest-json` means nextest experimental libtest JSON v0.1 and requires
+one reconciled terminal event for every sequential suite; multiple complete
+stress suites are supported. Impossible event order, unfinished started tests,
+missing declared result artifacts, and structured stdout beyond the capture limit
+fail closed. Container structured stdout without a result path is parsed from the
+controlled artifact under the same rules as local stdout; engine CLI stdout is not
+target evidence.
 
 `validation record` stores audit judgment only. Free-form text, a claimed exit
 code, a pasted digest, or a model-generated report cannot create a
@@ -254,7 +279,25 @@ delivery record requires, at minimum:
 - honest handling of every active high/critical failure mode.
 
 Recording delivery closes the current cycle as delivered. A later cycle starts
-with new candidate-scoped obligations; it does not inherit delivery credit.
+with unconfirmed scope and new candidate-scoped obligations; it does not inherit
+delivery credit. Baseline, finding, and qualification IDs are globally immutable
+history labels, so a later cycle must use new IDs. A target referenced by a
+closed cycle may be registered again only with every declared field unchanged;
+changing it requires a new target ID.
+
+Historical facts remain available without switching the current cycle:
+
+```bash
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle status \
+  --id CYCLE-current --json
+python3 plugins/codex-project-harness/scripts/harness.py --root . cycle audit \
+  --id CYCLE-current --json
+```
+
+`cycle audit` binds validations and executions to the candidate stored on the
+selected cycle, reports structured consistency blockers, counts the selected
+fact graph, and emits a stable fact-snapshot digest. It is read-only and never
+rewrites `project.current_cycle_id`.
 
 ## Audit Events Are Not Recovery
 

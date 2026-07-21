@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-07-21",
+  "local_statement_assurance": "unsigned-local-integrity-statement",
+  "sbom": {
+    "tool": "anchore/syft",
+    "version": "1.48.0",
+    "source_commit": "3e2bc6ed095f7ec1a415fb38cfe1c319e95dfed6",
+    "format": "cyclonedx-json@1.6",
+    "predicate_type": "https://cyclonedx.org/bom",
+    "release_url": "https://github.com/anchore/syft/releases/tag/v1.48.0",
+    "checksums_url": "https://github.com/anchore/syft/releases/download/v1.48.0/syft_1.48.0_checksums.txt",
+    "downloads": {
+      "darwin-amd64": {
+        "filename": "syft_1.48.0_darwin_amd64.tar.gz",
+        "sha256": "dc7b2135fa5591003596df4ddb3408f499b68174f5e7dc1c77a373b753463182"
+      },
+      "darwin-arm64": {
+        "filename": "syft_1.48.0_darwin_arm64.tar.gz",
+        "sha256": "fef3e6d5df336a0a4c3e421e503119d1e221cf82a3ef5e426a791fcd81667e87"
+      },
+      "linux-amd64": {
+        "filename": "syft_1.48.0_linux_amd64.tar.gz",
+        "sha256": "6cef9a7f37220d9067eaf9cfaaa2fce986e9f320a8d42cbc36658c99af78ea04"
+      },
+      "linux-arm64": {
+        "filename": "syft_1.48.0_linux_arm64.tar.gz",
+        "sha256": "6865a3d97c4e28b4b38571c17a2bf512da4494ef1d37613c3122fce0d67e63b0"
+      },
+      "windows-amd64": {
+        "filename": "syft_1.48.0_windows_amd64.zip",
+        "sha256": "b46cb02a47c5b76a1656958757d62ac07d0cb7de35f92e8a7e02d450cbb53097"
+      },
+      "windows-arm64": {
+        "filename": "syft_1.48.0_windows_arm64.zip",
+        "sha256": "7ac974ad525df58707dcdcdf3a54528ee31f6b104c8d42500df11987e469bc1e"
+      }
+    }
+  },
+  "github_attestation": {
+    "action": "actions/attest",
+    "version": "v4.2.0",
+    "commit": "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+    "uses": "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+    "release_url": "https://github.com/actions/attest/releases/tag/v4.2.0",
+    "documentation_url": "https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations"
+  },
+  "statements": {
+    "in_toto_type": "https://in-toto.io/Statement/v1",
+    "slsa_predicate_type": "https://slsa.dev/provenance/v1",
+    "slsa_spec": "1.2"
+  },
+  "python_build": {
+    "frontend": "build",
+    "version": "1.5.0",
+    "backend": "setuptools",
+    "backend_version": "83.0.0",
+    "command": [
+      "python",
+      "-m",
+      "build",
+      "--no-isolation",
+      "--wheel",
+      "--sdist",
+      "--outdir",
+      "<DIST>"
+    ]
+  },
+  "official_sources": [
+    "https://oss.anchore.com/docs/guides/sbom/formats/",
+    "https://oss.anchore.com/docs/installation/verification/",
+    "https://github.com/anchore/syft/releases/tag/v1.48.0",
+    "https://github.com/actions/attest",
+    "https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations",
+    "https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md",
+    "https://slsa.dev/spec/v1.2/provenance"
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:acceptance-target-qualification",
+  "title": "Kafa Acceptance Target Qualification",
+  "description": "Insert-only procedural mapping between one acceptance revision and one test-target definition.",
+  "type": "object",
+  "readOnly": true,
+  "required": [
+    "id",
+    "cycle_id",
+    "acceptance_id",
+    "acceptance_revision",
+    "target_id",
+    "target_definition_sha256",
+    "rationale",
+    "qualified_by",
+    "created_at"
+  ],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "cycle_id": { "type": "string" },
+    "acceptance_id": { "type": "string" },
+    "acceptance_revision": { "type": "integer", "minimum": 1 },
+    "target_id": { "type": "string" },
+    "target_definition_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "rationale": { "type": "string", "minLength": 1 },
+    "qualified_by": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

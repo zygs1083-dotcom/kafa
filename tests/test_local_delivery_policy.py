@@ -284,15 +284,21 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
             self.assertEqual(degraded_decision.status, "human-review-required")
             self.assertFalse(degraded_decision.delivery_allowed)
             self.assertIn("reviewed-local", " ".join(degraded_issues))
-            with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
+            with self.assertRaisesRegex(
+                harness_db.HarnessError, "delivery record requires active schema 31"
+            ):
                 harness_db.record_delivery(degraded_root, "local")
 
-            harness_db.record_delivery(reviewed_root, "local")
             with closing(sqlite3.connect(reviewed_db)) as conn:
-                reviewed_status = conn.execute(
-                    "select decision_status from deliveries"
-                ).fetchone()[0]
-            self.assertEqual(reviewed_status, "accepted-risk")
+                conn.row_factory = sqlite3.Row
+                reviewed_issues, reviewed_decision = delivery.evaluate_schema30_delivery(
+                    conn,
+                    reviewed_root,
+                    is_expired=lambda _: False,
+                    observed_at="2026-07-11T00:00:00Z",
+                )
+            self.assertEqual(reviewed_issues, [])
+            self.assertEqual(reviewed_decision.status, "accepted-risk")
 
     def test_local_trust_states_are_explicit_and_non_cryptographic(self) -> None:
         delivery = delivery_module()
@@ -309,6 +315,7 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
                     producer_context_id=producer,
                     reviewer_context_id=reviewer,
                     review_status=expected,
+                    residual_risk="explicit degraded residual risk",
                     risk_acceptances=[],
                     now="2026-07-11T00:00:00Z",
                 )
@@ -326,6 +333,7 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
                     producer_context_id="producer-context",
                     reviewer_context_id="different-looking-reviewer-context",
                     review_status="same-context-degraded",
+                    residual_risk="explicit degraded residual risk",
                     risk_acceptances=[],
                     now="2026-07-11T00:00:00Z",
                 )
@@ -618,7 +626,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
         self.assertIn("human-review-required", " ".join(issues))
         self.assertIn("reviewed-local", " ".join(issues))
 
-    def test_cli_delivery_validation_rejects_degraded_spoof_and_accepts_reviewed_local(self) -> None:
+    def test_cli_delivery_validation_requires_schema31_before_policy_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             degraded_root = Path(temp) / "degraded"
             degraded_root.mkdir()
@@ -652,10 +660,9 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
             reviewed = run_harness(reviewed_root, "validate", "--delivery")
 
         self.assertNotEqual(degraded.returncode, 0)
-        self.assertIn("human-review-required", degraded.stdout)
-        self.assertIn("review_status=reviewed-local", degraded.stdout)
-        self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
-        self.assertIn("OK: harness state is valid", reviewed.stdout)
+        self.assertIn("schema version mismatch: expected 31, actual 30", degraded.stdout)
+        self.assertNotEqual(reviewed.returncode, 0)
+        self.assertIn("schema version mismatch: expected 31, actual 30", reviewed.stdout)
 
     def test_schema30_low_risk_and_accepted_risk_paths_are_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -675,7 +682,8 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
         self.assertEqual(low_issues, [])
         self.assertEqual(accepted_issues, [])
 
-    def test_delivery_persists_degraded_and_accepted_risk_decision_labels(self) -> None:
+    def test_schema30_compatibility_reports_degraded_and_accepted_risk_labels(self) -> None:
+        delivery = delivery_module()
         with tempfile.TemporaryDirectory() as temp:
             degraded_root = Path(temp) / "degraded"
             degraded_root.mkdir()
@@ -686,24 +694,28 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
                     insert into failure_modes
                     (id, cycle_id, feature, scenario, trigger, expected_behavior, risk,
                      status, revision)
-                    values ('FM-medium', 'CYCLE-current', 'delivery', 'degraded review',
-                            'delivery', 'retain degraded label', 'medium', 'identified', 1)
+                    values ('FM-low', 'CYCLE-current', 'delivery', 'degraded review',
+                            'delivery', 'retain degraded label', 'low', 'identified', 1)
                     """
                 )
                 conn.execute(
                     """
                     update quality_gates
                     set review_status='same-context-degraded',
-                        reviewer_context_id=producer_context_id
+                        reviewer_context_id=producer_context_id,
+                        residual_risk='explicit low-risk degraded limitation'
                     where id='G1'
                     """
                 )
                 conn.commit()
-            harness_db.record_delivery(degraded_root, "local")
             with closing(sqlite3.connect(degraded_db)) as conn:
-                degraded_status = conn.execute(
-                    "select decision_status from deliveries"
-                ).fetchone()[0]
+                conn.row_factory = sqlite3.Row
+                degraded_issues, degraded_decision = delivery.evaluate_schema30_delivery(
+                    conn,
+                    degraded_root,
+                    is_expired=lambda _: False,
+                    observed_at="2026-07-11T00:00:00Z",
+                )
 
             accepted_root = Path(temp) / "accepted"
             accepted_root.mkdir()
@@ -711,23 +723,19 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
                 accepted_root,
                 failure_mode_status="accepted",
             )
-            harness_db.record_delivery(accepted_root, "local")
             with closing(sqlite3.connect(accepted_db)) as conn:
-                accepted_status = conn.execute(
-                    "select decision_status from deliveries"
-                ).fetchone()[0]
+                conn.row_factory = sqlite3.Row
+                accepted_issues, accepted_decision = delivery.evaluate_schema30_delivery(
+                    conn,
+                    accepted_root,
+                    is_expired=lambda _: False,
+                    observed_at="2026-07-11T00:00:00Z",
+                )
 
-            degraded_projection = (
-                degraded_root / "docs/harness/delivery.md"
-            ).read_text(encoding="utf-8")
-            accepted_projection = (
-                accepted_root / "docs/harness/delivery.md"
-            ).read_text(encoding="utf-8")
-
-        self.assertEqual(degraded_status, "same-context-degraded")
-        self.assertEqual(accepted_status, "accepted-risk")
-        self.assertIn("Decision Status\nsame-context-degraded", degraded_projection)
-        self.assertIn("Decision Status\naccepted-risk", accepted_projection)
+        self.assertEqual(degraded_issues, [])
+        self.assertEqual(degraded_decision.status, "same-context-degraded")
+        self.assertEqual(accepted_issues, [])
+        self.assertEqual(accepted_decision.status, "accepted-risk")
 
     def test_fractional_revision_metadata_blocks_delivery(self) -> None:
         cases = ("accepted-risk", "quality-gate", "project", "finding")
@@ -770,7 +778,10 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
 
                 issues = schema30_issues(root)
                 self.assertTrue(issues, f"fractional {case} revision was accepted")
-                with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
+                with self.assertRaisesRegex(
+                    harness_db.HarnessError,
+                    "delivery record requires active schema 31",
+                ):
                     harness_db.record_delivery(root, "local")
 
     def test_fractional_execution_metadata_blocks_delivery(self) -> None:
@@ -802,7 +813,10 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
                     issues,
                     f"fractional {table}.{field} passed delivery evaluation",
                 )
-                with self.assertRaisesRegex(harness_db.HarnessError, "delivery record blocked"):
+                with self.assertRaisesRegex(
+                    harness_db.HarnessError,
+                    "delivery record requires active schema 31",
+                ):
                     harness_db.record_delivery(root, "local")
 
     def test_invalid_finding_expiry_is_rejected_on_write_and_blocks_tampered_data(self) -> None:
@@ -1687,7 +1701,7 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Git object"):
                 current_candidate_sha(root)
 
-    def test_delivery_record_rejects_candidate_change_during_validation(self) -> None:
+    def test_schema30_direct_delivery_record_requires_migration_before_candidate_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             db = create_schema30_delivery_fixture(root)
@@ -1698,7 +1712,10 @@ class Schema30DeliveryDecisionTests(unittest.TestCase):
                 "current_candidate_sha",
                 side_effect=(validated_candidate, "changed-after-validation"),
             ):
-                with self.assertRaisesRegex(harness_db.HarnessError, "stale candidate"):
+                with self.assertRaisesRegex(
+                    harness_db.HarnessError,
+                    "delivery record requires active schema 31",
+                ):
                     harness_db.record_delivery(root, "candidate")
 
             with closing(sqlite3.connect(db)) as conn:

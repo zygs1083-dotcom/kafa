@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kafa:schema:31:failure-mode",
   "title": "Codex Project Harness Failure Mode",
   "type": "object",
   "required": ["uid", "id", "cycle_id", "feature", "scenario", "trigger", "expected_behavior", "risk", "status"],
@@ -14,13 +15,13 @@
     "recovery": { "type": "string" },
     "data_safety": { "type": "string" },
     "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
-    "status": { "type": "string", "enum": ["active", "identified", "accepted", "exempt"] },
+    "status": { "type": "string", "enum": ["identified", "accepted", "exempt"] },
     "accepted_by": { "type": "string" },
     "acceptance_reason": { "type": "string" },
     "acceptance_scope": { "type": "string" },
     "accepted_revision": { "type": ["integer", "null"] },
     "expires_at": { "type": "string" },
-    "revision": { "type": "integer" }
+    "revision": { "type": "integer", "minimum": 1 }
   },
   "additionalProperties": false
 }

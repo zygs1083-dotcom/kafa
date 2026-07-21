@@ -27,18 +27,26 @@ import harness_lib  # noqa: E402
 from core import local_core_migration  # noqa: E402
 from core import store as store_module  # noqa: E402
 from core.local_core_migration import migrate_project_to_schema30  # noqa: E402
-from core.projections import render_decisions, render_project_state  # noqa: E402
+from core.projections import (  # noqa: E402
+    projection_content_issues,
+    render_decisions,
+    render_project_state,
+)
 from core.schema_lifecycle import backup_sqlite_database  # noqa: E402
 from core.store import InMemoryStore, SqliteStore, project_db_operation  # noqa: E402
 from tests.test_schema30_migration import init_schema29_fixture  # noqa: E402
 
 
 def _active_projection_validator(root: Path):
-    def validate(_active_path: Path) -> None:
+    def validate(active_path: Path) -> None:
+        local_core_migration._schema30_doctor(active_path)
         harness_db.render_all(root)
-        issues = harness_db.doctor(root, require_project_files=False)
+        issues = projection_content_issues(root)
         if issues:
-            raise RuntimeError("projection validation failed: " + "; ".join(issues))
+            raise RuntimeError(
+                "projection validation failed: "
+                + "; ".join(str(issue) for issue in issues)
+            )
 
     return validate
 
@@ -690,10 +698,10 @@ class MigrationOperationLockTests(unittest.TestCase):
             project_state = (
                 root / ".ai-team/control/project-state.yaml"
             ).read_text(encoding="utf-8")
-            doctor_issues = harness_db.doctor(
-                root,
-                require_project_files=False,
+            local_core_migration._schema30_doctor(
+                root / ".ai-team/state/harness.db"
             )
+            doctor_issues = projection_content_issues(root)
 
         self.assertEqual(lock_outcome, "blocked")
         self.assertEqual(rebuild_outcome, ("ok", ""))

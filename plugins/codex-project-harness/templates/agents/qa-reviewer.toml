@@ -9,5 +9,7 @@ read-only: Do not edit the candidate. Do not write Kafa facts. Return findings
 and evidence to the root controller. Return required fixes to the producer, then
 require re-verification and re-review before acceptance. Native Codex/ChatGPT
 owns task, subagent, worktree, approval, model, cancellation, and handoff
-lifecycle.
+lifecycle. Check that acceptance evidence is explicitly qualified and that any
+schema 31 execution used for delivery has complete target/runtime/container
+provenance; `legacy-incomplete`, missing, or drifted facts are not passes.
 """

@@ -19,13 +19,23 @@ from .execution import command_matches_template
 from .errors import HarnessError, exception_text as _exception_text
 from .project_fs import ProjectFS, ProjectPathSafetyError, _PathSnapshot
 from .projections import PROJECTION_PATHS, PROJECTION_ROLLBACK_PATHS
+from .schema_guard import (
+    ACCEPTANCE_STATUSES,
+    FAILURE_MODE_STATUSES,
+    REQUIREMENT_STATUSES,
+)
 from .schema_lifecycle import (
+    ACTIVE_RUNTIME_VERSION,
+    ACTIVE_SCHEMA_CATALOG_TABLES,
+    ACTIVE_SCHEMA_TABLES,
+    ACTIVE_SCHEMA_VERSION,
     SCHEMA30_RUNTIME_VERSION,
     SCHEMA30_CATALOG_TABLES,
     SCHEMA30_TABLES,
     SCHEMA30_VERSION,
     SQLiteBackupManifest,
     backup_sqlite_database,
+    create_active_schema,
     create_schema30,
 )
 from .store import (
@@ -59,6 +69,7 @@ class _MigrationGuard:
     lock_path: Path
     project_fs: ProjectFS
     lock_snapshot: _PathSnapshot
+    target_schema: int = SCHEMA30_VERSION
     recovery_required: bool = False
     manifest_path: Path | None = None
     clear_allowed: bool = False
@@ -135,7 +146,7 @@ class _MigrationGuard:
         payload: dict[str, object] = {
             "pid": os.getpid(),
             "created_at": _timestamp(),
-            "target_schema": SCHEMA30_VERSION,
+            "target_schema": self.target_schema,
             "status": "recovery-required",
             "manifest_path": str(manifest_path),
         }
@@ -148,7 +159,6 @@ class _MigrationGuard:
             payload["manifest_error"] = _exception_text(manifest_exc)
             self.write_sentinel(payload)
             raise
-
     def arm_verified_clear(
         self,
         verifier: Callable[[], None],
@@ -219,6 +229,7 @@ class LocalCoreStagingReport:
     converted_execution_count: int
     converted_validation_count: int
     invalidated_validation_count: int
+    normalized_failure_mode_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -757,6 +768,11 @@ def _copy_tasks(
     return count
 
 
+def _legacy_gate_candidate(row: dict[str, object]) -> str:
+    candidate_sha = str(row.get("candidate_sha") or "").strip()
+    return candidate_sha or str(row.get("reviewed_commit") or "").strip()
+
+
 def _copy_quality_gates(
     source: sqlite3.Connection,
     destination: sqlite3.Connection,
@@ -801,7 +817,7 @@ def _copy_quality_gates(
                 "id": row["id"],
                 "sequence": sequence,
                 "cycle_id": cycle_id,
-                "candidate_sha": row.get("candidate_sha") or row.get("reviewed_commit") or "",
+                "candidate_sha": _legacy_gate_candidate(row),
                 "gate_status": row.get("gate_status") or "active",
                 "superseded_by": None,
                 "gate": row.get("gate") or "independent_qa",
@@ -1219,9 +1235,55 @@ def _copy_schema29_local_facts(
         pinned_fs,
     )
 
+    source_finding_rows = {
+        str(row.get("id") or ""): row for row in _rows(source, "findings")
+    }
+    evidence_candidates = {
+        str(row.get("id") or ""): str(row.get("source_tree_hash") or "").strip()
+        for row in _rows(source, "evidence")
+    }
+    gate_scopes = {
+        str(row.get("id") or ""): (
+            _normalize_cycle_id(row.get("cycle_id"), current_cycle_id),
+            _legacy_gate_candidate(row),
+        )
+        for row in _rows(source, "quality_gates")
+    }
+    finding_gate_scopes: dict[str, set[tuple[str, str]]] = {}
+    for link in _rows(source, "quality_gate_findings"):
+        finding_id = str(link.get("finding_id") or "")
+        gate_scope = gate_scopes.get(str(link.get("gate_id") or ""))
+        if finding_id and gate_scope is not None:
+            finding_gate_scopes.setdefault(finding_id, set()).add(gate_scope)
+
     def normalize_finding(values: dict[str, object]) -> dict[str, object]:
         values = normalize_cycle(values)
-        for key in ("candidate_sha", "waived_by", "waiver_reason", "waiver_scope", "waiver_expires_at"):
+        finding_id = str(values.get("id") or "")
+        source_row = source_finding_rows.get(finding_id, {})
+        candidate_sources = {
+            candidate
+            for candidate in (
+                str(values.get("candidate_sha") or "").strip(),
+                evidence_candidates.get(str(source_row.get("evidence_id") or ""), ""),
+                *(candidate for _, candidate in finding_gate_scopes.get(finding_id, set())),
+            )
+            if candidate
+        }
+        linked_cycles = {
+            cycle_id for cycle_id, _ in finding_gate_scopes.get(finding_id, set())
+        }
+        if linked_cycles and linked_cycles != {str(values["cycle_id"])}:
+            raise LocalCoreMigrationError(
+                "finding is linked to quality gates from a different cycle during "
+                f"migration: {finding_id}"
+            )
+        if len(candidate_sources) > 1:
+            raise LocalCoreMigrationError(
+                "finding has conflicting candidate provenance during migration: "
+                f"{finding_id}"
+            )
+        values["candidate_sha"] = next(iter(candidate_sources), "")
+        for key in ("waived_by", "waiver_reason", "waiver_scope", "waiver_expires_at"):
             values[key] = values.get(key) or ""
         return values
 
@@ -1821,6 +1883,513 @@ def stage_supported_schema_to_schema30(
         source_sha256=source_sha256,
         source_row_counts=original_counts,
     )
+
+
+SCHEMA30_TO31_COPY_ORDER = (
+    "delivery_cycles",
+    "project",
+    "requirements",
+    "acceptance",
+    "requirement_acceptance",
+    "failure_modes",
+    "failure_mode_acceptance",
+    "baselines",
+    "tasks",
+    "task_acceptance",
+    "task_failure_modes",
+    "task_dependencies",
+    "test_targets",
+    "task_test_targets",
+    "executions",
+    "validations",
+    "validation_executions",
+    "validation_failure_modes",
+    "findings",
+    "quality_gates",
+    "quality_gate_findings",
+    "deliveries",
+    "delivery_acceptance",
+    "decisions",
+    "invalidations",
+    "migrations",
+    "events",
+)
+
+
+def _validate_schema30_source_contract(conn: sqlite3.Connection) -> int:
+    tables = set(_catalog_table_names(conn))
+    if tables != SCHEMA30_CATALOG_TABLES:
+        raise LocalCoreMigrationError(
+            "schema 30 source table inventory mismatch: "
+            f"missing={sorted(SCHEMA30_CATALOG_TABLES - tables)} "
+            f"extra={sorted(tables - SCHEMA30_CATALOG_TABLES)}"
+        )
+    integrity = [str(row[0]) for row in conn.execute("pragma integrity_check")]
+    foreign_keys = conn.execute("pragma foreign_key_check").fetchall()
+    if integrity != ["ok"] or foreign_keys:
+        raise LocalCoreMigrationError(
+            "schema 30 source failed validation: "
+            f"integrity={integrity} foreign_keys={len(foreign_keys)}"
+        )
+    project = conn.execute(
+        "select schema_version, runtime_version from project where id=1"
+    ).fetchone()
+    if (
+        project is None
+        or int(project[0]) != SCHEMA30_VERSION
+        or str(project[1]) != SCHEMA30_RUNTIME_VERSION
+    ):
+        raise LocalCoreMigrationError(
+            "schema 30 source project metadata is invalid: "
+            f"{tuple(project) if project else None}"
+        )
+
+    state_contracts = (
+        ("requirements", "requirement", REQUIREMENT_STATUSES),
+        ("acceptance", "acceptance", ACCEPTANCE_STATUSES),
+        (
+            "failure_modes",
+            "failure-mode",
+            FAILURE_MODE_STATUSES | {"active"},
+        ),
+    )
+    for table, label, allowed in state_contracts:
+        for row in conn.execute(
+            f"select id, status from {_quote_identifier(table)} order by rowid"
+        ):
+            value = str(row[1])
+            if value not in allowed:
+                raise LocalCoreMigrationError(
+                    f"invalid {label} status: {table}:{row[0]}.status={value!r}"
+                )
+    return int(
+        conn.execute(
+            "select count(*) from failure_modes where status='active'"
+        ).fetchone()[0]
+    )
+
+
+def preflight_schema30_to_active(
+    source_path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> int:
+    """Validate schema-30 state domains before backup or migration publication."""
+
+    with _project_fs_scope(
+        _project_root_for_database(source_path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(source_path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="ro",
+        ) as source:
+            source.row_factory = sqlite3.Row
+            source.execute("pragma query_only = on")
+            normalized = _validate_schema30_source_contract(source)
+            project_fs._assert_unchanged(relative, snapshot)
+        project_fs._assert_unchanged(relative, snapshot)
+        return normalized
+
+
+def _copy_schema30_facts_to_schema31(
+    source: sqlite3.Connection,
+    destination: sqlite3.Connection,
+    *,
+    source_sha256: str,
+    staging_path: Path,
+    fail_at: str | None,
+) -> tuple[int, int]:
+    normalized_failure_modes = _validate_schema30_source_contract(source)
+
+    def transform(
+        table: str,
+        values: dict[str, object],
+    ) -> dict[str, object]:
+        if table == "project":
+            values["schema_version"] = ACTIVE_SCHEMA_VERSION
+            values["runtime_version"] = ACTIVE_RUNTIME_VERSION
+        elif table == "failure_modes" and values.get("status") == "active":
+            values["status"] = "identified"
+        elif table == "executions":
+            values.update(
+                {
+                    "target_definition_sha256": "",
+                    "platform": "",
+                    "runtime_executable": "",
+                    "runtime_version": "",
+                    "runtime_executable_sha256": "",
+                    "policy_version": "",
+                    "container_engine": "",
+                    "container_engine_version": "",
+                    "container_image_requested": "",
+                    "container_image_digest": "",
+                    "provenance_status": "legacy-incomplete",
+                }
+            )
+        elif table == "validations":
+            values["qualification_id"] = None
+        elif table == "events":
+            values["schema_version"] = ACTIVE_SCHEMA_VERSION
+        return values
+
+    for table in SCHEMA30_TO31_COPY_ORDER:
+        if table == "requirement_acceptance":
+            _inject_failure(fail_at, "during_relation_copy")
+        for row in _rows(source, table):
+            values = transform(table, dict(row))
+            _insert(destination, table, values)
+
+    project = source.execute(
+        "select updated_at from project where id=1"
+    ).fetchone()
+    _insert(
+        destination,
+        "migrations",
+        {
+            "from_version": SCHEMA30_VERSION,
+            "to_version": ACTIVE_SCHEMA_VERSION,
+            "source_sha256": source_sha256,
+            "backup_path": "",
+            "manifest_path": str(staging_path),
+            "row_counts_json": "{}",
+            "dropped_table_count": 0,
+            "status": "staged",
+            "applied_at": str(project[0] if project else "migration"),
+        },
+    )
+    return (
+        int(source.execute("select count(*) from executions").fetchone()[0]),
+        normalized_failure_modes,
+    )
+
+
+def _validate_active_staging_database(
+    conn: sqlite3.Connection,
+    *,
+    fail_at: str | None = None,
+) -> None:
+    _inject_failure(fail_at, "during_invariant_validation")
+    tables = set(_catalog_table_names(conn))
+    if tables != ACTIVE_SCHEMA_CATALOG_TABLES:
+        raise LocalCoreMigrationError(
+            "active staging table inventory mismatch: "
+            f"missing={sorted(ACTIVE_SCHEMA_CATALOG_TABLES - tables)} "
+            f"extra={sorted(tables - ACTIVE_SCHEMA_CATALOG_TABLES)}"
+        )
+    integrity = [str(row[0]) for row in conn.execute("pragma integrity_check")]
+    if integrity != ["ok"]:
+        raise LocalCoreMigrationError(
+            f"active staging integrity check failed: {integrity}"
+        )
+    foreign_keys = conn.execute("pragma foreign_key_check").fetchall()
+    if foreign_keys:
+        raise LocalCoreMigrationError(
+            "active staging foreign key check failed: "
+            f"{len(foreign_keys)} issue(s)"
+        )
+    project = conn.execute(
+        "select schema_version, runtime_version from project where id=1"
+    ).fetchone()
+    if (
+        project is None
+        or int(project[0]) != ACTIVE_SCHEMA_VERSION
+        or str(project[1]) != ACTIVE_RUNTIME_VERSION
+    ):
+        raise LocalCoreMigrationError(
+            "active staging project metadata is invalid: "
+            f"{tuple(project) if project else None}"
+        )
+
+
+def stage_schema30_to_schema31(
+    source_path: Path,
+    staging_path: Path,
+    *,
+    project_root: Path | None = None,
+    fail_at: str | None = None,
+    source_fs: ProjectFS | None = None,
+    destination_fs: ProjectFS | None = None,
+) -> LocalCoreStagingReport:
+    """Create a validated schema-31 staging DB without mutating schema 30."""
+
+    source_root = _project_root_for_database(source_path)
+    destination_root = project_root or _project_root_for_internal_path(
+        staging_path
+    )
+    created_staging = False
+    with _project_fs_scope(
+        source_root,
+        source_fs,
+    ) as active_source_fs, _project_fs_scope(
+        destination_root,
+        destination_fs,
+    ) as active_destination_fs:
+        source_relative = active_source_fs.relative_to_root(source_path)
+        staging_relative = active_destination_fs.relative_to_root(staging_path)
+        source_snapshot = active_source_fs._snapshot(
+            source_relative,
+            allow_missing=True,
+        )
+        if not source_snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"schema 30 source database is missing: {source_path}"
+            )
+        if (
+            active_source_fs.root_identity_key
+            == active_destination_fs.root_identity_key
+            and source_relative == staging_relative
+        ):
+            raise LocalCoreMigrationError(
+                "staging database must not replace the active source"
+            )
+        staging_snapshot = active_destination_fs._snapshot(
+            staging_relative,
+            allow_missing=True,
+        )
+        if staging_snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"staging database already exists: {staging_path}"
+            )
+        active_source_fs.audit(
+            _database_family(source_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.audit(
+            _database_family(staging_relative),
+            allow_missing=True,
+        )
+        active_destination_fs.create_exclusive(
+            staging_relative,
+            b"",
+            mode=0o600,
+        )
+        created_staging = True
+        staging_snapshot = active_destination_fs._snapshot(
+            staging_relative,
+            allow_missing=False,
+        )
+        source_fingerprint = _safe_database_fingerprint(
+            active_source_fs,
+            source_relative,
+        )
+        source_sha256 = _safe_database_digest(
+            active_source_fs,
+            source_relative,
+        )
+        source_absolute = active_source_fs.absolute(source_relative)
+        staging_absolute = active_destination_fs.absolute(staging_relative)
+        try:
+            with _verified_sqlite_connection(
+                active_source_fs,
+                source_relative,
+                access="ro",
+            ) as source:
+                source.row_factory = sqlite3.Row
+                source.execute("pragma query_only = on")
+                normalized_failure_modes = _validate_schema30_source_contract(
+                    source
+                )
+                source_counts = _row_counts(source)
+                with _verified_sqlite_connection(
+                    active_destination_fs,
+                    staging_relative,
+                    access="rw",
+                    journal_mode="memory",
+                ) as destination:
+                    destination.row_factory = sqlite3.Row
+                    destination.execute("pragma foreign_keys = on")
+                    destination.execute("begin immediate")
+                    destination.execute("pragma defer_foreign_keys = on")
+                    create_active_schema(destination)
+                    (
+                        converted_execution_count,
+                        copied_normalized_failure_modes,
+                    ) = _copy_schema30_facts_to_schema31(
+                        source,
+                        destination,
+                        source_sha256=source_sha256,
+                        staging_path=staging_absolute,
+                        fail_at=fail_at,
+                    )
+                    if (
+                        copied_normalized_failure_modes
+                        != normalized_failure_modes
+                    ):
+                        raise LocalCoreMigrationError(
+                            "failure-mode normalization preflight changed during copy"
+                        )
+                    destination.commit()
+                    destination.execute("pragma journal_mode = delete")
+                    _validate_active_staging_database(
+                        destination,
+                        fail_at=fail_at,
+                    )
+                    staging_counts = _row_counts(destination)
+                    active_destination_fs._assert_unchanged(
+                        staging_relative,
+                        staging_snapshot,
+                    )
+                active_source_fs._assert_unchanged(
+                    source_relative,
+                    source_snapshot,
+                )
+
+            active_destination_fs.audit(
+                _database_family(staging_relative),
+                allow_missing=True,
+            )
+            if (
+                _safe_database_fingerprint(
+                    active_source_fs,
+                    source_relative,
+                )
+                != source_fingerprint
+            ):
+                raise LocalCoreMigrationError(
+                    "active schema 30 database changed during staging conversion"
+                )
+            for table in SCHEMA30_TABLES:
+                expected = source_counts[table] + (
+                    1 if table == "migrations" else 0
+                )
+                actual = staging_counts[table]
+                if actual != expected:
+                    raise LocalCoreMigrationError(
+                        "schema 30 to 31 row count mismatch: "
+                        f"{table} expected={expected} actual={actual}"
+                    )
+            for table in ACTIVE_SCHEMA_TABLES - SCHEMA30_TABLES:
+                if staging_counts[table] != 0:
+                    raise LocalCoreMigrationError(
+                        f"schema 31 migration invented {table} facts"
+                    )
+            return LocalCoreStagingReport(
+                source_version=SCHEMA30_VERSION,
+                target_version=ACTIVE_SCHEMA_VERSION,
+                source_path=str(source_absolute),
+                staging_path=str(staging_absolute),
+                source_sha256=source_sha256,
+                staging_sha256=_safe_database_digest(
+                    active_destination_fs,
+                    staging_relative,
+                ),
+                source_row_counts=source_counts,
+                staging_row_counts=staging_counts,
+                retired_row_counts={},
+                dropped_event_count=0,
+                converted_execution_count=converted_execution_count,
+                converted_validation_count=0,
+                invalidated_validation_count=0,
+                normalized_failure_mode_count=normalized_failure_modes,
+            )
+        except BaseException as exc:
+            if created_staging:
+                _apply_sqlite_teardown_errors(
+                    exc,
+                    _temporary_sqlite_family_cleanup_errors(
+                        active_destination_fs,
+                        staging_relative,
+                        staging_snapshot,
+                        published=False,
+                    ),
+                )
+            raise
+
+
+def stage_supported_schema_to_active(
+    source_path: Path,
+    staging_path: Path,
+    *,
+    project_root: Path | None = None,
+    fail_at: str | None = None,
+    pinned_fs: ProjectFS | None = None,
+) -> LocalCoreStagingReport:
+    """Stage every supported legacy source to the one active schema contract."""
+
+    source_version = _read_source_version(
+        source_path,
+        pinned_fs=pinned_fs,
+    )
+    if source_version == SCHEMA30_VERSION:
+        return stage_schema30_to_schema31(
+            source_path,
+            staging_path,
+            project_root=project_root,
+            fail_at=fail_at,
+            source_fs=pinned_fs,
+            destination_fs=pinned_fs,
+        )
+    if source_version not in {27, 28, 29}:
+        raise LocalCoreMigrationError(
+            f"unsupported active-schema migration source {source_version}"
+        )
+
+    destination_root = project_root or _project_root_for_internal_path(
+        staging_path
+    )
+    intermediate_path = staging_path.with_name(
+        f".{staging_path.name}.schema30-intermediate-{uuid.uuid4().hex}.db"
+    )
+    intermediate_snapshot: _PathSnapshot | None = None
+    operation_error: BaseException | None = None
+    try:
+        legacy_report = stage_supported_schema_to_schema30(
+            source_path,
+            intermediate_path,
+            project_root=destination_root,
+            fail_at=fail_at,
+            pinned_fs=pinned_fs,
+        )
+        with _project_fs_scope(destination_root, pinned_fs) as destination_fs:
+            intermediate_relative = destination_fs.relative_to_root(
+                intermediate_path
+            )
+            intermediate_snapshot = destination_fs._snapshot(
+                intermediate_relative,
+                allow_missing=False,
+            )
+        active_report = stage_schema30_to_schema31(
+            intermediate_path,
+            staging_path,
+            project_root=destination_root,
+            fail_at=fail_at,
+            source_fs=pinned_fs,
+            destination_fs=pinned_fs,
+        )
+        return replace(
+            active_report,
+            source_version=legacy_report.source_version,
+            source_path=legacy_report.source_path,
+            source_sha256=legacy_report.source_sha256,
+            source_row_counts=legacy_report.source_row_counts,
+            retired_row_counts=legacy_report.retired_row_counts,
+            dropped_event_count=legacy_report.dropped_event_count,
+            converted_validation_count=legacy_report.converted_validation_count,
+            invalidated_validation_count=legacy_report.invalidated_validation_count,
+        )
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        if intermediate_snapshot is not None:
+            with _project_fs_scope(destination_root, pinned_fs) as destination_fs:
+                intermediate_relative = destination_fs.relative_to_root(
+                    intermediate_path
+                )
+                _apply_sqlite_teardown_errors(
+                    operation_error,
+                    _temporary_sqlite_family_cleanup_errors(
+                        destination_fs,
+                        intermediate_relative,
+                        intermediate_snapshot,
+                        published=False,
+                    ),
+                )
 
 
 def _timestamp() -> str:
@@ -2485,6 +3054,8 @@ def _assert_recovery_bundle_receipts(
 @contextmanager
 def _project_migration_lock(
     root: Path,
+    *,
+    target_schema: int = SCHEMA30_VERSION,
 ) -> Iterator[tuple[_MigrationGuard, ProjectFS]]:
     relative_lock = Path(".ai-team/state/local-core-migration.lock")
     with ProjectFS.open(root) as project_fs:
@@ -2494,7 +3065,7 @@ def _project_migration_lock(
             {
                 "pid": os.getpid(),
                 "created_at": _timestamp(),
-                "target_schema": SCHEMA30_VERSION,
+                "target_schema": target_schema,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -2512,6 +3083,7 @@ def _project_migration_lock(
             lock_path=lock_path,
             project_fs=project_fs,
             lock_snapshot=lock_snapshot,
+            target_schema=target_schema,
         )
         completed = False
 
@@ -2520,7 +3092,7 @@ def _project_migration_lock(
                 payload: dict[str, object] = {
                     "pid": os.getpid(),
                     "created_at": _timestamp(),
-                    "target_schema": SCHEMA30_VERSION,
+                    "target_schema": target_schema,
                     "status": status,
                 }
                 manifest_verified = False
@@ -2671,6 +3243,8 @@ def _finalize_staging_metadata(
     backup: SQLiteBackupManifest,
     migration_manifest_path: Path,
     *,
+    target_version: int = SCHEMA30_VERSION,
+    schema_validator: Callable[[sqlite3.Connection], None] | None = None,
     pinned_fs: ProjectFS | None = None,
 ) -> None:
     with _project_fs_scope(
@@ -2702,13 +3276,13 @@ def _finalize_staging_metadata(
                     _stable_json(report.staging_row_counts),
                     sum(report.retired_row_counts.values()),
                     _timestamp(),
-                    SCHEMA30_VERSION,
+                    target_version,
                 ),
             )
             if updated.rowcount != 1:
                 conn.rollback()
                 raise LocalCoreMigrationError(
-                    "schema 30 staging database is missing its migration record"
+                    f"schema {target_version} staging database is missing its migration record"
                 )
             conn.execute(
                 """
@@ -2720,7 +3294,7 @@ def _finalize_staging_metadata(
                 """,
                 (
                     str(uuid.uuid4()),
-                    SCHEMA30_VERSION,
+                    target_version,
                     _stable_json(
                         {
                             "source_version": report.source_version,
@@ -2733,7 +3307,7 @@ def _finalize_staging_metadata(
             )
             conn.commit()
             conn.execute("pragma journal_mode = delete")
-            _validate_staging_database(conn)
+            (schema_validator or _validate_staging_database)(conn)
             project_fs._assert_unchanged(relative, snapshot)
         project_fs.audit(_database_family(relative), allow_missing=True)
 
@@ -2782,6 +3356,60 @@ def _schema30_doctor(
             if migration is None or str(migration[0]) != "activated":
                 raise LocalCoreMigrationError(
                     "schema 30 activation record is missing or incomplete"
+                )
+            project_fs._assert_unchanged(relative, snapshot)
+
+
+def _active_schema_doctor(
+    path: Path,
+    *,
+    pinned_fs: ProjectFS | None = None,
+) -> None:
+    with _project_fs_scope(
+        _project_root_for_database(path),
+        pinned_fs,
+    ) as project_fs:
+        relative = project_fs.relative_to_root(path)
+        snapshot = project_fs._snapshot(relative, allow_missing=False)
+        project_fs.audit(_database_family(relative), allow_missing=True)
+        with _verified_sqlite_connection(
+            project_fs,
+            relative,
+            access="ro",
+            immutable=True,
+        ) as conn:
+            project_fs._assert_unchanged(relative, snapshot)
+            _validate_active_staging_database(conn)
+            triggers = {
+                str(row[0])
+                for row in conn.execute(
+                    "select name from sqlite_master where type='trigger' order by name"
+                )
+            }
+            required = {
+                "acceptance_target_qualifications_no_update",
+                "acceptance_target_qualifications_no_delete",
+                "quality_gate_qualifications_no_update",
+                "quality_gate_qualifications_no_delete",
+                "outcome_observations_no_update",
+                "outcome_observations_no_delete",
+                "executions_no_update",
+                "executions_no_delete",
+                "events_no_update",
+                "events_no_delete",
+            }
+            if not required.issubset(triggers):
+                raise LocalCoreMigrationError(
+                    "active immutable trigger contract is incomplete: "
+                    f"missing={sorted(required - triggers)}"
+                )
+            migration = conn.execute(
+                "select status from migrations where to_version=? order by id desc limit 1",
+                (ACTIVE_SCHEMA_VERSION,),
+            ).fetchone()
+            if migration is None or str(migration[0]) != "activated":
+                raise LocalCoreMigrationError(
+                    "active schema activation record is missing or incomplete"
                 )
             project_fs._assert_unchanged(relative, snapshot)
 
@@ -3310,14 +3938,21 @@ def _activate_staging_database(
     return activated_snapshot
 
 
-def migrate_project_to_schema30(
+def _migrate_project_to_target(
     root: Path,
     *,
+    target_version: int,
+    supported_source_versions: frozenset[int],
+    stage_function: Callable[..., LocalCoreStagingReport],
+    doctor_function: Callable[..., None],
+    schema_validator: Callable[[sqlite3.Connection], None],
+    target_label: str,
+    source_preflight: Callable[[Path, int, ProjectFS], None] | None = None,
     fail_at: str | None = None,
     staging_validator: Callable[[Path], None] | None = None,
     active_validator: Callable[[Path], None] | None = None,
 ) -> LocalCoreMigrationResult:
-    """Back up, stage, atomically activate, and automatically roll back schema 30."""
+    """Back up, stage, atomically activate, and roll back one target contract."""
 
     if active_validator is None:
         raise LocalCoreMigrationError(
@@ -3328,7 +3963,10 @@ def migrate_project_to_schema30(
             f"unknown migration failure point {fail_at!r}; expected one of {sorted(MIGRATION_FAILURE_POINTS)}"
         )
     active_relative = Path(".ai-team/state/harness.db")
-    with _project_migration_lock(root) as (
+    with _project_migration_lock(
+        root,
+        target_schema=target_version,
+    ) as (
         migration_guard,
         project_fs,
     ):
@@ -3356,11 +3994,17 @@ def migrate_project_to_schema30(
             active_path,
             pinned_fs=project_fs,
         )
-        if source_version not in {27, 28, 29}:
+        if source_version not in supported_source_versions:
             migration_guard.mark_safe()
             raise LocalCoreMigrationError(
                 f"unsupported local-core migration source schema {source_version}"
             )
+        if source_preflight is not None:
+            try:
+                source_preflight(active_path, source_version, project_fs)
+            except BaseException:
+                migration_guard.mark_safe()
+                raise
         source_fingerprint = _safe_database_fingerprint(
             project_fs,
             active_relative,
@@ -3369,6 +4013,8 @@ def migrate_project_to_schema30(
             root,
             source_path=active_path,
             expected_source_version=source_version,
+            target_version=target_version,
+            preserve_physical_bytes=(target_version == ACTIVE_SCHEMA_VERSION),
             project_fs=project_fs,
         )
         recovery_bundle_receipts = _capture_recovery_bundle_receipts(
@@ -3376,7 +4022,7 @@ def migrate_project_to_schema30(
             backup,
         )
         backup_dir = Path(backup.backup_path).parent
-        staging_path = backup_dir / "harness.schema30.new.db"
+        staging_path = backup_dir / f"harness.{target_label}.new.db"
         migration_manifest_path = backup_dir / "migration-manifest.json"
         backup_relative = project_fs.relative_to_root(backup_dir)
         staging_relative = project_fs.relative_to_root(staging_path)
@@ -3396,7 +4042,7 @@ def migrate_project_to_schema30(
         manifest_payload: dict[str, object] = {
             "status": "backup-created",
             "source_version": source_version,
-            "target_version": SCHEMA30_VERSION,
+            "target_version": target_version,
             "backup": backup.safe_payload(),
             "projection_backup": {"status": "pending"},
             "projection_restore_status": "not-needed",
@@ -3545,7 +4191,7 @@ def migrate_project_to_schema30(
         activated_snapshot: _PathSnapshot | None = None
         try:
             _inject_failure(fail_at, "before_copy")
-            report = stage_supported_schema_to_schema30(
+            report = stage_function(
                 active_path,
                 staging_path,
                 project_root=root,
@@ -3560,6 +4206,8 @@ def migrate_project_to_schema30(
                 report,
                 backup,
                 migration_manifest_path,
+                target_version=target_version,
+                schema_validator=schema_validator,
                 pinned_fs=project_fs,
             )
             if staging_validator:
@@ -3621,7 +4269,7 @@ def migrate_project_to_schema30(
                 active_relative,
                 activated_snapshot,
             )
-            _schema30_doctor(active_path, pinned_fs=project_fs)
+            doctor_function(active_path, pinned_fs=project_fs)
             project_fs._assert_unchanged(
                 active_relative,
                 activated_snapshot,
@@ -3685,7 +4333,7 @@ def migrate_project_to_schema30(
                 active_relative,
                 active_snapshot,
             )
-            _schema30_doctor(active_path, pinned_fs=project_fs)
+            doctor_function(active_path, pinned_fs=project_fs)
             project_fs._assert_unchanged(
                 active_relative,
                 active_snapshot,
@@ -3869,7 +4517,7 @@ def migrate_project_to_schema30(
             assert report is not None
             return LocalCoreMigrationResult(
                 source_version=source_version,
-                target_version=SCHEMA30_VERSION,
+                target_version=target_version,
                 active_path=str(active_path),
                 active_sha256=active_sha256,
                 backup=backup,
@@ -3968,7 +4616,9 @@ def migrate_project_to_schema30(
                             else "staging-missing-active-digest-mismatch"
                         )
             if activated:
-                failed_path = backup_dir / "harness.schema30.failed-after-activation.db"
+                failed_path = backup_dir / (
+                    f"harness.{target_label}.failed-after-activation.db"
+                )
                 try:
                     expected_failed_active_snapshot = (
                         activated_snapshot
@@ -3988,7 +4638,7 @@ def migrate_project_to_schema30(
                         allow_missing=True,
                     ).exists:
                         failed_path = backup_dir / (
-                            "harness.schema30.failed-after-activation-"
+                            f"harness.{target_label}.failed-after-activation-"
                             f"{uuid.uuid4().hex[:8]}.db"
                         )
                         failed_relative = project_fs.relative_to_root(
@@ -4009,10 +4659,11 @@ def migrate_project_to_schema30(
                 except Exception as preserve_exc:
                     preservation_status = "failed"
                     preservation_error = _exception_text(preserve_exc)
-                manifest_payload["failed_schema30_preservation_status"] = preservation_status
-                manifest_payload["failed_schema30_path"] = str(failed_path)
+                failure_key = f"failed_{target_label}"
+                manifest_payload[f"{failure_key}_preservation_status"] = preservation_status
+                manifest_payload[f"{failure_key}_path"] = str(failed_path)
                 if preservation_error:
-                    manifest_payload["failed_schema30_preservation_error"] = preservation_error
+                    manifest_payload[f"{failure_key}_preservation_error"] = preservation_error
                 try:
                     rollback_database_receipts = _restore_verified_backup(
                         active_path,
@@ -4073,7 +4724,7 @@ def migrate_project_to_schema30(
                     manifest_payload["error"] = primary_error
                     write_failure_manifest()
                     raise LocalCoreMigrationError(
-                        f"{primary_error}; database and projections restored but failed schema30 diagnostic "
+                        f"{primary_error}; database and projections restored but failed {target_label} diagnostic "
                         f"preservation was incomplete: {preservation_error}; "
                         f"recovery manifest: {recovery_manifest_path}"
                     ) from exc
@@ -4085,7 +4736,7 @@ def migrate_project_to_schema30(
                     )
                     if current_staging_snapshot.exists:
                         failed_path = backup_dir / (
-                            "harness.schema30.failed-before-activation.db"
+                            f"harness.{target_label}.failed-before-activation.db"
                         )
                         failed_relative = project_fs.relative_to_root(
                             failed_path
@@ -4096,7 +4747,7 @@ def migrate_project_to_schema30(
                         )
                         if failed_destination_snapshot.exists:
                             failed_path = backup_dir / (
-                                "harness.schema30.failed-before-activation-"
+                                f"harness.{target_label}.failed-before-activation-"
                                 f"{uuid.uuid4().hex[:8]}.db"
                             )
                             failed_relative = project_fs.relative_to_root(
@@ -4122,15 +4773,15 @@ def migrate_project_to_schema30(
                             failed_path,
                             pinned_fs=project_fs,
                         )
-                        manifest_payload["failed_schema30_path"] = str(
+                        manifest_payload[f"failed_{target_label}_path"] = str(
                             failed_path
                         )
                 except BaseException as preservation_exc:
                     manifest_payload[
-                        "failed_schema30_preservation_status"
+                        f"failed_{target_label}_preservation_status"
                     ] = "failed"
                     manifest_payload[
-                        "failed_schema30_preservation_error"
+                        f"failed_{target_label}_preservation_error"
                     ] = _exception_text(preservation_exc)
                 try:
                     _remove_empty_active_sidecars(
@@ -4388,3 +5039,137 @@ def migrate_project_to_schema30(
                         publish_terminal_authority_failure,
                     )
             raise
+
+
+def migrate_project_to_schema30(
+    root: Path,
+    *,
+    fail_at: str | None = None,
+    staging_validator: Callable[[Path], None] | None = None,
+    active_validator: Callable[[Path], None] | None = None,
+) -> LocalCoreMigrationResult:
+    """Retained compatibility migration for the fixed schema-30 contract."""
+
+    return _migrate_project_to_target(
+        root,
+        target_version=SCHEMA30_VERSION,
+        supported_source_versions=frozenset({27, 28, 29}),
+        stage_function=stage_supported_schema_to_schema30,
+        doctor_function=_schema30_doctor,
+        schema_validator=_validate_staging_database,
+        target_label="schema30",
+        fail_at=fail_at,
+        staging_validator=staging_validator,
+        active_validator=active_validator,
+    )
+
+
+def _preflight_active_source(
+    active_path: Path,
+    source_version: int,
+    project_fs: ProjectFS,
+) -> None:
+    if source_version == SCHEMA30_VERSION:
+        preflight_schema30_to_active(
+            active_path,
+            pinned_fs=project_fs,
+        )
+
+
+def migrate_project_to_active_schema(
+    root: Path,
+    *,
+    fail_at: str | None = None,
+    staging_validator: Callable[[Path], None] | None = None,
+    active_validator: Callable[[Path], None] | None = None,
+) -> LocalCoreMigrationResult:
+    """Migrate a supported local authority to the one active schema contract."""
+
+    return _migrate_project_to_target(
+        root,
+        target_version=ACTIVE_SCHEMA_VERSION,
+        supported_source_versions=frozenset({27, 28, 29, 30}),
+        stage_function=stage_supported_schema_to_active,
+        doctor_function=_active_schema_doctor,
+        schema_validator=_validate_active_staging_database,
+        target_label=f"schema{ACTIVE_SCHEMA_VERSION}",
+        source_preflight=_preflight_active_source,
+        fail_at=fail_at,
+        staging_validator=staging_validator,
+        active_validator=active_validator,
+    )
+
+
+def dry_run_project_to_active_schema(
+    root: Path,
+    *,
+    staging_validator: Callable[[Path], None] | None = None,
+) -> LocalCoreStagingReport:
+    """Stage and validate the active schema without backup or activation.
+
+    The complete source conversion runs under the ordinary project operation
+    lock. The temporary staging database is removed before return, while the
+    active DB, projections, migration sentinel, and backup tree remain
+    untouched.
+    """
+
+    active_relative = Path(".ai-team/state/harness.db")
+    staging_relative = Path(
+        ".ai-team/state/"
+        f".harness.schema{ACTIVE_SCHEMA_VERSION}.dry-run-{uuid.uuid4().hex}.db"
+    )
+    operation_error: BaseException | None = None
+    staging_snapshot: _PathSnapshot | None = None
+    with project_db_operation(root) as project_fs:
+        root = project_fs.root
+        active_snapshot = project_fs._snapshot(
+            active_relative,
+            allow_missing=True,
+        )
+        if not active_snapshot.exists:
+            raise LocalCoreMigrationError(
+                f"runtime database is missing: {project_fs.absolute(active_relative)}"
+            )
+        project_fs.audit(
+            (
+                *_database_family(active_relative),
+                *_database_family(staging_relative),
+            ),
+            allow_missing=True,
+        )
+        staging_path = project_fs.absolute(staging_relative)
+        try:
+            report = stage_supported_schema_to_active(
+                project_fs.absolute(active_relative),
+                staging_path,
+                project_root=root,
+                pinned_fs=project_fs,
+            )
+            staging_snapshot = project_fs._snapshot(
+                staging_relative,
+                allow_missing=False,
+            )
+            if staging_validator is not None:
+                staging_validator(staging_path)
+            project_fs._assert_unchanged(active_relative, active_snapshot)
+            return report
+        except BaseException as exc:
+            operation_error = exc
+            raise
+        finally:
+            if staging_snapshot is None:
+                candidate = project_fs._snapshot(
+                    staging_relative,
+                    allow_missing=True,
+                )
+                staging_snapshot = candidate if candidate.exists else None
+            if staging_snapshot is not None:
+                _apply_sqlite_teardown_errors(
+                    operation_error,
+                    _temporary_sqlite_family_cleanup_errors(
+                        project_fs,
+                        staging_relative,
+                        staging_snapshot,
+                        published=False,
+                    ),
+                )

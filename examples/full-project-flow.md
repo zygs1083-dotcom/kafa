@@ -55,8 +55,12 @@ and update each checkbox immediately after its evidence is verified.
 For an ordinary project, first verify that the installed Plugin is discoverable:
 
 ```bash
-kafa project doctor --repo .
+codex plugin list
 ```
+
+Look for `codex-project-harness@personal installed, enabled`. `kafa project
+doctor --repo ...` validates a Kafa/Plugin source layout; it is not the install
+check for an ordinary project.
 
 The remaining examples use the runtime resolved by the installed
 `project-harness` Skill. In a source checkout, a convenient shell helper is:
@@ -105,7 +109,9 @@ harness acceptance add \
   --priority must
 
 harness requirement link --requirement REQ1 --acceptance AC1
-harness baseline freeze --id BASE-1 --summary "OpenSpec family-mini-program baseline"
+harness baseline confirm --id BASE-1 \
+  --summary "OpenSpec family-mini-program confirmed scope" \
+  --by root-controller
 
 harness task add \
   --id T1 \
@@ -174,6 +180,13 @@ harness test-target add \
   --result-format regex
 
 harness test-target link --task T1 --target PROFILE-UNIT
+
+harness test-target qualify \
+  --id Q1 \
+  --target PROFILE-UNIT \
+  --acceptance AC1 \
+  --rationale "PROFILE-UNIT directly exercises AC1" \
+  --by root-controller
 ```
 
 The root controller, not the implementation worker, executes it:
@@ -182,10 +195,19 @@ The root controller, not the implementation worker, executes it:
 harness verify run --target PROFILE-UNIT --acceptance AC1
 ```
 
-A passing run records one immutable execution with the current candidate,
-command, exit code, positive test count, semantic result, stdout artifact and
-digest, runner policy, and validation link. A manual statement such as "tests
-passed" cannot replace this execution.
+A passing schema 31 run records one immutable execution with the current
+candidate, command, exit code, positive test count, semantic result, stdout
+artifact/digest, runner policy, validation link, `target_definition_sha256`,
+controller `platform`, `runtime_executable`/`runtime_version`/
+`runtime_executable_sha256`, `policy_version`, and
+`provenance_status=complete`. A manual statement such as "tests passed" cannot
+replace this execution. Schema-30 history migrates as `legacy-incomplete` and
+cannot satisfy current delivery.
+
+For a container target, the image must already be local. Kafa records the
+engine/version, requested image and `container_image_digest`, runs the immutable
+identity with `--pull=never`, and rejects missing images or engine/image drift;
+it never pulls implicitly.
 
 Missing or malformed structured output, zero executed tests, a stale candidate,
 artifact digest mismatch, or an unsatisfied sandbox/no-network policy fails
@@ -223,7 +245,8 @@ harness task accept T1 --evidence "independent QA accepted AC1 on the current ca
 harness gate record \
   --reviewer-context fresh \
   --reviewer-context-id native-reviewer-context \
-  --result pass
+  --result pass \
+  --qualification Q1
 ```
 
 For low/medium work, a same-context review must be labeled
@@ -242,6 +265,8 @@ After the gate passes and all delivery prerequisites are current, record the
 local handoff:
 
 ```bash
+harness delivery ready
+
 harness delivery record \
   --scope "Relative profile slice from family-mini-program" \
   --acceptance AC1 \
@@ -289,7 +314,7 @@ plan before applying it:
 harness repair --dry-run
 ```
 
-Schema migration creates and verifies a backup before activating schema 30. If
+Schema migration creates and verifies a backup before activating schema 31. If
 activation validation fails, Kafa restores that backup rather than rebuilding
 state from events.
 

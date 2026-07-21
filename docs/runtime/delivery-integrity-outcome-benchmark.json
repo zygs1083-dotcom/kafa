@@ -1,0 +1,226 @@
+{
+  "benchmark_status": "passed",
+  "denominator": {
+    "applicability": "required",
+    "definition": "all scenarios in kafa-p0-false-delivery-v1",
+    "value": 4
+  },
+  "evaluation_source": {
+    "generated_at": "2026-07-21T10:09:47+00:00",
+    "git_dirty": true,
+    "git_head": "e3d46d9feb850e2f2462cf6e6fd0ecb7016e66bb",
+    "source_scope": [
+      "kafa/",
+      "plugins/",
+      "tests/",
+      "benchmarks/",
+      ".gitattributes",
+      "VERSION",
+      "docs/runtime/fresh-skill-eval-prompts.md",
+      "docs/runtime/skill-eval-transcript-fixture.txt",
+      "pyproject.toml",
+      "release.json"
+    ],
+    "status_entry_count": 87,
+    "status_sha256": "41fcfbd12e5c6b02fc6a541599d7f4bfcb981f6e112ca7616ebad49a3bcb5e98",
+    "workspace_sha256": "f2f952f78008f24e4f9cf5c05d9a2c38ba258d41b8158ec2730f9d3965ddcb2e"
+  },
+  "evidence_mode": "regression-benchmark",
+  "field_evidence": {
+    "evidence_mode": "field",
+    "metrics": {
+      "escaped_defect_count": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      },
+      "false_green_prevented_count": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      },
+      "migration_recovery_success_rate": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      },
+      "qualification_coverage_rate": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      },
+      "rework_rate_per_delivery": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      },
+      "time_to_verified_delivery_seconds": {
+        "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+        "status": "not-run",
+        "value": null
+      }
+    },
+    "reason": "this source-repository regression benchmark did not observe an operator project or a completed field window; fixture results cannot substitute",
+    "status": "not-run"
+  },
+  "field_improvement_claimed": false,
+  "generated_at": "2026-07-21T10:09:47Z",
+  "inventory": {
+    "before_after_inventory_matches": true,
+    "scenario_count": 4,
+    "scenario_ids": [
+      "minimum-graph-empty",
+      "cancelled-sole-task-coverage",
+      "unqualified-unrelated-target",
+      "direct-record-before-readiness"
+    ],
+    "version": "kafa-p0-false-delivery-v1"
+  },
+  "missing_data_semantics": "not-run",
+  "numerator": {
+    "after_fail_closed_count": 4,
+    "before_false_delivery_count": 4,
+    "definition": "fixed P0 scenarios that falsely delivered before hardening"
+  },
+  "report_version": "kafa-outcome-benchmark-v1",
+  "scenarios": [
+    {
+      "after": {
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-B",
+          "-W",
+          "error::ResourceWarning",
+          "-m",
+          "unittest",
+          "tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed",
+          "-v"
+        ],
+        "duration_seconds": 0.493938,
+        "not_run_reason": "",
+        "result": "fail-closed",
+        "returncode": 0,
+        "status": "passed",
+        "stderr_sha256": "90bf26a24d36f610cc5784881b86207aec5801f93d8b206b4a6dc1079d9cc19c",
+        "stderr_tail": "test_empty_graph_direct_api_fails_closed (tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.353s\n\nOK\n",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_tail": ""
+      },
+      "before": {
+        "result": "false-delivery",
+        "source": "docs/audits/2026-07-20-delivery-integrity-hardening-baseline.md#p0-red-reproduction",
+        "status": "historical-reproduced"
+      },
+      "id": "minimum-graph-empty",
+      "test_id": "tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed",
+      "title": "delivery without the minimum graph"
+    },
+    {
+      "after": {
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-B",
+          "-W",
+          "error::ResourceWarning",
+          "-m",
+          "unittest",
+          "tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface",
+          "-v"
+        ],
+        "duration_seconds": 3.161672,
+        "not_run_reason": "",
+        "result": "fail-closed",
+        "returncode": 0,
+        "status": "passed",
+        "stderr_sha256": "d3e4daf9b1d9321b42d36b74e52a998d3014271320a8d806e41a0458ea369a06",
+        "stderr_tail": "test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface (tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 3.040s\n\nOK\n",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_tail": ""
+      },
+      "before": {
+        "result": "false-delivery",
+        "source": "docs/audits/2026-07-20-delivery-integrity-hardening-baseline.md#p0-red-reproduction",
+        "status": "historical-reproduced"
+      },
+      "id": "cancelled-sole-task-coverage",
+      "test_id": "tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface",
+      "title": "cancelled task as sole acceptance coverage"
+    },
+    {
+      "after": {
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-B",
+          "-W",
+          "error::ResourceWarning",
+          "-m",
+          "unittest",
+          "tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification",
+          "-v"
+        ],
+        "duration_seconds": 0.347265,
+        "not_run_reason": "",
+        "result": "fail-closed",
+        "returncode": 0,
+        "status": "passed",
+        "stderr_sha256": "6ef107bbf3a84d67df226d65a0ae421a2cc404babca0545e6defef7b21e85f24",
+        "stderr_tail": "test_existing_unrelated_target_cannot_claim_acceptance_without_qualification (tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.206s\n\nOK\n",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_tail": ""
+      },
+      "before": {
+        "result": "false-delivery",
+        "source": "docs/audits/2026-07-20-delivery-integrity-hardening-baseline.md#p0-red-reproduction",
+        "status": "historical-reproduced"
+      },
+      "id": "unqualified-unrelated-target",
+      "test_id": "tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification",
+      "title": "unrelated target as acceptance evidence"
+    },
+    {
+      "after": {
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-B",
+          "-W",
+          "error::ResourceWarning",
+          "-m",
+          "unittest",
+          "tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes",
+          "-v"
+        ],
+        "duration_seconds": 0.877684,
+        "not_run_reason": "",
+        "result": "fail-closed",
+        "returncode": 0,
+        "status": "passed",
+        "stderr_sha256": "40eaec0489ddae7174c4db299129c1d5b5a9ca631d405878ff9b1eeda499dcf9",
+        "stderr_tail": "test_record_mode_requires_readiness_even_when_all_evidence_passes (tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.751s\n\nOK\n",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_tail": ""
+      },
+      "before": {
+        "result": "false-delivery",
+        "source": "docs/audits/2026-07-20-delivery-integrity-hardening-baseline.md#p0-red-reproduction",
+        "status": "historical-reproduced"
+      },
+      "id": "direct-record-before-readiness",
+      "test_id": "tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes",
+      "title": "low-level delivery record before readiness"
+    }
+  ],
+  "started_at": "2026-07-21T10:09:42Z",
+  "summary": {
+    "failed_count": 0,
+    "not_run_count": 0,
+    "passed_count": 4,
+    "regression_closure_rate": 1.0,
+    "scenario_count": 4
+  },
+  "window": {
+    "after": "2026-07-21T10:09:47Z",
+    "before": "2026-07-20 historical reproduced red checkpoint",
+    "complete": true,
+    "kind": "fixed-before-after-regression"
+  }
+}

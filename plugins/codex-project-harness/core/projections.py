@@ -1,12 +1,19 @@
 """Markdown projection builder for SQLite runtime state."""
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 from typing import Callable, Iterable
 
 from harness_lib import ensure_parent, markdown_row, write_state
+from .errors import HarnessError
 from .project_fs import ProjectFS
+from .schema_guard import (
+    ACCEPTANCE_STATUSES,
+    FAILURE_MODE_STATUSES,
+    REQUIREMENT_STATUSES,
+)
 
 
 def _runtime():
@@ -15,8 +22,22 @@ def _runtime():
     return harness_db
 
 
-def render_all(root: Path) -> None:
-    render_affected(root, PROJECTION_NAMES)
+def render_all(
+    root: Path,
+    *,
+    failure_mode_evidence_root: Path | None = None,
+    failure_mode_candidate: str | None = None,
+    trace_evidence_root: Path | None = None,
+    trace_candidate: str | None = None,
+) -> None:
+    render_affected(
+        root,
+        PROJECTION_NAMES,
+        failure_mode_evidence_root=failure_mode_evidence_root,
+        failure_mode_candidate=failure_mode_candidate,
+        trace_evidence_root=trace_evidence_root,
+        trace_candidate=trace_candidate,
+    )
 
 
 def render_project_state(root: Path) -> None:
@@ -69,9 +90,24 @@ def render_requirements(root: Path) -> None:
     write_view(root, ".ai-team/requirements/requirements.md", "\n".join(lines))
 
 
-def render_traceability(root: Path) -> None:
+def render_traceability(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    candidate_override: str | None = None,
+) -> None:
     runtime = _runtime()
-    write_view(root, ".ai-team/requirements/traceability.md", "\n".join(runtime.trace_show(root)))
+    write_view(
+        root,
+        ".ai-team/requirements/traceability.md",
+        "\n".join(
+            runtime.trace_show(
+                root,
+                evidence_root=evidence_root,
+                candidate_override=candidate_override,
+            )
+        ),
+    )
 
 
 def render_acceptance(root: Path) -> None:
@@ -84,8 +120,26 @@ def render_acceptance(root: Path) -> None:
     write_view(root, ".ai-team/requirements/acceptance.md", "\n".join(lines))
 
 
-def render_failure_modes(root: Path) -> None:
+def render_failure_modes(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    candidate_override: str | None = None,
+) -> None:
+    """Render failure-mode coverage from the DB and its live evidence root.
+
+    Schema 30 projects retain the historical audit-only coverage projection.
+    Schema 31 coverage is stricter and depends on current-candidate immutable
+    execution artifacts.  Projection verification renders from a DB backup in
+    a temporary root, so it must explicitly use the original project as the
+    evidence authority instead of treating the empty verifier root as a new
+    candidate.
+    """
+
     runtime = _runtime()
+    from .cycle_ledger import current_candidate_sha
+    from .delivery import qualified_validation_execution_issues
+
     with runtime.connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from failure_modes where cycle_id = ? order by id", (cycle_id,)).fetchall()
@@ -96,18 +150,66 @@ def render_failure_modes(root: Path) -> None:
                 (cycle_id,),
             )
         }
-        covered = {
-            row["failure_mode_id"]
-            for row in conn.execute(
-                """
-                select distinct vfm.failure_mode_id
-                from validation_failure_modes vfm
-                join validations v on v.id = vfm.validation_id
-                where vfm.cycle_id = ? and v.cycle_id = vfm.cycle_id and v.result = 'pass'
-                """,
-                (cycle_id,),
-            )
+        validation_columns = {
+            str(column["name"])
+            for column in conn.execute("pragma table_info(validations)")
         }
+        if "qualification_id" not in validation_columns:
+            covered = {
+                str(row["failure_mode_id"])
+                for row in conn.execute(
+                    """
+                    select distinct vfm.failure_mode_id
+                    from validation_failure_modes vfm
+                    join validations v on v.id = vfm.validation_id
+                    where vfm.cycle_id = ? and v.cycle_id = vfm.cycle_id
+                      and v.result = 'pass'
+                    """,
+                    (cycle_id,),
+                )
+            }
+        else:
+            evidence_authority = evidence_root or root
+            candidate = candidate_override or current_candidate_sha(
+                evidence_authority
+            )
+            covered = set()
+            coverage_candidates = conn.execute(
+                """
+                select vfm.failure_mode_id, fm.risk, v.*
+                from validation_failure_modes vfm
+                join failure_modes fm
+                  on fm.cycle_id = vfm.cycle_id and fm.id = vfm.failure_mode_id
+                join validations v on v.id = vfm.validation_id
+                join failure_mode_acceptance fma
+                  on fma.cycle_id = vfm.cycle_id
+                 and fma.failure_mode_id = vfm.failure_mode_id
+                 and fma.acceptance_id = v.acceptance_id
+                where vfm.cycle_id = ? and v.cycle_id = vfm.cycle_id
+                  and v.candidate_sha = ? and v.result = 'pass'
+                  and v.validation_status = 'active'
+                  and v.qualification_id is not null
+                order by vfm.failure_mode_id, v.created_at desc, v.id desc
+                """,
+                (cycle_id, candidate),
+            ).fetchall()
+            for validation in coverage_candidates:
+                qualification = conn.execute(
+                    "select * from acceptance_target_qualifications where id = ?",
+                    (validation["qualification_id"],),
+                ).fetchone()
+                if qualification is None:
+                    continue
+                if not qualified_validation_execution_issues(
+                    conn,
+                    evidence_authority,
+                    validation,
+                    qualification,
+                    candidate,
+                    require_structured=str(validation["risk"])
+                    in {"medium", "high", "critical"},
+                ):
+                    covered.add(str(validation["failure_mode_id"]))
     lines = ["# Failure Modes", "", "| ID | Feature | Scenario | Trigger | Expected Behavior | Recovery | Data Safety | Risk | Test Mapping | Status | Derived Coverage | Accepted By | Acceptance Reason | Acceptance Scope | Accepted Revision | Expires At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         lines.append(
@@ -166,6 +268,65 @@ def render_test_targets(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
         targets = conn.execute("select * from test_targets order by id").fetchall()
+        has_qualifications = conn.execute(
+            "select 1 from sqlite_master where type='table' "
+            "and name='acceptance_target_qualifications'"
+        ).fetchone()
+        qualifications = (
+            conn.execute(
+                """
+                select q.*,
+                       coalesce(
+                         (
+                           select g.id
+                           from quality_gate_qualifications qg
+                           join quality_gates g on g.id = qg.gate_id
+                           where qg.qualification_id = q.id
+                           order by g.sequence desc
+                           limit 1
+                         ),
+                         'unreviewed'
+                       ) as gate_id,
+                       coalesce(
+                         (
+                           select g.candidate_sha
+                           from quality_gate_qualifications qg
+                           join quality_gates g on g.id = qg.gate_id
+                           where qg.qualification_id = q.id
+                           order by g.sequence desc
+                           limit 1
+                         ),
+                         ''
+                       ) as gate_candidate_sha,
+                       coalesce(
+                         (
+                           select g.gate_status
+                           from quality_gate_qualifications qg
+                           join quality_gates g on g.id = qg.gate_id
+                           where qg.qualification_id = q.id
+                           order by g.sequence desc
+                           limit 1
+                         ),
+                         'unreviewed'
+                       ) as gate_status,
+                       coalesce(
+                         (
+                           select g.review_status
+                           from quality_gate_qualifications qg
+                           join quality_gates g on g.id = qg.gate_id
+                           where qg.qualification_id = q.id
+                           order by g.sequence desc
+                           limit 1
+                         ),
+                         'unreviewed'
+                       ) as gate_review_status
+                from acceptance_target_qualifications q
+                order by q.created_at, q.id
+                """
+            ).fetchall()
+            if has_qualifications
+            else []
+        )
     lines = [
         "# Test Targets",
         "",
@@ -192,6 +353,37 @@ def render_test_targets(root: Path) -> None:
             ]
         )
         for row in targets
+    )
+    lines.extend(
+        [
+            "",
+            "## Acceptance-Target Qualifications",
+            "",
+            "These insert-only rows record procedural accountability; they do not prove semantic correctness or cryptographic provenance.",
+            "",
+            "| ID | Cycle | Acceptance | Acceptance Revision | Target | Target Definition SHA-256 | Rationale | Qualified By | Gate ID | Gate Candidate | Gate Status | Gate Review Status | Created At |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    lines.extend(
+        markdown_row(
+            [
+                row["id"],
+                row["cycle_id"],
+                row["acceptance_id"],
+                row["acceptance_revision"],
+                row["target_id"],
+                row["target_definition_sha256"],
+                row["rationale"],
+                row["qualified_by"],
+                row["gate_id"],
+                row["gate_candidate_sha"],
+                row["gate_status"],
+                row["gate_review_status"],
+                row["created_at"],
+            ]
+        )
+        for row in qualifications
     )
     write_view(root, ".ai-team/control/test-targets.md", "\n".join(lines))
 
@@ -257,35 +449,59 @@ def render_executions(root: Path) -> None:
     runtime = _runtime()
     with runtime.connection(root) as conn:
         rows = conn.execute("select * from executions order by created_at, id").fetchall()
-    lines = [
-        "# Immutable Executions",
-        "",
-        "| ID | Cycle | Candidate | Target | Command | Exit | Stdout SHA256 | Artifact | Count | Format | Semantic | Runner | Sandbox | No Network | Policy | Created At |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    lines.extend(
-        markdown_row(
-            [
-                row["id"],
-                row["cycle_id"],
-                row["candidate_sha"],
-                row["target_id"] or "",
-                row["command"],
-                row["exit_code"],
-                row["stdout_sha256"],
-                row["artifact_path"],
-                row["executed_count"],
-                row["result_format"],
-                row["semantic_status"],
-                row["runner"],
-                row["sandbox_status"],
-                row["no_network"],
-                row["policy_status"],
-                row["created_at"],
-            ]
+        project = conn.execute(
+            "select schema_version from project where id = 1"
+        ).fetchone()
+    schema_version = int(project[0]) if project is not None else 0
+    if schema_version >= 31:
+        lines = [
+            "# Immutable Executions",
+            "",
+            "| ID | Cycle | Candidate | Target | Target Definition SHA-256 | Command | Exit | Stdout SHA256 | Artifact | Count | Format | Semantic | Runner | Sandbox | No Network | Policy | Platform | Runtime Executable | Runtime Version | Runtime Executable SHA-256 | Policy Version | Container Engine | Container Engine Version | Container Engine Endpoint | Container Image Requested | Container Image Digest | Provenance Status | Created At |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        lines.extend(
+            markdown_row(
+                [
+                    row["id"], row["cycle_id"], row["candidate_sha"],
+                    row["target_id"] or "", row["target_definition_sha256"],
+                    row["command"], row["exit_code"], row["stdout_sha256"],
+                    row["artifact_path"], row["executed_count"],
+                    row["result_format"], row["semantic_status"], row["runner"],
+                    row["sandbox_status"], row["no_network"], row["policy_status"],
+                    row["platform"], row["runtime_executable"],
+                    row["runtime_version"], row["runtime_executable_sha256"],
+                    row["policy_version"], row["container_engine"],
+                    row["container_engine_version"],
+                    row["container_engine_endpoint"],
+                    row["container_image_requested"],
+                    row["container_image_digest"], row["provenance_status"],
+                    row["created_at"],
+                ]
+            )
+            for row in rows
         )
-        for row in rows
-    )
+    else:
+        lines = [
+            "# Immutable Executions",
+            "",
+            "| ID | Cycle | Candidate | Target | Command | Exit | Stdout SHA256 | Artifact | Count | Format | Semantic | Runner | Sandbox | No Network | Policy | Created At |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        lines.extend(
+            markdown_row(
+                [
+                    row["id"], row["cycle_id"], row["candidate_sha"],
+                    row["target_id"] or "", row["command"], row["exit_code"],
+                    row["stdout_sha256"], row["artifact_path"],
+                    row["executed_count"], row["result_format"],
+                    row["semantic_status"], row["runner"],
+                    row["sandbox_status"], row["no_network"],
+                    row["policy_status"], row["created_at"],
+                ]
+            )
+            for row in rows
+        )
     write_view(root, "docs/harness/executions.md", "\n".join(lines))
     _remove_retired_projection(root, Path("docs/harness/evidence.md"))
 
@@ -416,7 +632,46 @@ def preflight_projection_paths(root: Path) -> None:
         project_fs.audit(PROJECTION_ROLLBACK_PATHS, allow_missing=True)
 
 
-def render_affected(root: Path, projections: Iterable[str]) -> None:
+def _preflight_projection_states(root: Path) -> None:
+    """Reject non-canonical entity states before publishing any view bytes."""
+
+    runtime = _runtime()
+    with runtime.connection(root) as conn:
+        project = conn.execute(
+            "select schema_version from project where id = 1"
+        ).fetchone()
+        schema_version = int(project[0]) if project is not None else 0
+        contracts = (
+            ("requirements", "requirement", REQUIREMENT_STATUSES),
+            ("acceptance", "acceptance", ACCEPTANCE_STATUSES),
+            (
+                "failure_modes",
+                "failure mode",
+                FAILURE_MODE_STATUSES
+                | ({"active"} if schema_version <= 30 else set()),
+            ),
+        )
+        for table, label, allowed in contracts:
+            for row in conn.execute(
+                f"select id, status from {table} order by id"
+            ):
+                value = str(row["status"])
+                if value not in allowed:
+                    raise HarnessError(
+                        "projection state preflight failed: "
+                        f"invalid {label} status: {table}:{row['id']}.status={value!r}"
+                    )
+
+
+def render_affected(
+    root: Path,
+    projections: Iterable[str],
+    *,
+    failure_mode_evidence_root: Path | None = None,
+    failure_mode_candidate: str | None = None,
+    trace_evidence_root: Path | None = None,
+    trace_candidate: str | None = None,
+) -> None:
     """Rebuild only explicitly affected generated views in stable order."""
 
     selected = frozenset(projections)
@@ -424,9 +679,78 @@ def render_affected(root: Path, projections: Iterable[str]) -> None:
     if unknown:
         raise ValueError(f"unknown projection(s): {', '.join(unknown)}")
     preflight_projection_paths(root)
+    _preflight_projection_states(root)
     for name, renderer in PROJECTION_RENDERERS:
         if name in selected:
-            renderer(root)
+            if name == "failure-modes":
+                render_failure_modes(
+                    root,
+                    evidence_root=failure_mode_evidence_root,
+                    candidate_override=failure_mode_candidate,
+                )
+            elif name == "traceability":
+                render_traceability(
+                    root,
+                    evidence_root=trace_evidence_root,
+                    candidate_override=trace_candidate,
+                )
+            else:
+                renderer(root)
+
+
+def _snapshot_projection_execution_artifacts(
+    actual_fs: ProjectFS,
+    evidence_root: Path,
+    artifact_paths: Iterable[str],
+) -> tuple[dict[Path, tuple[object, str | None]], list[str]]:
+    """Copy safe referenced artifacts into an isolated immutable verifier root."""
+
+    receipts: dict[Path, tuple[object, str | None]] = {}
+    issues: list[str] = []
+    with ProjectFS.open(evidence_root) as evidence_fs:
+        for raw_path in sorted(set(artifact_paths)):
+            try:
+                relative = actual_fs.relative_to_root(Path(raw_path))
+                snapshot = actual_fs._snapshot(relative, allow_missing=True)
+                if relative in receipts:
+                    continue
+                if not snapshot.exists:
+                    receipts[relative] = (snapshot, None)
+                    continue
+                payload = actual_fs.read_bytes(relative, expected=snapshot)
+                actual_fs._assert_unchanged(relative, snapshot)
+                digest = hashlib.sha256(payload).hexdigest()
+                evidence_fs.atomic_write(relative, payload, mode=0o600)
+                receipts[relative] = (snapshot, digest)
+            except Exception as exc:
+                issues.append(
+                    "execution artifact could not be snapshotted for projection "
+                    f"verification: {raw_path}: {exc}"
+                )
+    return receipts, issues
+
+
+def _projection_artifact_receipt_issues(
+    actual_fs: ProjectFS,
+    receipts: dict[Path, tuple[object, str | None]],
+) -> list[str]:
+    issues: list[str] = []
+    for relative, (snapshot, expected_digest) in receipts.items():
+        try:
+            current = actual_fs._snapshot(relative, allow_missing=True)
+            if current != snapshot:
+                raise RuntimeError("path identity changed")
+            if expected_digest is not None:
+                payload = actual_fs.read_bytes(relative, expected=snapshot)
+                actual_fs._assert_unchanged(relative, snapshot)
+                if hashlib.sha256(payload).hexdigest() != expected_digest:
+                    raise RuntimeError("content digest changed")
+        except Exception as exc:
+            issues.append(
+                "execution artifact changed during projection verification: "
+                f"{relative.as_posix()}: {exc}"
+            )
+    return issues
 
 
 def projection_content_issues(root: Path) -> list[str]:
@@ -434,47 +758,104 @@ def projection_content_issues(root: Path) -> list[str]:
 
     runtime = _runtime()
     try:
+        from .cycle_ledger import current_candidate_sha
+        from .store import project_db_operation
+
         with tempfile.TemporaryDirectory(prefix="kafa-projection-verify-") as temp:
-            expected_root = Path(temp)
+            temp_root = Path(temp)
+            expected_root = temp_root / "expected"
+            evidence_root = temp_root / "evidence"
             expected_db = expected_root / runtime.DB_PATH
             ensure_parent(expected_db)
-            runtime.get_store(root).backup_to(expected_db)
-            render_all(expected_root)
-
-            issues: list[str] = []
-            with ProjectFS.open(root) as actual_fs, ProjectFS.open(
-                expected_root
-            ) as expected_fs:
-                for relative_path in PROJECTION_PATHS:
-                    try:
-                        actual = actual_fs.read_bytes(relative_path)
-                    except Exception:
-                        issues.append(
-                            f"missing or unsafe view: {relative_path.as_posix()}"
-                        )
-                        continue
-                    try:
-                        expected = expected_fs.read_bytes(relative_path)
-                    except Exception:
-                        issues.append(
-                            "projection verifier did not generate expected view: "
-                            f"{relative_path.as_posix()}"
-                        )
-                        continue
-                    if actual != expected:
-                        issues.append(
-                            f"stale or invalid view content: {relative_path.as_posix()}"
-                        )
-
-                retired_path = PROJECTION_ROLLBACK_PATHS[-1]
-                if actual_fs._snapshot(
-                    retired_path,
-                    allow_missing=True,
-                ).exists:
-                    issues.append(
-                        "retired projection is still present: "
-                        f"{retired_path.as_posix()}"
+            with project_db_operation(root) as actual_fs:
+                runtime.get_store(root).backup_to(expected_db)
+                with runtime.connection(expected_root) as conn:
+                    validation_columns = {
+                        str(column["name"])
+                        for column in conn.execute("pragma table_info(validations)")
+                    }
+                    strict_coverage = "qualification_id" in validation_columns
+                    artifact_paths = (
+                        [
+                            str(row[0])
+                            for row in conn.execute(
+                                "select distinct artifact_path from executions "
+                                "where artifact_path <> '' order by artifact_path"
+                            )
+                        ]
+                        if strict_coverage
+                        else []
                     )
-            return issues
+
+                candidate = (
+                    current_candidate_sha(root) if strict_coverage else None
+                )
+                receipts, issues = _snapshot_projection_execution_artifacts(
+                    actual_fs,
+                    evidence_root,
+                    artifact_paths,
+                )
+                render_all(
+                    expected_root,
+                    failure_mode_evidence_root=(
+                        evidence_root if strict_coverage else None
+                    ),
+                    failure_mode_candidate=candidate,
+                    trace_evidence_root=(
+                        evidence_root if strict_coverage else None
+                    ),
+                    trace_candidate=candidate,
+                )
+
+                with ProjectFS.open(expected_root) as expected_fs:
+                    for relative_path in PROJECTION_PATHS:
+                        try:
+                            actual = actual_fs.read_bytes(relative_path)
+                        except Exception:
+                            issues.append(
+                                f"missing or unsafe view: {relative_path.as_posix()}"
+                            )
+                            continue
+                        try:
+                            expected = expected_fs.read_bytes(relative_path)
+                        except Exception:
+                            issues.append(
+                                "projection verifier did not generate expected view: "
+                                f"{relative_path.as_posix()}"
+                            )
+                            continue
+                        if actual != expected:
+                            issues.append(
+                                f"stale or invalid view content: {relative_path.as_posix()}"
+                            )
+
+                    retired_path = PROJECTION_ROLLBACK_PATHS[-1]
+                    if actual_fs._snapshot(
+                        retired_path,
+                        allow_missing=True,
+                    ).exists:
+                        issues.append(
+                            "retired projection is still present: "
+                            f"{retired_path.as_posix()}"
+                        )
+
+                issues.extend(
+                    _projection_artifact_receipt_issues(actual_fs, receipts)
+                )
+                if candidate is not None:
+                    try:
+                        current_candidate = current_candidate_sha(root)
+                    except Exception as exc:
+                        issues.append(
+                            "candidate changed during projection verification: "
+                            f"candidate identity became invalid: {exc}"
+                        )
+                    else:
+                        if current_candidate != candidate:
+                            issues.append(
+                                "candidate changed during projection verification: "
+                                f"before={candidate} after={current_candidate}"
+                            )
+                return issues
     except Exception as exc:
         return [f"projection content verification failed: {exc}"]

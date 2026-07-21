@@ -96,11 +96,18 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
 kafa project doctor --repo /path/to/business-project
 ```
 
-Initialization creates the schema 30 local runtime at:
+Initialization creates the active schema 31 local runtime at:
 
 ```text
 .ai-team/state/harness.db
 ```
+
+Schema 31 closes the public entity states: requirements and acceptance criteria
+use only `active` or `cancelled`; failure modes use only `identified`,
+`accepted`, or `exempt`. CLI guards, SQLite, migration preflight, doctor,
+projections, and JSON schemas reject unknown or approximately matching values.
+The only legacy normalization is schema-30 failure-mode `active` to
+`identified`, which is counted in the migration report.
 
 It also creates local Markdown views and the approved Native Codex agent templates. No remote credentials are requested, and no network call is part of project initialization.
 
@@ -150,6 +157,24 @@ If an unsafe path prevents DB or projection restoration, retain every recovery a
 and follow the `rollback-incomplete` procedure below. Never relabel an incomplete restore
 as successful and never auto-repair the link.
 
+## Schema 31 execution provenance
+
+Local verification records `target_definition_sha256`, controller `platform`,
+`runtime_executable`, `runtime_version`, `runtime_executable_sha256`,
+`policy_version`, and `provenance_status=complete` before the result can become
+delivery evidence. Doctor checks complete rows against the same contract. Executions
+migrated from schema 30 or older are retained as `legacy-incomplete` history and cannot
+satisfy a new schema 31 delivery.
+
+Container verification requires an already-local Docker image or Linux native-local
+Podman image. Kafa freezes and records `container_engine_endpoint`, accepts only a local
+Unix socket or Windows named pipe for Docker, pins every daemon command to it, resolves
+`container_image_digest`, invokes the immutable identity with `--pull=never`, and
+rechecks endpoint/engine/image identity before commit. Remote or ambiguous Docker
+routing and Podman remote/machine routing fail closed. Kafa does not pull images. A
+missing image, provenance drift, or incomplete provenance creates no passing validation;
+prepare or update the local image explicitly outside Kafa, then rerun verification.
+
 ## Upgrade
 
 First pull or checkout the desired Kafa source version, then refresh the installation:
@@ -168,7 +193,7 @@ kafa plugin upgrade --scope user --repo .
 
 Restart Codex after upgrading so it reloads plugin metadata and Hooks.
 
-## Migrate an initialized project to schema 30
+## Migrate an initialized project to schema 31
 
 Always inspect the current project first:
 
@@ -177,7 +202,7 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
   --root /path/to/business-project status
 ```
 
-For a schema 29 project, verify the CLI contract and run the dry-run before the real migration:
+For a schema 27, 28, 29, or 30 project, verify the CLI contract and run the dry-run before the real migration. Pass the actual source version reported by `status`; the following example uses schema 30:
 
 ```bash
 python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
@@ -185,23 +210,23 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
 
 python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
   --root /path/to/business-project migrate \
-  --from-version 29 \
-  --to-version 30 \
+  --from-version 30 \
+  --to-version 31 \
   --dry-run
 
 python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
   --root /path/to/business-project migrate \
-  --from-version 29 \
-  --to-version 30
+  --from-version 30 \
+  --to-version 31
 ```
 
-Published schema 27 and development schema 28 projects use the isolated legacy conversion stage before the same schema 30 conversion. Pass the actual source version reported by the project; never guess `--from-version`.
+Schema 27, 28, and 29 projects use the supported legacy conversion path before activation of schema 31. Schema 30 is a fixed compatibility and migration source, not an active runtime target. Never guess `--from-version`.
 
 The migration is side-by-side and recoverable:
 
 1. Validate the source database and compare-and-swap its schema version.
 2. Create a consistent SQLite backup with SHA-256, integrity result, foreign-key result, and row counts.
-3. Convert only approved local delivery facts into a staging schema 30 database.
+3. Convert only approved local delivery facts into a staging schema 31 database.
 4. Validate schema inventory, foreign keys, invariants, and projection dry-run.
 5. Atomically activate the staging database.
 6. Run final doctor; if it fails after activation, restore the verified backup and preserve the failed database for diagnosis.
@@ -213,7 +238,7 @@ and every generated projection. A `rollback-incomplete`, hard process exit, or
 interrupted recovery keeps the sentinel fail-closed; operators must not remove
 it until the manifest has been used to recover and verify database/projection
 authority. A core caller without the mandatory projection activation validator
-is rejected and cannot report schema 30 activated.
+is rejected and cannot report schema 31 activated.
 
 The validator proves content, not only path presence: it renders all 13 views
 from an independent temporary database snapshot and compares the live bytes.
@@ -223,7 +248,7 @@ its timestamp from SQLite `project.updated_at`, not the render-time clock, and
 rebuild uses replace rather than merge semantics so unchanged facts are
 byte-stable and stale ad-hoc keys are removed. The exact keys include database
 `id` and `current_cycle_id` and exclude generic `blocked_reason`. During rollback, failed
-schema-30 WAL/SHM files are quarantined with the failed main database before the
+failed-schema WAL/SHM files are quarantined with the failed main database before the
 source backup is restored and opened through ordinary read-only SQLite
 semantics. A handle or sidecar that cannot be neutralized leaves
 `rollback-incomplete`; it is never masked by an immutable SQLite open.
@@ -235,10 +260,10 @@ Core also fingerprints the stabilized active DB before and after the callback;
 any callback database write rolls back even when its value and regenerated
 views would otherwise pass doctor.
 
-Migration artifacts are stored under `.ai-team/backups/`. Removed remote-collaboration and execution-lifecycle rows remain only in that backup and never enter the active schema 30 database.
+Migration artifacts are stored under `.ai-team/backups/`. Removed remote-collaboration and execution-lifecycle rows remain only in that backup and never enter the active schema 31 database.
 
 Git source inspection pins the requested root with controlled `GIT_WORK_TREE`.
-Schema 30 permits exactly 27 active tables plus SQLite's `sqlite_sequence`;
+Schema 31 permits exactly 30 active tables plus SQLite's `sqlite_sequence`;
 other reserved-prefix tables are corruption, not hidden internals. Real Native
 controller verification runs from a start-verified private Git-backed snapshot
 and compares the original source again at completion. Snapshot initialization,
@@ -256,7 +281,7 @@ python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scrip
   --root /path/to/business-project status
 ```
 
-Do not delete the verified backup until the migrated project has passed its required local checks. After new schema 30 facts are written, Kafa does not promise an automatic downgrade.
+Do not delete the verified backup until the migrated project has passed its required local checks. After new schema 31 facts are written, Kafa does not promise an automatic downgrade.
 
 ## Repair and local recovery
 

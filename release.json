@@ -9,6 +9,6 @@
   "plugin": "codex-project-harness",
   "runtime_version": "5.0.0",
   "kernel_version": "5.0.0",
-  "schema_version_runtime": 30,
+  "schema_version_runtime": 31,
   "codex_cli_smoke_version": "0.143.0"
 }

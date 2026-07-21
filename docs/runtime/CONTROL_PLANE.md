@@ -54,7 +54,12 @@ They do not claim database leases or advance their own task state.
   Free-form validation text remains audit-only.
 - Every passing execution must bind to the current cycle, current candidate,
   exact registered target, artifact digest, positive test count, semantic
-  result, and actual sandbox/no-network policy status.
+  result, actual sandbox/no-network policy status, target-definition digest,
+  controller runtime digest, policy version, and complete provenance status.
+- Container evidence requires a frozen local daemon endpoint, an already-local
+  immutable image identity, and `--pull=never`; remote/ambiguous routing,
+  missing images, `legacy-incomplete` history, or provenance drift cannot
+  satisfy delivery.
 - A candidate change invalidates old execution and review credit for delivery.
   Historical rows remain auditable.
 - A passing review gate cannot be recorded with a dirty Git worktree.
@@ -80,14 +85,19 @@ active schema or satisfy delivery trust.
 
 1. Read applicable project instructions and the authoritative OpenSpec change.
 2. Confirm the real workspace, current branch/revision, and dirty state.
-3. Initialize the local runtime and record acceptance-linked task intent.
+3. Initialize the local runtime, confirm the baseline, and record
+   acceptance-linked task intent and target qualification.
 4. Let the native host perform implementation in its visible task or worktree.
 5. Return to the root workspace and establish the current candidate.
 6. Run an exact registered target with root-controller `verify run`.
-7. Store one immutable execution and link validation judgment to it.
+7. Store one immutable schema-31 execution and link qualified validation judgment
+   to it.
 8. Obtain an independent review through a distinct native-host context.
-9. Resolve findings and apply the honest high-risk policy.
-10. Record delivery only when the current-candidate decision has no blockers.
+9. Resolve findings, accept the submitted task, and then record the current
+   quality gate linked to the exact qualification; apply the honest high-risk
+   policy.
+10. Enter `delivery ready` and record delivery only when the shared prerequisite
+    evaluator has no blockers.
 
 The database stores the execution once. Validation, review, and delivery logic
 read that normalized fact instead of copying command output or accepting a

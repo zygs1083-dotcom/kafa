@@ -56,6 +56,24 @@ def add_dummy_target(root: Path) -> None:
     )
 
 
+def qualify_dummy_target(root: Path, acceptance_id: str, qualification_id: str) -> None:
+    run_harness(
+        root,
+        "test-target",
+        "qualify",
+        "--id",
+        qualification_id,
+        "--target",
+        "UNIT",
+        "--acceptance",
+        acceptance_id,
+        "--rationale",
+        "The structured unit target directly verifies this acceptance.",
+        "--by",
+        "test-controller",
+    )
+
+
 def submit_and_accept(root: Path, task_id: str) -> None:
     run_harness(root, "task", "start", task_id)
     run_harness(
@@ -146,10 +164,12 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "requirement", "link", "--requirement", "R1", "--acceptance", "AC1")
             run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
             submit_and_accept(root, "T1")
-            run_harness(root, "baseline", "freeze", "--id", "B1", "--summary", "original")
+            run_harness(root, "baseline", "confirm", "--id", "B1", "--summary", "original", "--by", "test-controller")
             add_dummy_target(root)
+            qualify_dummy_target(root, "AC1", "Q1")
             run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--qualification", "Q1", "--residual-risk", "explicit low-risk degraded limitation")
+            run_harness(root, "delivery", "ready")
             before = run_harness(root, "validate", "--delivery")
 
             run_harness(root, "acceptance", "add", "--id", "AC1", "--criterion", "Changed")
@@ -159,9 +179,11 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     "select target_type from invalidations where resolved_at is null order by target_type"
                 ).fetchall()
 
-            run_harness(root, "baseline", "freeze", "--id", "B2", "--summary", "updated")
+            run_harness(root, "baseline", "confirm", "--id", "B2", "--summary", "updated", "--by", "test-controller")
+            qualify_dummy_target(root, "AC1", "Q2")
             run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
-            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass")
+            run_harness(root, "gate", "record", "--reviewer-context", "same-context-degraded", "--result", "pass", "--qualification", "Q2", "--residual-risk", "explicit low-risk degraded limitation")
+            run_harness(root, "delivery", "ready")
             after = run_harness(root, "validate", "--delivery")
 
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
@@ -199,6 +221,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
             run_harness(root, "task", "add", "--id", "T1", "--task", "Example", "--acceptance", "AC1")
             submit_and_accept(root, "T1")
             add_dummy_target(root)
+            qualify_dummy_target(root, "AC1", "Q1")
             run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
 
             blocked = run_harness(root, "trace", "validate", check=False)
@@ -222,7 +245,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     insert into events
                     (id, schema_version, event_type, entity_type, entity_id, actor, command,
                      before_json, after_json, correlation_id, created_at)
-                    values ('bad-event', 30, 'tampered', 'project', '1', 'test', 'tamper',
+                    values ('bad-event', 31, 'tampered', 'project', '1', 'test', 'tamper',
                             '{bad json', '{}', 'corr-bad-event', 'now')
                     """
                 )

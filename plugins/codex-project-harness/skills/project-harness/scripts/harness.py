@@ -14,7 +14,7 @@ def plugin_root() -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument(
         "--root",
         default=".",

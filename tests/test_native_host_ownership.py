@@ -164,6 +164,24 @@ class NativeHostOwnershipTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
+            self.assertEqual(
+                run_harness(
+                    root,
+                    "test-target",
+                    "qualify",
+                    "--id",
+                    "UNIT-Q1",
+                    "--target",
+                    "UNIT",
+                    "--acceptance",
+                    "AC1",
+                    "--rationale",
+                    "UNIT proves the candidate acceptance criterion",
+                    "--by",
+                    "controller",
+                ).returncode,
+                0,
+            )
             verified = run_harness(root, "verify", "run", "--target", "UNIT", "--acceptance", "AC1")
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 

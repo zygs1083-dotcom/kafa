@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-20
+goal: Implement every acceptance item in the 2026-07-20 delivery integrity issue
+  checklist in strict P0-P1-P2 order.
