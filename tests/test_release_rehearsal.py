@@ -13,6 +13,13 @@ from tests.test_supply_chain_release import create_source_repo
 
 class ReleaseRehearsalContractTest(unittest.TestCase):
     @staticmethod
+    def _user_state_env(home: Path) -> dict[str, str]:
+        return {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+        }
+
+    @staticmethod
     def _user_install_fixture(
         root: Path,
         *,
@@ -188,7 +195,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
                 )
                 with (
                     self.subTest(marketplace=marketplace),
-                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch.dict(os.environ, self._user_state_env(home), clear=False),
                     patch(
                         "kafa.rehearsal._run_read_only",
                         side_effect=[
@@ -254,7 +261,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
             for label, installed in cases.items():
                 with (
                     self.subTest(label=label),
-                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch.dict(os.environ, self._user_state_env(home), clear=False),
                     patch(
                         "kafa.rehearsal._run_read_only",
                         side_effect=[
@@ -269,7 +276,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
 
             (cache / "payload.txt").write_bytes(b"different-cache\n")
             with (
-                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch.dict(os.environ, self._user_state_env(home), clear=False),
                 patch(
                     "kafa.rehearsal._run_read_only",
                     side_effect=[
@@ -290,7 +297,11 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
             for unsafe_home in ("", "relative-home"):
                 with (
                     self.subTest(home=unsafe_home),
-                    patch.dict(os.environ, {"HOME": unsafe_home}, clear=False),
+                    patch.dict(
+                        os.environ,
+                        {**self._user_state_env(home), "HOME": unsafe_home},
+                        clear=False,
+                    ),
                     patch(
                         "kafa.rehearsal._run_read_only",
                         side_effect=[
@@ -307,7 +318,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
                 )
 
             with (
-                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch.dict(os.environ, self._user_state_env(home), clear=False),
                 patch("kafa.rehearsal.managed_tree_is_safe", return_value=False),
                 patch(
                     "kafa.rehearsal._run_read_only",
@@ -332,7 +343,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
                 managed.rmdir()
                 managed.symlink_to(outside, target_is_directory=True)
                 with (
-                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch.dict(os.environ, self._user_state_env(home), clear=False),
                     patch(
                         "kafa.rehearsal._run_read_only",
                         side_effect=[
@@ -353,7 +364,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
             external = root / "external-kafa"
             external.write_bytes(b"#!/usr/bin/env python3\n")
             external.chmod(0o755)
-            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            with patch.dict(os.environ, self._user_state_env(home), clear=False):
                 state = capture_user_state("/tmp/codex", str(external))
             self.assertEqual(state["status"], "not-run")
             self.assertEqual(
@@ -369,7 +380,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
                 "sha256": "a" * 64,
             }
             with (
-                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch.dict(os.environ, self._user_state_env(home), clear=False),
                 patch("kafa.rehearsal._executable_identity", return_value=linked_identity),
             ):
                 state = capture_user_state(
@@ -386,7 +397,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
 
             def capture() -> dict[str, object]:
                 with (
-                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch.dict(os.environ, self._user_state_env(home), clear=False),
                     patch(
                         "kafa.rehearsal._run_read_only",
                         side_effect=[
@@ -427,7 +438,7 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
             (managed_cache / "runtime.cpython-314.pyc").write_bytes(b"managed-runtime-cache")
             (codex_cache / "runtime.cpython-313.pyc").write_bytes(b"codex-runtime-cache")
             with (
-                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch.dict(os.environ, self._user_state_env(home), clear=False),
                 patch(
                     "kafa.rehearsal._run_read_only",
                     side_effect=[
