@@ -194,6 +194,50 @@ class SupplyChainToolingContractTest(unittest.TestCase):
 
 
 class SupplyChainGenerationContractTest(unittest.TestCase):
+    def test_cli_generate_queries_the_installed_build_frontend_version(self) -> None:
+        from kafa import supply_chain
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = create_source_repo(root)
+            dist = create_artifacts(root)
+            versions = {"build": "0.0.0", "setuptools": "83.0.0"}
+            with (
+                patch.object(
+                    supply_chain,
+                    "_distribution_version",
+                    side_effect=lambda name: versions[name],
+                ) as distribution_version,
+                patch.object(
+                    supply_chain,
+                    "generate_release_evidence",
+                    return_value={"ok": True},
+                ) as generate,
+                patch("builtins.print"),
+            ):
+                result = supply_chain.main(
+                    [
+                        "generate",
+                        "--repo",
+                        str(repo),
+                        "--dist",
+                        str(dist),
+                        "--syft",
+                        "/tmp/pinned-syft",
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [item.args[0] for item in distribution_version.call_args_list],
+            ["build", "setuptools"],
+        )
+        self.assertEqual(
+            generate.call_args.kwargs["build_frontend_version"],
+            "0.0.0",
+        )
+
     def test_generate_and_verify_exact_wheel_sdist_evidence(self) -> None:
         from kafa.supply_chain import generate_release_evidence, verify_release_evidence
 
@@ -260,6 +304,51 @@ class SupplyChainGenerationContractTest(unittest.TestCase):
                 self.assertEqual(
                     component["hashes"],
                     [{"alg": "SHA-256", "content": artifact["sha256"]}],
+                )
+
+    def test_verifier_accepts_an_unchanged_candidate_moved_to_a_new_directory(self) -> None:
+        from kafa.supply_chain import verify_release_evidence
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo, original = generate_fixture(root)
+            moved = root / "downloaded-candidate"
+            original.rename(moved)
+
+            verified = verify_release_evidence(repo, moved)
+
+        self.assertTrue(verified["ok"], verified)
+
+    def test_generation_still_rejects_a_builder_targeting_another_directory(self) -> None:
+        from kafa.supply_chain import SupplyChainError, generate_release_evidence
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = create_source_repo(root)
+            dist = create_artifacts(root)
+            other = root / "other-dist"
+            other.mkdir()
+
+            with self.assertRaisesRegex(
+                SupplyChainError,
+                "builder command does not match",
+            ):
+                generate_release_evidence(
+                    repo,
+                    dist,
+                    syft_command=create_fake_syft(root),
+                    builder_command=[
+                        sys.executable,
+                        "-m",
+                        "build",
+                        "--no-isolation",
+                        "--wheel",
+                        "--sdist",
+                        "--outdir",
+                        str(other),
+                    ],
+                    build_frontend_version="1.5.0",
+                    build_backend_version="83.0.0",
                 )
 
     def test_generation_rejects_wrong_syft_version_or_commit(self) -> None:

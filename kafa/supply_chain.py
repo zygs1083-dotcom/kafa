@@ -15,7 +15,7 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 
@@ -78,7 +78,9 @@ def main(argv: list[str] | None = None) -> int:
                 dist,
                 syft_command=[syft],
                 builder_command=builder,
-                build_frontend_version=str(tooling["python_build"]["version"]),
+                build_frontend_version=_distribution_version(
+                    str(tooling["python_build"]["frontend"])
+                ),
                 build_backend_version=_distribution_version(
                     str(tooling["python_build"]["backend"])
                 ),
@@ -309,7 +311,7 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
         },
         "supply-chain builder",
     )
-    _validate_builder_command(builder["command"], dist)
+    _validate_builder_command(builder["command"])
     if builder["build_frontend_version"] != tooling["python_build"]["version"]:
         raise SupplyChainError("supply-chain build frontend pin mismatch")
     if builder["build_backend_version"] != tooling["python_build"]["backend_version"]:
@@ -368,7 +370,6 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
         subjects=expected_subjects,
         byproducts=expected_byproducts,
         builder=builder,
-        dist=dist,
     )
 
     evidence_names = [
@@ -533,7 +534,10 @@ def _validate_syft(command: Sequence[str], tooling: dict[str, Any]) -> dict[str,
     return {"version": actual_version, "git_commit": actual_commit}
 
 
-def _validate_builder_command(command: Sequence[str], dist: Path) -> list[str]:
+def _validate_builder_command(
+    command: Sequence[str],
+    dist: Path | None = None,
+) -> list[str]:
     if not isinstance(command, (list, tuple)) or not all(
         isinstance(item, str) and item for item in command
     ):
@@ -547,18 +551,25 @@ def _validate_builder_command(command: Sequence[str], dist: Path) -> list[str]:
         "--sdist",
         "--outdir",
     ]
-    if (
-        len(normalized) != 2 + len(expected_tail)
-        or normalized[1:-1] != expected_tail
-        or Path(normalized[-1]).expanduser().resolve() != dist
-    ):
+    if len(normalized) != 2 + len(expected_tail) or normalized[1:-1] != expected_tail:
         raise SupplyChainError(
             "builder command does not match pinned wheel+sdist build path"
         )
     executable = Path(normalized[0]).name.lower()
     if "python" not in executable and executable not in {"py", "py.exe"}:
         raise SupplyChainError("builder command does not use Python")
-    normalized[-1] = str(dist)
+    recorded_dist = normalized[-1]
+    if dist is not None:
+        if Path(recorded_dist).expanduser().resolve() != dist:
+            raise SupplyChainError(
+                "builder command does not match pinned wheel+sdist build path"
+            )
+        normalized[-1] = str(dist)
+    elif not (
+        PurePosixPath(recorded_dist).is_absolute()
+        or PureWindowsPath(recorded_dist).is_absolute()
+    ):
+        raise SupplyChainError("builder command output path is not absolute")
     return normalized
 
 
@@ -719,7 +730,6 @@ def _verify_provenance(
     subjects: dict[str, str],
     byproducts: list[dict[str, Any]],
     builder: dict[str, Any],
-    dist: Path,
 ) -> None:
     _require_exact_keys(
         provenance,
@@ -743,7 +753,7 @@ def _verify_provenance(
     if definition["buildType"] != BUILD_TYPE:
         raise SupplyChainError("provenance build type mismatch")
     command = definition["externalParameters"].get("builder_command")
-    _validate_builder_command(command, dist)
+    _validate_builder_command(command)
     if command != builder["command"]:
         raise SupplyChainError("provenance builder command mismatch")
     expected_internal = {

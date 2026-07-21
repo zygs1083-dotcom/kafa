@@ -268,6 +268,16 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertIn("attestations: write", candidate)
         self.assertIn("artifact-metadata: write", candidate)
         self.assertNotIn("contents: write", candidate)
+        self.assertEqual(
+            workflow.count(
+                "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../.release-candidate"
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/.release-candidate",
+            workflow,
+        )
         self.assertIn("python -m build --no-isolation --wheel --sdist", candidate)
         resolve_syft_at = candidate.index("Resolve checksum-pinned Syft asset")
         download_syft_at = candidate.index("Download checksum-pinned Syft")

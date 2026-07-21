@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,47 @@ from tests.test_supply_chain_release import create_source_repo
 
 
 class ReleaseRehearsalContractTest(unittest.TestCase):
+    @staticmethod
+    def _user_install_fixture(
+        root: Path,
+        *,
+        marketplace: str = "kafa-local",
+    ) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+        home = root / "home"
+        managed = home / ".agents" / "plugins" / "codex-project-harness"
+        cache = (
+            home
+            / ".codex"
+            / "plugins"
+            / "cache"
+            / marketplace
+            / "codex-project-harness"
+            / "2.0.0-beta.1"
+        )
+        kafa_bin = home / ".local" / "bin" / "kafa"
+        for tree in (managed, cache):
+            tree.mkdir(parents=True)
+            (tree / "payload.txt").write_bytes(b"installed-plugin\n")
+        kafa_bin.parent.mkdir(parents=True)
+        kafa_bin.write_bytes(b"#!/usr/bin/env python3\n")
+        kafa_bin.chmod(0o755)
+        plugin: dict[str, object] = {
+            "pluginId": f"codex-project-harness@{marketplace}",
+            "name": "codex-project-harness",
+            "marketplaceName": marketplace,
+            "version": "2.0.0-beta.1",
+            "installed": True,
+            "enabled": True,
+            "source": {"source": "local", "path": str(managed)},
+            "marketplaceSource": {
+                "sourceType": "local",
+                "source": str(home),
+            },
+            "installPolicy": "AVAILABLE",
+            "authPolicy": "ON_INSTALL",
+        }
+        return home, managed, cache, kafa_bin, plugin
+
     @staticmethod
     def _artifact_manifest() -> dict[str, dict[str, str]]:
         return {
@@ -133,6 +175,289 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(RehearsalError, "plugin digest"):
                     _validate_smoke(smoke, self._artifact_manifest())
+
+    def test_user_state_accepts_the_unique_managed_kafa_plugin_for_any_marketplace(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            for marketplace in ("kafa-local", "personal", "custom-marketplace"):
+                fixture_root = Path(temp) / marketplace
+                home, _, _, kafa_bin, plugin = self._user_install_fixture(
+                    fixture_root,
+                    marketplace=marketplace,
+                )
+                with (
+                    self.subTest(marketplace=marketplace),
+                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch(
+                        "kafa.rehearsal._run_read_only",
+                        side_effect=[
+                            ("2.0.0-beta.1\n", ""),
+                            (json.dumps({"installed": [plugin]}), ""),
+                        ],
+                    ),
+                ):
+                    state = capture_user_state("/tmp/codex", str(kafa_bin))
+
+                self.assertEqual(state["status"], "observed")
+                self.assertEqual(state["plugin"]["pluginId"], plugin["pluginId"])
+                self.assertEqual(
+                    state["plugin"]["marketplaceName"],
+                    marketplace,
+                )
+                self.assertRegex(state["kafa_executable"]["sha256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(state["managed_plugin"]["sha256"], r"^[0-9a-f]{64}$")
+                self.assertEqual(
+                    state["managed_plugin"]["sha256"],
+                    state["plugin_cache"]["sha256"],
+                )
+
+    def test_user_state_rejects_unmanaged_disabled_or_ambiguous_kafa_plugins(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            home, _, cache, kafa_bin, valid = self._user_install_fixture(Path(temp))
+            cases = {
+                "wrong-source": [
+                    {
+                        **valid,
+                        "source": {"source": "local", "path": str(home / "other")},
+                    }
+                ],
+                "disabled": [{**valid, "enabled": False}],
+                "ambiguous": [
+                    valid,
+                    {
+                        **valid,
+                        "pluginId": "codex-project-harness@personal",
+                        "marketplaceName": "personal",
+                    },
+                ],
+                "malformed-duplicate-id": [
+                    valid,
+                    {
+                        **valid,
+                        "name": "renamed-to-evade-name-filter",
+                        "pluginId": "codex-project-harness@personal",
+                        "marketplaceName": "personal",
+                    },
+                ],
+                "malformed-duplicate-source": [
+                    valid,
+                    {
+                        **valid,
+                        "name": "renamed-to-evade-identity-filter",
+                        "pluginId": "renamed-plugin@personal",
+                    },
+                ],
+            }
+            for label, installed in cases.items():
+                with (
+                    self.subTest(label=label),
+                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch(
+                        "kafa.rehearsal._run_read_only",
+                        side_effect=[
+                            ("2.0.0-beta.1\n", ""),
+                            (json.dumps({"installed": installed}), ""),
+                        ],
+                    ),
+                ):
+                    state = capture_user_state("/tmp/codex", str(kafa_bin))
+
+                self.assertEqual(state["status"], "not-run")
+
+            (cache / "payload.txt").write_bytes(b"different-cache\n")
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch(
+                    "kafa.rehearsal._run_read_only",
+                    side_effect=[
+                        ("2.0.0-beta.1\n", ""),
+                        (json.dumps({"installed": [valid]}), ""),
+                    ],
+                ),
+            ):
+                state = capture_user_state("/tmp/codex", str(kafa_bin))
+            self.assertEqual(state["status"], "not-run")
+
+    def test_user_state_rejects_unsafe_home_and_managed_tree_aliases(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home, managed, _, kafa_bin, valid = self._user_install_fixture(root)
+            for unsafe_home in ("", "relative-home"):
+                with (
+                    self.subTest(home=unsafe_home),
+                    patch.dict(os.environ, {"HOME": unsafe_home}, clear=False),
+                    patch(
+                        "kafa.rehearsal._run_read_only",
+                        side_effect=[
+                            ("2.0.0-beta.1\n", ""),
+                            (json.dumps({"installed": [valid]}), ""),
+                        ],
+                    ),
+                ):
+                    state = capture_user_state("/tmp/codex", str(kafa_bin))
+                self.assertEqual(state["status"], "not-run")
+                self.assertEqual(
+                    state["reason"],
+                    "HOME must be a non-empty absolute path",
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch("kafa.rehearsal.managed_tree_is_safe", return_value=False),
+                patch(
+                    "kafa.rehearsal._run_read_only",
+                    side_effect=[
+                        ("2.0.0-beta.1\n", ""),
+                        (json.dumps({"installed": [valid]}), ""),
+                    ],
+                ),
+            ):
+                state = capture_user_state("/tmp/codex", str(kafa_bin))
+            self.assertEqual(state["status"], "not-run")
+
+            if os.name != "nt":
+                outside = root / "repo-plugin"
+                outside.mkdir()
+                (outside / "payload.txt").write_bytes(b"installed-plugin\n")
+                for path in sorted(managed.rglob("*"), reverse=True):
+                    if path.is_file():
+                        path.unlink()
+                    elif path.is_dir():
+                        path.rmdir()
+                managed.rmdir()
+                managed.symlink_to(outside, target_is_directory=True)
+                with (
+                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch(
+                        "kafa.rehearsal._run_read_only",
+                        side_effect=[
+                            ("2.0.0-beta.1\n", ""),
+                            (json.dumps({"installed": [valid]}), ""),
+                        ],
+                    ),
+                ):
+                    state = capture_user_state("/tmp/codex", str(kafa_bin))
+                self.assertEqual(state["status"], "not-run")
+
+    def test_user_state_rejects_kafa_executable_outside_home(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home, _, _, _, _ = self._user_install_fixture(root)
+            external = root / "external-kafa"
+            external.write_bytes(b"#!/usr/bin/env python3\n")
+            external.chmod(0o755)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                state = capture_user_state("/tmp/codex", str(external))
+            self.assertEqual(state["status"], "not-run")
+            self.assertEqual(
+                state["reason"],
+                "user Kafa binary must be installed within HOME",
+            )
+
+            linked_identity = {
+                "invocation_path": str(home / ".local" / "bin" / "kafa"),
+                "resolved_path": str(external),
+                "link_target": str(external),
+                "size": external.stat().st_size,
+                "sha256": "a" * 64,
+            }
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch("kafa.rehearsal._executable_identity", return_value=linked_identity),
+            ):
+                state = capture_user_state(
+                    "/tmp/codex",
+                    str(home / ".local" / "bin" / "kafa"),
+                )
+            self.assertEqual(state["status"], "not-run")
+
+    def test_user_state_snapshot_detects_plugin_and_executable_byte_changes(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            home, managed, cache, kafa_bin, plugin = self._user_install_fixture(Path(temp))
+
+            def capture() -> dict[str, object]:
+                with (
+                    patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                    patch(
+                        "kafa.rehearsal._run_read_only",
+                        side_effect=[
+                            ("2.0.0-beta.1\n", ""),
+                            (json.dumps({"installed": [plugin]}), ""),
+                        ],
+                    ),
+                ):
+                    return capture_user_state("/tmp/codex", str(kafa_bin))
+
+            before = capture()
+            (managed / "payload.txt").write_bytes(b"changed-plugin\n")
+            after_plugin_change = capture()
+            (cache / "payload.txt").write_bytes(b"changed-plugin\n")
+            after_lockstep_plugin_change = capture()
+            for tree in (managed, cache):
+                (tree / "payload.txt").write_bytes(b"installed-plugin\n")
+            kafa_bin.write_bytes(b"#!/usr/bin/env python3\n# changed\n")
+            after_executable_change = capture()
+
+        self.assertEqual(before["status"], "observed")
+        self.assertEqual(after_plugin_change["status"], "not-run")
+        self.assertEqual(after_lockstep_plugin_change["status"], "observed")
+        self.assertEqual(after_executable_change["status"], "observed")
+        self.assertNotEqual(before, after_lockstep_plugin_change)
+        self.assertNotEqual(before, after_plugin_change)
+        self.assertNotEqual(before, after_executable_change)
+
+    def test_user_state_ignores_generated_python_cache_bytes(self) -> None:
+        from kafa.rehearsal import capture_user_state
+
+        with tempfile.TemporaryDirectory() as temp:
+            home, managed, cache, kafa_bin, plugin = self._user_install_fixture(Path(temp))
+            managed_cache = managed / "core" / "__pycache__"
+            codex_cache = cache / "core" / "__pycache__"
+            managed_cache.mkdir(parents=True)
+            codex_cache.mkdir(parents=True)
+            (managed_cache / "runtime.cpython-314.pyc").write_bytes(b"managed-runtime-cache")
+            (codex_cache / "runtime.cpython-313.pyc").write_bytes(b"codex-runtime-cache")
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                patch(
+                    "kafa.rehearsal._run_read_only",
+                    side_effect=[
+                        ("2.0.0-beta.1\n", ""),
+                        (json.dumps({"installed": [plugin]}), ""),
+                    ],
+                ),
+            ):
+                state = capture_user_state("/tmp/codex", str(kafa_bin))
+
+        self.assertEqual(state["status"], "observed")
+        self.assertEqual(
+            state["managed_plugin"]["sha256"],
+            state["plugin_cache"]["sha256"],
+        )
+
+    def test_windows_reparse_attribute_is_treated_as_a_link(self) -> None:
+        from kafa.cli import path_is_link
+
+        class ReparsePath:
+            @staticmethod
+            def is_symlink() -> bool:
+                return False
+
+            @staticmethod
+            def lstat() -> object:
+                return type("ReparseStat", (), {"st_file_attributes": 0x400})()
+
+        with patch("kafa.cli.stat.FILE_ATTRIBUTE_REPARSE_POINT", 0x400, create=True):
+            self.assertTrue(path_is_link(ReparsePath()))
 
     def test_rehearsal_uses_one_build_and_two_verifications_without_publish(self) -> None:
         from kafa.rehearsal import run_release_rehearsal

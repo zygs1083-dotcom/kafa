@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .cli import PLUGIN_NAME, managed_tree_is_safe, path_is_link, plugin_tree_digest
 from .release import release_report
 from .supply_chain import (
     SupplyChainError,
@@ -326,30 +327,225 @@ def capture_user_state(codex_bin: str, user_kafa_bin: str = "") -> dict[str, Any
     kafa_bin = user_kafa_bin or shutil.which("kafa")
     if not kafa_bin:
         return {"status": "not-run", "reason": "user Kafa binary is unavailable"}
+    executable = _executable_identity(Path(kafa_bin).expanduser())
+    if executable is None:
+        return {
+            "status": "not-run",
+            "reason": "user Kafa binary is not an absolute regular executable",
+        }
+    home_text = os.environ.get("HOME", "")
+    home = Path(home_text).expanduser() if home_text else None
+    if home is None or not home.is_absolute():
+        return {
+            "status": "not-run",
+            "reason": "HOME must be a non-empty absolute path",
+        }
+    try:
+        invocation_in_home = Path(executable["invocation_path"]).is_relative_to(home)
+        resolved_in_home = Path(executable["resolved_path"]).is_relative_to(
+            home.resolve(strict=True)
+        )
+    except OSError:
+        invocation_in_home = False
+        resolved_in_home = False
+    if not invocation_in_home or not resolved_in_home:
+        return {
+            "status": "not-run",
+            "reason": "user Kafa binary must be installed within HOME",
+        }
+    managed_plugin = home / ".agents" / "plugins" / PLUGIN_NAME
     kafa = _run_read_only([kafa_bin, "--version"])[0].strip()
     plugin_text = _run_read_only([codex_bin, "plugin", "list", "--json"])[0]
     try:
         plugin_report = json.loads(plugin_text)
+        installed = plugin_report.get("installed", [])
+        if not isinstance(installed, list):
+            raise AttributeError("installed is not a list")
         matches = [
             item
-            for item in plugin_report.get("installed", [])
-            if item.get("pluginId") == "codex-project-harness@personal"
+            for item in installed
+            if _is_kafa_plugin_entry(item, managed_plugin)
         ]
     except (AttributeError, json.JSONDecodeError) as exc:
         raise RehearsalError(f"invalid user plugin state: {exc}") from exc
     if len(matches) != 1:
         return {
             "status": "not-run",
-            "reason": f"expected one personal Kafa plugin, found {len(matches)}",
+            "reason": f"expected one managed user Kafa plugin, found {len(matches)}",
         }
     plugin = matches[0]
+    marketplace = plugin.get("marketplaceName")
+    version = plugin.get("version")
+    source = plugin.get("source")
+    source_path = _absolute_lexical_path(source.get("path")) if isinstance(source, dict) else None
+    managed_safe = _directory_chain_is_safe(home, managed_plugin)
+    managed_identity = _safe_tree_identity(managed_plugin) if managed_safe else None
+    valid = (
+        isinstance(marketplace, str)
+        and _safe_path_component(marketplace)
+        and isinstance(version, str)
+        and _safe_path_component(version)
+        and plugin.get("pluginId") == f"{PLUGIN_NAME}@{marketplace}"
+        and plugin.get("name") == PLUGIN_NAME
+        and plugin.get("installed") is True
+        and plugin.get("enabled") is True
+        and isinstance(source, dict)
+        and source.get("source") == "local"
+        and source_path == managed_plugin
+        and managed_identity is not None
+    )
+    if not valid:
+        return {
+            "status": "not-run",
+            "reason": "Kafa plugin is not an enabled managed user installation",
+        }
+
+    codex_home_text = os.environ.get("CODEX_HOME", "")
+    codex_home = (
+        Path(codex_home_text).expanduser()
+        if codex_home_text
+        else home / ".codex"
+    )
+    if not codex_home.is_absolute():
+        return {
+            "status": "not-run",
+            "reason": "CODEX_HOME must be an absolute path",
+        }
+    cache_path = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / marketplace
+        / PLUGIN_NAME
+        / version
+    )
+    cache_boundary = home if not codex_home_text else codex_home
+    cache_safe = _directory_chain_is_safe(cache_boundary, cache_path)
+    cache_identity = _safe_tree_identity(cache_path) if cache_safe else None
+    if (
+        cache_identity is None
+        or managed_identity["sha256"] != cache_identity["sha256"]
+    ):
+        return {
+            "status": "not-run",
+            "reason": "Kafa plugin cache is missing, unsafe, or differs from managed installation",
+        }
     return {
         "status": "observed",
         "kafa_version": kafa,
+        "kafa_executable": executable,
+        "managed_plugin": managed_identity,
+        "plugin_cache": cache_identity,
         "plugin": {
             key: plugin.get(key)
-            for key in ("pluginId", "version", "installed", "enabled", "source")
+            for key in (
+                "pluginId",
+                "name",
+                "marketplaceName",
+                "version",
+                "installed",
+                "enabled",
+                "source",
+                "marketplaceSource",
+                "installPolicy",
+                "authPolicy",
+            )
         },
+    }
+
+
+def _is_kafa_plugin_entry(value: object, managed_plugin: Path) -> bool:
+    if not isinstance(value, dict):
+        return False
+    plugin_id = value.get("pluginId")
+    source = value.get("source")
+    source_path = _absolute_lexical_path(source.get("path")) if isinstance(source, dict) else None
+    return value.get("name") == PLUGIN_NAME or (
+        isinstance(plugin_id, str)
+        and (plugin_id == PLUGIN_NAME or plugin_id.startswith(f"{PLUGIN_NAME}@"))
+    ) or source_path == managed_plugin
+
+
+def _absolute_lexical_path(value: object) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return None
+    return Path(os.path.normpath(str(path)))
+
+
+def _safe_path_component(value: str) -> bool:
+    return (
+        bool(value)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and Path(value).name == value
+    )
+
+
+def _directory_chain_is_safe(boundary: Path, target: Path) -> bool:
+    if not boundary.is_absolute() or not target.is_absolute():
+        return False
+    try:
+        relative = target.relative_to(boundary)
+    except ValueError:
+        return False
+    current = boundary
+    for part in relative.parts:
+        if not current.is_dir() or path_is_link(current):
+            return False
+        current = current / part
+    return (
+        current == target
+        and current.is_dir()
+        and not path_is_link(current)
+        and managed_tree_is_safe(current)
+    )
+
+
+def _safe_tree_identity(root: Path) -> dict[str, Any] | None:
+    if not managed_tree_is_safe(root):
+        return None
+    try:
+        files = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix not in {".pyc", ".pyo"}
+        ]
+    except OSError:
+        return None
+    digest = plugin_tree_digest(root)
+    if not digest:
+        return None
+    return {
+        "path": str(root),
+        "file_count": len(files),
+        "sha256": digest,
+    }
+
+
+def _executable_identity(path: Path) -> dict[str, Any] | None:
+    if not path.is_absolute():
+        return None
+    invocation = Path(os.path.normpath(str(path)))
+    try:
+        resolved = invocation.resolve(strict=True)
+        if not resolved.is_file() or path_is_link(resolved):
+            return None
+        payload = resolved.read_bytes()
+        link_target = os.readlink(invocation) if invocation.is_symlink() else None
+    except OSError:
+        return None
+    return {
+        "invocation_path": str(invocation),
+        "resolved_path": str(resolved),
+        "link_target": link_target,
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
     }
 
 
