@@ -1,10 +1,10 @@
 {
-  "agent_runtime_seconds": 61.162525,
+  "agent_runtime_seconds": 62.541681,
   "estimated_cost": null,
   "evaluation_source": {
-    "generated_at": "2026-07-21T15:40:44+00:00",
+    "generated_at": "2026-07-21T16:21:15+00:00",
     "git_dirty": false,
-    "git_head": "350ef60deaec99bfce0c94cf49db5a7b2ee61bd6",
+    "git_head": "d7956226520658717bf7ce87e252fe7ad005f555",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -19,7 +19,7 @@
     ],
     "status_entry_count": 0,
     "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "workspace_sha256": "41eda5ab73c94252a89b0fc3f4d97109e8de6c9fb6461678cd82e1ca8d3c7087"
+    "workspace_sha256": "222ee103c2d33599575217feead6b4f7a4bd733f6f6bd9cf49ecf19c1904ff54"
   },
   "evidence_scope": "live-codex-parallel",
   "live_skipped": false,
@@ -65,23 +65,23 @@
         "integration_dependency_blocked_before_producers": true,
         "integration_start_returncode": 0,
         "integration_submit_returncode": 0,
-        "native_runtime_seconds": 61.162525,
+        "native_runtime_seconds": 62.541681,
         "native_runtime_source": "controller-parallel-wall-clock",
-        "native_token_count": 103370,
+        "native_token_count": 116558,
         "native_token_scope": "native-producers-only",
         "native_token_source": "codex-json-turn.completed",
         "native_usage": {
-          "cached_input_tokens": 84992,
-          "input_tokens": 102181,
-          "output_tokens": 1189,
-          "reasoning_output_tokens": 26,
-          "token_count": 103370
+          "cached_input_tokens": 97664,
+          "input_tokens": 115332,
+          "output_tokens": 1226,
+          "reasoning_output_tokens": 34,
+          "token_count": 116558
         },
         "overlap_policy": "block-parallel-on-declared-overlap",
         "pre_edit_returncode": 1,
         "producer_attribution_valid": true,
         "producer_count": 2,
-        "producer_overlap_seconds": 55.628549,
+        "producer_overlap_seconds": 62.448769,
         "producer_state_returncodes": [
           0,
           0,
@@ -100,23 +100,23 @@
             "exclusive_files": [
               "alpha.py"
             ],
-            "finished_offset_seconds": 55.630572,
+            "finished_offset_seconds": 62.541681,
             "last_message_recorded": true,
             "native_usage": {
-              "cached_input_tokens": 46592,
-              "input_tokens": 51504,
-              "output_tokens": 624,
-              "reasoning_output_tokens": 16,
-              "token_count": 52128
+              "cached_input_tokens": 52096,
+              "input_tokens": 64596,
+              "output_tokens": 669,
+              "reasoning_output_tokens": 21,
+              "token_count": 65265
             },
             "returncode": 0,
-            "runtime_seconds": 55.630572,
+            "runtime_seconds": 62.541681,
             "scope_valid": true,
             "started_offset_seconds": 0.0,
             "target": "LIVE-ALPHA",
             "task": "LIVE-P1",
             "test_file_unchanged": true,
-            "token_count": 52128,
+            "token_count": 65265,
             "token_source": "codex-json-turn.completed"
           },
           {
@@ -130,23 +130,23 @@
             "exclusive_files": [
               "beta.py"
             ],
-            "finished_offset_seconds": 61.162525,
+            "finished_offset_seconds": 62.450741,
             "last_message_recorded": true,
             "native_usage": {
-              "cached_input_tokens": 38400,
-              "input_tokens": 50677,
-              "output_tokens": 565,
-              "reasoning_output_tokens": 10,
-              "token_count": 51242
+              "cached_input_tokens": 45568,
+              "input_tokens": 50736,
+              "output_tokens": 557,
+              "reasoning_output_tokens": 13,
+              "token_count": 51293
             },
             "returncode": 0,
-            "runtime_seconds": 61.160502,
+            "runtime_seconds": 62.448769,
             "scope_valid": true,
-            "started_offset_seconds": 0.002023,
+            "started_offset_seconds": 0.001972,
             "target": "LIVE-BETA",
             "task": "LIVE-P2",
             "test_file_unchanged": true,
-            "token_count": 51242,
+            "token_count": 51293,
             "token_source": "codex-json-turn.completed"
           }
         ],
@@ -169,7 +169,7 @@
         "workload_unit_sha256": "9ba01d673f4fa619943603cfc8e660cdcc2cbf61331c1c08c382083cbc694dc9",
         "workload_units": 2
       },
-      "duration_seconds": 65.79857,
+      "duration_seconds": 67.154094,
       "mode": "live-codex-parallel",
       "name": "native_codex_two_producer_integration",
       "pass": true,
@@ -177,7 +177,7 @@
     }
   ],
   "summary": {
-    "duration_seconds": 65.798586,
+    "duration_seconds": 67.154111,
     "expected_human_review_required_count": 0,
     "failed_count": 0,
     "false_pass_count": 0,
@@ -189,12 +189,12 @@
     "skipped_count": 0,
     "sqlite_lock_error_count": 0
   },
-  "token_count": 103370,
+  "token_count": 116558,
   "token_usage": {
-    "cached_input_tokens": 84992,
-    "input_tokens": 102181,
-    "output_tokens": 1189,
-    "reasoning_output_tokens": 26,
-    "token_count": 103370
+    "cached_input_tokens": 97664,
+    "input_tokens": 115332,
+    "output_tokens": 1226,
+    "reasoning_output_tokens": 34,
+    "token_count": 116558
   }
 }
