@@ -270,9 +270,13 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertNotIn("contents: write", candidate)
         self.assertEqual(
             workflow.count(
-                "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../.release-candidate"
+                "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../release-candidate"
             ),
             2,
+        )
+        self.assertNotIn(
+            "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/../.release-candidate",
+            workflow,
         )
         self.assertNotIn(
             "RELEASE_CANDIDATE_DIR: ${{ github.workspace }}/.release-candidate",
