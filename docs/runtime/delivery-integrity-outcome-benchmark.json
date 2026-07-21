@@ -6,9 +6,9 @@
     "value": 4
   },
   "evaluation_source": {
-    "generated_at": "2026-07-21T15:42:46+00:00",
+    "generated_at": "2026-07-21T16:22:50+00:00",
     "git_dirty": false,
-    "git_head": "ba17297baf101e64dbccf35d8902dd6bfbb4f187",
+    "git_head": "6bae90b5c19f474b6255ed69bc0a0f08f9046f55",
     "source_scope": [
       "kafa/",
       "plugins/",
@@ -23,7 +23,7 @@
     ],
     "status_entry_count": 0,
     "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "workspace_sha256": "41eda5ab73c94252a89b0fc3f4d97109e8de6c9fb6461678cd82e1ca8d3c7087"
+    "workspace_sha256": "222ee103c2d33599575217feead6b4f7a4bd733f6f6bd9cf49ecf19c1904ff54"
   },
   "evidence_mode": "regression-benchmark",
   "field_evidence": {
@@ -64,7 +64,7 @@
     "status": "not-run"
   },
   "field_improvement_claimed": false,
-  "generated_at": "2026-07-21T15:42:46Z",
+  "generated_at": "2026-07-21T16:22:50Z",
   "inventory": {
     "before_after_inventory_matches": true,
     "scenario_count": 4,
@@ -96,13 +96,13 @@
           "tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed",
           "-v"
         ],
-        "duration_seconds": 0.499895,
+        "duration_seconds": 0.529439,
         "not_run_reason": "",
         "result": "fail-closed",
         "returncode": 0,
         "status": "passed",
-        "stderr_sha256": "6114d897983f465383e78653998c132682faebe5841e0da800fe980487b92757",
-        "stderr_tail": "test_empty_graph_direct_api_fails_closed (tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.294s\n\nOK\n",
+        "stderr_sha256": "24276fecf0608398197fbe0565ebf421794fb31ae574c91967c7a686e0b221e2",
+        "stderr_tail": "test_empty_graph_direct_api_fails_closed (tests.test_delivery_integrity_p0_contracts.MinimumDeliveryGraphRedTests.test_empty_graph_direct_api_fails_closed) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.314s\n\nOK\n",
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_tail": ""
       },
@@ -127,13 +127,13 @@
           "tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface",
           "-v"
         ],
-        "duration_seconds": 2.783597,
+        "duration_seconds": 2.862153,
         "not_run_reason": "",
         "result": "fail-closed",
         "returncode": 0,
         "status": "passed",
-        "stderr_sha256": "47c2f926dde2983289cdbdb6c1054464ddf6503524b7845e9467055b622672b5",
-        "stderr_tail": "test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface (tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 2.583s\n\nOK\n",
+        "stderr_sha256": "11218701927d56d33e28479a593ad0a31f051c1482b43805929831a82367e566",
+        "stderr_tail": "test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface (tests.test_delivery_integrity_p0_contracts.CancelledTaskCoverageRedTests.test_cancelled_sole_coverage_is_rejected_by_every_delivery_surface) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 2.661s\n\nOK\n",
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_tail": ""
       },
@@ -158,13 +158,13 @@
           "tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification",
           "-v"
         ],
-        "duration_seconds": 0.263427,
+        "duration_seconds": 0.280347,
         "not_run_reason": "",
         "result": "fail-closed",
         "returncode": 0,
         "status": "passed",
-        "stderr_sha256": "1ba8a4be49f488235cd9d37e6a2dcb1757580fcad97e1e6604782b6194f8c5a2",
-        "stderr_tail": "test_existing_unrelated_target_cannot_claim_acceptance_without_qualification (tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.145s\n\nOK\n",
+        "stderr_sha256": "3194ac110c206686d1ad1d86de3d1a777a6d05a7303573f5d6f9fff4ceaa4aa2",
+        "stderr_tail": "test_existing_unrelated_target_cannot_claim_acceptance_without_qualification (tests.test_delivery_integrity_p0_contracts.QualifiedAcceptanceEvidenceRedTests.test_existing_unrelated_target_cannot_claim_acceptance_without_qualification) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.154s\n\nOK\n",
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_tail": ""
       },
@@ -189,13 +189,13 @@
           "tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes",
           "-v"
         ],
-        "duration_seconds": 0.788097,
+        "duration_seconds": 0.794279,
         "not_run_reason": "",
         "result": "fail-closed",
         "returncode": 0,
         "status": "passed",
-        "stderr_sha256": "097b24217d0445af99bd4fb024ddf031d52c614cbd8ac20c14cd7c967658187a",
-        "stderr_tail": "test_record_mode_requires_readiness_even_when_all_evidence_passes (tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.663s\n\nOK\n",
+        "stderr_sha256": "d6aaf1bd1f33d906d53cfbb9c78d9a8f7e0f22e485fa72d0c7ee726fa4d3d6ef",
+        "stderr_tail": "test_record_mode_requires_readiness_even_when_all_evidence_passes (tests.test_delivery_integrity_p0_contracts.UnifiedPrerequisiteAndReadinessRedTests.test_record_mode_requires_readiness_even_when_all_evidence_passes) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.674s\n\nOK\n",
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_tail": ""
       },
@@ -209,7 +209,7 @@
       "title": "low-level delivery record before readiness"
     }
   ],
-  "started_at": "2026-07-21T15:42:41Z",
+  "started_at": "2026-07-21T16:22:45Z",
   "summary": {
     "failed_count": 0,
     "not_run_count": 0,
@@ -218,7 +218,7 @@
     "scenario_count": 4
   },
   "window": {
-    "after": "2026-07-21T15:42:46Z",
+    "after": "2026-07-21T16:22:50Z",
     "before": "2026-07-20 historical reproduced red checkpoint",
     "complete": true,
     "kind": "fixed-before-after-regression"
