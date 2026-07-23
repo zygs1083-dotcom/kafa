@@ -35,6 +35,7 @@ def create_source_repo(root: Path) -> Path:
     (repo / "release.json").write_bytes((REPO_ROOT / "release.json").read_bytes())
     (repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
     run(["git", "init"], cwd=repo)
+    run(["git", "config", "core.autocrlf", "false"], cwd=repo)
     run(["git", "config", "user.email", "supply-chain-test@example.invalid"], cwd=repo)
     run(["git", "config", "user.name", "Supply Chain Test"], cwd=repo)
     run(["git", "add", "."], cwd=repo)
@@ -416,6 +417,54 @@ class SupplyChainGenerationContractTest(unittest.TestCase):
 
 
 class SupplyChainTamperContractTest(unittest.TestCase):
+    def test_verifier_rejects_checksum_swapped_between_regular_check_and_open(self) -> None:
+        from kafa.supply_chain import SupplyChainError, verify_release_evidence
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo, dist = generate_fixture(root)
+            checksums = (dist / "SHA256SUMS").resolve()
+            good_copy = root / "SHA256SUMS.good"
+            corrupt_holder = root / "SHA256SUMS.corrupt"
+            good_copy.write_bytes(checksums.read_bytes())
+            corrupt_bytes = b"0" * 64 + b"  corrupted-artifact.whl\n"
+            checksums.write_bytes(corrupt_bytes)
+            original_os_open = os.open
+            swap_count = 0
+
+            def open_good_descriptor_during_race(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+            ) -> int:
+                nonlocal swap_count
+                if (
+                    isinstance(path, (str, os.PathLike))
+                    and Path(path) == checksums
+                    and swap_count == 0
+                ):
+                    os.replace(checksums, corrupt_holder)
+                    os.replace(good_copy, checksums)
+                    swap_count += 1
+                    return original_os_open(path, flags, mode)
+                return original_os_open(path, flags, mode)
+
+            try:
+                with patch.object(
+                    os,
+                    "open",
+                    new=open_good_descriptor_during_race,
+                ):
+                    with self.assertRaises(SupplyChainError):
+                        verify_release_evidence(repo, dist)
+            finally:
+                if corrupt_holder.exists():
+                    if checksums.exists():
+                        os.replace(checksums, good_copy)
+                    os.replace(corrupt_holder, checksums)
+            self.assertGreater(swap_count, 0)
+            self.assertEqual(checksums.read_bytes(), corrupt_bytes)
+
     def test_verifier_rejects_each_bound_input_tamper(self) -> None:
         from kafa.supply_chain import SupplyChainError, verify_release_evidence
 

@@ -17,8 +17,9 @@ handoff lifecycle; Kafa stores none of it.
   files, three modules, schema/migration/trust/security/permission/concurrency/
   data-loss/delivery-gate/public-API/cross-module decisions.
 - Native Host maps capability hints to actual models; hints never weaken gates.
-- Root loads this once. Producers get only task, acceptance, dependencies,
-  allowed files/sources, tests, escalation, and evidence format—not this Skill.
+- Root loads this reference only for parallel fan-out, shared-file integration,
+  or explicit advanced review. Producers receive a bounded task packet, not
+  this reference.
 - Entry Skill + this reference: <=16,000 UTF-8 bytes. Target producer packet and
   output at <=4,000 UTF-8 bytes each. Put long logs in local artifacts and return
   path + digest + summary. Root may approve one cohesive producer over target;

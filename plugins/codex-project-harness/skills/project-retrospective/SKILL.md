@@ -45,3 +45,13 @@ Review:
 ## Runtime Changes
 ## Follow-Up Tasks
 ```
+
+<!-- BEGIN GENERATED: workflow-contract:project-retrospective-trigger -->
+## Trigger (Non-Default)
+
+Trigger when: delivery milestone completes or a failure loop exposes a stable lesson
+
+Activates: project-retrospective
+
+This Skill is not part of the default small single-producer path. Once triggered, its complete evidence obligations remain active. If a required check is blocked, skipped, not-run, or unavailable, report that exact state; a fixture cannot substitute for required live evidence.
+<!-- END GENERATED: workflow-contract:project-retrospective-trigger -->

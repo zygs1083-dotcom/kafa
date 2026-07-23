@@ -363,6 +363,43 @@ class MediumRiskPolicyRedTests(unittest.TestCase):
         self.assertEqual(cells[10], "")
         self.assertEqual(projection_issues, [])
 
+    def test_stale_candidate_validation_does_not_cover_failure_mode_after_lazy_filter(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build_medium_graph(
+                root,
+                failure_mode_status="identified",
+                cover_failure_mode=True,
+            )
+            source = root / "emit_structured_result.py"
+            source.write_text(
+                source.read_text(encoding="utf-8") + "# stale\n",
+                encoding="utf-8",
+            )
+            from core.cycle_ledger import current_candidate_sha
+
+            with patch(
+                "core.cycle_ledger.current_candidate_sha",
+                wraps=current_candidate_sha,
+            ) as candidate:
+                projection_views.render_failure_modes(root)
+
+            row = next(
+                line
+                for line in (
+                    root / ".ai-team/requirements/failure-modes.md"
+                ).read_text(encoding="utf-8").splitlines()
+                if line.startswith("| FM-MEDIUM ")
+            )
+
+        self.assertEqual(
+            [cell.strip() for cell in row.strip("|").split("|")][10],
+            "",
+        )
+        self.assertEqual(candidate.call_count, 1)
+
     def test_failure_mode_coverage_must_use_its_linked_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

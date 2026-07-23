@@ -21,8 +21,8 @@ Check whether the project operating system still matches reality.
   policy version, optional frozen local container endpoint/image digest, and
   `provenance_status`
 - recent code changes and local tests
-- `scripts/harness.py status`
-- `scripts/harness.py validate --delivery`
+- `kafa project status --repo . --verbose`
+- `kafa project validate --repo . --delivery`
 
 ## Detect
 
@@ -50,3 +50,13 @@ Check whether the project operating system still matches reality.
 ## Optional Improvements
 ## Risks
 ```
+
+<!-- BEGIN GENERATED: workflow-contract:harness-audit-trigger -->
+## Trigger (Non-Default)
+
+Trigger when: multi-day work, repeated escapes, schema or runtime change or drift, or milestone review
+
+Activates: harness-audit
+
+This Skill is not part of the default small single-producer path. Once triggered, its complete evidence obligations remain active. If a required check is blocked, skipped, not-run, or unavailable, report that exact state; a fixture cannot substitute for required live evidence.
+<!-- END GENERATED: workflow-contract:harness-audit-trigger -->

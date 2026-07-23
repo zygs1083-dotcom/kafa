@@ -18,6 +18,16 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
+from .artifact_subject import (
+    ArtifactSubject,
+    ArtifactSubjectError,
+    RegularFileSnapshot,
+    in_toto_subjects,
+    manifest_records,
+    read_regular_file,
+    sha256sum_bytes,
+)
+
 
 TOOLING_MANIFEST = "release-tooling.json"
 RELEASE_MANIFEST = "release.json"
@@ -57,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     dist = Path(args.dist).expanduser().resolve()
     try:
         if args.command == "generate":
-            tooling = load_tooling(repo)
+            tooling, tooling_snapshot = _load_tooling_snapshot(repo)
             syft = args.syft or shutil.which("syft")
             if not syft:
                 raise SupplyChainError(
@@ -86,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 started_at=args.started_at or None,
                 finished_at=args.finished_at or None,
+                _tooling_input=(tooling, tooling_snapshot),
             )
         else:
             report = verify_release_evidence(repo, dist)
@@ -114,12 +125,23 @@ def generate_release_evidence(
     build_backend_version: str,
     started_at: str | None = None,
     finished_at: str | None = None,
+    _tooling_input: tuple[dict[str, Any], RegularFileSnapshot] | None = None,
 ) -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     dist = dist.expanduser().resolve()
     _validate_source_and_dist(repo, dist)
-    tooling = load_tooling(repo)
-    artifacts = discover_artifacts(repo, dist)
+    if _tooling_input is None:
+        tooling, tooling_snapshot = _load_tooling_snapshot(repo)
+    else:
+        tooling, tooling_snapshot = _tooling_input
+    source_snapshots = {TOOLING_MANIFEST: tooling_snapshot}
+    subjects = discover_artifact_subjects(
+        repo,
+        dist,
+        _source_snapshots=source_snapshots,
+    )
+    artifacts = manifest_records(subjects)
+    subjects_by_name = {subject.name: subject for subject in subjects}
     builder = _validate_builder_command(builder_command, dist)
     expected_build_version = str(tooling["python_build"]["version"])
     if build_frontend_version != expected_build_version:
@@ -139,11 +161,11 @@ def generate_release_evidence(
     if _parse_timestamp(finish) < _parse_timestamp(start):
         raise SupplyChainError("build finished_at precedes started_at")
 
-    source_before = source_identity(repo)
+    source_before = source_identity(repo, _preloaded=source_snapshots)
     artifact_before = {
         artifact["name"]: artifact["sha256"] for artifact in artifacts
     }
-    tooling_sha256 = sha256_file(repo / TOOLING_MANIFEST)
+    tooling_sha256 = tooling_snapshot.sha256
 
     staged_names: list[str] = []
     with tempfile.TemporaryDirectory(
@@ -151,6 +173,7 @@ def generate_release_evidence(
     ) as temp:
         stage = Path(temp)
         generated_artifacts: list[dict[str, str]] = []
+        staged_snapshots: dict[str, RegularFileSnapshot] = {}
         for artifact in artifacts:
             artifact_path = dist / artifact["name"]
             sbom_name = f"{artifact['name']}.cdx.json"
@@ -163,31 +186,32 @@ def generate_release_evidence(
                 f"{tooling['sbom']['format']}={raw_sbom}",
             ]
             _run(command, env=_isolated_syft_env(stage))
-            if sha256_file(artifact_path) != artifact["sha256"]:
+            if _artifact_subject(artifact_path, kind=artifact["kind"]) != subjects_by_name[artifact["name"]]:
                 raise SupplyChainError(
                     f"artifact changed while generating SBOM: {artifact['name']}"
                 )
             sbom = _load_json(raw_sbom)
             normalized = _normalize_sbom(
                 sbom,
-                artifact_name=artifact["name"],
-                artifact_sha256=artifact["sha256"],
+                subject=subjects_by_name[artifact["name"]],
                 syft_version=syft["version"],
             )
             sbom_path = stage / sbom_name
             _write_json(sbom_path, normalized)
+            sbom_snapshot = _regular_snapshot(sbom_path, "generated SBOM")
+            staged_snapshots[sbom_name] = sbom_snapshot
             generated_artifacts.append(
                 {
                     **artifact,
                     "sbom": sbom_name,
-                    "sbom_sha256": sha256_file(sbom_path),
+                    "sbom_sha256": sbom_snapshot.sha256,
                 }
             )
             staged_names.append(sbom_name)
 
         artifact_after = {
-            artifact["name"]: sha256_file(dist / artifact["name"])
-            for artifact in artifacts
+            subject.name: _artifact_subject(dist / subject.name, kind=subject.kind).sha256
+            for subject in subjects
         }
         if artifact_after != artifact_before:
             raise SupplyChainError("artifact bytes changed during evidence generation")
@@ -196,11 +220,10 @@ def generate_release_evidence(
             raise SupplyChainError("source identity changed during evidence generation")
 
         checksums_path = stage / CHECKSUMS_FILE
-        checksums_path.write_bytes(
-            b"".join(
-                f"{artifact['sha256']}  {artifact['name']}\n".encode("utf-8")
-                for artifact in generated_artifacts
-            )
+        checksums_path.write_bytes(sha256sum_bytes(subjects))
+        staged_snapshots[CHECKSUMS_FILE] = _regular_snapshot(
+            checksums_path,
+            "generated checksums",
         )
         staged_names.append(CHECKSUMS_FILE)
 
@@ -208,6 +231,7 @@ def generate_release_evidence(
             tooling=tooling,
             tooling_sha256=tooling_sha256,
             source=source_before,
+            subjects=subjects,
             artifacts=generated_artifacts,
             builder_command=builder,
             build_frontend_version=build_frontend_version,
@@ -218,12 +242,16 @@ def generate_release_evidence(
         )
         provenance_path = stage / PROVENANCE_FILE
         _write_json(provenance_path, provenance)
+        staged_snapshots[PROVENANCE_FILE] = _regular_snapshot(
+            provenance_path,
+            "generated provenance",
+        )
         staged_names.append(PROVENANCE_FILE)
 
         evidence_files = [
             {
                 "name": name,
-                "sha256": sha256_file(stage / name),
+                "sha256": staged_snapshots[name].sha256,
             }
             for name in sorted(staged_names)
         ]
@@ -262,11 +290,18 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     dist = dist.expanduser().resolve()
     _validate_source_and_dist(repo, dist)
-    tooling = load_tooling(repo)
-    artifacts = discover_artifacts(repo, dist)
-    source = source_identity(repo)
-    tooling_sha256 = sha256_file(repo / TOOLING_MANIFEST)
-    manifest = _load_json(dist / EVIDENCE_MANIFEST)
+    tooling, tooling_snapshot = _load_tooling_snapshot(repo)
+    source_snapshots = {TOOLING_MANIFEST: tooling_snapshot}
+    subjects = discover_artifact_subjects(
+        repo,
+        dist,
+        _source_snapshots=source_snapshots,
+    )
+    artifacts = manifest_records(subjects)
+    subjects_by_name = {subject.name: subject for subject in subjects}
+    source = source_identity(repo, _preloaded=source_snapshots)
+    tooling_sha256 = tooling_snapshot.sha256
+    manifest, _manifest_snapshot = _load_json_snapshot(dist / EVIDENCE_MANIFEST)
     _require_exact_keys(
         manifest,
         {
@@ -323,30 +358,25 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
     if not isinstance(builder["python_version"], str) or not builder["python_version"].strip():
         raise SupplyChainError("supply-chain Python version is missing")
 
-    expected_subjects = {
-        artifact["name"]: artifact["sha256"] for artifact in artifacts
-    }
-    expected_checksums = b"".join(
-        f"{artifact['sha256']}  {artifact['name']}\n".encode("utf-8")
-        for artifact in artifacts
-    )
-    checksums_path = _regular_evidence_file(dist, CHECKSUMS_FILE)
-    if checksums_path.read_bytes() != expected_checksums:
+    expected_checksums = sha256sum_bytes(subjects)
+    evidence_snapshots: dict[str, RegularFileSnapshot] = {}
+    checksums_snapshot = _regular_evidence_snapshot(dist, CHECKSUMS_FILE)
+    evidence_snapshots[CHECKSUMS_FILE] = checksums_snapshot
+    if checksums_snapshot.payload != expected_checksums:
         raise SupplyChainError("SHA256SUMS does not exactly match artifact bytes")
 
     expected_artifact_records: list[dict[str, str]] = []
     expected_byproducts: list[dict[str, Any]] = []
     for artifact in artifacts:
         sbom_name = f"{artifact['name']}.cdx.json"
-        sbom_path = _regular_evidence_file(dist, sbom_name)
-        sbom = _load_json(sbom_path)
+        sbom, sbom_snapshot = _load_evidence_json_snapshot(dist, sbom_name)
+        evidence_snapshots[sbom_name] = sbom_snapshot
         _verify_sbom(
             sbom,
-            artifact_name=artifact["name"],
-            artifact_sha256=artifact["sha256"],
+            subject=subjects_by_name[artifact["name"]],
             syft_version=str(tooling["sbom"]["version"]),
         )
-        sbom_sha256 = sha256_file(sbom_path)
+        sbom_sha256 = sbom_snapshot.sha256
         expected_artifact_records.append(
             {
                 **artifact,
@@ -360,14 +390,17 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
     if manifest["artifacts"] != expected_artifact_records:
         raise SupplyChainError("supply-chain artifact/SBOM manifest mismatch")
 
-    provenance_path = _regular_evidence_file(dist, PROVENANCE_FILE)
-    provenance = _load_json(provenance_path)
+    provenance, provenance_snapshot = _load_evidence_json_snapshot(
+        dist,
+        PROVENANCE_FILE,
+    )
+    evidence_snapshots[PROVENANCE_FILE] = provenance_snapshot
     _verify_provenance(
         provenance,
         tooling=tooling,
         tooling_sha256=tooling_sha256,
         source=source,
-        subjects=expected_subjects,
+        subjects=subjects,
         byproducts=expected_byproducts,
         builder=builder,
     )
@@ -378,7 +411,7 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
         *[record["sbom"] for record in expected_artifact_records],
     ]
     expected_evidence_files = [
-        {"name": name, "sha256": sha256_file(_regular_evidence_file(dist, name))}
+        {"name": name, "sha256": evidence_snapshots[name].sha256}
         for name in sorted(evidence_names)
     ]
     if manifest["evidence_files"] != expected_evidence_files:
@@ -399,7 +432,14 @@ def verify_release_evidence(repo: Path, dist: Path) -> dict[str, Any]:
 
 
 def load_tooling(repo: Path) -> dict[str, Any]:
-    tooling = _load_json(repo / TOOLING_MANIFEST)
+    tooling, _snapshot = _load_tooling_snapshot(repo)
+    return tooling
+
+
+def _load_tooling_snapshot(
+    repo: Path,
+) -> tuple[dict[str, Any], RegularFileSnapshot]:
+    tooling, snapshot = _load_json_snapshot(repo / TOOLING_MANIFEST)
     try:
         if tooling["schema_version"] != 1:
             raise SupplyChainError("unsupported release tooling schema")
@@ -413,11 +453,22 @@ def load_tooling(repo: Path) -> dict[str, Any]:
             raise SupplyChainError("unsupported SLSA predicate pin")
     except (KeyError, TypeError) as exc:
         raise SupplyChainError(f"invalid release tooling manifest: {exc}") from exc
-    return tooling
+    return tooling, snapshot
 
 
 def discover_artifacts(repo: Path, dist: Path) -> list[dict[str, str]]:
-    release = _load_json(repo / RELEASE_MANIFEST)
+    return manifest_records(discover_artifact_subjects(repo, dist))
+
+
+def discover_artifact_subjects(
+    repo: Path,
+    dist: Path,
+    *,
+    _source_snapshots: dict[str, RegularFileSnapshot] | None = None,
+) -> tuple[ArtifactSubject, ...]:
+    release, release_snapshot = _load_json_snapshot(repo / RELEASE_MANIFEST)
+    if _source_snapshots is not None:
+        _source_snapshots[RELEASE_MANIFEST] = release_snapshot
     pep440 = str(release.get("pep440_version", ""))
     package = str(release.get("package", ""))
     if not pep440 or package != "kafa":
@@ -441,15 +492,26 @@ def discover_artifacts(repo: Path, dist: Path) -> list[dict[str, str]]:
         raise SupplyChainError(
             f"release artifact names mismatch: actual={sorted(actual)} expected={sorted(expected)}"
         )
-    records: list[dict[str, str]] = []
+    subjects: list[ArtifactSubject] = []
     for name, kind in expected.items():
         path = dist / name
         _require_regular(path, "release artifact")
-        records.append({"name": name, "kind": kind, "sha256": sha256_file(path)})
-    return sorted(records, key=lambda item: item["name"])
+        subjects.append(_artifact_subject(path, kind=kind))
+    return tuple(sorted(subjects, key=lambda subject: (subject.name, subject.kind)))
 
 
-def source_identity(repo: Path) -> dict[str, Any]:
+def _artifact_subject(path: Path, *, kind: str) -> ArtifactSubject:
+    try:
+        return ArtifactSubject.from_file(path, kind=kind)
+    except ArtifactSubjectError as exc:
+        raise SupplyChainError(str(exc)) from exc
+
+
+def source_identity(
+    repo: Path,
+    *,
+    _preloaded: dict[str, RegularFileSnapshot] | None = None,
+) -> dict[str, Any]:
     commit = _git(repo, ["rev-parse", "HEAD"]).decode("ascii").strip()
     if not _is_hex(commit, 40):
         raise SupplyChainError("source git commit is unavailable")
@@ -474,10 +536,16 @@ def source_identity(repo: Path) -> dict[str, Any]:
             digest.update(b"missing\0")
             count += 1
             continue
-        if path.is_symlink() or not path.is_file():
-            raise SupplyChainError(f"source identity rejects non-regular path: {relative}")
-        payload = path.read_bytes()
-        executable = bool(path.stat().st_mode & stat.S_IXUSR)
+        snapshot = _preloaded.get(relative) if _preloaded is not None else None
+        if snapshot is not None:
+            if not snapshot.matches_path(path):
+                raise SupplyChainError(
+                    f"source identity changed after snapshot: {relative}"
+                )
+        else:
+            snapshot = _regular_snapshot(path, "source identity")
+        payload = snapshot.payload
+        executable = bool(snapshot.mode & stat.S_IXUSR)
         digest.update((b"executable\0" if executable else b"regular\0"))
         digest.update(str(len(payload)).encode("ascii") + b"\0")
         digest.update(payload)
@@ -492,12 +560,7 @@ def source_identity(repo: Path) -> dict[str, Any]:
 
 
 def sha256_file(path: Path) -> str:
-    _require_regular(path, "hashed file")
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return _regular_snapshot(path, "hashed file").sha256
 
 
 def _validate_source_and_dist(repo: Path, dist: Path) -> None:
@@ -576,22 +639,19 @@ def _validate_builder_command(
 def _normalize_sbom(
     sbom: dict[str, Any],
     *,
-    artifact_name: str,
-    artifact_sha256: str,
+    subject: ArtifactSubject,
     syft_version: str,
 ) -> dict[str, Any]:
     _verify_sbom_base(
         sbom,
-        artifact_name=artifact_name,
-        artifact_sha256=artifact_sha256,
+        subject=subject,
         syft_version=syft_version,
     )
     component = sbom["metadata"]["component"]
-    component["hashes"] = [{"alg": "SHA-256", "content": artifact_sha256}]
+    component["hashes"] = [{"alg": "SHA-256", "content": subject.sha256}]
     _verify_sbom(
         sbom,
-        artifact_name=artifact_name,
-        artifact_sha256=artifact_sha256,
+        subject=subject,
         syft_version=syft_version,
     )
     return sbom
@@ -600,10 +660,10 @@ def _normalize_sbom(
 def _verify_sbom_base(
     sbom: dict[str, Any],
     *,
-    artifact_name: str,
-    artifact_sha256: str,
+    subject: ArtifactSubject,
     syft_version: str,
 ) -> None:
+    artifact_name = subject.name
     if sbom.get("$schema") != "http://cyclonedx.org/schema/bom-1.6.schema.json":
         raise SupplyChainError(f"SBOM schema mismatch for {artifact_name}")
     if sbom.get("bomFormat") != "CycloneDX" or sbom.get("specVersion") != "1.6":
@@ -614,7 +674,7 @@ def _verify_sbom_base(
         raise SupplyChainError(f"SBOM subject is missing for {artifact_name}")
     if component.get("name") != artifact_name:
         raise SupplyChainError(f"SBOM subject name mismatch for {artifact_name}")
-    if component.get("version") != f"sha256:{artifact_sha256}":
+    if component.get("version") != f"sha256:{subject.sha256}":
         raise SupplyChainError(f"SBOM subject version mismatch for {artifact_name}")
     tools = metadata.get("tools") if isinstance(metadata, dict) else None
     components = tools.get("components") if isinstance(tools, dict) else None
@@ -630,19 +690,17 @@ def _verify_sbom_base(
 def _verify_sbom(
     sbom: dict[str, Any],
     *,
-    artifact_name: str,
-    artifact_sha256: str,
+    subject: ArtifactSubject,
     syft_version: str,
 ) -> None:
     _verify_sbom_base(
         sbom,
-        artifact_name=artifact_name,
-        artifact_sha256=artifact_sha256,
+        subject=subject,
         syft_version=syft_version,
     )
     hashes = sbom["metadata"]["component"].get("hashes")
-    if hashes != [{"alg": "SHA-256", "content": artifact_sha256}]:
-        raise SupplyChainError(f"SBOM subject digest mismatch for {artifact_name}")
+    if hashes != [{"alg": "SHA-256", "content": subject.sha256}]:
+        raise SupplyChainError(f"SBOM subject digest mismatch for {subject.name}")
 
 
 def _provenance_statement(
@@ -650,6 +708,7 @@ def _provenance_statement(
     tooling: dict[str, Any],
     tooling_sha256: str,
     source: dict[str, Any],
+    subjects: Sequence[ArtifactSubject],
     artifacts: list[dict[str, str]],
     builder_command: list[str],
     build_frontend_version: str,
@@ -660,10 +719,7 @@ def _provenance_statement(
 ) -> dict[str, Any]:
     return {
         "_type": tooling["statements"]["in_toto_type"],
-        "subject": [
-            {"name": item["name"], "digest": {"sha256": item["sha256"]}}
-            for item in artifacts
-        ],
+        "subject": in_toto_subjects(subjects),
         "predicateType": tooling["statements"]["slsa_predicate_type"],
         "predicate": {
             "buildDefinition": {
@@ -727,7 +783,7 @@ def _verify_provenance(
     tooling: dict[str, Any],
     tooling_sha256: str,
     source: dict[str, Any],
-    subjects: dict[str, str],
+    subjects: Sequence[ArtifactSubject],
     byproducts: list[dict[str, Any]],
     builder: dict[str, Any],
 ) -> None:
@@ -740,7 +796,8 @@ def _verify_provenance(
         raise SupplyChainError("provenance in-toto type mismatch")
     if provenance["predicateType"] != tooling["statements"]["slsa_predicate_type"]:
         raise SupplyChainError("provenance predicate type mismatch")
-    if _subject_map(provenance["subject"], "provenance") != subjects:
+    expected_subjects = {subject.name: subject.sha256 for subject in subjects}
+    if _subject_map(provenance["subject"], "provenance") != expected_subjects:
         raise SupplyChainError("provenance subjects do not exactly match artifacts")
     predicate = provenance["predicate"]
     _require_exact_keys(predicate, {"buildDefinition", "runDetails"}, "provenance predicate")
@@ -834,12 +891,25 @@ def _subject_map(value: Any, label: str) -> dict[str, str]:
     return result
 
 
-def _regular_evidence_file(dist: Path, name: str) -> Path:
+def _regular_evidence_snapshot(dist: Path, name: str) -> RegularFileSnapshot:
     if Path(name).name != name:
         raise SupplyChainError(f"unsafe evidence filename: {name}")
-    path = dist / name
-    _require_regular(path, "release evidence")
-    return path
+    return _regular_snapshot(dist / name, "release evidence")
+
+
+def _load_evidence_json_snapshot(
+    dist: Path,
+    name: str,
+) -> tuple[dict[str, Any], RegularFileSnapshot]:
+    snapshot = _regular_evidence_snapshot(dist, name)
+    return _json_from_snapshot(dist / name, snapshot), snapshot
+
+
+def _regular_snapshot(path: Path, label: str) -> RegularFileSnapshot:
+    try:
+        return read_regular_file(path)
+    except ArtifactSubjectError as exc:
+        raise SupplyChainError(f"{label} is not a stable regular file: {path}") from exc
 
 
 def _require_regular(path: Path, label: str) -> None:
@@ -856,9 +926,23 @@ def _require_exact_keys(value: Any, expected: set[str], label: str) -> None:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    _require_regular(path, "JSON evidence")
+    value, _snapshot = _load_json_snapshot(path)
+    return value
+
+
+def _load_json_snapshot(
+    path: Path,
+) -> tuple[dict[str, Any], RegularFileSnapshot]:
+    snapshot = _regular_snapshot(path, "JSON evidence")
+    return _json_from_snapshot(path, snapshot), snapshot
+
+
+def _json_from_snapshot(
+    path: Path,
+    snapshot: RegularFileSnapshot,
+) -> dict[str, Any]:
     try:
-        value = _loads_json(path.read_text(encoding="utf-8"))
+        value = _loads_json(snapshot.payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, SupplyChainError) as exc:
         raise SupplyChainError(f"invalid JSON evidence {path.name}: {exc}") from exc
     if not isinstance(value, dict):

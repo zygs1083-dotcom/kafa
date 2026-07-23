@@ -40,7 +40,7 @@ Each subagent must return evidence to the root controller: files inspected,
 commands run, findings, and residual risk. Subagents do not mutate Kafa state.
 
 The root controller records material command proof by registering an exact
-`test-target` and running `scripts/harness.py --root . verify run ...` on the
+`test-target` and running `kafa project verify --repo . run ...` on the
 current candidate. Use `validation record` only for reviewer judgment,
 `finding record` for unresolved issues, and `gate record` for the decision.
 Free-form validation cannot substitute for immutable execution provenance.
@@ -92,5 +92,5 @@ Include the local execution artifacts and record IDs used during review.
 
 After recording a gate linked with `--qualification`, the root controller enters
 `delivery ready`; after delivery recording, run
-`scripts/harness.py --root . validate --delivery` and report any warnings or
+`kafa project validate --repo . --delivery` and report any warnings or
 errors.

@@ -5,158 +5,152 @@ description: "Use for developing or fully delivering software, data, or automati
 
 # Project Harness
 
-Act as the project manager and root controller for verified code delivery.
+Act as the project manager and root controller for verified code delivery. Use
+existing project instructions and mature local tooling first. This Skill ends at
+verified code handoff; deployment, release, infrastructure provisioning,
+production migration, secret changes, paid resources, and post-release operations
+require separate authorization.
+Generated Markdown is a human-readable projection, not a fact source.
 
-## Authority And Boundary
+<!-- BEGIN GENERATED: workflow-contract:entry-workflow -->
+## Canonical Workflow Contract
 
-Use existing project instructions and mature local tooling first.
+OpenSpec is the specification authority; Kafa SQLite is the delivery-fact authority; `core.delivery.evaluate_delivery_prerequisites` is gate authority; Native Codex/ChatGPT owns collaboration lifecycle. Only the root controller writes Kafa delivery facts. This generated block is presentation guidance and cannot relax runtime eligibility.
 
-- OpenSpec is the specification authority for unclear requirements, medium or large features, architecture or cross-module changes, and long-lived behavior. Follow its proposal, design, specs, tasks, and archive. Do not copy those documents into Kafa as a competing source of truth.
-- Kafa SQLite is the delivery authority for local requirements when OpenSpec is not needed, acceptance links, failure modes, tasks, immutable controller executions, validation judgments, findings, quality gates, delivery decisions, and audit events.
-- Generated Markdown is a human-readable projection, not a fact source.
-- Local Git identity, or content identity for a no-Git project, identifies the candidate under review.
-- Native Codex/ChatGPT owns task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle. Kafa never starts a second host lifecycle.
-- Only the root controller writes Kafa delivery facts. Workers and reviewers return changed files, commands, findings, and risks through the host.
+- **local-only** — Business runtime uses only project files, local Git or content identity, project SQLite, and optional already-local container execution.
+- **root-controller-single-writer** — Only the root controller mutates Kafa facts; producers and reviewers return results through the Native Host.
+- **native-host-lifecycle** — Native Codex/ChatGPT is the only owner of task, subagent, worktree, approval, model, cancel, steer, and handoff lifecycle.
+- **immutable-execution** — Command evidence is created only by controller execution and is stored once without overwrite.
+- **current-candidate-verification** — Execution, validation, qualification, gate, and delivery must remain current for the candidate under review.
+- **fail-closed-delivery-gate** — Missing, stale, skipped, blocked, not-run, fixture-only, zero-count, or unverifiable evidence never becomes delivery pass.
 
-This ends at verified code handoff: no deployment, release, infrastructure
-provisioning, production migration, secret change, paid resource, or post-release
-operation.
+### Route
 
-## Route The Request
+| Skill | Use when | Added obligation |
+| --- | --- | --- |
+| `project-harness` | broad, architectural, cross-module, long-lived, or complete verified delivery work | route to OpenSpec when specification is needed, then run the complete local delivery workflow |
+| `minimal-safe-change` | small clear low-risk patch with explicit acceptance | keep the diff and evidence surface narrow |
+| `bug-fix-loop` | reproducible defect or failing behavior | reproduce before fixing and retain a regression oracle |
+| `test-first-delivery` | contract-sensitive or regression-sensitive behavior | establish the failing test before production change |
+| `independent-quality-gate` | finished implementation needs fresh review | keep producer and reviewer contexts distinct when independent review is claimed |
+| `harness-audit` | runtime, boundary, fact, or generated-view drift requires audit | audit evidence without relabelling missing checks as pass |
+| `project-retrospective` | a completed milestone or repeated escape needs lessons captured | derive lessons from verified delivery evidence |
 
-| Work | Route |
-| --- | --- |
-| Explanation, translation, or summary only | Answer directly; do not initialize Kafa |
-| Small clear patch | `minimal-safe-change` |
-| Reproducible bug or failing behavior | `bug-fix-loop` |
-| New contract-sensitive behavior | `test-first-delivery` |
-| Broad, vague, architectural, cross-module, or long-lived change | OpenSpec first, then this delivery workflow |
-| Finished implementation needing a fresh review | `independent-quality-gate` |
-| Harness state or generated-view drift | `harness-audit` |
-| Completed milestone needing lessons captured | `project-retrospective` |
+### Advanced Trigger Index
+
+- `parallel-delegation` — two or more producers run in parallel, shared-file integration is required, or explicit advanced review is requested
+- `deep-kernel-review` — schema, migration, runtime ownership, trust, delivery gate, security, permissions, concurrency, data loss, public API, or cross-module authority changes; activates root/deep ownership and adversarial review
+- `harness-audit` — multi-day work, repeated escapes, schema or runtime change or drift, or milestone review
+- `project-retrospective` — delivery milestone completes or a failure loop exposes a stable lesson
+- `live-host-compatibility` — Native Host integration, evaluator, packaging, or release surface changes
+- `release-rehearsal` — packaging, supply-chain, release tooling, or an authorized release candidate changes
+
+This compact index selects obligations without loading the full delegation matrix. See [`docs/TRIGGER_MATRIX.md`](../../docs/TRIGGER_MATRIX.md) for the generated full definitions.
+
+### Stage Dependencies
+
+- `delivery-plan` → `baseline-confirmation`
+- `delivery-plan` → `qualification`
+- `delivery-plan` → `task-start`
+- `task-start` → `task-submit`
+- `qualification` → `controller-verification`
+- `task-submit` → `task-accept`
+- `controller-verification` → `task-accept`
+- `task-accept` → `quality-gate`
+- `baseline-confirmation` → `delivery-readiness`
+- `quality-gate` → `delivery-readiness`
+- `delivery-readiness` → `delivery-record`
+- `delivery-record` → `delivery-validation`
+
+Task submission and controller verification may occur in either order; both must finish before task acceptance.
+<!-- END GENERATED: workflow-contract:entry-workflow -->
 
 ## Bootstrap The Workspace
 
 Before substantial work:
 
 1. Read applicable `AGENTS.md` and project entry documents.
-2. Inspect the real workspace, repository root, branch, remotes, candidate revision, and dirty state.
-3. Preserve user changes. Do not initialize Git, create a branch, or mutate unrelated files unless that is within the request.
-4. Inspect the applicable OpenSpec change and validate it when OpenSpec owns the work.
-5. Initialize the local Kernel when appropriate:
+2. Inspect the real root, branch, remotes, candidate identity, and dirty state.
+3. Preserve user changes; do not create Git state or mutate unrelated files unless requested.
+4. If OpenSpec owns the work, read proposal, design, specs, and `tasks.md` in dependency order and validate the change.
+5. Initialize the local Kernel only when delivery facts are needed.
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . init
-python3 plugins/codex-project-harness/scripts/harness.py --root . status
+kafa project init --repo .
+kafa project status --repo .
 ```
 
-When the Plugin is installed outside the project, use the retained proxy:
-
-```bash
-python3 <project-harness-skill-dir>/scripts/harness.py --root . status
-python3 <project-harness-skill-dir>/scripts/harness.py --root . validate --delivery
-```
-
-In an ordinary project, verify `codex-project-harness@personal installed,
-enabled` with `codex plugin list`, then use runtime `status`. The Kafa doctor
-commands validate a Kafa/Plugin source layout, not an ordinary project.
+In an ordinary project, use the public `kafa project` entrypoint and
+`codex plugin list` to confirm
+`codex-project-harness@personal installed, enabled`; Kafa source/plugin doctor is
+not the installation check for an ordinary repository.
 
 ## Specification And Requirement Baseline
 
-For work that meets the OpenSpec boundary:
+OpenSpec is the specification authority for unclear, medium/large,
+architecture, cross-module, or long-lived behavior. Treat its `tasks.md` as the
+unique implementation checklist when the change says so; Kafa records only the
+local facts needed to verify delivery and may reference stable OpenSpec IDs.
 
-1. Read and follow the selected OpenSpec proposal, design, specs, and tasks in dependency order.
-2. Treat the OpenSpec task list as implementation authority when the change says it is the unique checklist.
-3. Record only the local facts needed to verify delivery; reference stable OpenSpec IDs or paths without duplicating the spec.
-
-For narrow work that does not need OpenSpec:
-
-1. Identify the goal, users, observable scenarios, constraints, non-goals, and success criteria.
-2. Turn vague statements into acceptance criteria.
-3. Ask only questions whose answers materially change scope, permissions, data shape, irreversible behavior, or acceptance.
-4. State conservative assumptions when safe to continue.
-
-For risky work, record failure modes before implementation. Data writes, permissions, concurrency, migrations, billing, destructive behavior, sandbox/no-network requirements, and external effects require explicit failure-mode analysis. High or critical accepted/exempt risks require actor, reason, scope, revision, and unexpired expiry.
-
-Use stable local IDs and links:
+For narrow work, establish goal, user scenario, must-have behavior, non-goals,
+acceptance, and permissions directly. Confirm the scope before implementation.
+Record failure modes before risky writes, permissions, concurrency, migrations,
+billing, destructive behavior, sandbox changes, or external effects. High or
+critical accepted/exempt risk metadata requires actor, reason, scope, revision,
+and an unexpired expiry.
 
 ```bash
-harness.py --root . requirement add --id R1 --kind functional --body "..." --priority must
-harness.py --root . acceptance add --id AC1 --criterion "..." --priority must
-harness.py --root . requirement link --requirement R1 --acceptance AC1
-harness.py --root . failure-mode add --id FM1 --feature "..." --scenario "..." \
+kafa project requirement --repo . add --id R1 --kind functional --body "..." --priority must
+kafa project acceptance --repo . add --id AC1 --criterion "..." --priority must
+kafa project requirement --repo . link --requirement R1 --acceptance AC1
+kafa project failure-mode --repo . add --id FM1 --feature "..." --scenario "..." \
   --trigger "..." --expected "..." --risk high --acceptance AC1
 ```
 
-For broad or ambiguous work, confirm this baseline before implementation:
-
-```text
-我理解本阶段要交付的是：
-- 目标：
-- 用户/场景：
-- 必须实现：
-- 暂不实现：
-- 验收标准：
-- 风险和待确认：
-
-请确认或修正以上范围。确认后我会按这个基线开始实现。
-```
-
-Every implementation task must map to acceptance or an explicit documented exception.
-
-## Delivery Sequence
-
-Use this reasoning sequence when it fits the work:
-
-```text
-intake -> specification/baseline -> planning -> implementation
-       -> controller verification -> independent QA -> verified handoff
-       -> retrospective
-```
-
-These are workflow stages, not public CLI state and not separate Skills. Do not
-enter implementation before the spec or confirmed local baseline is ready.
-Always perform QA before claiming handoff readiness.
+Every implementation task maps to acceptance or a documented exception. The
+transactional `quickstart delivery-plan` may create this linked graph, but it
+does not confirm scope, start a task, create verification, or pass a gate.
 
 ## Team And Delegation
 
-Default to one root controller, bounded producers, and a distinct reviewer. Add parallelism only when tasks are independent and the merge/review cost is justified.
+Default to one root controller, bounded producers, and a distinct reviewer.
+For one bounded producer, send only:
 
-Before delegating, read
+- Goal
+- Acceptance
+- Allowed Files
+- Exact Test
+- Escalation
+
+Do not load the full matrix by default. Only for parallel fan-out, shared-file
+integration, or explicit advanced review, read
 [`references/delegation-matrix.md`](../../references/delegation-matrix.md) and
-fill its bounded Host-side matrix. Do not load that reference for work that stays
-inside the root-controller context. Capability hints are advisory; the Native
-Host owns actual model selection and Kafa stores no model lifecycle.
-
-- The root controller retains schema, migration, trust, delivery-gate, and cross-module integration decisions.
-- Use subagents for bounded implementation or review; give them explicit files, acceptance, and tests.
-- Every worker returns concrete changed files, commands run, results, remaining risks, and blockers.
-- Workers never mutate Kafa task, validation, gate, or delivery state.
-- Keep producer and reviewer contexts distinct. A same-context review is `same-context-degraded`, never `fresh`.
-- Use at most two producer-review loops before escalating a persistent failure or design conflict.
+fill it. The packet is transfer format only: the generated trigger index,
+root/deep ownership, review, verification, and fail-closed delivery still apply.
+Native Host selects models; workers return results to the sole Kafa writer,
+root. Same-context review is `same-context-degraded`, never fresh.
 
 ## Local Runtime Commands
 
-The installed or vendored `harness.py` is the executable interface:
+Use `kafa project <domain> --repo <path> --help` before unfamiliar writes.
+The runtime domains are:
 
-| Need | Command |
-| --- | --- |
-| Status and health | `status`, `doctor`, `validate`, `validate --delivery` |
-| Guided start | `quickstart status`, `quickstart minimal ... --execute` |
-| Delivery cycle | `cycle status`, `cycle close`, `cycle start` |
-| Baseline | `baseline freeze/confirm/diff/validate` |
-| Requirements | `requirement add/link`, `acceptance add`, `failure-mode add`, `trace show/validate` |
-| Root-owned task state | `task add/list/start/submit/accept/block/cancel` |
-| Verification | `test-target add/list/link/qualify`, `verify run` |
-| Audit judgments | `validation record`, `finding record`, `decision record` |
-| Delivery decision | `gate record`, `delivery ready`, `delivery record` |
-| Recovery | `migrate`, `repair`, `projection rebuild`; `doctor` validates invariants |
+- health: `status`, `doctor`, `validate`, `validate --delivery`;
+- guided setup: `quickstart status`, `quickstart delivery-plan`, `quickstart verified-patch`;
+- cycle and baseline: `cycle status/start/close`, `baseline confirm/diff/validate`;
+- graph: `requirement`, `acceptance`, `failure-mode`, `trace`, `test-target`;
+- root-owned lifecycle: `task add/list/start/submit/accept/block/cancel`;
+- evidence and review: `verify run`, `validation record`, `finding record`, `decision record`;
+- delivery: `gate record`, `delivery ready`, `delivery record`;
+- recovery: `migrate`, `repair`, `projection rebuild`.
 
-Events are compact append-only audit facts, not a replay source. Migration and administrator recovery use verified SQLite backups. There is no Connector, adapter, provider, dispatch, host receipt, checkpoint, or event export runtime.
+Events are compact audit facts, not a replay or restore source. Recovery uses
+verified SQLite and projection backups. There is no Connector, adapter,
+provider, dispatch, Host receipt, checkpoint, or event-export runtime.
 
 ## Root-Owned Task Lifecycle
 
-Task state is single-writer:
+Only the root controller records task state:
 
 ```text
 planned -> active -> submitted -> accepted
@@ -165,88 +159,76 @@ planned -> active -> submitted -> accepted
 planned/active/submitted -> cancelled
 ```
 
-Example:
-
 ```bash
-harness.py --root . task add --id T1 --task "Implement profile CRUD" \
+kafa project task --repo . add --id T1 --task "Implement behavior" \
   --owner developer --acceptance AC1 --failure-mode FM1
-harness.py --root . task start T1
-harness.py --root . task submit T1 --context-id producer-context \
+kafa project task --repo . start T1
+kafa project task --repo . submit T1 --context-id producer-context \
   --evidence "implementation returned to root controller"
-harness.py --root . task accept T1 --evidence "independent review accepted"
+kafa project task --repo . accept T1 --evidence "verification and review accepted"
 ```
 
 There are no worker writes, leases, heartbeat, fence, claim/release, or stale
-recovery. SQLite transactions and explicit preconditions prevent duplicates.
+recovery. A cancelled task never supplies accepted-task coverage.
 
 ## Immutable Verification
 
-Register an exact target, then let the root controller execute it:
+Register and qualify an exact target, then let the root controller execute it:
 
 ```bash
-harness.py --root . test-target add --id UNIT --kind unit \
+kafa project test-target --repo . add --id UNIT --kind unit \
   --command-template "python3 -m unittest" --result-format regex
-harness.py --root . test-target link --task T1 --target UNIT
-harness.py --root . test-target qualify --id Q1 --target UNIT \
-  --acceptance AC1 --rationale "UNIT directly exercises AC1" \
-  --by root-controller
-harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
+kafa project test-target --repo . link --task T1 --target UNIT
+kafa project test-target --repo . qualify --id Q1 --target UNIT \
+  --acceptance AC1 --rationale "UNIT directly exercises AC1" --by root-controller
+kafa project verify --repo . run --target UNIT --acceptance AC1 --failure-mode FM1
 ```
 
-Schema 31 `verify run` records immutable validation/artifact facts plus
-`target_definition_sha256`, controller `platform`/runtime/
-`runtime_executable_sha256`, `policy_version`, and `provenance_status=complete`.
-Free-form validation and `legacy-incomplete` history are ineligible. Container
-images must already be local: record engine/version, a frozen local
-`container_engine_endpoint`, and `container_image_digest`; pin every daemon call;
-run the immutable identity with `--pull=never`; and fail closed on remote routing
-or drift. Kafa never pulls. Medium/high/critical unit/integration coverage requires
-positive reconciled structured results, including streaming terminal events;
-regex remains low-risk only.
+Schema 31 verification records immutable facts including
+`target_definition_sha256`, controller `platform`, runtime,
+`runtime_executable_sha256`, `policy_version`, and
+`provenance_status=complete`. Free-form validation and `legacy-incomplete`
+history are ineligible. Containers must already be local and record engine,
+endpoint, and `container_image_digest`; every daemon call uses the same identity
+and `--pull=never`. Remote routing, target drift, missing structured results,
+semantic failure, or zero passing tests fails closed.
 
-High/critical delivery first requires a structured current-candidate execution, exact `reviewed-local`, and distinct non-empty producer/reviewer contexts. Risk acceptance cannot waive these prerequisites; it only covers each named remaining risk with complete, current, unexpired metadata. Never fabricate Host, CI, HMAC, Connector, or receipt provenance.
-If any prerequisite is missing, the result is `human-review-required`.
+High/critical delivery requires structured current-candidate execution, exact
+`reviewed-local`, and distinct non-empty producer/reviewer contexts.
+Risk acceptance cannot waive these prerequisites; it only covers each named residual
+risk with complete, current, unexpired metadata. Otherwise the result is
+`human-review-required`. Never fabricate Host, CI, HMAC, Connector, receipt, or
+independent-review provenance.
 
 ## Quality Review And Delivery Handoff
 
 Before a passing gate:
 
-1. Confirm the candidate identity and worktree state under review.
-2. Map delivered behavior to acceptance criteria and active failure modes.
-3. Confirm exact tests/checks actually run on the current candidate; `skipped`, `blocked`, `not-run`, and fixture-only are not passes.
-4. Resolve or explicitly record independent QA findings and residual risk.
-5. Confirm immutable executions are current, structured, positive-count where required, artifact-consistent, and policy-compliant.
-6. Confirm same-context review is labeled degraded and high/critical work follows `human-review-required` semantics.
-7. Run adversarial review for logic gaps, false facts, simpler alternatives, data loss, stale candidate, forged evidence, and missing verification.
-
-Record review and delivery only after those checks:
+1. Confirm the candidate and worktree identity under review.
+2. Map active acceptance and failure modes to accepted tasks and current qualified executions.
+3. Keep `skipped`, `blocked`, `not-run`, fixture-only, and zero-count distinct from pass.
+4. Resolve or explicitly record reviewer findings and every residual risk.
+5. Confirm executions, qualifications, validations, and artifacts are current and policy-compliant.
+6. Run adversarial review for logic gaps, false facts, simpler alternatives, data loss, stale candidates, forged evidence, and missing verification.
 
 ```bash
-harness.py --root . gate record --reviewer-context fresh \
-  --reviewer-context-id reviewer-context --result pass \
-  --qualification Q1
-harness.py --root . delivery ready
-harness.py --root . delivery record --scope "..." --acceptance AC1 \
-  --changed-files "..." --validation "..." --qa "..." \
-  --failure-mode-coverage "..." --quality-gate "pass" \
-  --known-gaps "..." --handoff "..."
-harness.py --root . validate --delivery
+kafa project gate --repo . record --reviewer-context fresh \
+  --reviewer-context-id reviewer-context --result pass --qualification Q1
+kafa project delivery --repo . ready
+kafa project delivery --repo . record --scope "..." --handoff "verified code; no deployment"
+kafa project validate --repo . --delivery
 ```
 
-The final handoff must report:
-
-- delivered behavior and acceptance mapping;
-- changed files/modules and current candidate;
-- exact tests/checks with counts and outcomes;
-- independent QA and quality-gate result;
-- failure-mode coverage or accepted/exempt risk metadata;
-- migration/data/config implications;
-- local artifact paths;
-- known gaps, not-run checks, and residual risk;
-- explicit statement that deployment is not included.
+The final handoff reports behavior and acceptance IDs, changed files or
+not-derivable status, exact checks and counts, independent QA and gate result,
+failure-mode/risk status, data/config implications, local artifacts, known gaps,
+not-run checks, residual risk, and that deployment is not included. Compatibility
+prose flags on `delivery record` are supplemental notes; structured relations and
+the canonical prerequisite evaluator remain authoritative.
 
 ## Work Discipline
 
-Before implementation, restate the root problem, split it into the smallest verifiable units, and explain why key decisions are made. Preserve unrelated user work.
-
-Before handoff, challenge the result from four angles: logic gaps, incorrect facts, simpler alternatives, and verification evidence. Do not claim completion because the code merely looks correct.
+Before implementation, restate the root problem, split it into the smallest
+verifiable units, explain key decisions, and preserve unrelated work. Before
+handoff, challenge logic, facts, simpler routes, and proof sufficiency. Never
+claim completion merely because code looks correct.

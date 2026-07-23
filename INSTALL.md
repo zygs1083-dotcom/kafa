@@ -15,7 +15,9 @@ The business-project runtime is local-only. Installation and normal delivery do 
 
 ## Validate the source checkout
 
-Run these commands from the Kafa repository root:
+The internal scripts in this section are maintainer-only source-checkout
+validation tools, not business-project runtime entrypoints. Run them from the
+Kafa repository root:
 
 ```bash
 python3 plugins/codex-project-harness/scripts/validate_structure.py \
@@ -87,12 +89,10 @@ When a project is not initialized, all three return a concise not-initialized re
 
 ## Initialize a business project
 
-Use the consolidated `project-harness` proxy from the installed plugin or source checkout:
+Use the public Kafa project entrypoint from the installed plugin or source checkout:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project init
-
+kafa project init --repo /path/to/business-project
 kafa project doctor --repo /path/to/business-project
 ```
 
@@ -198,24 +198,20 @@ Restart Codex after upgrading so it reloads plugin metadata and Hooks.
 Always inspect the current project first:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project status
+kafa project status --repo /path/to/business-project
 ```
 
 For a schema 27, 28, 29, or 30 project, verify the CLI contract and run the dry-run before the real migration. Pass the actual source version reported by `status`; the following example uses schema 30:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project migrate --help
+kafa project migrate --repo /path/to/business-project --help
 
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project migrate \
+kafa project migrate --repo /path/to/business-project \
   --from-version 30 \
   --to-version 31 \
   --dry-run
 
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project migrate \
+kafa project migrate --repo /path/to/business-project \
   --from-version 30 \
   --to-version 31
 ```
@@ -273,12 +269,9 @@ an explicit empty template.
 After migration:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project doctor
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project validate
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project status
+kafa project doctor --repo /path/to/business-project
+kafa project validate --repo /path/to/business-project
+kafa project status --repo /path/to/business-project
 ```
 
 Do not delete the verified backup until the migrated project has passed its required local checks. After new schema 31 facts are written, Kafa does not promise an automatic downgrade.
@@ -288,15 +281,13 @@ Do not delete the verified backup until the migrated project has passed its requ
 Inspect the planned repair first:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project repair --dry-run
+kafa project repair --repo /path/to/business-project --dry-run
 ```
 
 Any mutating repair creates and verifies a SQLite backup before changing the active database. `projection rebuild` regenerates supported Markdown views from SQLite and does not make those views a recovery source:
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root /path/to/business-project projection rebuild
+kafa project projection --repo /path/to/business-project rebuild
 ```
 
 Do not manually replace `harness.db` unless a diagnosed failure requires operator recovery and the selected backup digest and integrity results have been independently checked.
@@ -324,7 +315,14 @@ The isolated smoke test proves plugin discovery and exact inventory in a tempora
 python3 tests/run_isolated_install_smoke.py --repo .
 ```
 
-A real Native Codex compatibility profile is a separate, explicit opt-in check. If it is unavailable, not run, blocked, or fails a scenario, report that state exactly; isolated discovery or fixture results do not replace it.
+A real Native Codex compatibility profile is selected by the closed release
+change-scope classifier. Host, packaging, release-tooling, Native-evaluator,
+and unknown paths require blocking single and parallel profiles; advisory
+scopes still run every deterministic gate. CI keeps volatile detail as a
+retained artifact and exposes a digest-bound stable summary. The summary never
+replaces its detail. If selected evidence is unavailable, not run, blocked, or
+fails, report that state exactly; isolated discovery or fixture results do not
+replace it.
 
 ## Uninstall
 
@@ -356,7 +354,7 @@ If Codex previously pointed at this plugin manually:
 
 - macOS/Linux examples use `python3`; Windows can use `py -3.11`.
 - If Python reports `externally-managed-environment`, create a virtual environment: `python3 -m venv .venv`, activate it, then run `python -m pip install -e .`.
-- Quote paths that contain spaces when passing `--repo`, `--plugin-path`, or `--root`.
+- Quote paths that contain spaces when passing `--repo` or `--plugin-path`.
 - Repo-scope installation writes inside the Kafa checkout. User scope writes under the current user's home directory.
 - Business-project runtime state and backups must remain ignored by Git unless the project has an explicit, reviewed policy to do otherwise.
 

@@ -6,38 +6,41 @@ Kafa 不替代 Codex/ChatGPT，也不实现第二套协作生命周期。Native 
 
 当前源码候选版本是 **v2.0.0-beta.1**，`release.json` 将其明确标记为 `development`，因此它不是已发布版本。最新正式 tag/release 以 GitHub 和 `git tag` 为准。当前架构代际定位为 **Codex Harness Kernel v5.0.0**。它只负责交付经过验证的代码和证据，不负责生产部署、上线发布、基础设施开通、生产迁移、密钥变更或付费资源创建。
 
-## 三个权威边界
+<!-- BEGIN GENERATED: workflow-contract:workflow-overview -->
+## Workflow Authority
 
-一次完整交付只有三个清晰的 owner：
-
-| 层 | 权威内容 | 不负责 |
+| Authority | Owns | Does not own |
 | --- | --- | --- |
-| OpenSpec | 在需求不清晰、中大型功能、架构或跨模块变更中，维护 proposal、design、tasks 和归档后的产品行为 | 不保存 Kafa 的运行时事实 |
-| Kafa | 本地 SQLite 中的需求、验收、任务、不可变执行、验证判断、finding、质量门和交付结论 | 不创建或管理 Native Codex/ChatGPT 的协作生命周期 |
-| Native Codex/ChatGPT | task、subagent、worktree、approval、model、cancel、steer 和 handoff | 不直接写 Kafa SQLite，也不把自报文本升级为验证证据 |
+| OpenSpec | proposal, design, specs, and the unique tasks checklist for specification-led changes | Kafa SQLite runtime facts |
+| Kafa SQLite | local delivery facts and immutable execution, validation, review, and delivery records | Native Codex/ChatGPT lifecycle |
+| core.delivery.evaluate_delivery_prerequisites | executable fail-closed readiness, recording, and delivered-consistency decisions | documentation wording and workflow presentation |
+| workflow-contract presentation source | generated owner, route, stage dependency, command, and advanced-trigger views | delivery eligibility and persisted project facts |
+| Native Codex/ChatGPT | task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle | direct Kafa SQLite mutation |
+| root controller | all Kafa fact mutation, candidate inspection, controller verification, integration, and delivery recording | invented independent provenance |
 
-OpenSpec 是需要规格化时的 spec authority；Kafa 是 verified delivery authority。Kafa 可以引用 OpenSpec 的路径和结论，但不会复制一套 OpenSpec 文档作为自己的事实源。
+## Non-negotiable Safeguards
 
-## 一条本地交付路径
+- `local-only`: Business runtime uses only project files, local Git or content identity, project SQLite, and optional already-local container execution.
+- `root-controller-single-writer`: Only the root controller mutates Kafa facts; producers and reviewers return results through the Native Host.
+- `native-host-lifecycle`: Native Codex/ChatGPT is the only owner of task, subagent, worktree, approval, model, cancel, steer, and handoff lifecycle.
+- `immutable-execution`: Command evidence is created only by controller execution and is stored once without overwrite.
+- `current-candidate-verification`: Execution, validation, qualification, gate, and delivery must remain current for the candidate under review.
+- `fail-closed-delivery-gate`: Missing, stale, skipped, blocked, not-run, fixture-only, zero-count, or unverifiable evidence never becomes delivery pass.
+<!-- END GENERATED: workflow-contract:workflow-overview -->
 
-```text
-User intent
-  -> OpenSpec proposal/design/tasks（需要时）
-  -> Kafa init + local requirement baseline
-  -> root controller 建立 task 与 test target
-  -> Native Codex/ChatGPT 完成可见的本地代码工作
-  -> root controller 接收结果并推进 task
-  -> Kafa verify run 独立执行当前 candidate
-  -> validation + finding + independent quality gate
-  -> delivery decision / verified code handoff
-```
+<!-- BEGIN GENERATED: workflow-contract:skill-routes -->
+## Skill Routes
 
-这条路径有四个不可绕过的约束：
-
-- 业务运行时只使用项目文件、本地 Git 或内容身份、项目级 SQLite，以及可选的本地容器执行；不需要外部凭证，也不直接调用项目管理 SaaS API。
-- 只有根控制器可以修改 Kafa 事实。子任务执行者返回代码、审查信息和上下文标识，由根控制器验证和记录。
-- 命令证据只能由 controller executor 生成，并以 immutable execution 保存。人工文字只能是判断或审计说明。
-- High/critical 风险没有可验证 provenance 时返回 `human-review-required`；它不是通过状态。
+| Skill | Use when | Added obligation |
+| --- | --- | --- |
+| `project-harness` | broad, architectural, cross-module, long-lived, or complete verified delivery work | route to OpenSpec when specification is needed, then run the complete local delivery workflow |
+| `minimal-safe-change` | small clear low-risk patch with explicit acceptance | keep the diff and evidence surface narrow |
+| `bug-fix-loop` | reproducible defect or failing behavior | reproduce before fixing and retain a regression oracle |
+| `test-first-delivery` | contract-sensitive or regression-sensitive behavior | establish the failing test before production change |
+| `independent-quality-gate` | finished implementation needs fresh review | keep producer and reviewer contexts distinct when independent review is claimed |
+| `harness-audit` | runtime, boundary, fact, or generated-view drift requires audit | audit evidence without relabelling missing checks as pass |
+| `project-retrospective` | a completed milestone or repeated escape needs lessons captured | derive lessons from verified delivery evidence |
+<!-- END GENERATED: workflow-contract:skill-routes -->
 
 ## 快速开始
 
@@ -52,17 +55,14 @@ kafa doctor --repo .
 重启 Codex 后，从 `kafa-local` marketplace 安装 `codex-project-harness`。在普通业务项目中初始化：
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root . init
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root . status
+kafa project init --repo .
+kafa project status --repo .
 ```
 
 如果目标已经清晰并且有真实测试命令，可以运行最小闭环：
 
 ```bash
-python3 /path/to/kafa/plugins/codex-project-harness/skills/project-harness/scripts/harness.py \
-  --root . quickstart minimal \
+kafa project quickstart --repo . minimal \
   --id SMOKE \
   --goal "Keep the current behavior working" \
   --acceptance "The existing test command passes" \
@@ -130,38 +130,31 @@ Runtime 使用 active schema 31 的 30 张 local delivery tables。schema 30 仅
 登记和执行本地 target 的典型命令：
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --root . test-target add \
+kafa project test-target --repo . add \
   --id UNIT \
   --kind unit \
   --command-template "python3 -B -m unittest discover -s tests -p 'test_*.py'"
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . baseline confirm \
+kafa project baseline --repo . confirm \
   --id B1 --summary "Current candidate baseline" --by controller
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . test-target qualify \
+kafa project test-target --repo . qualify \
   --id Q1 --acceptance AC1 --target UNIT \
   --rationale "UNIT directly proves AC1" --by controller
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . test-target link \
+kafa project test-target --repo . link \
   --task T1 \
   --target UNIT
 
-python3 plugins/codex-project-harness/scripts/harness.py --root . verify run \
+kafa project verify --repo . run \
   --target UNIT \
   --acceptance AC1
 ```
 
-The delivery path is intentionally ordered: confirm the frozen baseline, qualify the
-target for the acceptance, run verification, accept the linked task, record a gate
-with `--qualification Q1`, enter `delivery ready`, then record delivery. A passing
-but unqualified target, a cancelled task, or a missing readiness phase cannot cover
-an acceptance or create a delivery.
-
-After starting a later cycle, inspect an earlier delivered graph without changing
-the current cycle with `harness cycle audit --id <cycle-id> --json`. Global
-baseline, finding, and qualification IDs from a closed cycle cannot be reused;
-an already referenced target ID is exact-no-op only and requires a new ID for any
-field change.
+The generated workflow above is the maintained delivery order. A passing but
+unqualified target, cancelled task, or missing readiness phase cannot cover an
+acceptance. Historical cycles remain read-only through
+`cycle audit --id <cycle-id> --json`; closed-cycle global IDs cannot be reused.
 
 每个 schema 31 execution 在成为可交付证据前必须记录
 `target_definition_sha256`、`platform`、`runtime_executable`、
@@ -182,16 +175,10 @@ execution/validation facts。
 
 `validation record` 只记录判断。没有 controller execution 支撑的自由文本，不会变成 delivery gate 可接受的命令证据。
 
-如果 structured runner 通过 `--result-path` 生成结果文件，建议把路径放在
-`.ai-team/runtime/` 下，或直接从 stdout 解析。命令若在普通项目路径创建或修改结果
-文件，post-execution candidate 会正确变化，该次 execution 将以 stale candidate
-丢弃；Kafa 不会为了结果文件而动态排除任意业务源码路径。
-Go JSON 必须包含可对账的 terminal package event；`cargo-nextest-json` 明确绑定
-nextest experimental libtest JSON v0.1；每个 suite 都必须先开始、逐项终结并有且仅有
-一个可对账的 terminal suite event，stress 输出可以顺序包含多个完整 suite。
-事件乱序、任一 started test 未终结、只有 test-level pass、或 structured stdout 超过
-捕获上限都会 fail closed。Container 未声明 `result_path` 时与 local runner 一致，
-解析受控 artifact 中的 structured stdout；声明了路径却没有生成结果文件时不会回退到 stdout。
+Structured result 建议写入 `.ai-team/runtime/` 或从 stdout 解析；业务源码路径中的
+结果文件会改变 candidate，不能被动态排除。各 runner 必须提供可对账的 terminal
+suite/package 结果；乱序、未终结、零测试、缺失或超限输出都 fail closed。声明
+`result_path` 后缺失文件不会回退到 stdout。
 
 ## Canonical project path safety
 
@@ -246,28 +233,15 @@ Identity Git 命令同时禁用 replace-object lookup；仓库内的 `refs/repla
 受控 `GIT_WORK_TREE` 同时固定实际评估根目录，repo-local `core.worktree`
 不能重定向 source inventory 或触发 Git 到 content identity 的静默降级。
 
-持久 Native 报告只接受四个精确 mode，并绑定 `evidence_scope`、matrix profile、
-有序 scenario inventory、local scenario category/mode、正数且有限的 token/runtime/
-duration，以及 parallel task-to-scope/context/target/acceptance 映射。生成时还会核对
-当前 Native Codex binary 与 CLI version；未知 Connector/Host 标签、零 telemetry、
-producer 互换或自洽但错误的 binary metadata 都不能保留 passing 状态。
-Passing matrix 必须同时记录 Codex available 且无 skip reason，成功 producer 的
-error 必须为空，Git dirty/status count 必须一致；Host 未暴露可信金额时
-`estimated_cost` 固定为 `null`。生成时 platform、Python、Git 和 container facts
-必须与当前环境一致；跨平台读取持久报告时只把它们作为经过类型校验的历史事实，
-不伪称是在当前机器生成。
-Compact evidence 使用 closed `report_version=1`；passing live detail/producer
-出现未声明字段会失败，显式 test binary override 只能用于 evaluator 回归，不能通过
-`--evidence-out` 写成 persistent real-Native evidence。evaluation-scoped Git
-source 只要存在 unmerged entry，也不会生成可用 workspace digest。版本、summary
-counter、return code、execution/validation/workload/producer count 与 token count
-均使用递归 exact JSON 类型校验，`true`/`false` 或浮点数不能冒充整数。
-Fixture/stability 的每个 detail counter 在聚合前必须是 exact non-negative
-integer；passing single/parallel 还要求 active table inventory 精确等于 schema 31
-的 30 张表，并且 catalog 只额外允许 `sqlite_sequence`；任何其他 `sqlite_*`
-或 Connector/Host/runtime 表都会 fail closed。Real Native controller command 从
-启动身份验证过的 private Git-backed snapshot 执行，报告绑定 start identity 并复核
-completion identity，短暂替换后恢复的源码也不会成为实际执行字节。
+真实 Native detail 使用闭合 contract，绑定 executable source、Git 状态、Native
+binary、matrix、scenario、token/runtime 和 schema-31 table inventory。CI 将这类易变
+detail 作为有期限 artifact 保存，默认 review surface 只显示绑定其精确字节 digest 的
+stable summary。summary 不能脱离 detail 证明通过；缺失、digest 不符、stale、fixture、
+显式测试 binary、dirty source 冒充 current，或 identity/matrix 不一致都会 fail closed。
+仓库内 `docs/runtime/native-codex-*-summary.json` 明确把既有 dirty-worktree
+明细标为 `historical`；后续候选运行默认在 CI/本地 opt-in 路径生成新明细，不靠改写
+历史 bundle 制造 current 结论。
+真实 controller 从私有 Git-backed snapshot 执行，并在结束时复核同一源码身份。
 
 ## Public CLI
 
@@ -284,26 +258,17 @@ validate  repair  migrate  projection
 先用 `--help` 确认具体参数：
 
 ```bash
-python3 plugins/codex-project-harness/scripts/harness.py --help
-python3 plugins/codex-project-harness/scripts/harness.py task --help
-python3 plugins/codex-project-harness/scripts/harness.py verify run --help
+kafa project init --repo . --help
+kafa project task --repo . --help
+kafa project verify --repo . run --help
 ```
 
 `projection rebuild` 是本地视图恢复命令。正常 mutation 只重建受影响的视图。`repair` 在修改前创建并验证 SQLite backup。
 
 ## Plugin surface
 
-Plugin 保留七个 delivery-focused Skills：
-
-| Skill | 用途 |
-| --- | --- |
-| `project-harness` | 从工作区检查、OpenSpec 路由和需求基线到 verified handoff 的总入口 |
-| `minimal-safe-change` | 验收明确的小型安全改动 |
-| `bug-fix-loop` | 复现、定位、修复和回归 bug |
-| `test-first-delivery` | 契约敏感或回归敏感的测试优先交付 |
-| `independent-quality-gate` | 独立 QA、finding 和 current-candidate 审查 |
-| `harness-audit` | 审计运行时、边界和交付证据 |
-| `project-retrospective` | 交付后复盘和方法改进 |
+Plugin 保留上述七个 delivery-focused Skills；用途和路由由
+`workflow-contract.json` 的生成视图统一维护。
 
 Plugin 只定义三个 Hooks：
 
@@ -355,7 +320,7 @@ Kafa 不会：
 
 ## 维护本仓库
 
-结构和本地回归入口：
+以下内部脚本仅供 Kafa 源码维护者验证本仓库，不是普通业务项目的运行入口。结构和本地回归入口：
 
 ```bash
 python3 plugins/codex-project-harness/scripts/validate_structure.py plugins/codex-project-harness
@@ -369,7 +334,11 @@ python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode stabi
 git diff --check
 ```
 
-真实 Native Codex compatibility profile 是显式 opt-in 的独立验证面。没有运行、能力不可用、认证缺失或场景被阻塞时，必须如实报告，不能用本地 fixture 结果替代。
+release workflow 先用完整 immutable Git OID 运行闭合 change-scope classifier。
+Host、packaging、release-tooling、Native-evaluator 和 unknown 变更要求 blocking 的
+single+parallel Native evidence；schema/runtime 与纯文档变更可为 advisory，但所有
+确定性门禁仍运行。没有运行、能力不可用、认证缺失或场景被阻塞时必须如实报告，
+不能用 fixture/stability 结果替代，也不能据此声称已发布。
 
 版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。
 

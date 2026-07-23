@@ -1,0 +1,361 @@
+{
+  "contract_version": 1,
+  "authorities": [
+    {
+      "id": "openspec",
+      "owner": "OpenSpec",
+      "owns": "proposal, design, specs, and the unique tasks checklist for specification-led changes",
+      "excludes": "Kafa SQLite runtime facts"
+    },
+    {
+      "id": "sqlite",
+      "owner": "Kafa SQLite",
+      "owns": "local delivery facts and immutable execution, validation, review, and delivery records",
+      "excludes": "Native Codex/ChatGPT lifecycle"
+    },
+    {
+      "id": "delivery-evaluator",
+      "owner": "core.delivery.evaluate_delivery_prerequisites",
+      "owns": "executable fail-closed readiness, recording, and delivered-consistency decisions",
+      "excludes": "documentation wording and workflow presentation"
+    },
+    {
+      "id": "workflow-contract",
+      "owner": "workflow-contract presentation source",
+      "owns": "generated owner, route, stage dependency, command, and advanced-trigger views",
+      "excludes": "delivery eligibility and persisted project facts"
+    },
+    {
+      "id": "native-host",
+      "owner": "Native Codex/ChatGPT",
+      "owns": "task, thread, subagent, worktree, approval, model, cancellation, steering, and handoff lifecycle",
+      "excludes": "direct Kafa SQLite mutation"
+    },
+    {
+      "id": "root-controller",
+      "owner": "root controller",
+      "owns": "all Kafa fact mutation, candidate inspection, controller verification, integration, and delivery recording",
+      "excludes": "invented independent provenance"
+    }
+  ],
+  "safeguards": [
+    {
+      "id": "local-only",
+      "rule": "Business runtime uses only project files, local Git or content identity, project SQLite, and optional already-local container execution."
+    },
+    {
+      "id": "root-controller-single-writer",
+      "rule": "Only the root controller mutates Kafa facts; producers and reviewers return results through the Native Host."
+    },
+    {
+      "id": "native-host-lifecycle",
+      "rule": "Native Codex/ChatGPT is the only owner of task, subagent, worktree, approval, model, cancel, steer, and handoff lifecycle."
+    },
+    {
+      "id": "immutable-execution",
+      "rule": "Command evidence is created only by controller execution and is stored once without overwrite."
+    },
+    {
+      "id": "current-candidate-verification",
+      "rule": "Execution, validation, qualification, gate, and delivery must remain current for the candidate under review."
+    },
+    {
+      "id": "fail-closed-delivery-gate",
+      "rule": "Missing, stale, skipped, blocked, not-run, fixture-only, zero-count, or unverifiable evidence never becomes delivery pass."
+    }
+  ],
+  "routes": [
+    {
+      "id": "project-harness",
+      "when": "broad, architectural, cross-module, long-lived, or complete verified delivery work",
+      "obligation": "route to OpenSpec when specification is needed, then run the complete local delivery workflow"
+    },
+    {
+      "id": "minimal-safe-change",
+      "when": "small clear low-risk patch with explicit acceptance",
+      "obligation": "keep the diff and evidence surface narrow"
+    },
+    {
+      "id": "bug-fix-loop",
+      "when": "reproducible defect or failing behavior",
+      "obligation": "reproduce before fixing and retain a regression oracle"
+    },
+    {
+      "id": "test-first-delivery",
+      "when": "contract-sensitive or regression-sensitive behavior",
+      "obligation": "establish the failing test before production change"
+    },
+    {
+      "id": "independent-quality-gate",
+      "when": "finished implementation needs fresh review",
+      "obligation": "keep producer and reviewer contexts distinct when independent review is claimed"
+    },
+    {
+      "id": "harness-audit",
+      "when": "runtime, boundary, fact, or generated-view drift requires audit",
+      "obligation": "audit evidence without relabelling missing checks as pass"
+    },
+    {
+      "id": "project-retrospective",
+      "when": "a completed milestone or repeated escape needs lessons captured",
+      "obligation": "derive lessons from verified delivery evidence"
+    }
+  ],
+  "advanced_triggers": [
+    {
+      "id": "parallel-delegation",
+      "when": "two or more producers run in parallel, shared-file integration is required, or explicit advanced review is requested",
+      "activates": "full delegation matrix and root integration checkpoint"
+    },
+    {
+      "id": "deep-kernel-review",
+      "when": "schema, migration, runtime ownership, trust, delivery gate, security, permissions, concurrency, data loss, public API, or cross-module authority changes",
+      "activates": "root/deep ownership and adversarial review"
+    },
+    {
+      "id": "harness-audit",
+      "when": "multi-day work, repeated escapes, schema or runtime change or drift, or milestone review",
+      "activates": "harness-audit"
+    },
+    {
+      "id": "project-retrospective",
+      "when": "delivery milestone completes or a failure loop exposes a stable lesson",
+      "activates": "project-retrospective"
+    },
+    {
+      "id": "live-host-compatibility",
+      "when": "Native Host integration, evaluator, packaging, or release surface changes",
+      "activates": "real Native single and parallel evidence"
+    },
+    {
+      "id": "release-rehearsal",
+      "when": "packaging, supply-chain, release tooling, or an authorized release candidate changes",
+      "activates": "non-publishing isolated rehearsal"
+    }
+  ],
+  "stages": [
+    {
+      "id": "delivery-plan",
+      "label": "Delivery plan",
+      "action": "atomically create the linked local plan graph"
+    },
+    {
+      "id": "baseline-confirmation",
+      "label": "Baseline confirmation",
+      "action": "explicitly freeze and confirm current scope"
+    },
+    {
+      "id": "qualification",
+      "label": "Acceptance-target qualification",
+      "action": "bind acceptance revision and target digest with rationale and actor"
+    },
+    {
+      "id": "task-start",
+      "label": "Task start",
+      "action": "root controller explicitly starts the generated planned task"
+    },
+    {
+      "id": "task-submit",
+      "label": "Task submission",
+      "action": "root controller inspects returned code and records producer context"
+    },
+    {
+      "id": "controller-verification",
+      "label": "Controller verification",
+      "action": "run the qualified target and persist immutable current-candidate evidence"
+    },
+    {
+      "id": "task-accept",
+      "label": "Task acceptance",
+      "action": "accept only after submitted code and controller verification are complete"
+    },
+    {
+      "id": "quality-gate",
+      "label": "Quality gate",
+      "action": "record reviewer findings, qualifications, and residual risk"
+    },
+    {
+      "id": "delivery-readiness",
+      "label": "Delivery readiness",
+      "action": "reuse the canonical prerequisite evaluator before phase transition"
+    },
+    {
+      "id": "delivery-record",
+      "label": "Delivery record",
+      "action": "record the fact-derived verified local handoff; compatibility prose flags are supplemental and deployment remains excluded"
+    },
+    {
+      "id": "delivery-validation",
+      "label": "Delivery validation",
+      "action": "re-evaluate delivered consistency on the recorded candidate"
+    }
+  ],
+  "dependencies": [
+    {
+      "before": "delivery-plan",
+      "after": "baseline-confirmation"
+    },
+    {
+      "before": "delivery-plan",
+      "after": "qualification"
+    },
+    {
+      "before": "delivery-plan",
+      "after": "task-start"
+    },
+    {
+      "before": "task-start",
+      "after": "task-submit"
+    },
+    {
+      "before": "qualification",
+      "after": "controller-verification"
+    },
+    {
+      "before": "task-submit",
+      "after": "task-accept"
+    },
+    {
+      "before": "controller-verification",
+      "after": "task-accept"
+    },
+    {
+      "before": "task-accept",
+      "after": "quality-gate"
+    },
+    {
+      "before": "baseline-confirmation",
+      "after": "delivery-readiness"
+    },
+    {
+      "before": "quality-gate",
+      "after": "delivery-readiness"
+    },
+    {
+      "before": "delivery-readiness",
+      "after": "delivery-record"
+    },
+    {
+      "before": "delivery-record",
+      "after": "delivery-validation"
+    }
+  ],
+  "commands": {
+    "init": "kafa project init --repo .",
+    "status": "kafa project quickstart --repo . status",
+    "delivery-plan": "kafa project quickstart --repo . delivery-plan --file delivery-plan.json --json",
+    "baseline-confirmation": "kafa project baseline --repo . confirm --id BL1 --summary 'confirmed scope' --by root-controller",
+    "task-start": "kafa project task --repo . start PATCH-T1",
+    "verified-patch": "kafa project quickstart --repo . verified-patch --id PATCH --json",
+    "task-submit": "kafa project task --repo . submit PATCH-T1 --context-id producer-context --evidence 'root inspected returned code'",
+    "task-accept": "kafa project task --repo . accept PATCH-T1 --evidence 'verification and review complete'",
+    "quality-gate": "kafa project gate --repo . record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification PATCH-Q1",
+    "delivery-readiness": "kafa project delivery --repo . ready",
+    "delivery-record": "kafa project delivery --repo . record --scope 'verified local handoff' --handoff 'return code and residual risks'",
+    "delivery-validation": "kafa project validate --repo . --delivery"
+  },
+  "output_labels": {
+    "state": "state",
+    "blocker": "blocker",
+    "next": "next",
+    "verbose": "complete human detail",
+    "json": "complete structured report",
+    "human_review_required": "human-review-required"
+  },
+  "handoff_obligations": [
+    "delivered behavior and acceptance IDs",
+    "changed files or an explicit not-derivable statement",
+    "exact tests with counts and outcomes",
+    "quality-gate and failure-mode status",
+    "known gaps, not-run checks, and residual risk",
+    "local artifact paths",
+    "explicit statement that deployment is not included"
+  ],
+  "generated_views": [
+    {
+      "path": "README.md",
+      "blocks": [
+        {
+          "id": "workflow-overview",
+          "renderer": "overview"
+        },
+        {
+          "id": "skill-routes",
+          "renderer": "routes"
+        }
+      ]
+    },
+    {
+      "path": "QUICKSTART.md",
+      "blocks": [
+        {
+          "id": "happy-path",
+          "renderer": "happy-path"
+        }
+      ]
+    },
+    {
+      "path": "plugins/codex-project-harness/skills/project-harness/SKILL.md",
+      "blocks": [
+        {
+          "id": "entry-workflow",
+          "renderer": "skill-entry"
+        }
+      ]
+    },
+    {
+      "path": "plugins/codex-project-harness/skills/harness-audit/SKILL.md",
+      "blocks": [
+        {
+          "id": "harness-audit-trigger",
+          "renderer": "harness-audit-trigger"
+        }
+      ]
+    },
+    {
+      "path": "plugins/codex-project-harness/skills/project-retrospective/SKILL.md",
+      "blocks": [
+        {
+          "id": "project-retrospective-trigger",
+          "renderer": "project-retrospective-trigger"
+        }
+      ]
+    },
+    {
+      "path": "plugins/codex-project-harness/docs/TRIGGER_MATRIX.md",
+      "blocks": [
+        {
+          "id": "trigger-matrix",
+          "renderer": "trigger-matrix"
+        }
+      ]
+    },
+    {
+      "path": "examples/full-project-flow.md",
+      "blocks": [
+        {
+          "id": "full-flow",
+          "renderer": "full-flow"
+        }
+      ]
+    },
+    {
+      "path": "docs/runtime/fresh-skill-eval-prompts.md",
+      "blocks": [
+        {
+          "id": "skill-eval-prompts",
+          "renderer": "skill-eval-prompts"
+        }
+      ]
+    },
+    {
+      "path": "docs/runtime/skill-eval-transcript-fixture.txt",
+      "blocks": [
+        {
+          "id": "skill-eval-transcript",
+          "renderer": "skill-eval-transcript"
+        }
+      ]
+    }
+  ]
+}

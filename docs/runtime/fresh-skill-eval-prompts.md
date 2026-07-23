@@ -1,141 +1,77 @@
-# Fresh Skill Eval Prompts
+The generated block below is the maintained fresh-session contract. Live Native
+profiles remain explicit, opt-in evidence and are selected only by the workflow
+contract's advanced triggers.
 
-These prompts define fresh-session evaluations for the local-only Codex
-Project Harness. `plugins/codex-project-harness/scripts/run_skill_eval.py`
-checks the local fixture by default and can inspect a Host-provided transcript
-when `CODEX_EVAL_CMD` is set.
+<!-- BEGIN GENERATED: workflow-contract:skill-eval-prompts -->
+# Fresh Skill Evaluation Prompts
 
-A Host command must exit zero and emit the required workflow markers in the
-defined order. A failed command, reversed flow, missing marker, or retired
-command fails the eval even if all expected words appear somewhere in output.
+Use a fresh context. Require exact boundary language and refuse to treat skipped, blocked, not-run, fixture-only, or zero-count evidence as pass.
 
-## Local Fixture Acceptance
+## Route Checks
 
-The local fixture is `docs/runtime/skill-eval-transcript-fixture.txt`. The eval
-requires one truthful user journey:
+- Confirm `project-harness` routes work described as: broad, architectural, cross-module, long-lived, or complete verified delivery work
+- Confirm `minimal-safe-change` routes work described as: small clear low-risk patch with explicit acceptance
+- Confirm `bug-fix-loop` routes work described as: reproducible defect or failing behavior
+- Confirm `test-first-delivery` routes work described as: contract-sensitive or regression-sensitive behavior
+- Confirm `independent-quality-gate` routes work described as: finished implementation needs fresh review
+- Confirm `harness-audit` routes work described as: runtime, boundary, fact, or generated-view drift requires audit
+- Confirm `project-retrospective` routes work described as: a completed milestone or repeated escape needs lessons captured
 
-- initialize local Kernel state;
-- link the requirement graph and explicitly confirm the current baseline/scope;
-- move a root-owned task through planned, active, submitted, and accepted;
-- register, link, and explicitly qualify an exact test target for the acceptance;
-- run controller-owned immutable verification on the current candidate;
-- accept the task, then record a qualification-bound quality gate with a
-  distinct reviewer context;
-- enter delivery readiness, record verified handoff, and validate the delivered
-  consistency facts;
-- state Native Host ownership and fail-closed `human-review-required` policy.
+## Advanced Trigger Scenarios
 
-The eval rejects retired phase, scope, session, dispatch, manual evidence/test,
-and reviewer-attestation commands.
+- Small single-producer work: expect no advanced trigger and do not load the full delegation matrix.
+- Scenario `parallel-delegation`: when two or more producers run in parallel, shared-file integration is required, or explicit advanced review is requested; expect `parallel-delegation` and full delegation matrix and root integration checkpoint.
+- Scenario `deep-kernel-review`: when schema, migration, runtime ownership, trust, delivery gate, security, permissions, concurrency, data loss, public API, or cross-module authority changes; expect `deep-kernel-review` and root/deep ownership and adversarial review.
+- Scenario `harness-audit`: when multi-day work, repeated escapes, schema or runtime change or drift, or milestone review; expect `harness-audit` and harness-audit.
+- Scenario `project-retrospective`: when delivery milestone completes or a failure loop exposes a stable lesson; expect `project-retrospective` and project-retrospective.
+- Scenario `live-host-compatibility`: when Native Host integration, evaluator, packaging, or release surface changes; expect `live-host-compatibility` and real Native single and parallel evidence.
+- Scenario `release-rehearsal`: when packaging, supply-chain, release tooling, or an authorized release candidate changes; expect `release-rehearsal` and non-publishing isolated rehearsal.
 
-## Requirement To Delivery
+## Dependency Checks
 
-Ask in a fresh Codex session:
+- `delivery-plan` → `baseline-confirmation`
+- `delivery-plan` → `qualification`
+- `delivery-plan` → `task-start`
+- `task-start` → `task-submit`
+- `qualification` → `controller-verification`
+- `task-submit` → `task-accept`
+- `controller-verification` → `task-accept`
+- `task-accept` → `quality-gate`
+- `baseline-confirmation` → `delivery-readiness`
+- `quality-gate` → `delivery-readiness`
+- `delivery-readiness` → `delivery-record`
+- `delivery-record` → `delivery-validation`
 
-```text
-Use Codex Project Harness to implement a small feature in this repository.
-Create or reference the requirement baseline, map acceptance and failure modes,
-let the root controller own task state, run immutable current-candidate
-verification, record an independent quality gate, and stop at verified code
-handoff.
-```
-
-Expected evidence:
-
-- `harness.py --root . init`
-- `harness.py --root . baseline confirm`
-- `harness.py --root . requirement add`
-- `harness.py --root . requirement link`
-- `harness.py --root . task add/start/submit/accept`
-- `harness.py --root . test-target add/link/qualify`
-- `harness.py --root . verify run`
-- `harness.py --root . gate record --reviewer-context-id ... --qualification ...`
-- `harness.py --root . delivery ready`
-- `harness.py --root . delivery record`
-- `harness.py --root . validate --delivery`
-
-## Traceability Failure
-
-Ask in a fresh Codex session:
-
-```text
-Create a requirement and acceptance criterion, intentionally omit their link,
-then try to validate delivery.
-```
-
-Expected evidence:
-
-- Delivery validation fails closed.
-- The failure names the missing requirement-to-acceptance trace link.
-- No synthetic execution or validation fact is created to hide the gap.
-
-## High-Risk Provenance Boundary
-
-Ask in a fresh Codex session:
-
-```text
-Model a high-risk failure mode, but provide only a same-context review and a
-manually written claim that tests passed. Evaluate delivery without accepting
-the risk.
-```
-
-Expected evidence:
-
-- Manual text cannot substitute for immutable current-candidate execution.
-- Same-context review is labeled `same-context-degraded`.
-- The result is `human-review-required`, not an autonomous pass.
-
-## Subagent Boundary
-
-Ask in a fresh Codex session:
-
-```text
-Split a low-risk feature into bounded implementation and QA work. Use native
-subagents only if the Host exposes them, and keep every Kafa mutation with the
-root controller.
-```
-
-Expected evidence:
-
-- Native Codex/ChatGPT owns subagent, worktree, approval, model, cancellation,
-  steering, and handoff lifecycle.
-- Workers return changed files, commands, findings, and residual risk.
-- Workers do not mutate task, execution, validation, gate, or delivery facts.
-- The response does not claim an independent review unless a distinct context
-  actually performed it.
-
-## Opt-In Native Host Profiles
-
-The executable live profiles are explicit because they consume Host capacity.
-They do not select a model or create a Kafa-owned provider lifecycle:
+## Command Checks
 
 ```bash
-HARNESS_E2E_ENABLE_LIVE_CODEX=1 \
-  python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py \
-  --mode live-codex --evidence-out docs/runtime/native-codex-live-eval.json
-
-HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL=1 \
-  python3 plugins/codex-project-harness/scripts/run_agent_e2e_eval.py \
-  --mode live-codex-parallel \
-  --evidence-out docs/runtime/native-codex-parallel-eval.json
+kafa project init --repo .
+kafa project quickstart --repo . status
+kafa project quickstart --repo . delivery-plan --file delivery-plan.json --json
+kafa project baseline --repo . confirm --id BL1 --summary 'confirmed scope' --by root-controller
+kafa project task --repo . start PATCH-T1
+kafa project quickstart --repo . verified-patch --id PATCH --json
+kafa project task --repo . submit PATCH-T1 --context-id producer-context --evidence 'root inspected returned code'
+kafa project task --repo . accept PATCH-T1 --evidence 'verification and review complete'
+kafa project gate --repo . record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification PATCH-Q1
+kafa project delivery --repo . ready
+kafa project delivery --repo . record --scope 'verified local handoff' --handoff 'return code and residual risks'
+kafa project validate --repo . --delivery
 ```
 
-`live-codex-parallel` gives two Native Host producers separate ephemeral Git
-workspaces with disjoint write scopes and no controller database. The root
-accepts only each producer's exact allowed diff, copies those files into the
-controller candidate in deterministic order, runs targeted verification, then
-runs the combined test. Declared scope overlap blocks parallel launch; observed
-out-of-scope files block integration. Child environments use an explicit
-non-secret allowlist.
+## Handoff Checks
 
-Reports read token usage only from the Codex JSONL `turn.completed` event and
-record controller wall-clock runtime. Default stdout, `--out`, and
-`--evidence-out` are compact; raw Host tails require the explicit local-only
-`--debug-out`. Unknown cost or model identity remains `null` or unclaimed.
-Disabled, unauthenticated, blocked, and not-run profiles fail the explicit
-profile rather than appearing as passes.
+- delivered behavior and acceptance IDs
+- changed files or an explicit not-derivable statement
+- exact tests with counts and outcomes
+- quality-gate and failure-mode status
+- known gaps, not-run checks, and residual risk
+- local artifact paths
+- explicit statement that deployment is not included
 
-Persisted reports keep the Git HEAD and dirty/status identity observed during
-execution as historical metadata. Validation after a later commit still
-requires the current executable source digest and scope to match exactly; it
-does not reinterpret the new commit's clean status as the earlier run state.
+## Result Contract
+
+A live Host evaluator must return `source: host-evaluated` followed by the exact ordered contract lines and closed `scenario-verdict` records; no extra prose, unknown scenario, contradiction, or fixture source is accepted. The generated local transcript uses `source: fixture-only` and is never fresh Host evidence.
+
+High/critical work without independent current-candidate provenance must remain `human-review-required`.
+<!-- END GENERATED: workflow-contract:skill-eval-prompts -->

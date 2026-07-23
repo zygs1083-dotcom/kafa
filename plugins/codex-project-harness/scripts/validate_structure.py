@@ -9,38 +9,13 @@ import sys
 import tomllib
 from pathlib import Path
 
+from harness_lib import (
+    DistributionManifestError,
+    distribution_inventory_issues,
+    hook_definition_issues,
+    load_distribution_manifest,
+)
 
-REQUIRED_SKILLS = [
-    "project-harness",
-    "minimal-safe-change",
-    "test-first-delivery",
-    "bug-fix-loop",
-    "independent-quality-gate",
-    "harness-audit",
-    "project-retrospective",
-]
-
-REQUIRED_CORE = [
-    "__init__.py",
-    "api.py",
-]
-
-REQUIRED_SCRIPTS = [
-    "validate_structure.py",
-    "harness_lib.py",
-    "harness_db.py",
-    "harness.py",
-    "run_runtime_smoke.py",
-    "run_skill_eval.py",
-    "run_agent_e2e_eval.py",
-]
-
-REQUIRED_HOOKS = [
-    "hooks.json",
-    "harness_hook.py",
-]
-REQUIRED_HOOK_EVENTS = ["SessionStart", "SubagentStart", "Stop"]
-REQUIRED_AGENT_TEMPLATES = ["architect.toml", "developer.toml", "qa-reviewer.toml"]
 RETIRED_CORE_FILES = ["agent_provider.py", "agent_runner.py", "connector_trust.py"]
 FORBIDDEN_RUNTIME_LITERALS = [
     "gh api",
@@ -58,28 +33,6 @@ FORBIDDEN_RUNTIME_LITERALS = [
     "harness_connector_key",
 ]
 FORBIDDEN_PROVIDER_IMPORTS = {"github", "linear", "notion_client", "figma", "slack_sdk", "openai_codex"}
-
-REQUIRED_SCHEMAS = [
-    "project-state.schema.json",
-    "delivery-cycle.schema.json",
-    "requirement.schema.json",
-    "acceptance.schema.json",
-    "task.schema.json",
-    "task-test-target.schema.json",
-    "event.schema.json",
-    "quality-gate.schema.json",
-    "failure-mode.schema.json",
-    "validation.schema.json",
-    "test-target.schema.json",
-    "execution.schema.json",
-    "finding.schema.json",
-    "invalidation.schema.json",
-    "delivery.schema.json",
-    "baseline.schema.json",
-    "acceptance-target-qualification.schema.json",
-    "outcome-observation.schema.json",
-]
-
 
 def pep440_version(release_version: str) -> str:
     marker = "-beta."
@@ -111,6 +64,31 @@ def python_constants(path: Path) -> dict[str, object]:
     return resolved
 
 
+def static_runtime_domains(path: Path) -> set[str]:
+    """Read top-level ``sub.add_parser`` literals without importing runtime."""
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return set()
+    domains: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "add_parser"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "sub"
+        ):
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            domains.add(first.value)
+    return domains
+
+
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
     repo_root = root.parent.parent
@@ -125,7 +103,14 @@ def main() -> int:
         print(f"ERROR: invalid plugin.json: {exc}")
         return 1
 
+    try:
+        distribution = load_distribution_manifest(root)
+    except DistributionManifestError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
     errors: list[str] = []
+    errors.extend(distribution_inventory_issues(root, distribution))
     if data.get("name") != "codex-project-harness":
         errors.append("plugin name must be codex-project-harness")
     version_file = repo_root / "VERSION"
@@ -219,7 +204,7 @@ def main() -> int:
         if "defaultPrompt" in interface and not isinstance(interface["defaultPrompt"], list):
             errors.append("plugin interface.defaultPrompt must be a list")
 
-    for skill in REQUIRED_SKILLS:
+    for skill in distribution["skills"]:
         skill_dir = root / "skills" / skill
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
@@ -241,15 +226,22 @@ def main() -> int:
                 if required not in yaml_text:
                     errors.append(f"openai.yaml missing {required}: {openai_yaml}")
 
-    skill_dirs = {path.name for path in (root / "skills").iterdir() if path.is_dir()}
-    extra_skills = sorted(skill_dirs - set(REQUIRED_SKILLS))
-    for skill in extra_skills:
-        errors.append(f"unexpected skill directory: {root / 'skills' / skill}")
+    skill_dirs = {
+        path.name for path in (root / "skills").iterdir()
+        if path.name != "__pycache__"
+    }
+    expected_skills = set(distribution["skills"])
+    for skill in sorted(skill_dirs ^ expected_skills):
+        errors.append(f"skill inventory mismatch: {root / 'skills' / skill}")
 
-    for core_file in REQUIRED_CORE:
-        core_path = root / "core" / core_file
-        if not core_path.exists():
-            errors.append(f"missing kernel core file: {core_path}")
+    core_files = {
+        path.name
+        for path in (root / "core").iterdir()
+        if path.is_file()
+    } if (root / "core").is_dir() else set()
+    expected_core = set(distribution["core"])
+    for core_file in sorted(core_files ^ expected_core):
+        errors.append(f"core inventory mismatch: {root / 'core' / core_file}")
     for retired in RETIRED_CORE_FILES:
         retired_path = root / "core" / retired
         if retired_path.exists():
@@ -257,16 +249,27 @@ def main() -> int:
     errors.extend(local_python_import_errors(root))
     errors.extend(local_only_runtime_errors(root))
 
-    for script in REQUIRED_SCRIPTS:
+    for script in distribution["scripts"]:
         script_path = root / "scripts" / script
         if not script_path.exists():
             errors.append(f"missing runtime script: {script_path}")
-    script_files = {path.name for path in (root / "scripts").iterdir() if path.is_file() and path.suffix == ".py"}
-    for script in sorted(script_files - set(REQUIRED_SCRIPTS)):
-        errors.append(f"unexpected runtime script: {root / 'scripts' / script}")
+    script_files = {
+        path.name for path in (root / "scripts").iterdir()
+        if path.is_file()
+    }
+    expected_scripts = set(distribution["scripts"])
+    for script in sorted(script_files ^ expected_scripts):
+        errors.append(f"runtime script inventory mismatch: {root / 'scripts' / script}")
+    actual_domains = static_runtime_domains(root / "scripts/harness.py")
+    expected_domains = set(distribution["public_runtime_domains"])
+    if actual_domains != expected_domains:
+        errors.append(
+            "public runtime domain inventory mismatch: "
+            f"actual={sorted(actual_domains)} expected={sorted(expected_domains)}"
+        )
 
     hooks_dir = root / "hooks"
-    for hook in REQUIRED_HOOKS:
+    for hook in distribution["hooks"]["files"]:
         hook_path = hooks_dir / hook
         if not hook_path.exists():
             errors.append(f"missing hook file: {hook_path}")
@@ -278,17 +281,23 @@ def main() -> int:
                 errors.append(f"invalid hook json {hook_path}: {exc}")
             else:
                 actual_events = set(hook_payload.get("hooks", {})) if isinstance(hook_payload, dict) else set()
-                if actual_events != set(REQUIRED_HOOK_EVENTS):
+                expected_events = set(distribution["hooks"]["events"])
+                if actual_events != expected_events:
                     errors.append(
                         f"hook event inventory mismatch: actual={sorted(actual_events)} "
-                        f"expected={sorted(REQUIRED_HOOK_EVENTS)}"
+                        f"expected={sorted(expected_events)}"
                     )
     if hooks_dir.exists():
-        hook_files = {path.name for path in hooks_dir.iterdir() if path.is_file()}
-        for hook in sorted(hook_files - set(REQUIRED_HOOKS)):
-            errors.append(f"unexpected hook file: {hooks_dir / hook}")
+        hook_files = {
+            path.name for path in hooks_dir.iterdir()
+            if path.name != "__pycache__"
+        }
+        expected_hooks = set(distribution["hooks"]["files"])
+        for hook in sorted(hook_files ^ expected_hooks):
+            errors.append(f"hook file inventory mismatch: {hooks_dir / hook}")
     else:
         errors.append(f"missing hooks directory: {hooks_dir}")
+    errors.extend(hook_definition_issues(root, distribution))
 
     runtime_cli = root / "skills" / "project-harness" / "scripts" / "harness.py"
     if not runtime_cli.exists():
@@ -296,14 +305,16 @@ def main() -> int:
 
     templates_dir = root / "templates" / "agents"
     template_files = {
-        path.name for path in templates_dir.iterdir() if path.is_file() and path.suffix == ".toml"
+        path.name for path in templates_dir.iterdir()
+        if path.is_file()
     } if templates_dir.exists() else set()
-    if template_files != set(REQUIRED_AGENT_TEMPLATES):
+    expected_agent_templates = set(distribution["templates"]["native_agents"])
+    if template_files != expected_agent_templates:
         errors.append(
             f"agent template inventory mismatch: actual={sorted(template_files)} "
-            f"expected={sorted(REQUIRED_AGENT_TEMPLATES)}"
+            f"expected={sorted(expected_agent_templates)}"
         )
-    for template_name in REQUIRED_AGENT_TEMPLATES:
+    for template_name in distribution["templates"]["native_agents"]:
         template_path = templates_dir / template_name
         try:
             payload = tomllib.loads(template_path.read_text(encoding="utf-8"))
@@ -315,12 +326,39 @@ def main() -> int:
         if payload.get("name") != template_name.removesuffix(".toml"):
             errors.append(f"agent template name mismatch: {template_path}")
 
+    project_templates_dir = root / "templates" / "project"
+    project_template_files = {
+        path.name for path in project_templates_dir.iterdir()
+        if path.is_file()
+    } if project_templates_dir.is_dir() else set()
+    expected_project_templates = set(
+        distribution["templates"]["project_support"]
+    )
+    if project_template_files != expected_project_templates:
+        errors.append(
+            "project template inventory mismatch: "
+            f"actual={sorted(project_template_files)} "
+            f"expected={sorted(expected_project_templates)}"
+        )
+
+    references_dir = root / "references"
+    reference_files = {
+        path.name for path in references_dir.iterdir()
+        if path.is_file()
+    } if references_dir.is_dir() else set()
+    expected_references = set(distribution["references"])
+    if reference_files != expected_references:
+        errors.append(
+            f"reference inventory mismatch: actual={sorted(reference_files)} "
+            f"expected={sorted(expected_references)}"
+        )
+
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from core.json_schema_contract import schema_definition_issues
 
     schema_ids: dict[str, str] = {}
-    for schema in REQUIRED_SCHEMAS:
+    for schema in distribution["schemas"]:
         schema_path = root / "schemas" / schema
         if not schema_path.exists():
             errors.append(f"missing schema file: {schema_path}")
@@ -356,9 +394,13 @@ def main() -> int:
             )
         for issue in schema_definition_issues(schema_payload):
             errors.append(f"{schema_path.name}: {issue}")
-    schema_files = {path.name for path in (root / "schemas").iterdir() if path.is_file() and path.suffix == ".json"}
-    for schema in sorted(schema_files - set(REQUIRED_SCHEMAS)):
-        errors.append(f"unexpected schema file: {root / 'schemas' / schema}")
+    schema_files = {
+        path.name for path in (root / "schemas").iterdir()
+        if path.is_file()
+    }
+    expected_schemas = set(distribution["schemas"])
+    for schema in sorted(schema_files ^ expected_schemas):
+        errors.append(f"schema inventory mismatch: {root / 'schemas' / schema}")
 
     install_md = root.parent.parent / "INSTALL.md"
     if install_md.exists() and "Copy every folder under" in install_md.read_text(encoding="utf-8"):

@@ -1,333 +1,61 @@
-# Full Local Project Flow
+<!-- BEGIN GENERATED: workflow-contract:full-flow -->
+# Full Local Delivery Flow
 
-This example shows one end-to-end local-only path from a substantial feature
-request to a verified local code handoff. OpenSpec owns the specification, Native
-Codex/ChatGPT owns the work lifecycle, and Kafa records only local delivery
-facts. The flow stops before deployment or release.
+This appendix expands the same contract used by the overview, quickstart, and Skill. It is an example, not a second policy source. The schema 31 runtime is local-only; Native Codex/ChatGPT owns collaboration lifecycle and the root controller is the sole Kafa writer. `verified-patch` reuses immutable `verify run` evidence and stops before deployment or release.
 
-## Example Request
+## Stages
 
-```text
-我要开发一个微信小程序，用于管理亲友关系、生日提醒和关系图谱。
-```
+1. **Delivery plan** (`delivery-plan`): atomically create the linked local plan graph
+2. **Baseline confirmation** (`baseline-confirmation`): explicitly freeze and confirm current scope
+3. **Acceptance-target qualification** (`qualification`): bind acceptance revision and target digest with rationale and actor
+4. **Task start** (`task-start`): root controller explicitly starts the generated planned task
+5. **Task submission** (`task-submit`): root controller inspects returned code and records producer context
+6. **Controller verification** (`controller-verification`): run the qualified target and persist immutable current-candidate evidence
+7. **Task acceptance** (`task-accept`): accept only after submitted code and controller verification are complete
+8. **Quality gate** (`quality-gate`): record reviewer findings, qualifications, and residual risk
+9. **Delivery readiness** (`delivery-readiness`): reuse the canonical prerequisite evaluator before phase transition
+10. **Delivery record** (`delivery-record`): record the fact-derived verified local handoff; compatibility prose flags are supplemental and deployment remains excluded
+11. **Delivery validation** (`delivery-validation`): re-evaluate delivered consistency on the recorded candidate
 
-## 1. Inspect the Real Workspace
+## Required Ordering
 
-The root controller first reads applicable `AGENTS.md` files and project entry
-documents, then inspects the repository root, current branch/revision, remotes,
-and dirty state. Existing user changes are preserved.
+- `delivery-plan` → `baseline-confirmation`
+- `delivery-plan` → `qualification`
+- `delivery-plan` → `task-start`
+- `task-start` → `task-submit`
+- `qualification` → `controller-verification`
+- `task-submit` → `task-accept`
+- `controller-verification` → `task-accept`
+- `task-accept` → `quality-gate`
+- `baseline-confirmation` → `delivery-readiness`
+- `quality-gate` → `delivery-readiness`
+- `delivery-readiness` → `delivery-record`
+- `delivery-record` → `delivery-validation`
 
-Expected summary:
-
-```text
-目标是交付一个可运行的亲友关系管理小程序代码候选，包含亲友档案、生日提醒和
-基础关系图。该范围跨多个模块并具有长期行为约束，因此先由 OpenSpec 固定规格，
-再由 Kafa 对本地候选执行可验证交付。部署和发布不在本次范围内。
-```
-
-The root controller does not initialize Git, create a branch, commit, or push
-unless the user authorized that action.
-
-## 2. Make OpenSpec the Specification Authority
-
-Because the request is broad and cross-module, create or select an OpenSpec
-change such as `family-mini-program`. The change owns:
-
-- `proposal.md`: problem, goals, non-goals, and impact;
-- `design.md`: architecture and locked decisions;
-- `specs/**/spec.md`: observable requirements and scenarios; and
-- `tasks.md`: dependency-ordered implementation checklist.
-
-Before implementation, read those files in order and validate the change:
+## Command Skeleton
 
 ```bash
-openspec status --change family-mini-program
-openspec validate family-mini-program
+kafa project init --repo .
+kafa project quickstart --repo . status
+kafa project quickstart --repo . delivery-plan --file delivery-plan.json --json
+kafa project baseline --repo . confirm --id BL1 --summary 'confirmed scope' --by root-controller
+kafa project task --repo . start PATCH-T1
+kafa project quickstart --repo . verified-patch --id PATCH --json
+kafa project task --repo . submit PATCH-T1 --context-id producer-context --evidence 'root inspected returned code'
+kafa project task --repo . accept PATCH-T1 --evidence 'verification and review complete'
+kafa project gate --repo . record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification PATCH-Q1
+kafa project delivery --repo . ready
+kafa project delivery --repo . record --scope 'verified local handoff' --handoff 'return code and residual risks'
+kafa project validate --repo . --delivery
 ```
 
-Do not copy the OpenSpec documents into Kafa as a second specification. Record
-only stable IDs and local acceptance/task facts needed for verification. When
-`tasks.md` is the unique implementation checklist, follow its dependency order
-and update each checkbox immediately after its evidence is verified.
-
-## 3. Initialize the Local Runtime
-
-For an ordinary project, first verify that the installed Plugin is discoverable:
-
-```bash
-codex plugin list
-```
-
-Look for `codex-project-harness@personal installed, enabled`. `kafa project
-doctor --repo ...` validates a Kafa/Plugin source layout; it is not the install
-check for an ordinary project.
-
-The remaining examples use the runtime resolved by the installed
-`project-harness` Skill. In a source checkout, a convenient shell helper is:
-
-```bash
-KAFA_PLUGIN_ROOT=/absolute/path/to/kafa/plugins/codex-project-harness
-harness() {
-  python3 "$KAFA_PLUGIN_ROOT/scripts/harness.py" --root . "$@"
-}
-```
-
-Initialize and inspect the project-local facts:
-
-```bash
-harness init
-harness status
-harness quickstart status
-```
-
-Initialization creates `.ai-team/state/harness.db` and local projections. It
-does not request external credentials, create a remote project, or start a
-worker process.
-
-## 4. Record the Minimal Delivery Baseline
-
-Suppose OpenSpec defines:
-
-```text
-REQ1  A user can create and edit a relative profile.
-AC1   A saved profile can be reopened with the same name and birthday.
-T1    Implement the profile model, storage, and tests.
-```
-
-The root controller records those local verification facts:
-
-```bash
-harness requirement add \
-  --id REQ1 \
-  --kind functional \
-  --body "A user can create and edit a relative profile" \
-  --priority must
-
-harness acceptance add \
-  --id AC1 \
-  --criterion "A saved profile reopens with the same name and birthday" \
-  --priority must
-
-harness requirement link --requirement REQ1 --acceptance AC1
-harness baseline confirm --id BASE-1 \
-  --summary "OpenSpec family-mini-program confirmed scope" \
-  --by root-controller
-
-harness task add \
-  --id T1 \
-  --task "Implement the profile model, storage, and tests" \
-  --owner developer \
-  --acceptance AC1
-```
-
-These rows support traceability and delivery checks. OpenSpec still owns the
-full product language, design, and task checklist.
-
-For data loss, permissions, concurrency, migrations, destructive behavior, or
-other meaningful risk, record explicit failure modes before implementation.
-High/critical work follows the stricter review rule described below.
-
-## 5. Let the Native Host Own Implementation
-
-The root controller starts the local task intent:
-
-```bash
-harness task start T1
-```
-
-Native Codex/ChatGPT then creates any visible task, subagent, or worktree needed
-for implementation. Kafa does not create or merge that worktree, choose the
-model, manage approval, cancel the worker, or collect hidden worker output.
-
-A bounded developer returns:
-
-```text
-Changed files:
-- src/profile.py
-- tests/test_profile.py
-
-Checks run:
-- focused unit test during implementation
-
-Remaining risk:
-- persistence failure path still needs root-controller verification
-```
-
-The worker does not mutate `.ai-team/state/harness.db`. The root controller
-reviews the returned change in the target workspace.
-
-## 6. Establish the Current Candidate
-
-Before trusted verification, make the candidate stable and inspectable:
-
-- In Git, use an existing clean revision or a user-authorized commit.
-- Without Git, Kafa uses local content identity.
-- Never create a passing quality gate on a dirty Git worktree.
-- Never commit merely to satisfy Kafa unless the user authorized committing.
-
-If the candidate changes after verification, run verification again. Historical
-results remain auditable but do not satisfy the new candidate.
-
-## 7. Run Controller Verification
-
-Register the exact test target and link it to the task:
-
-```bash
-harness test-target add \
-  --id PROFILE-UNIT \
-  --kind unit \
-  --command-template "python3 -B -m unittest discover -s tests -p 'test_*.py'" \
-  --result-format regex
-
-harness test-target link --task T1 --target PROFILE-UNIT
-
-harness test-target qualify \
-  --id Q1 \
-  --target PROFILE-UNIT \
-  --acceptance AC1 \
-  --rationale "PROFILE-UNIT directly exercises AC1" \
-  --by root-controller
-```
-
-The root controller, not the implementation worker, executes it:
-
-```bash
-harness verify run --target PROFILE-UNIT --acceptance AC1
-```
-
-A passing schema 31 run records one immutable execution with the current
-candidate, command, exit code, positive test count, semantic result, stdout
-artifact/digest, runner policy, validation link, `target_definition_sha256`,
-controller `platform`, `runtime_executable`/`runtime_version`/
-`runtime_executable_sha256`, `policy_version`, and
-`provenance_status=complete`. A manual statement such as "tests passed" cannot
-replace this execution. Schema-30 history migrates as `legacy-incomplete` and
-cannot satisfy current delivery.
-
-For a container target, the image must already be local. Kafa records the
-engine/version, requested image and `container_image_digest`, runs the immutable
-identity with `--pull=never`, and rejects missing images or engine/image drift;
-it never pulls implicitly.
-
-Missing or malformed structured output, zero executed tests, a stale candidate,
-artifact digest mismatch, or an unsatisfied sandbox/no-network policy fails
-closed.
-
-After implementation evidence has returned to the root controller:
-
-```bash
-harness task submit T1 \
-  --context-id native-producer-context \
-  --evidence "candidate and controller verification ready for independent review"
-```
-
-The context identifier is procedural audit metadata, not proof of host identity.
-
-## 8. Perform Independent Review
-
-The native host starts a short-lived `qa-reviewer` context distinct from the
-producer. The reviewer checks:
-
-- behavior against OpenSpec scenarios and `AC1`;
-- logic errors and simpler alternatives;
-- data-loss and error paths;
-- current-candidate test evidence;
-- dirty-tree and stale-candidate hazards; and
-- any open finding or unverified claim.
-
-The reviewer returns concrete findings and the checks actually inspected. The
-root controller records any material finding, resolves blockers, and accepts the
-task only after review:
-
-```bash
-harness task accept T1 --evidence "independent QA accepted AC1 on the current candidate"
-
-harness gate record \
-  --reviewer-context fresh \
-  --reviewer-context-id native-reviewer-context \
-  --result pass \
-  --qualification Q1
-```
-
-For low/medium work, a same-context review must be labeled
-`same-context-degraded`; it must not be called fresh.
-
-For high/critical work, current structured execution and distinct context
-metadata are necessary but not sufficient for autonomous delivery. Without
-verifiable provenance, Kafa returns `human-review-required`. Delivery may
-continue only if the user explicitly accepts or exempts every remaining risk
-with actor, reason, scope, current revision, and unexpired expiry. That path is
-reported as procedural accepted risk, never cryptographic proof.
-
-## 9. Record Verified Handoff
-
-After the gate passes and all delivery prerequisites are current, record the
-local handoff:
-
-```bash
-harness delivery ready
-
-harness delivery record \
-  --scope "Relative profile slice from family-mini-program" \
-  --acceptance AC1 \
-  --changed-files "src/profile.py,tests/test_profile.py" \
-  --validation "PROFILE-UNIT passed with a positive executed-test count" \
-  --qa "independent qa-reviewer context accepted AC1" \
-  --quality-gate pass \
-  --known-gaps "birthday reminders and relationship graph remain in later tasks" \
-  --handoff "verified local code candidate; no deployment performed"
-
-harness validate --delivery
-harness status
-```
-
-The final user-facing handoff reports:
-
-- delivered behavior and OpenSpec acceptance mapping;
-- current candidate identity and changed files;
-- exact checks run, test counts, and outcomes;
-- independent review and quality-gate result;
-- failure-mode coverage or complete accepted-risk metadata;
-- data/config/migration implications;
-- local artifact paths;
-- known gaps, not-run checks, and residual risk; and
-- an explicit statement that deployment and release were not performed.
-
-`skipped`, `blocked`, `not-run`, unavailable, and fixture-only checks remain
-listed as such. They are not converted into passes.
-
-## 10. Recovery and Audit
-
-Normal changes update only affected local projections. If a generated view is
-missing or damaged:
-
-```bash
-harness projection rebuild
-harness doctor
-```
-
-Compact audit events explain local mutations but are not a replay source.
-Migration and administrator repair use verified SQLite backups. Inspect a repair
-plan before applying it:
-
-```bash
-harness repair --dry-run
-```
-
-Schema migration creates and verifies a backup before activating schema 31. If
-activation validation fails, Kafa restores that backup rather than rebuilding
-state from events.
-
-## Ownership Summary
-
-```text
-OpenSpec                 Kafa local runtime              Native host
-----------------------   -----------------------------   ----------------------
-proposal/design/specs    acceptance links               task/thread/subagent
-tasks and archive        root-owned task status          worktree and approval
-behavioral authority     immutable verification          model/cancel/handoff
-                         findings/gate/delivery
-```
-
-This separation is the product contract: one specification authority, one
-native lifecycle owner, and one local verified-delivery fact source.
+## Handoff
+
+- delivered behavior and acceptance IDs
+- changed files or an explicit not-derivable statement
+- exact tests with counts and outcomes
+- quality-gate and failure-mode status
+- known gaps, not-run checks, and residual risk
+- local artifact paths
+- explicit statement that deployment is not included
+<!-- END GENERATED: workflow-contract:full-flow -->

@@ -23,11 +23,9 @@ SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_REPO_ROOT))
 
-from kafa.codex_app_server import (
-    APPROVED_AGENT_TEMPLATES,
-    AppServerClient,
-    validate_app_server_discovery,
-)
+from kafa.cli import load_distribution_manifest
+from kafa.codex_app_server import AppServerClient, validate_app_server_discovery
+from kafa.artifact_subject import ArtifactSubject, ArtifactSubjectError
 
 
 PLUGIN_ID = "codex-project-harness@kafa-local"
@@ -304,6 +302,7 @@ def artifact_installed_migration_evidence(
             "--root",
             str(migration_repo),
             "doctor",
+            "--verbose",
         ],
         env=env,
         cwd=migration_repo,
@@ -317,7 +316,7 @@ def artifact_installed_migration_evidence(
             cwd=migration_repo,
         )
     )
-    if project_doctor.get("ok") is not True:
+    if project_doctor.get("details", {}).get("ok") is not True:
         raise RuntimeError(f"artifact migration public doctor failed: {project_doctor}")
 
     manifests = sorted(
@@ -503,9 +502,13 @@ def run_smoke(
                 cwd=release_repo,
             )
             wheel = next(dist.glob("kafa-*.whl"))
+            try:
+                wheel_subject = ArtifactSubject.from_file(wheel, kind="wheel")
+            except ArtifactSubjectError as exc:
+                raise RuntimeError(str(exc)) from exc
             artifact_inputs = {
-                "wheel_name": wheel.name,
-                "wheel_sha256": sha256_file(wheel),
+                "wheel_name": wheel_subject.name,
+                "wheel_sha256": wheel_subject.sha256,
                 "source_archive_name": None,
                 "source_archive_sha256": None,
             }
@@ -585,7 +588,7 @@ def run_smoke(
             cwd=business_repo,
         )
         project_status = run(
-            [*kafa, "project", "status", "--repo", str(business_repo)],
+            [*kafa, "project", "status", "--repo", str(business_repo), "--verbose"],
             env=env,
             cwd=business_repo,
         )
@@ -600,10 +603,13 @@ def run_smoke(
         installed_templates = {
             path.name for path in (business_repo / ".codex/agents").glob("*.toml")
         }
-        if installed_templates != APPROVED_AGENT_TEMPLATES:
+        expected_templates = set(
+            load_distribution_manifest(cache_root)["templates"]["native_agents"]
+        )
+        if installed_templates != expected_templates:
             raise RuntimeError(
                 f"project agent template inventory mismatch: actual={sorted(installed_templates)} "
-                f"expected={sorted(APPROVED_AGENT_TEMPLATES)}"
+                f"expected={sorted(expected_templates)}"
             )
 
         (business_repo / "test_quickstart.py").write_text(
@@ -622,10 +628,11 @@ def run_smoke(
             env=env,
             cwd=business_repo,
         ))
+        quickstart_details = quickstart_status["details"]
         quickstart_facts, quickstart_task_status = read_quickstart_facts(
             business_repo / ".ai-team/state/harness.db"
         )
-        if "OK: quickstart minimal verified setup INSTALL" not in quickstart or quickstart_facts != (1, 1, 0, 0) or quickstart_task_status != "submitted" or quickstart_status["ready_for_delivery"] or "controller_execution" in quickstart_status["missing"]:
+        if "OK: quickstart minimal verified setup INSTALL" not in quickstart or quickstart_facts != (1, 1, 0, 0) or quickstart_task_status != "submitted" or quickstart_details["ready_for_delivery"] or "controller_execution" in quickstart_details["missing"]:
             raise RuntimeError(f"installed quickstart contract failed: facts={quickstart_facts} task={quickstart_task_status} status={quickstart_status} output={quickstart}")
 
         migration_evidence = artifact_installed_migration_evidence(
@@ -743,8 +750,22 @@ def run_smoke(
             "app_server_hook_events": discovery_report["hook_events"],
             "app_server_template_count": discovery_report["template_count"],
             "app_server_templates": discovery_report["template_names"],
+            "app_server_project_template_count": discovery_report["project_template_count"],
+            "app_server_project_templates": discovery_report["project_template_names"],
             "app_server_runtime_script_count": discovery_report["runtime_script_count"],
             "app_server_schema_count": discovery_report["schema_count"],
+            "app_server_core_count": discovery_report["core_count"],
+            "app_server_core": discovery_report["core_names"],
+            "app_server_hook_file_count": discovery_report["hook_file_count"],
+            "app_server_hook_files": discovery_report["hook_file_names"],
+            "app_server_reference_count": discovery_report["reference_count"],
+            "app_server_references": discovery_report["reference_names"],
+            "app_server_public_runtime_domain_count": discovery_report[
+                "public_runtime_domain_count"
+            ],
+            "app_server_public_runtime_domains": discovery_report[
+                "public_runtime_domains"
+            ],
             "app_server_runtime_anchor_count": discovery_report["runtime_anchor_count"],
             "retired_runtime_absent": discovery_report["retired_runtime_absent"],
             "project_init_ok": "OK: project harness initialized" in project_init,
@@ -803,11 +824,16 @@ def validate_artifact_inputs(
             "release artifact names mismatch: "
             f"wheel={wheel.name} source={source_archive.name} expected={expected}"
         )
+    try:
+        wheel_subject = ArtifactSubject.from_file(wheel, kind="wheel")
+        source_subject = ArtifactSubject.from_file(source_archive, kind="sdist")
+    except ArtifactSubjectError as exc:
+        raise RuntimeError(str(exc)) from exc
     return {
-        "wheel_name": wheel.name,
-        "wheel_sha256": sha256_file(wheel),
-        "source_archive_name": source_archive.name,
-        "source_archive_sha256": sha256_file(source_archive),
+        "wheel_name": wheel_subject.name,
+        "wheel_sha256": wheel_subject.sha256,
+        "source_archive_name": source_subject.name,
+        "source_archive_sha256": source_subject.sha256,
     }
 
 

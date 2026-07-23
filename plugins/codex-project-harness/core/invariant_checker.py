@@ -122,6 +122,65 @@ def _has_task_accept_event(
     return False
 
 
+def _delivery_acceptance_relation_issues(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    cycle_id: str,
+) -> list[InvariantIssue]:
+    expected = {
+        str(row[0])
+        for row in conn.execute(
+            """
+            select id from acceptance
+            where cycle_id = ? and status = 'active'
+            order by id
+            """,
+            (cycle_id,),
+        ).fetchall()
+    }
+    rows = conn.execute(
+        """
+        select cycle_id, acceptance_id from delivery_acceptance
+        where delivery_id = ? order by cycle_id, acceptance_id
+        """,
+        (delivery_id,),
+    ).fetchall()
+    actual = {
+        str(row["acceptance_id"])
+        for row in rows
+        if str(row["cycle_id"]) == cycle_id
+    }
+    cross_cycle = tuple(
+        f"{row['cycle_id']}:{row['acceptance_id']}"
+        for row in rows
+        if str(row["cycle_id"]) != cycle_id
+    )
+    issues: list[InvariantIssue] = []
+    if cross_cycle:
+        issues.append(
+            issue(
+                "cross-cycle-delivery-acceptance",
+                "delivery",
+                delivery_id,
+                "invariant failed: delivery acceptance relation crosses "
+                f"cycle boundary delivery={delivery_id} cycle={cycle_id} "
+                f"links={list(cross_cycle)}",
+            )
+        )
+    if actual != expected:
+        issues.append(
+            issue(
+                "delivery-acceptance-set-mismatch",
+                "delivery",
+                delivery_id,
+                "invariant failed: delivery acceptance relation does not "
+                "equal the complete active proven set: "
+                f"expected={sorted(expected)} actual={sorted(actual)}",
+            )
+        )
+    return issues
+
+
 def check_cycle_invariants(
     conn: sqlite3.Connection,
     root: Path,
@@ -186,22 +245,20 @@ def check_cycle_invariants(
                 )
             )
 
-    for row in conn.execute(
-        "select id, acceptance from deliveries where cycle_id = ? order by created_at, id",
-        (cycle_id,),
-    ).fetchall():
-        if not str(row["acceptance"] or "").strip():
-            continue
-        if conn.execute(
-            "select 1 from delivery_acceptance where delivery_id = ? limit 1",
-            (row["id"],),
-        ).fetchone() is None:
-            issues.append(
-                issue(
-                    "delivery-missing-acceptance-link",
-                    "delivery",
+    schema_row = conn.execute(
+        "select schema_version from project where id = 1"
+    ).fetchone()
+    schema_version = int(schema_row[0]) if schema_row is not None else 0
+    if schema_version >= 31:
+        for row in conn.execute(
+            "select id from deliveries where cycle_id = ? order by created_at, id",
+            (cycle_id,),
+        ).fetchall():
+            issues.extend(
+                _delivery_acceptance_relation_issues(
+                    conn,
                     str(row["id"]),
-                    f"invariant failed: delivery has no linked acceptance {row['id']}",
+                    cycle_id,
                 )
             )
 
@@ -340,17 +397,24 @@ def check_runtime_invariants(
         if row["status"] not in FAILURE_MODE_STATUSES:
             issues.append(issue("invalid-failure-mode-status", "failure_mode", row["id"], f"invariant failed: invalid failure mode status {row['id']}={row['status']}"))
 
-    for row in query_scoped(
-        conn,
-        "select id, scope, acceptance from deliveries order by created_at, id",
-        "select id, scope, acceptance from deliveries where id in ({placeholders}) order by created_at, id",
-        delivery_ids,
-    ):
-        if not row["acceptance"]:
-            continue
-        linked_acceptance = conn.execute("select 1 from delivery_acceptance where delivery_id = ? limit 1", (row["id"],)).fetchone()
-        if not linked_acceptance:
-            issues.append(issue("delivery-missing-acceptance-link", "delivery", row["id"], f"invariant failed: delivery has no linked acceptance {row['id']}"))
+    schema_row = conn.execute(
+        "select schema_version from project where id = 1"
+    ).fetchone()
+    schema_version = int(schema_row[0]) if schema_row is not None else 0
+    if schema_version >= 31:
+        for row in query_scoped(
+            conn,
+            "select id, cycle_id from deliveries order by created_at, id",
+            "select id, cycle_id from deliveries where id in ({placeholders}) order by created_at, id",
+            delivery_ids,
+        ):
+            issues.extend(
+                _delivery_acceptance_relation_issues(
+                    conn,
+                    str(row["id"]),
+                    str(row["cycle_id"]),
+                )
+            )
 
     if scope is None or full:
         project = conn.execute(

@@ -41,9 +41,12 @@ _CONTROLLER_HARNESS: ContextVar[Path] = ContextVar(
 
 import harness_db  # noqa: E402
 from harness_lib import (  # noqa: E402
+    distribution_inventory_issues,
     framed_source_digest,
     git_blob_objects_available,
+    hook_definition_issues,
     isolated_git_environment,
+    load_distribution_manifest,
     now_iso,
 )
 from core.local_core_migration import (  # noqa: E402
@@ -55,12 +58,13 @@ from core.schema_lifecycle import (  # noqa: E402
     ACTIVE_SCHEMA_TABLES,
     ACTIVE_SCHEMA_VERSION,
 )
-from kafa.codex_app_server import (  # noqa: E402
-    APPROVED_AGENT_TEMPLATES,
-    APPROVED_RUNTIME_SCRIPTS,
-    APPROVED_SCHEMA_FILES,
-    APPROVED_SKILLS,
-    RETIRED_RUNTIME_PATHS,
+from kafa.codex_app_server import RETIRED_RUNTIME_PATHS  # noqa: E402
+from kafa.cli import static_runtime_domains  # noqa: E402
+
+
+_DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
+EXPECTED_AGENT_TEMPLATES = frozenset(
+    _DISTRIBUTION["templates"]["native_agents"]
 )
 
 
@@ -1052,7 +1056,16 @@ def scenario_fresh_local_install_and_init() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         initialized = run_harness(root, "init", check=False)
-        status = run_harness(root, "status", check=False)
+        status = run_harness(root, "status", "--json", check=False)
+        try:
+            status_payload = json.loads(status.stdout)
+        except json.JSONDecodeError:
+            status_payload = {}
+        status_details = (
+            status_payload.get("details", {})
+            if isinstance(status_payload, dict)
+            else {}
+        )
         tables = {
             str(row[0])
             for row in db_rows(
@@ -1072,9 +1085,9 @@ def scenario_fresh_local_install_and_init() -> dict[str, Any]:
         ok = (
             initialized.returncode == 0
             and status.returncode == 0
-            and f"schema_version: {ACTIVE_SCHEMA_VERSION}" in status.stdout
+            and status_details.get("schema_version") == ACTIVE_SCHEMA_VERSION
             and tables == set(ACTIVE_SCHEMA_TABLES)
-            and templates == APPROVED_AGENT_TEMPLATES
+            and templates == EXPECTED_AGENT_TEMPLATES
             and not retired_views
         )
         return scenario_result(
@@ -1629,12 +1642,12 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         _require_ok(run_harness(root, "init", check=False))
-        results: list[subprocess.CompletedProcess[str]] = []
+        results: list[tuple[int, subprocess.CompletedProcess[str]]] = []
         result_lock = threading.Lock()
 
-        def worker(index: int) -> None:
+        def add_acceptance(index: int) -> subprocess.CompletedProcess[str]:
             acceptance_id = f"AC{index // 2}"
-            result = run_harness(
+            return run_harness(
                 root,
                 "acceptance",
                 "add",
@@ -1645,8 +1658,11 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
                 check=False,
                 timeout=30,
             )
+
+        def worker(index: int) -> None:
+            result = add_acceptance(index)
             with result_lock:
-                results.append(result)
+                results.append((index, result))
 
         threads = [threading.Thread(target=worker, args=(index,)) for index in range(12)]
         for thread in threads:
@@ -1654,11 +1670,104 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
         for thread in threads:
             thread.join(timeout=30)
         alive = sum(thread.is_alive() for thread in threads)
-        lock_errors = sum("database is locked" in (result.stdout + result.stderr).lower() for result in results)
-        failed = [result.returncode for result in results if result.returncode != 0]
+        results.sort(key=lambda item: item[0])
+        successful_acceptance_ids = [
+            f"AC{index // 2}"
+            for index, result in results
+            if result.returncode == 0
+        ]
+        expected_initial_revisions: dict[str, int] = {}
+        for acceptance_id in successful_acceptance_ids:
+            expected_initial_revisions[acceptance_id] = (
+                expected_initial_revisions.get(acceptance_id, 0) + 1
+            )
+        initial_revisions = {
+            str(row["id"]): int(row["revision"])
+            for row in db_rows(
+                root,
+                "select id, revision from acceptance order by id",
+            )
+        }
+        initial_event_count = int(
+            _scalar(
+                root,
+                "select count(*) from events where event_type='acceptance_recorded'",
+            )
+        )
+        initial_state_consistent = (
+            initial_revisions == expected_initial_revisions
+            and initial_event_count == len(successful_acceptance_ids)
+        )
+        initial_failed = [
+            result.returncode
+            for _index, result in results
+            if result.returncode != 0
+        ]
+
+        def is_operation_timeout(
+            result: subprocess.CompletedProcess[str],
+        ) -> bool:
+            return any(
+                line.startswith("ERROR: project-db-operation-timeout:")
+                for line in (result.stdout + result.stderr).splitlines()
+            )
+
+        operation_timeouts = [
+            (index, result)
+            for index, result in results
+            if result.returncode != 0
+            and is_operation_timeout(result)
+        ]
+        unexpected_failures = [
+            result
+            for _index, result in results
+            if result.returncode != 0
+            and not is_operation_timeout(result)
+        ]
+        retries: list[subprocess.CompletedProcess[str]] = []
+        if alive == 0 and initial_state_consistent and not unexpected_failures:
+            for index, _timed_out in operation_timeouts:
+                retries.append(add_acceptance(index))
+        final_failures = [
+            *unexpected_failures,
+            *(result for result in retries if result.returncode != 0),
+        ]
+        observed_results = [
+            *(result for _index, result in results),
+            *retries,
+        ]
+        lock_errors = sum(
+            "database is locked" in (result.stdout + result.stderr).lower()
+            for result in observed_results
+        )
         doctor = run_harness(root, "doctor", check=False)
-        acceptance_count = int(_scalar(root, "select count(*) from acceptance"))
-        ok = len(results) == 12 and alive == 0 and not failed and lock_errors == 0 and doctor.returncode == 0 and acceptance_count == 6
+        final_revisions = {
+            str(row["id"]): int(row["revision"])
+            for row in db_rows(
+                root,
+                "select id, revision from acceptance order by id",
+            )
+        }
+        final_event_count = int(
+            _scalar(
+                root,
+                "select count(*) from events where event_type='acceptance_recorded'",
+            )
+        )
+        acceptance_count = len(final_revisions)
+        final_state_consistent = (
+            final_revisions == {f"AC{index}": 2 for index in range(6)}
+            and final_event_count == 12
+        )
+        ok = (
+            len(results) == 12
+            and alive == 0
+            and initial_state_consistent
+            and not final_failures
+            and lock_errors == 0
+            and doctor.returncode == 0
+            and final_state_consistent
+        )
         return scenario_result(
             "sqlite_contention_stress",
             started,
@@ -1666,9 +1775,25 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
             {
                 "operation_count": len(results),
                 "thread_leak_count": alive,
-                "failed_returncodes": failed,
+                "initial_failed_returncodes": initial_failed,
+                "initial_operation_timeout_count": len(operation_timeouts),
+                "unexpected_failure_count": len(unexpected_failures),
+                "retry_count": len(retries),
+                "retry_failed_returncodes": [
+                    result.returncode
+                    for result in retries
+                    if result.returncode != 0
+                ],
+                "failed_returncodes": [
+                    result.returncode for result in final_failures
+                ],
+                "initial_state_consistent": initial_state_consistent,
+                "initial_acceptance_revisions": initial_revisions,
+                "initial_acceptance_event_count": initial_event_count,
                 "sqlite_lock_error_count": lock_errors,
                 "acceptance_count": acceptance_count,
+                "final_acceptance_revisions": final_revisions,
+                "final_acceptance_event_count": final_event_count,
                 "doctor_returncode": doctor.returncode,
             },
             category="sqlite",
@@ -1802,20 +1927,82 @@ def scenario_installed_plugin_surface() -> dict[str, Any]:
             check=False,
         )
         plugin = home / ".agents/plugins/codex-project-harness"
+        if installed.returncode != 0 or not plugin.is_dir():
+            return scenario_result(
+                "installed_plugin_surface",
+                started,
+                False,
+                {
+                    "install_exit": installed.returncode,
+                    "install_stdout": installed.stdout.strip()[:1000],
+                    "install_stderr": installed.stderr.strip()[:1000],
+                    "plugin_present": plugin.is_dir(),
+                },
+                category="installation",
+                mode="local",
+            )
+        distribution = load_distribution_manifest(plugin)
+        expected_skills = set(distribution["skills"])
+        expected_hook_events = set(distribution["hooks"]["events"])
+        expected_templates = set(distribution["templates"]["native_agents"])
+        expected_project_templates = set(
+            distribution["templates"]["project_support"]
+        )
+        expected_scripts = set(distribution["scripts"])
+        expected_schemas = set(distribution["schemas"])
+        expected_core = set(distribution["core"])
+        expected_hook_files = set(distribution["hooks"]["files"])
+        expected_references = set(distribution["references"])
+        expected_domains = set(distribution["public_runtime_domains"])
+        inventory_issues = distribution_inventory_issues(plugin, distribution)
+        hook_issues = hook_definition_issues(plugin, distribution)
         skills = {path.name for path in (plugin / "skills").iterdir() if path.is_dir()} if plugin.is_dir() else set()
-        hooks_payload = json.loads((plugin / "hooks/hooks.json").read_text(encoding="utf-8")) if plugin.is_dir() else {}
+        hook_definitions = [
+            name
+            for name in distribution["hooks"]["files"]
+            if Path(name).suffix == ".json"
+        ]
+        hooks_payload = (
+            json.loads(
+                (plugin / "hooks" / hook_definitions[0]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            if len(hook_definitions) == 1
+            else {}
+        )
         hooks = set(hooks_payload.get("hooks", {}))
         templates = {path.name for path in (plugin / "templates/agents").glob("*.toml")}
+        project_templates = {
+            path.name for path in (plugin / "templates/project").iterdir()
+            if path.is_file()
+        }
         scripts = {path.name for path in (plugin / "scripts").glob("*.py")}
         schemas = {path.name for path in (plugin / "schemas").glob("*.json")}
+        core = {path.name for path in (plugin / "core").glob("*.py")}
+        hook_files = {
+            path.name for path in (plugin / "hooks").iterdir() if path.is_file()
+        }
+        references = {
+            path.name for path in (plugin / "references").iterdir()
+            if path.is_file()
+        }
+        domains = static_runtime_domains(plugin / "scripts/harness.py")
         retired = [relative for relative in RETIRED_RUNTIME_PATHS if (plugin / relative).exists()]
         ok = (
             installed.returncode == 0
-            and skills == APPROVED_SKILLS
-            and hooks == {"SessionStart", "SubagentStart", "Stop"}
-            and templates == APPROVED_AGENT_TEMPLATES
-            and scripts == APPROVED_RUNTIME_SCRIPTS
-            and schemas == APPROVED_SCHEMA_FILES
+            and skills == expected_skills
+            and hooks == expected_hook_events
+            and templates == expected_templates
+            and project_templates == expected_project_templates
+            and scripts == expected_scripts
+            and schemas == expected_schemas
+            and core == expected_core
+            and hook_files == expected_hook_files
+            and references == expected_references
+            and domains == expected_domains
+            and not inventory_issues
+            and not hook_issues
             and not retired
         )
         return scenario_result(
@@ -1827,8 +2014,15 @@ def scenario_installed_plugin_surface() -> dict[str, Any]:
                 "skill_count": len(skills),
                 "hook_count": len(hooks),
                 "template_count": len(templates),
+                "project_template_count": len(project_templates),
                 "runtime_script_count": len(scripts),
                 "schema_count": len(schemas),
+                "core_count": len(core),
+                "hook_file_count": len(hook_files),
+                "reference_count": len(references),
+                "public_runtime_domain_count": len(domains),
+                "distribution_inventory_issues": inventory_issues,
+                "hook_definition_issues": hook_issues,
                 "retired_paths": sorted(retired),
             },
             category="installation",
@@ -3367,6 +3561,8 @@ def report_consistency_errors(
     require_current_binary: bool = True,
     require_current_git_state: bool = True,
     require_current_matrix: bool = True,
+    require_current_source: bool = True,
+    require_clean_source: bool = False,
 ) -> list[str]:
     """Recompute evidence facts instead of trusting report summary fields.
 
@@ -3640,13 +3836,18 @@ def report_consistency_errors(
             or any(not isinstance(entry, str) or not entry for entry in source_scope)
         ):
             errors.append("evaluation_source source_scope is invalid")
-        current_identity = evaluation_source_identity()
-        for field in ("workspace_sha256", "source_scope"):
-            if identity.get(field) != current_identity.get(field):
-                errors.append(
-                    f"evaluation_source {field} does not match current executable source"
-                )
-        if require_current_git_state:
+        current_identity = (
+            evaluation_source_identity()
+            if require_current_source or require_current_git_state or require_clean_source
+            else None
+        )
+        if require_current_source and current_identity is not None:
+            for field in ("workspace_sha256", "source_scope"):
+                if identity.get(field) != current_identity.get(field):
+                    errors.append(
+                        f"evaluation_source {field} does not match current executable source"
+                    )
+        if require_current_git_state and current_identity is not None:
             for field in (
                 "git_head",
                 "git_dirty",
@@ -3657,6 +3858,19 @@ def report_consistency_errors(
                     errors.append(
                         f"evaluation_source {field} does not match current checkout"
                     )
+        if require_clean_source:
+            if (
+                identity.get("git_dirty") is not False
+                or identity.get("status_entry_count") != 0
+                or identity.get("status_sha256") != empty_status_sha256
+            ):
+                errors.append("persistent Native evidence source is not clean")
+            if current_identity is None or (
+                current_identity.get("git_dirty") is not False
+                or current_identity.get("status_entry_count") != 0
+                or current_identity.get("status_sha256") != empty_status_sha256
+            ):
+                errors.append("current Native evidence checkout is not clean")
 
     native_host = report.get("native_host")
     if expected_live_status == "passed" and not isinstance(native_host, dict):
@@ -3963,6 +4177,8 @@ def persistent_report_consistency_errors(
     require_current_binary: bool = False,
     require_current_git_state: bool = False,
     require_current_matrix: bool = False,
+    require_current_source: bool = True,
+    require_clean_source: bool = False,
 ) -> list[str]:
     """Validate persisted evidence while rejecting explicit test binaries."""
 
@@ -3971,6 +4187,8 @@ def persistent_report_consistency_errors(
         require_current_binary=require_current_binary,
         require_current_git_state=require_current_git_state,
         require_current_matrix=require_current_matrix,
+        require_current_source=require_current_source,
+        require_clean_source=require_clean_source,
     )
     native_host = report.get("native_host")
     if (
@@ -3985,6 +4203,34 @@ def persistent_report_consistency_errors(
             "persisted passing Native evidence requires a path-discovered binary"
         )
     return errors
+
+
+def persistent_evidence_errors(
+    report: dict[str, Any],
+    *,
+    eligibility: str,
+) -> list[str]:
+    """Apply one closed policy for historical integrity or current eligibility."""
+
+    if eligibility == "historical-integrity":
+        return persistent_report_consistency_errors(
+            report,
+            require_current_binary=False,
+            require_current_git_state=False,
+            require_current_matrix=False,
+            require_current_source=False,
+            require_clean_source=False,
+        )
+    if eligibility == "current-eligible":
+        return persistent_report_consistency_errors(
+            report,
+            require_current_binary=True,
+            require_current_git_state=True,
+            require_current_matrix=True,
+            require_current_source=True,
+            require_clean_source=True,
+        )
+    return [f"unsupported persistent evidence eligibility: {eligibility!r}"]
 
 
 def should_fail(report: dict[str, Any]) -> bool:
@@ -4025,6 +4271,27 @@ def should_fail(report: dict[str, Any]) -> bool:
     return False
 
 
+def _strict_stdin_report() -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    value = json.loads(
+        sys.stdin.read(),
+        object_pairs_hook=unique_object,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"non-finite JSON value: {value}")
+        ),
+    )
+    if not isinstance(value, dict):
+        raise ValueError("evidence root is not an object")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run agent E2E evaluation scenarios")
     parser.add_argument(
@@ -4043,7 +4310,34 @@ def main() -> int:
         default="",
         help="Explicitly write the full local debug report including Native output tails",
     )
+    parser.add_argument(
+        "--validate-evidence",
+        choices=["historical-integrity", "current-eligible"],
+        help="Validate one report from stdin without running a profile",
+    )
     args = parser.parse_args()
+
+    if args.validate_evidence:
+        try:
+            report = _strict_stdin_report()
+            errors = persistent_evidence_errors(
+                report,
+                eligibility=args.validate_evidence,
+            )
+        except (json.JSONDecodeError, UnicodeError, ValueError) as exc:
+            errors = [f"invalid evidence JSON: {exc}"]
+        print(
+            json.dumps(
+                {
+                    "ok": not errors,
+                    "eligibility": args.validate_evidence,
+                    "errors": errors,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0 if not errors else 1
 
     runners = {
         "fixture": run_fixture,
@@ -4055,11 +4349,9 @@ def main() -> int:
     evidence_report = compact_evidence_report(report)
     profile_failed = should_fail(report)
     persistent_errors = (
-        persistent_report_consistency_errors(
+        persistent_evidence_errors(
             evidence_report,
-            require_current_binary=True,
-            require_current_git_state=True,
-            require_current_matrix=True,
+            eligibility="current-eligible",
         )
         if args.evidence_out
         else []

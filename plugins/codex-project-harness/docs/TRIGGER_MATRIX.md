@@ -1,27 +1,26 @@
+<!-- BEGIN GENERATED: workflow-contract:trigger-matrix -->
 # Trigger Matrix
 
-| User intent | Preferred skill | Notes |
+| Skill | Trigger | Obligation |
 | --- | --- | --- |
-| 我要开发/创建/搭建项目，或需要完整验证交付 | `project-harness` | Single entrypoint for bootstrap, OpenSpec routing, local Kernel facts, QA, and verified handoff |
-| 最小改动/不要重构 | `minimal-safe-change` | Keep diff narrow but complete |
-| 先写测试/测试驱动 | `test-first-delivery` | Contract and regression oriented |
-| 修 bug/复现问题 | `bug-fix-loop` | Reproduction before fix |
-| 独立验收/代码审查/QA | `independent-quality-gate` | Reviewer must not be the producer |
-| 检查方法论漂移/Agent 漂移 | `harness-audit` | Maintenance and drift repair |
-| 复盘/沉淀方法论 | `project-retrospective` | Convert evidence into improvements |
+| `project-harness` | broad, architectural, cross-module, long-lived, or complete verified delivery work | route to OpenSpec when specification is needed, then run the complete local delivery workflow |
+| `minimal-safe-change` | small clear low-risk patch with explicit acceptance | keep the diff and evidence surface narrow |
+| `bug-fix-loop` | reproducible defect or failing behavior | reproduce before fixing and retain a regression oracle |
+| `test-first-delivery` | contract-sensitive or regression-sensitive behavior | establish the failing test before production change |
+| `independent-quality-gate` | finished implementation needs fresh review | keep producer and reviewer contexts distinct when independent review is claimed |
+| `harness-audit` | runtime, boundary, fact, or generated-view drift requires audit | audit evidence without relabelling missing checks as pass |
+| `project-retrospective` | a completed milestone or repeated escape needs lessons captured | derive lessons from verified delivery evidence |
 
-Broad, ambiguous, architectural, cross-module, or long-lived work routes from
-`project-harness` to OpenSpec before implementation. The retained seven Skills
-do not own a Host task lifecycle; Native Codex/ChatGPT owns tasks, subagents,
-worktrees, approvals, models, cancellation, steering, and handoff.
+## Advanced Modes
 
-## Should Not Trigger
+| Advanced mode | Trigger | Activates |
+| --- | --- | --- |
+| `parallel-delegation` | two or more producers run in parallel, shared-file integration is required, or explicit advanced review is requested | full delegation matrix and root integration checkpoint |
+| `deep-kernel-review` | schema, migration, runtime ownership, trust, delivery gate, security, permissions, concurrency, data loss, public API, or cross-module authority changes | root/deep ownership and adversarial review |
+| `harness-audit` | multi-day work, repeated escapes, schema or runtime change or drift, or milestone review | harness-audit |
+| `project-retrospective` | delivery milestone completes or a failure loop exposes a stable lesson | project-retrospective |
+| `live-host-compatibility` | Native Host integration, evaluator, packaging, or release surface changes | real Native single and parallel evidence |
+| `release-rehearsal` | packaging, supply-chain, release tooling, or an authorized release candidate changes | non-publishing isolated rehearsal |
 
-| Request | Reason |
-| --- | --- |
-| 帮我部署/上线/发布到生产 | Deployment and production release are outside this harness |
-| 只执行一个外部 SaaS 动作 | External Apps/tools are Host-owned and outside the local Kafa runtime |
-| 解释什么是上线 | Educational, not code delivery execution |
-| 什么是 Agent | Conceptual explanation |
-| 翻译这段话 | Translation task |
-| 总结我提供的文本 | Summarization unless it asks for project artifacts |
+A user's explicit request for a named advanced mode also activates it. Explanation, translation, and supplied-text summary do not initialize Kafa. Deployment, production release, external SaaS actions, and Native Host lifecycle remain outside the local runtime.
+<!-- END GENERATED: workflow-contract:trigger-matrix -->

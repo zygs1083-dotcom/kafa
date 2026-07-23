@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -13,15 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from kafa import cli as kafa_cli
-from kafa.codex_app_server import (
-    APPROVED_AGENT_TEMPLATES,
-    APPROVED_APP_SERVER_HOOK_EVENTS,
-    APPROVED_RUNTIME_SCRIPTS,
-    APPROVED_SCHEMA_FILES,
-    APPROVED_SKILLS,
-    AppServerClient,
-    validate_app_server_discovery,
-)
+from kafa.codex_app_server import AppServerClient, validate_app_server_discovery
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,8 +25,16 @@ RELEASE_VERSION = str(RELEASE["version"])
 RELEASE_PEP440_VERSION = str(RELEASE["pep440_version"])
 
 
+def distribution(cache_root: Path = PLUGIN_ROOT) -> dict[str, object]:
+    return kafa_cli.load_distribution_manifest(cache_root)
+
+
 def run_kafa(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     command_env = os.environ.copy()
+    command_env.setdefault(
+        "CODEX_PROJECT_HARNESS_PLUGIN_ROOT", str(PLUGIN_ROOT)
+    )
+    command_env.setdefault("KAFA_MAINTAINER_RUNTIME", "1")
     if env:
         command_env.update(env)
     result = subprocess.run([sys.executable, "-m", "kafa.cli", *args], cwd=cwd or REPO_ROOT, text=True, capture_output=True, check=False, env=command_env)
@@ -47,6 +48,33 @@ def copy_release_repo(target: Path) -> Path:
     shutil.copyfile(REPO_ROOT / "VERSION", target / "VERSION")
     shutil.copyfile(REPO_ROOT / "release.json", target / "release.json")
     shutil.copyfile(REPO_ROOT / "pyproject.toml", target / "pyproject.toml")
+    return target
+
+
+def sqlite_audit_runtime(target: Path, marker: Path) -> Path:
+    """Copy a valid runtime whose child process records every SQLite open."""
+
+    shutil.copytree(
+        PLUGIN_ROOT,
+        target,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    harness = target / "scripts" / "harness.py"
+    source = harness.read_text(encoding="utf-8")
+    probe = (
+        "from __future__ import annotations\n\n"
+        "import sys as _sqlite_audit_sys\n"
+        "from pathlib import Path as _SqliteAuditPath\n\n"
+        "def _record_sqlite_open(event, _args):\n"
+        "    if event == 'sqlite3.connect':\n"
+        f"        _SqliteAuditPath({str(marker)!r}).write_text('observed', encoding='utf-8')\n"
+        "        raise RuntimeError('sqlite3.connect observed by test audit hook')\n\n"
+        "_sqlite_audit_sys.addaudithook(_record_sqlite_open)\n"
+    )
+    future = "from __future__ import annotations\n"
+    if source.count(future) != 1:
+        raise AssertionError("runtime harness future import marker is not unique")
+    harness.write_text(source.replace(future, probe, 1), encoding="utf-8")
     return target
 
 
@@ -89,13 +117,15 @@ def fake_codex_env(root: Path, plugin_root: Path, marketplace_name: str = "kafa-
 
 
 def app_server_discovery(cache_root: Path) -> dict[str, object]:
+    manifest = distribution(cache_root)
     event_names = {
         "sessionStart": "SessionStart",
         "subagentStart": "SubagentStart",
         "stop": "Stop",
     }
+    app_event_names = {value: key for key, value in event_names.items()}
     expected_skills = {
-        f"codex-project-harness:{name}" for name in APPROVED_SKILLS
+        f"codex-project-harness:{name}" for name in manifest["skills"]
     }
     return {
         "plugin": {
@@ -139,17 +169,17 @@ def app_server_discovery(cache_root: Path) -> dict[str, object]:
                     "warnings": [],
                     "hooks": [
                         {
-                            "eventName": event,
+                            "eventName": app_event_names[event],
                             "enabled": True,
                             "source": "plugin",
                             "pluginId": "codex-project-harness@kafa-local",
                             "sourcePath": str(cache_root / "hooks/hooks.json"),
                             "command": (
                                 f'python "${{PLUGIN_ROOT}}/hooks/harness_hook.py" '
-                                f"{event_names[event]}"
+                                f"{event}"
                             ),
                         }
-                        for event in sorted(APPROVED_APP_SERVER_HOOK_EVENTS)
+                        for event in sorted(manifest["hooks"]["events"])
                     ],
                 }
             ]
@@ -189,17 +219,42 @@ class InstallReleaseTest(unittest.TestCase):
                 plugin_id="codex-project-harness@kafa-local",
                 version=RELEASE_VERSION,
             )
+            manifest = distribution(cache_root)
 
         self.assertEqual(report["skill_count"], 7)
         self.assertEqual(
             set(report["skill_names"]),
-            {f"codex-project-harness:{name}" for name in APPROVED_SKILLS},
+            {f"codex-project-harness:{name}" for name in manifest["skills"]},
         )
-        self.assertEqual(set(report["hook_events"]), APPROVED_APP_SERVER_HOOK_EVENTS)
+        self.assertEqual(
+            set(report["hook_events"]),
+            {
+                {"SessionStart": "sessionStart", "SubagentStart": "subagentStart", "Stop": "stop"}[event]
+                for event in manifest["hooks"]["events"]
+            },
+        )
         self.assertEqual(report["template_count"], 3)
-        self.assertEqual(set(report["template_names"]), APPROVED_AGENT_TEMPLATES)
-        self.assertEqual(set(report["runtime_script_names"]), APPROVED_RUNTIME_SCRIPTS)
-        self.assertEqual(set(report["schema_names"]), APPROVED_SCHEMA_FILES)
+        self.assertEqual(
+            set(report["template_names"]),
+            set(manifest["templates"]["native_agents"]),
+        )
+        self.assertEqual(set(report["runtime_script_names"]), set(manifest["scripts"]))
+        self.assertEqual(set(report["schema_names"]), set(manifest["schemas"]))
+        self.assertEqual(
+            set(report["project_template_names"]),
+            set(manifest["templates"]["project_support"]),
+        )
+        self.assertEqual(set(report["core_names"]), set(manifest["core"]))
+        self.assertEqual(
+            set(report["hook_file_names"]), set(manifest["hooks"]["files"])
+        )
+        self.assertEqual(
+            set(report["reference_names"]), set(manifest["references"])
+        )
+        self.assertEqual(
+            set(report["public_runtime_domains"]),
+            set(manifest["public_runtime_domains"]),
+        )
         self.assertTrue(report["retired_runtime_absent"])
         self.assertEqual(report["plugin_local_version"], RELEASE_VERSION)
 
@@ -226,7 +281,10 @@ class InstallReleaseTest(unittest.TestCase):
             extra.write_text('name = "bootstrap-coordinator"\n', encoding="utf-8")
             discovery = app_server_discovery(cache_root)
 
-            with self.assertRaisesRegex(RuntimeError, "template inventory mismatch"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"(?:template inventory mismatch|distribution inventory.*extra)",
+            ):
                 validate_app_server_discovery(
                     discovery,
                     cache_root=cache_root,
@@ -240,6 +298,169 @@ class InstallReleaseTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "retired runtime files"):
                 validate_app_server_discovery(
                     discovery,
+                    cache_root=cache_root,
+                    plugin_id="codex-project-harness@kafa-local",
+                    version=RELEASE_VERSION,
+                )
+
+    def test_app_server_discovery_rejects_wrong_or_duplicate_skill_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(
+                PLUGIN_ROOT,
+                cache_root,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+            for case in ("wrong-path", "duplicate-path"):
+                with self.subTest(case=case):
+                    discovery = app_server_discovery(cache_root)
+                    skills = discovery["skills"]["data"][0]["skills"]
+                    self.assertGreaterEqual(len(skills), 2)
+                    if case == "wrong-path":
+                        skill_name = str(skills[0]["name"]).split(":", 1)[1]
+                        skills[0]["path"] = str(
+                            cache_root
+                            / "skills"
+                            / skill_name
+                            / "agents"
+                            / "openai.yaml"
+                        )
+                    else:
+                        skills[1]["path"] = skills[0]["path"]
+
+                    with self.assertRaises(
+                        RuntimeError,
+                        msg=f"app-server accepted {case} Skill wiring",
+                    ):
+                        validate_app_server_discovery(
+                            discovery,
+                            cache_root=cache_root,
+                            plugin_id="codex-project-harness@kafa-local",
+                            version=RELEASE_VERSION,
+                        )
+
+    def test_app_server_discovery_rejects_wrong_hook_source_runner_or_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(
+                PLUGIN_ROOT,
+                cache_root,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+            for case in (
+                "source-path",
+                "runner",
+                "event-argument",
+                "event-substring",
+            ):
+                with self.subTest(case=case):
+                    discovery = app_server_discovery(cache_root)
+                    hook = discovery["hooks"]["data"][0]["hooks"][0]
+                    if case == "source-path":
+                        hook["sourcePath"] = str(
+                            cache_root / "hooks" / "harness_hook.py"
+                        )
+                    elif case == "runner":
+                        hook["command"] = (
+                            'ruby "${PLUGIN_ROOT}/hooks/harness_hook.py" '
+                            "SessionStart"
+                        )
+                    elif case == "event-argument":
+                        hook["command"] = (
+                            'python "${PLUGIN_ROOT}/hooks/harness_hook.py" Stop'
+                        )
+                    else:
+                        hook["command"] = (
+                            'python "${PLUGIN_ROOT}/hooks/harness_hook.py" '
+                            "--label=SessionStart-forged"
+                        )
+
+                    with self.assertRaises(
+                        RuntimeError,
+                        msg=f"app-server accepted wrong Hook {case}",
+                    ):
+                        validate_app_server_discovery(
+                            discovery,
+                            cache_root=cache_root,
+                            plugin_id="codex-project-harness@kafa-local",
+                            version=RELEASE_VERSION,
+                        )
+
+    def test_app_server_discovery_binds_cache_and_requested_plugin_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(
+                PLUGIN_ROOT,
+                cache_root,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            plugin_manifest_path = cache_root / ".codex-plugin" / "plugin.json"
+            original_manifest = plugin_manifest_path.read_bytes()
+
+            for field, value in (
+                ("name", "wrong-plugin-name"),
+                ("version", "0.0.0"),
+            ):
+                with self.subTest(cache_manifest_field=field):
+                    plugin_manifest_path.write_bytes(original_manifest)
+                    plugin_manifest = json.loads(
+                        plugin_manifest_path.read_text(encoding="utf-8")
+                    )
+                    plugin_manifest[field] = value
+                    plugin_manifest_path.write_text(
+                        json.dumps(plugin_manifest, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(
+                        RuntimeError,
+                        msg=f"app-server accepted cache plugin {field} mismatch",
+                    ):
+                        validate_app_server_discovery(
+                            app_server_discovery(cache_root),
+                            cache_root=cache_root,
+                            plugin_id="codex-project-harness@kafa-local",
+                            version=RELEASE_VERSION,
+                        )
+
+            plugin_manifest_path.write_bytes(original_manifest)
+            mismatch_cases = (
+                ("requested-id", "wrong-plugin@kafa-local", RELEASE_VERSION),
+                (
+                    "local-version",
+                    "codex-project-harness@kafa-local",
+                    "0.0.0",
+                ),
+            )
+            for case, plugin_id, version in mismatch_cases:
+                with self.subTest(case=case):
+                    with self.assertRaises(RuntimeError):
+                        validate_app_server_discovery(
+                            app_server_discovery(cache_root),
+                            cache_root=cache_root,
+                            plugin_id=plugin_id,
+                            version=version,
+                        )
+
+    def test_app_server_discovery_rejects_undeclared_nested_cache_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_root = Path(temp) / "cache"
+            shutil.copytree(
+                PLUGIN_ROOT,
+                cache_root,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            nested_extra = cache_root / "core" / "undeclared" / "extra.py"
+            nested_extra.parent.mkdir()
+            nested_extra.write_text("raise RuntimeError('must not load')\n", encoding="utf-8")
+
+            with self.assertRaises(
+                RuntimeError,
+                msg="app-server accepted an undeclared nested cache file",
+            ):
+                validate_app_server_discovery(
+                    app_server_discovery(cache_root),
                     cache_root=cache_root,
                     plugin_id="codex-project-harness@kafa-local",
                     version=RELEASE_VERSION,
@@ -456,7 +677,7 @@ class InstallReleaseTest(unittest.TestCase):
         ]:
             self.assertTrue(checks[name]["ok"], checks[name])
 
-    def test_plugin_install_preserves_on_demand_delegation_reference(self) -> None:
+    def test_plugin_install_preserves_workflow_and_delegation_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = copy_release_repo(Path(temp) / "repo")
             home = Path(temp) / "home"
@@ -465,14 +686,21 @@ class InstallReleaseTest(unittest.TestCase):
             installed = home / ".agents/plugins/codex-project-harness"
             source_reference = root / "plugins/codex-project-harness/references/delegation-matrix.md"
             installed_reference = installed / "references/delegation-matrix.md"
+            source_workflow = root / "plugins/codex-project-harness/references/workflow-contract.json"
+            installed_workflow = installed / "references/workflow-contract.json"
             installed_skill = (installed / "skills/project-harness/SKILL.md").read_text(encoding="utf-8")
             installed_exists = installed_reference.is_file()
             source_bytes = source_reference.read_bytes()
             installed_bytes = installed_reference.read_bytes()
+            source_workflow_bytes = source_workflow.read_bytes()
+            installed_workflow_bytes = installed_workflow.read_bytes()
 
         self.assertTrue(installed_exists)
         self.assertEqual(installed_bytes, source_bytes)
+        self.assertEqual(installed_workflow_bytes, source_workflow_bytes)
+        self.assertEqual(json.loads(installed_workflow_bytes)["contract_version"], 1)
         self.assertIn("references/delegation-matrix.md", installed_skill)
+        self.assertIn("BEGIN GENERATED: workflow-contract:entry-workflow", installed_skill)
 
     def test_user_doctor_detects_same_version_installed_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -592,18 +820,88 @@ class InstallReleaseTest(unittest.TestCase):
             root = Path(temp)
 
             result = run_kafa("project", "doctor", "--repo", str(root), "--json", check=False)
-            report = json.loads(result.stdout)
+            envelope = json.loads(result.stdout)
+            report = envelope["details"]
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            set(envelope),
+            {"state", "blockers", "actions", "details"},
+        )
+        self.assertTrue(envelope["blockers"])
         self.assertFalse(report["ok"], report)
         self.assertEqual(report["kind"], "project")
         self.assertIn("harness initialized", {check["name"] for check in report["checks"]})
         self.assertNotIn("plugin structure", {check["name"] for check in report["checks"]})
         self.assertTrue(report["next_commands"][0].startswith("kafa project init --repo "))
 
-    def test_project_doctor_fails_closed_on_migration_sentinel_without_opening_sqlite(self) -> None:
+    def test_project_doctor_fails_on_real_foreign_key_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            initialized = run_kafa(
+                "project", "init", "--repo", str(root), check=False
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stdout + initialized.stderr,
+            )
+            (root / ".gitignore").write_text("user-rule.log\n", encoding="utf-8")
+            conn = sqlite3.connect(root / ".ai-team/state/harness.db")
+            try:
+                conn.execute("pragma foreign_keys = off")
+                conn.execute(
+                    "insert into task_acceptance "
+                    "(cycle_id, task_id, acceptance_id) values (?, ?, ?)",
+                    ("CYCLE-current", "missing-task", "missing-acceptance"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            concise = run_kafa(
+                "project", "doctor", "--repo", str(root), check=False
+            )
+            verbose = run_kafa(
+                "project", "doctor", "--repo", str(root), "--verbose", check=False
+            )
+            json_result = run_kafa(
+                "project", "doctor", "--repo", str(root), "--json", check=False
+            )
+
+        self.assertNotEqual(concise.returncode, 0)
+        self.assertEqual(len(concise.stdout.splitlines()), 3)
+        self.assertIn("[foreign-key-integrity]", concise.stdout)
+        self.assertNotEqual(verbose.returncode, 0)
+        self.assertLess(
+            verbose.stdout.index("foreign-key-integrity"),
+            verbose.stdout.index("gitignore-missing"),
+        )
+        self.assertNotEqual(json_result.returncode, 0)
+        self.assertEqual(json_result.stderr, "")
+        payload = json.loads(json_result.stdout)
+        codes = [blocker["code"] for blocker in payload["blockers"]]
+        self.assertEqual(codes[0], "foreign-key-integrity")
+        self.assertIn("runtime", payload["details"])
+        self.assertEqual(
+            payload["details"]["runtime"]["blockers"][0]["code"],
+            "foreign-key-integrity",
+        )
+
+    def test_project_doctor_fails_closed_on_migration_sentinel_without_opening_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            marker = base / "sqlite-opened"
+            runtime = sqlite_audit_runtime(base / "runtime", marker)
             sentinel = root / ".ai-team/state/local-core-migration.lock"
             sentinel.parent.mkdir(parents=True)
             sentinel.write_text(
@@ -612,9 +910,15 @@ class InstallReleaseTest(unittest.TestCase):
             )
             (sentinel.parent / "harness.db").touch()
 
-            with patch("sqlite3.connect", side_effect=AssertionError("SQLite must stay closed")):
-                report = kafa_cli.project_doctor_report(root)
+            report = kafa_cli.project_doctor_report(
+                root,
+                authority=kafa_cli.validate_project_runtime_root(
+                    runtime, label="test runtime"
+                ),
+            )
+            sqlite_opened = marker.exists()
 
+        self.assertFalse(sqlite_opened)
         initialized = next(check for check in report["checks"] if check["name"] == "harness initialized")
         self.assertFalse(report["ok"])
         self.assertFalse(initialized["ok"])
@@ -629,7 +933,10 @@ class InstallReleaseTest(unittest.TestCase):
 
     def test_project_doctor_reports_recovery_required_manifest_without_opening_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            base = Path(temp)
+            root = base / "project"
+            marker = base / "sqlite-opened"
+            runtime = sqlite_audit_runtime(base / "runtime", marker)
             sentinel = root / ".ai-team/state/local-core-migration.lock"
             manifest = root / ".ai-team/backups/schema-29/migration-manifest.json"
             sentinel.parent.mkdir(parents=True)
@@ -647,9 +954,15 @@ class InstallReleaseTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("sqlite3.connect", side_effect=AssertionError("SQLite must stay closed")):
-                report = kafa_cli.project_doctor_report(root)
+            report = kafa_cli.project_doctor_report(
+                root,
+                authority=kafa_cli.validate_project_runtime_root(
+                    runtime, label="test runtime"
+                ),
+            )
+            sqlite_opened = marker.exists()
 
+        self.assertFalse(sqlite_opened)
         initialized = next(
             check for check in report["checks"] if check["name"] == "harness initialized"
         )
@@ -667,6 +980,8 @@ class InstallReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
             root = base / "project"
+            marker = base / "sqlite-opened"
+            runtime = sqlite_audit_runtime(base / "runtime", marker)
             state = root / ".ai-team/state"
             state.mkdir(parents=True)
             external = base / "outside-sentinel.json"
@@ -677,13 +992,16 @@ class InstallReleaseTest(unittest.TestCase):
             before = external.read_bytes()
             (state / "local-core-migration.lock").symlink_to(external)
 
-            with patch(
-                "sqlite3.connect",
-                side_effect=AssertionError("SQLite must stay closed"),
-            ):
-                report = kafa_cli.project_doctor_report(root)
+            report = kafa_cli.project_doctor_report(
+                root,
+                authority=kafa_cli.validate_project_runtime_root(
+                    runtime, label="test runtime"
+                ),
+            )
+            sqlite_opened = marker.exists()
             self.assertEqual(external.read_bytes(), before)
 
+        self.assertFalse(sqlite_opened)
         initialized = next(
             check for check in report["checks"] if check["name"] == "harness initialized"
         )
@@ -694,6 +1012,39 @@ class InstallReleaseTest(unittest.TestCase):
             initialized["details"],
         )
         self.assertEqual(report["next_commands"], [])
+
+    def test_project_doctor_sqlite_audit_probe_observes_initialized_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            marker = base / "sqlite-opened"
+            root.mkdir()
+            initialized = run_kafa(
+                "project",
+                "init",
+                "--repo",
+                str(root),
+                check=False,
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stdout + initialized.stderr,
+            )
+            runtime = sqlite_audit_runtime(base / "runtime", marker)
+            authority = kafa_cli.validate_project_runtime_root(
+                runtime,
+                label="test runtime",
+            )
+
+            with self.assertRaisesRegex(
+                kafa_cli.KafaError,
+                "emitted stderr",
+            ):
+                kafa_cli.project_doctor_report(root, authority=authority)
+            sqlite_opened = marker.exists()
+
+        self.assertTrue(sqlite_opened)
 
     def test_project_doctor_uses_single_gitignore_probe_without_reopening_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -720,18 +1071,23 @@ class InstallReleaseTest(unittest.TestCase):
             )
             exchange_called = False
 
-            def exchange_after_probe(_repo: Path, _probe: dict[str, object]) -> None:
+            def exchange_after_report(_repo: Path, _runtime: dict[str, object]) -> None:
                 nonlocal exchange_called
                 exchange_called = True
                 os.replace(replacement, gitignore)
 
             with patch.object(
                 kafa_cli,
-                "_after_project_doctor_probe",
-                side_effect=exchange_after_probe,
+                "_after_project_doctor_runtime_report",
+                side_effect=exchange_after_report,
                 create=True,
             ):
-                report = kafa_cli.project_doctor_report(root)
+                report = kafa_cli.project_doctor_report(
+                    root,
+                    authority=kafa_cli.validate_project_runtime_root(
+                        PLUGIN_ROOT.resolve(), label="test runtime"
+                    ),
+                )
 
             runtime_gitignore = next(
                 check
@@ -752,12 +1108,92 @@ class InstallReleaseTest(unittest.TestCase):
             initialized = run_kafa("project", "init", "--repo", str(root), cwd=root, env=package_env, check=False)
             status = run_kafa("project", "status", "--repo", str(root), cwd=root, env=package_env, check=False)
             quickstart = run_kafa("project", "quickstart", "--repo", str(root), "status", cwd=root, env=package_env, check=False)
+            verbose_status = run_kafa("project", "status", "--repo", str(root), "--verbose", cwd=root, env=package_env, check=False)
+            verbose_quickstart = run_kafa("project", "quickstart", "--repo", str(root), "status", "--verbose", cwd=root, env=package_env, check=False)
 
         self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertEqual(quickstart.returncode, 0, quickstart.stdout + quickstart.stderr)
-        self.assertIn("schema_version:", status.stdout)
-        self.assertIn("initialized: true", quickstart.stdout)
+        self.assertEqual(len(status.stdout.splitlines()), 3)
+        self.assertEqual(len(quickstart.stdout.splitlines()), 3)
+        self.assertIn("schema_version:", verbose_status.stdout)
+        self.assertIn("initialized: true", verbose_quickstart.stdout)
+
+    def test_project_launcher_routes_status_and_quickstart_output_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "business"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            package_env = {"PYTHONPATH": str(REPO_ROOT)}
+            run_kafa("project", "init", "--repo", str(root), cwd=root, env=package_env)
+
+            status_json = run_kafa(
+                "project", "status", "--repo", str(root), "--json",
+                cwd=root, env=package_env,
+            )
+            quickstart_json = run_kafa(
+                "project", "quickstart", "--repo", str(root),
+                "status", "--json", cwd=root, env=package_env,
+            )
+
+        for result in (status_json, quickstart_json):
+            with self.subTest(stdout=result.stdout[:80]):
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(
+                    set(json.loads(result.stdout)),
+                    {"state", "blockers", "actions", "details"},
+                )
+
+    def test_project_doctor_recovery_json_is_first_and_has_no_init_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(root / ".ai-team/backups/recovery/manifest.json"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_kafa(
+                "project", "doctor", "--repo", str(root), "--json",
+                check=False,
+            )
+            envelope = json.loads(result.stdout)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(envelope["state"], "recovery-required")
+        self.assertEqual(envelope["blockers"][0]["code"], "rollback-incomplete")
+        self.assertEqual(envelope["actions"], [])
+        self.assertEqual(envelope["details"]["next_commands"], [])
+
+    def test_project_doctor_existing_unreadable_database_never_recommends_init(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / ".ai-team/state/harness.db"
+            database.parent.mkdir(parents=True)
+            database.write_bytes(b"not-a-sqlite-database")
+
+            result = run_kafa(
+                "project", "doctor", "--repo", str(root), "--json",
+                check=False,
+            )
+            envelope = json.loads(result.stdout)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(envelope["state"], "error")
+        self.assertEqual(envelope["blockers"][0]["code"], "runtime-error")
+        self.assertEqual(envelope["actions"], [])
+        self.assertEqual(envelope["details"]["next_commands"], [])
 
     def test_repo_install_writes_marketplace_and_preserves_other_plugins(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -790,19 +1226,37 @@ class InstallReleaseTest(unittest.TestCase):
             root = copy_release_repo(Path(temp) / "repo")
             home = Path(temp) / "home"
             env = {"HOME": str(home)}
-            source_marker = root / "plugins" / "codex-project-harness" / "marker.txt"
-            source_marker.write_text("first\n", encoding="utf-8")
+            source_marker = (
+                root
+                / "plugins"
+                / "codex-project-harness"
+                / "scripts"
+                / "fixtures"
+                / "schema27-v1.21.3-seed.sql"
+            )
+            original_marker = source_marker.read_bytes()
+            first_marker = original_marker + b"\n-- install-copy-marker:first\n"
+            second_marker = original_marker + b"\n-- install-copy-marker:second\n"
+            source_marker.write_bytes(first_marker)
 
             run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env)
             blocked = run_kafa("plugin", "install", "--scope", "user", "--repo", str(root), env=env, check=False)
-            source_marker.write_text("second\n", encoding="utf-8")
+            source_marker.write_bytes(second_marker)
             run_kafa("plugin", "upgrade", "--scope", "user", "--repo", str(root), env=env)
-            copied = home / ".agents" / "plugins" / "codex-project-harness" / "marker.txt"
+            copied = (
+                home
+                / ".agents"
+                / "plugins"
+                / "codex-project-harness"
+                / "scripts"
+                / "fixtures"
+                / "schema27-v1.21.3-seed.sql"
+            )
             marketplace = json.loads((home / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
 
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn("target plugin already exists", blocked.stderr)
-            self.assertEqual(copied.read_text(encoding="utf-8"), "second\n")
+            self.assertEqual(copied.read_bytes(), second_marker)
             self.assertEqual(marketplace["plugins"][0]["source"]["path"], "./.agents/plugins/codex-project-harness")
 
     def test_uninstall_removes_marketplace_entry_and_optionally_files(self) -> None:

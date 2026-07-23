@@ -26,6 +26,7 @@ for path in (PLUGIN_ROOT, SCRIPTS_ROOT):
         sys.path.insert(0, str(path))
 
 import harness_db  # noqa: E402
+from harness_lib import load_distribution_manifest  # noqa: E402
 from core import local_core_migration  # noqa: E402
 from core import schema_lifecycle  # noqa: E402
 from core import delivery as delivery_module  # noqa: E402
@@ -58,6 +59,7 @@ _FAKE_DOCKER_ENDPOINT = (
 )
 _FAKE_DOCKER_IMAGE_DIGEST = f"sha256:{'a' * 64}"
 _REAL_SUBPROCESS_RUN = subprocess.run
+_DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
 
 
 def fake_local_docker_subprocess(argv, *, run_handler=None, **kwargs):
@@ -1652,7 +1654,7 @@ class CanonicalPathPublicRedTests(unittest.TestCase):
     def test_init_preflights_all_agent_template_destinations_before_first_write(self) -> None:
         if not hasattr(os, "symlink"):
             self.skipTest("symlink primitive unavailable")
-        for name in sorted(harness_db.CODEX_AGENT_TEMPLATE_NAMES):
+        for name in sorted(_DISTRIBUTION["templates"]["native_agents"]):
             relative = Path(".codex/agents") / name
             with self.subTest(relative=relative.as_posix()), tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)

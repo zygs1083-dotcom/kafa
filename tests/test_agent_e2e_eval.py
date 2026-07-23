@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -1202,6 +1203,72 @@ class AgentE2EEvalTest(unittest.TestCase):
                 )
                 self.assertTrue(run_agent_e2e_eval.should_fail(invalid_time))
 
+    def test_closed_persistent_eligibility_separates_history_from_current_cleanliness(self) -> None:
+        report = json.loads(
+            (REPO_ROOT / "docs/runtime/native-codex-live-eval.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "evaluation_source_identity",
+            side_effect=AssertionError("historical validation consulted current checkout"),
+        ):
+            historical_errors = run_agent_e2e_eval.persistent_evidence_errors(
+                report,
+                eligibility="historical-integrity",
+            )
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "evaluation_source_identity",
+            return_value=report["evaluation_source"],
+        ):
+            current_errors = run_agent_e2e_eval.persistent_report_consistency_errors(
+                report,
+                require_current_binary=False,
+                require_current_git_state=True,
+                require_current_matrix=False,
+                require_current_source=True,
+                require_clean_source=True,
+            )
+
+        self.assertEqual(historical_errors, [])
+        self.assertTrue(any("not clean" in error for error in current_errors), current_errors)
+
+    def test_validate_evidence_cli_only_validates_stdin_and_rejects_incomplete_native(self) -> None:
+        detail = (REPO_ROOT / "docs/runtime/native-codex-live-eval.json").read_text(
+            encoding="utf-8"
+        )
+        valid = subprocess.run(
+            [
+                sys.executable,
+                str(EVAL),
+                "--validate-evidence",
+                "historical-integrity",
+            ],
+            input=detail,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        invalid = subprocess.run(
+            [
+                sys.executable,
+                str(EVAL),
+                "--validate-evidence",
+                "historical-integrity",
+            ],
+            input='{"report_version":1,"mode":"live-codex"}\n',
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        self.assertTrue(json.loads(valid.stdout)["ok"])
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertFalse(json.loads(invalid.stdout)["ok"])
+
     def test_fixture_eval_runs_six_real_local_kernel_scenarios(self) -> None:
         report = run_eval("--mode", "fixture")
 
@@ -1293,7 +1360,252 @@ class AgentE2EEvalTest(unittest.TestCase):
                 "rollback_observed"
             ]
         )
-        self.assertEqual(scenarios["installed_plugin_surface"]["details"]["skill_count"], 7)
+        installed_details = scenarios["installed_plugin_surface"]["details"]
+        self.assertEqual(installed_details["skill_count"], 7)
+        self.assertEqual(installed_details["hook_count"], 3)
+        self.assertEqual(installed_details["template_count"], 3)
+        self.assertEqual(installed_details["project_template_count"], 3)
+        self.assertEqual(installed_details["schema_count"], 18)
+        self.assertEqual(installed_details["core_count"], 20)
+        self.assertEqual(installed_details["runtime_script_count"], 7)
+        self.assertEqual(installed_details["hook_file_count"], 2)
+        self.assertEqual(installed_details["reference_count"], 3)
+        self.assertEqual(installed_details["public_runtime_domain_count"], 22)
+
+    def test_sqlite_contention_stress_retries_only_explicit_operation_timeouts(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        call_lock = threading.Lock()
+
+        def inject_timeouts(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] == ("acceptance", "add"):
+                with call_lock:
+                    acceptance_calls += 1
+                    inject = acceptance_calls <= 8
+                if inject:
+                    return subprocess.CompletedProcess(
+                        args=["harness", *args],
+                        returncode=1,
+                        stdout="",
+                        stderr=(
+                            "ERROR: project-db-operation-timeout: could not acquire "
+                            "exclusive operation lock within 5.0 seconds\n"
+                        ),
+                    )
+            return real_run_harness(root, *args, **kwargs)
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_timeouts,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertTrue(scenario["pass"], details)
+        self.assertEqual(details["initial_operation_timeout_count"], 8)
+        self.assertEqual(details["unexpected_failure_count"], 0)
+        self.assertEqual(details["retry_count"], 8)
+        self.assertEqual(details["retry_failed_returncodes"], [])
+        self.assertEqual(details["failed_returncodes"], [])
+        self.assertEqual(details["acceptance_count"], 6)
+        self.assertTrue(details["initial_state_consistent"])
+        self.assertEqual(
+            details["final_acceptance_revisions"],
+            {f"AC{index}": 2 for index in range(6)},
+        )
+        self.assertEqual(details["final_acceptance_event_count"], 12)
+        self.assertEqual(details["doctor_returncode"], 0)
+
+    def test_sqlite_contention_stress_does_not_retry_unexpected_failures(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        acceptance_lock = threading.Lock()
+
+        def inject_unexpected_failure(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] != ("acceptance", "add"):
+                return real_run_harness(root, *args, **kwargs)
+            with acceptance_lock:
+                acceptance_calls += 1
+                if acceptance_calls == 1:
+                    return subprocess.CompletedProcess(
+                        args=["harness", *args],
+                        returncode=1,
+                        stdout="",
+                        stderr="ERROR: unrelated mutation failure\n",
+                    )
+                return real_run_harness(root, *args, **kwargs)
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_unexpected_failure,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertFalse(scenario["pass"])
+        self.assertEqual(details["initial_operation_timeout_count"], 0)
+        self.assertEqual(details["unexpected_failure_count"], 1)
+        self.assertEqual(details["retry_count"], 0)
+        self.assertEqual(details["failed_returncodes"], [1])
+
+    def test_sqlite_contention_stress_rejects_timeout_after_partial_commit(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        acceptance_lock = threading.Lock()
+
+        def inject_partial_commit_timeout(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] != ("acceptance", "add"):
+                return real_run_harness(root, *args, **kwargs)
+            with acceptance_lock:
+                acceptance_calls += 1
+                result = real_run_harness(root, *args, **kwargs)
+                if acceptance_calls == 1:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    return subprocess.CompletedProcess(
+                        args=result.args,
+                        returncode=1,
+                        stdout=result.stdout,
+                        stderr=(
+                            result.stderr
+                            + "ERROR: project-db-operation-timeout: injected after commit\n"
+                        ),
+                    )
+                return result
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_partial_commit_timeout,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertFalse(scenario["pass"])
+        self.assertEqual(details["initial_operation_timeout_count"], 1)
+        self.assertFalse(details["initial_state_consistent"])
+        self.assertEqual(details["retry_count"], 0)
+
+    def test_installed_surface_rejects_undeclared_nested_runtime_file(self) -> None:
+        nested_relative = Path("core/nested/undeclared.py")
+
+        def install_fixture(
+            command: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            environment = kwargs.get("env")
+            self.assertIsInstance(environment, dict)
+            home = Path(str(environment["HOME"]))  # type: ignore[index]
+            installed = home / ".agents/plugins/codex-project-harness"
+            shutil.copytree(
+                run_agent_e2e_eval.PLUGIN_ROOT,
+                installed,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            extra = installed / nested_relative
+            extra.parent.mkdir(parents=True)
+            extra.write_text("undeclared nested runtime file\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "installed\n", "")
+
+        with mock.patch.object(
+            run_agent_e2e_eval.subprocess,
+            "run",
+            side_effect=install_fixture,
+        ):
+            scenario = run_agent_e2e_eval.scenario_installed_plugin_surface()
+
+        self.assertFalse(scenario["pass"], scenario["details"])
+
+    def test_installed_surface_follows_manifest_hook_file_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            plugin = repo / "plugins/codex-project-harness"
+            plugin.parent.mkdir(parents=True)
+            shutil.copytree(
+                REPO_ROOT / "kafa",
+                repo / "kafa",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            shutil.copytree(
+                run_agent_e2e_eval.PLUGIN_ROOT,
+                plugin,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            for name in ("VERSION", "release.json", "pyproject.toml"):
+                shutil.copyfile(REPO_ROOT / name, repo / name)
+
+            hooks_root = plugin / "hooks"
+            old_definition = hooks_root / "hooks.json"
+            old_runner = hooks_root / "harness_hook.py"
+            new_definition = hooks_root / "event-bindings.json"
+            new_runner = hooks_root / "event_runner.py"
+            old_definition.rename(new_definition)
+            old_runner.rename(new_runner)
+
+            manifest_path = plugin / "references/distribution-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["hooks"]["files"] = [
+                new_definition.name,
+                new_runner.name,
+            ]
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            hooks = json.loads(new_definition.read_text(encoding="utf-8"))
+            for groups in hooks["hooks"].values():
+                for group in groups:
+                    for hook in group["hooks"]:
+                        hook["command"] = hook["command"].replace(
+                            "harness_hook.py",
+                            new_runner.name,
+                        )
+                        hook["commandWindows"] = hook["commandWindows"].replace(
+                            "harness_hook.py",
+                            new_runner.name,
+                        )
+            new_definition.write_text(
+                json.dumps(hooks, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            structure = subprocess.run(
+                [
+                    sys.executable,
+                    str(plugin / "scripts/validate_structure.py"),
+                    str(plugin),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                structure.returncode,
+                0,
+                structure.stdout + structure.stderr,
+            )
+
+            with mock.patch.object(run_agent_e2e_eval, "ROOT", repo):
+                scenario = run_agent_e2e_eval.scenario_installed_plugin_surface()
+
+        self.assertTrue(scenario["pass"], scenario["details"])
+        self.assertEqual(scenario["details"]["hook_file_count"], 2)
 
     def test_eval_source_contains_no_retired_provider_or_connector_scenarios(self) -> None:
         source = EVAL.read_text(encoding="utf-8")

@@ -11,13 +11,22 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
-from harness_lib import git_dirty, git_head_sha, now_iso
+from harness_lib import (
+    SOURCE_ENVIRONMENT_ROOTS,
+    git_dirty,
+    git_head_sha,
+    git_source_snapshot,
+    isolated_git_environment,
+    now_iso,
+    source_path_excluded,
+)
 
 from .cycle_ledger import (
     baseline_issues,
@@ -83,12 +92,120 @@ class DeliveryPrerequisiteReport:
     trust: LocalTrustDecision
     cycle_id: str
     candidate_sha: str
+    proven_acceptance_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDeliveryReport:
+    """One closed-cycle prerequisite and trust decision at delivery time."""
+
+    blockers: tuple[DeliveryBlocker, ...]
+    trust: LocalTrustDecision
+    cycle_id: str
+    candidate_sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryValidationFact:
+    """One cycle-bound validation and its immutable execution relations."""
+
+    id: str
+    surface: str
+    result: str
+    acceptance_id: str
+    qualification_id: str
+    execution_ids: tuple[str, ...]
+    eligibility_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryFailureModeFact:
+    """One cycle-bound failure mode and execution-backed coverage relations."""
+
+    id: str
+    risk: str
+    status: str
+    validation_ids: tuple[str, ...]
+    accepted_by: str
+    acceptance_reason: str
+    acceptance_scope: str
+    accepted_revision: int | None
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryFindingFact:
+    """One candidate-bound reviewer finding."""
+
+    id: str
+    surface: str
+    severity: str
+    status: str
+    waived_by: str
+    waiver_reason: str
+    waiver_scope: str
+    waived_revision: int | None
+    waiver_expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryGateFact:
+    """The persisted gate reviewed for one delivered candidate."""
+
+    id: str
+    result: str
+    review_status: str
+    producer_context_id: str
+    reviewer_context_id: str
+    residual_risk: str
+    reviewed_revision: int
+    qualification_ids: tuple[str, ...]
+    finding_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryNarrativeFacts:
+    """Immutable, delivery-ID-bound facts used by the human projection."""
+
+    delivery_id: str
+    cycle_id: str
+    candidate_sha: str
+    recorded_at: str
+    cycle_status: str
+    cycle_phase: str
+    base_ref: str
+    decision_status: str
+    trust_status: str
+    requirement_ids: tuple[str, ...]
+    acceptance_ids: tuple[str, ...]
+    task_ids: tuple[str, ...]
+    qualification_ids: tuple[str, ...]
+    target_ids: tuple[str, ...]
+    execution_ids: tuple[str, ...]
+    validation_ids: tuple[str, ...]
+    ineligible_validation_ids: tuple[str, ...]
+    judgment_validation_ids: tuple[str, ...]
+    failure_mode_ids: tuple[str, ...]
+    finding_ids: tuple[str, ...]
+    gate_ids: tuple[str, ...]
+    requirement_acceptance_links: tuple[tuple[str, str], ...]
+    task_acceptance_links: tuple[tuple[str, str], ...]
+    qualification_links: tuple[tuple[str, str, str], ...]
+    validation_facts: tuple[DeliveryValidationFact, ...]
+    ineligible_validation_facts: tuple[DeliveryValidationFact, ...]
+    judgment_validation_facts: tuple[DeliveryValidationFact, ...]
+    failure_mode_facts: tuple[DeliveryFailureModeFact, ...]
+    finding_facts: tuple[DeliveryFindingFact, ...]
+    gate: DeliveryGateFact | None
+    changed_files_status: str
+    changed_files: tuple[str, ...]
 
 
 _BLOCKER_ORDER = {
     code: index
     for index, code in enumerate(
         (
+            "candidate-snapshot-changed",
             "requirement-missing",
             "acceptance-missing",
             "requirement-acceptance-link-missing",
@@ -102,6 +219,8 @@ _BLOCKER_ORDER = {
             "qualification-unreviewed",
             "current-validation-missing",
             "current-execution-missing",
+            "delivery-acceptance-set-mismatch",
+            "delivery-decision-trust-mismatch",
             "medium-failure-mode-uncovered",
             "medium-finding-open",
             "risk-acceptance-invalid",
@@ -111,6 +230,7 @@ _BLOCKER_ORDER = {
             "phase-not-ready",
             "cycle-not-active",
             "delivery-row-missing",
+            "delivery-row-count-invalid",
             "delivered-candidate-inconsistent",
             "delivered-phase-inconsistent",
             "delivered-cycle-not-closed",
@@ -786,7 +906,11 @@ def _evaluate_local_delivery_policy(
         reason = str(exc)
         return [reason], _human_review_decision(reason)
     cycle_id = str(cycle["id"])
-    candidate = candidate_override or current_candidate_sha(root)
+    candidate = (
+        candidate_override
+        if candidate_override is not None
+        else current_candidate_sha(root)
+    )
     revision_source = (
         revision_override
         if historical or revision_override is not None
@@ -1146,6 +1270,40 @@ def _blocker(
     )
 
 
+def _delivery_decision_trust_blocker(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: str,
+    trust: LocalTrustDecision,
+) -> DeliveryBlocker | None:
+    """Require the persisted decision to match the canonical policy trust."""
+
+    if not trust.delivery_allowed:
+        return None
+    deliveries = conn.execute(
+        "select id, decision_status from deliveries where cycle_id = ? order by id",
+        (cycle_id,),
+    ).fetchall()
+    if len(deliveries) != 1:
+        return None
+    delivery = deliveries[0]
+    expected = (
+        trust.status
+        if trust.status in {"accepted-risk", "same-context-degraded"}
+        else "delivered"
+    )
+    actual = str(delivery["decision_status"] or "")
+    if actual == expected:
+        return None
+    return _blocker(
+        "delivery-decision-trust-mismatch",
+        "persisted delivery decision does not match the canonical trust "
+        f"decision: expected={expected} actual={actual}",
+        "delivery",
+        str(delivery["id"]),
+    )
+
+
 def _ordered_blockers(
     blockers: Iterable[DeliveryBlocker],
 ) -> tuple[DeliveryBlocker, ...]:
@@ -1170,6 +1328,626 @@ def _ordered_blockers(
                 item.message,
             ),
         )
+    )
+
+
+_FULL_GIT_OID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+
+
+def _local_git(
+    root: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[bytes] | None:
+    """Run one bounded, non-fetching local Git read."""
+
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", *arguments],
+            cwd=root,
+            env=isolated_git_environment(work_tree=root),
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _resolved_commit(root: Path, reference: str) -> str:
+    result = _local_git(
+        root,
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        f"{reference}^{{commit}}",
+    )
+    if result is None or result.returncode != 0:
+        return ""
+    try:
+        resolved = result.stdout.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError:
+        return ""
+    return resolved.lower() if _FULL_GIT_OID.fullmatch(resolved) else ""
+
+
+def _has_cycle_bound_task_accept_event(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    cycle_id: str,
+) -> bool:
+    for event in conn.execute(
+        """
+        select after_json from events
+        where event_type = 'task_accepted' and entity_id = ?
+        order by sequence desc
+        """,
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(str(event["after_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and str(payload.get("cycle_id") or "") == cycle_id
+        ):
+            return True
+    return False
+
+
+def _eligible_accepted_tasks_for_acceptance(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: str,
+    acceptance_id: str,
+) -> tuple[sqlite3.Row, ...]:
+    """Return tasks satisfying the same evidence/actor rule used by delivery."""
+
+    rows = conn.execute(
+        """
+        select t.* from task_acceptance ta
+        join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id
+        where ta.cycle_id = ? and ta.acceptance_id = ?
+          and t.status = 'accepted'
+        order by t.id
+        """,
+        (cycle_id, acceptance_id),
+    ).fetchall()
+    return tuple(
+        task
+        for task in rows
+        if str(task["evidence"] or "").strip()
+        and (
+            bool(str(task["accepted_by"] or "").strip())
+            or _has_cycle_bound_task_accept_event(
+                conn,
+                task_id=str(task["id"]),
+                cycle_id=cycle_id,
+            )
+        )
+    )
+
+
+def derive_delivery_changed_files(
+    root: Path,
+    *,
+    base_ref: str,
+    delivery_candidate: str,
+    candidate_override: str | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Conservatively derive source changes for a provably comparable Git base.
+
+    ``candidate_sha`` is Kafa's framed source digest, not a Git object name.  A
+    changed-file list is therefore authoritative only while a clean local HEAD
+    still hashes to the delivered candidate and ``base_ref`` is an immutable
+    full commit object ID.  Every other case is explicitly unknown.
+    """
+
+    unknown = ("unknown/not derivable", ())
+    immutable_base = str(base_ref or "").strip()
+    if not _FULL_GIT_OID.fullmatch(immutable_base):
+        return unknown
+    try:
+        before_snapshot = git_source_snapshot(root)
+    except Exception:
+        return unknown
+    if before_snapshot is None:
+        return unknown
+    before, before_dirty, before_head_comparable = before_snapshot
+    expected_candidate = (
+        candidate_override
+        if candidate_override is not None
+        else before
+    )
+    if (
+        before_dirty
+        or not before_head_comparable
+        or before != delivery_candidate
+        or expected_candidate != delivery_candidate
+    ):
+        return unknown
+
+    base_commit = _resolved_commit(root, immutable_base)
+    head_commit = _resolved_commit(root, "HEAD")
+    if (
+        not base_commit
+        or immutable_base.lower() != base_commit
+        or not head_commit
+    ):
+        return unknown
+    ancestor = _local_git(
+        root,
+        "merge-base",
+        "--is-ancestor",
+        base_commit,
+        head_commit,
+    )
+    if ancestor is None or ancestor.returncode != 0:
+        return unknown
+    changed = _local_git(
+        root,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        "--diff-filter=ACDMRTUXB",
+        base_commit,
+        head_commit,
+        "--",
+    )
+    if changed is None or changed.returncode != 0:
+        return unknown
+
+    paths: set[str] = set()
+    for raw_path in changed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            relative = raw_path.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return unknown
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            return unknown
+        if source_path_excluded(
+            relative,
+            versioned_environment_roots=SOURCE_ENVIRONMENT_ROOTS,
+        ):
+            continue
+        paths.add(relative)
+    try:
+        after_snapshot = git_source_snapshot(root)
+    except Exception:
+        return unknown
+    if after_snapshot != (delivery_candidate, False, True):
+        return unknown
+    if _resolved_commit(root, immutable_base) != base_commit:
+        return unknown
+    if _resolved_commit(root, "HEAD") != head_commit:
+        return unknown
+    try:
+        final_snapshot = git_source_snapshot(root)
+    except Exception:
+        return unknown
+    if final_snapshot != after_snapshot:
+        return unknown
+    return "derived", tuple(sorted(paths))
+
+
+def derive_delivery_narrative_facts(
+    conn: sqlite3.Connection,
+    root: Path,
+    delivery_id: str,
+    *,
+    evidence_root: Path | None = None,
+    git_root: Path | None = None,
+    candidate_override: str | None = None,
+) -> DeliveryNarrativeFacts:
+    """Build one immutable delivery-ID and cycle-bound narrative read model."""
+
+    delivery = conn.execute(
+        "select * from deliveries where id = ?",
+        (delivery_id,),
+    ).fetchone()
+    if delivery is None:
+        raise ValueError(f"delivery is missing: {delivery_id}")
+    cycle_id = str(delivery["cycle_id"])
+    candidate_sha = str(delivery["candidate_sha"])
+    cycle = conn.execute(
+        "select * from delivery_cycles where id = ?",
+        (cycle_id,),
+    ).fetchone()
+    if cycle is None:
+        raise ValueError(f"delivery cycle is missing: {cycle_id}")
+
+    acceptance_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            select da.acceptance_id
+            from delivery_acceptance da
+            join acceptance a
+              on a.cycle_id = da.cycle_id and a.id = da.acceptance_id
+            where da.delivery_id = ? and da.cycle_id = ?
+              and a.status = 'active'
+            order by da.acceptance_id
+            """,
+            (delivery_id, cycle_id),
+        ).fetchall()
+    )
+    requirement_acceptance_links = tuple(
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(
+            """
+            select ra.requirement_id, ra.acceptance_id
+            from delivery_acceptance da
+            join requirement_acceptance ra
+              on ra.cycle_id = da.cycle_id
+             and ra.acceptance_id = da.acceptance_id
+            join requirements r
+              on r.cycle_id = ra.cycle_id and r.id = ra.requirement_id
+            where da.delivery_id = ? and da.cycle_id = ?
+              and r.status = 'active'
+            order by ra.requirement_id, ra.acceptance_id
+            """,
+            (delivery_id, cycle_id),
+        ).fetchall()
+    )
+    task_acceptance_links = tuple(
+        sorted(
+            (str(task["id"]), acceptance_id)
+            for acceptance_id in acceptance_ids
+            for task in _eligible_accepted_tasks_for_acceptance(
+                conn,
+                cycle_id=cycle_id,
+                acceptance_id=acceptance_id,
+            )
+        )
+    )
+
+    gate_row = conn.execute(
+        """
+        select * from quality_gates
+        where cycle_id = ? and candidate_sha = ? and gate_status = 'active'
+        order by sequence desc limit 1
+        """,
+        (cycle_id, candidate_sha),
+    ).fetchone()
+    qualification_rows = (
+        conn.execute(
+            """
+            select q.*
+            from quality_gate_qualifications qg
+            join acceptance_target_qualifications q
+              on q.id = qg.qualification_id
+             and q.cycle_id = qg.cycle_id
+            join delivery_acceptance da
+              on da.delivery_id = ? and da.cycle_id = q.cycle_id
+             and da.acceptance_id = q.acceptance_id
+            where qg.gate_id = ? and qg.cycle_id = ?
+              and qg.candidate_sha = ?
+            order by q.id
+            """,
+            (delivery_id, gate_row["id"], cycle_id, candidate_sha),
+        ).fetchall()
+        if gate_row is not None
+        else []
+    )
+    qualification_links = tuple(
+        (
+            str(row["id"]),
+            str(row["acceptance_id"]),
+            str(row["target_id"]),
+        )
+        for row in qualification_rows
+    )
+    qualification_ids = tuple(link[0] for link in qualification_links)
+    qualification_by_id = {link[0]: link for link in qualification_links}
+    qualification_row_by_id = {
+        str(row["id"]): row for row in qualification_rows
+    }
+
+    validation_facts: list[DeliveryValidationFact] = []
+    ineligible_validation_facts: list[DeliveryValidationFact] = []
+    judgment_validation_facts: list[DeliveryValidationFact] = []
+    execution_evidence_root = evidence_root or root
+    for validation in conn.execute(
+        """
+        select * from validations
+        where cycle_id = ? and candidate_sha = ?
+          and validation_status = 'active'
+        order by id
+        """,
+        (cycle_id, candidate_sha),
+    ).fetchall():
+        execution_rows = conn.execute(
+            """
+            select e.* from validation_executions ve
+            join executions e
+              on e.id = ve.execution_id
+             and e.cycle_id = ve.cycle_id
+             and e.candidate_sha = ve.candidate_sha
+            where ve.validation_id = ? and ve.cycle_id = ?
+              and ve.candidate_sha = ?
+            order by e.id
+            """,
+            (validation["id"], cycle_id, candidate_sha),
+        ).fetchall()
+        execution_ids = tuple(
+            str(execution["id"]) for execution in execution_rows
+        )
+        validation_id = str(validation["id"])
+        result = str(validation["result"])
+        acceptance_id = str(validation["acceptance_id"] or "")
+        qualification_id = str(validation["qualification_id"] or "")
+        qualification = qualification_by_id.get(qualification_id)
+        qualification_row = qualification_row_by_id.get(
+            qualification_id
+        )
+        eligibility_issues: list[str] = []
+        if result != "pass":
+            eligibility_issues.append(f"validation result is not pass: {result}")
+        if not execution_ids:
+            eligibility_issues.append("validation has no linked immutable execution")
+        if qualification is None or qualification_row is None:
+            eligibility_issues.append(
+                "validation has no gate-reviewed qualification relation"
+            )
+        elif acceptance_id not in acceptance_ids or qualification[1] != acceptance_id:
+            eligibility_issues.append(
+                "validation acceptance does not match delivered qualification"
+            )
+        elif not all(
+                str(execution["target_id"] or "") == qualification[2]
+                and str(execution["target_definition_sha256"] or "")
+                == str(qualification_row["target_definition_sha256"] or "")
+                for execution in execution_rows
+        ):
+            eligibility_issues.append(
+                "execution target identity does not match qualification"
+            )
+        else:
+            eligibility_issues.extend(
+                qualified_validation_execution_issues(
+                    conn,
+                    execution_evidence_root,
+                    validation,
+                    qualification_row,
+                    candidate_sha,
+                )
+            )
+        fact = DeliveryValidationFact(
+            id=validation_id,
+            surface=str(validation["surface"]),
+            result=result,
+            acceptance_id=acceptance_id,
+            qualification_id=qualification_id,
+            execution_ids=execution_ids,
+            eligibility_issues=tuple(eligibility_issues),
+        )
+        if not eligibility_issues:
+            validation_facts.append(fact)
+        elif execution_ids:
+            ineligible_validation_facts.append(fact)
+        else:
+            judgment_validation_facts.append(fact)
+
+    validation_ids = tuple(fact.id for fact in validation_facts)
+    execution_ids = tuple(
+        sorted(
+            {
+                execution_id
+                for fact in validation_facts
+                for execution_id in fact.execution_ids
+            }
+        )
+    )
+    execution_target_ids = tuple(
+        str(row[0])
+        for execution_id in execution_ids
+        for row in conn.execute(
+            """
+            select target_id from executions
+            where id = ? and cycle_id = ? and candidate_sha = ?
+              and target_id is not null
+            """,
+            (execution_id, cycle_id, candidate_sha),
+        ).fetchall()
+    )
+    target_ids = tuple(
+        sorted({link[2] for link in qualification_links} | set(execution_target_ids))
+    )
+
+    authoritative_validation_ids = frozenset(validation_ids)
+    failure_mode_fact_list: list[DeliveryFailureModeFact] = []
+    for row in conn.execute(
+        """
+        select id, risk, status, accepted_by, acceptance_reason,
+               acceptance_scope, accepted_revision, expires_at
+        from failure_modes where cycle_id = ? order by id
+        """,
+        (cycle_id,),
+    ).fetchall():
+        risk = str(row["risk"])
+        coverage_ids: list[str] = []
+        for validation in conn.execute(
+            """
+            select v.*
+            from validation_failure_modes vfm
+            join validations v
+              on v.id = vfm.validation_id
+             and v.cycle_id = vfm.cycle_id
+            join failure_mode_acceptance fma
+              on fma.cycle_id = vfm.cycle_id
+             and fma.failure_mode_id = vfm.failure_mode_id
+             and fma.acceptance_id = v.acceptance_id
+            where vfm.cycle_id = ? and vfm.failure_mode_id = ?
+            order by vfm.validation_id
+            """,
+            (cycle_id, row["id"]),
+        ).fetchall():
+            validation_id = str(validation["id"])
+            if validation_id not in authoritative_validation_ids:
+                continue
+            if risk in {"medium", "high", "critical"}:
+                qualification = qualification_row_by_id.get(
+                    str(validation["qualification_id"] or "")
+                )
+                if qualification is None or qualified_validation_execution_issues(
+                    conn,
+                    execution_evidence_root,
+                    validation,
+                    qualification,
+                    candidate_sha,
+                    require_structured=True,
+                ):
+                    continue
+            coverage_ids.append(validation_id)
+        failure_mode_fact_list.append(
+            DeliveryFailureModeFact(
+                id=str(row["id"]),
+                risk=risk,
+                status=str(row["status"]),
+                validation_ids=tuple(coverage_ids),
+                accepted_by=str(row["accepted_by"] or ""),
+                acceptance_reason=str(row["acceptance_reason"] or ""),
+                acceptance_scope=str(row["acceptance_scope"] or ""),
+                accepted_revision=(
+                    row["accepted_revision"]
+                    if type(row["accepted_revision"]) is int
+                    else None
+                ),
+                expires_at=str(row["expires_at"] or ""),
+            )
+        )
+    failure_mode_facts = tuple(failure_mode_fact_list)
+    finding_facts = tuple(
+        DeliveryFindingFact(
+            id=str(row["id"]),
+            surface=str(row["surface"]),
+            severity=str(row["severity"]),
+            status=str(row["status"]),
+            waived_by=str(row["waived_by"] or ""),
+            waiver_reason=str(row["waiver_reason"] or ""),
+            waiver_scope=str(row["waiver_scope"] or ""),
+            waived_revision=(
+                row["waived_revision"]
+                if type(row["waived_revision"]) is int
+                else None
+            ),
+            waiver_expires_at=str(row["waiver_expires_at"] or ""),
+        )
+        for row in conn.execute(
+            """
+            select id, surface, severity, status, waived_by, waiver_reason,
+                   waiver_scope, waived_revision, waiver_expires_at
+            from findings
+            where cycle_id = ? and candidate_sha = ? order by id
+            """,
+            (cycle_id, candidate_sha),
+        ).fetchall()
+    )
+    gate_fact: DeliveryGateFact | None = None
+    if gate_row is not None:
+        gate_finding_ids = tuple(
+            str(row[0])
+            for row in conn.execute(
+                """
+                select qgf.finding_id
+                from quality_gate_findings qgf
+                join findings f on f.id = qgf.finding_id
+                where qgf.gate_id = ? and f.cycle_id = ?
+                  and f.candidate_sha = ?
+                order by qgf.finding_id
+                """,
+                (gate_row["id"], cycle_id, candidate_sha),
+            ).fetchall()
+        )
+        reviewed_revision = (
+            gate_row["reviewed_revision"]
+            if type(gate_row["reviewed_revision"]) is int
+            else 0
+        )
+        gate_fact = DeliveryGateFact(
+            id=str(gate_row["id"]),
+            result=str(gate_row["result"]),
+            review_status=str(gate_row["review_status"]),
+            producer_context_id=str(gate_row["producer_context_id"] or ""),
+            reviewer_context_id=str(gate_row["reviewer_context_id"] or ""),
+            residual_risk=str(gate_row["residual_risk"] or ""),
+            reviewed_revision=reviewed_revision,
+            qualification_ids=qualification_ids,
+            finding_ids=gate_finding_ids,
+        )
+
+    historical_report = evaluate_historical_cycle_report(
+        conn,
+        execution_evidence_root,
+        cycle_id,
+    )
+    delivery_events = conn.execute(
+        """
+        select created_at from events
+        where event_type = 'delivery_recorded'
+          and entity_type = 'delivery' and entity_id = ?
+        order by sequence
+        """,
+        (delivery_id,),
+    ).fetchall()
+    recorded_at = (
+        str(delivery_events[0]["created_at"])
+        if len(delivery_events) == 1
+        else "unknown/not corroborated"
+    )
+    decision_status = str(delivery["decision_status"])
+    trust_status = historical_report.trust.status
+
+    changed_files_status, changed_files = derive_delivery_changed_files(
+        git_root or root,
+        base_ref=str(cycle["base_ref"] or ""),
+        delivery_candidate=candidate_sha,
+        candidate_override=candidate_override,
+    )
+    return DeliveryNarrativeFacts(
+        delivery_id=str(delivery["id"]),
+        cycle_id=cycle_id,
+        candidate_sha=candidate_sha,
+        recorded_at=recorded_at,
+        cycle_status=str(cycle["status"]),
+        cycle_phase=str(cycle["phase"]),
+        base_ref=str(cycle["base_ref"] or ""),
+        decision_status=decision_status,
+        trust_status=trust_status,
+        requirement_ids=tuple(sorted({link[0] for link in requirement_acceptance_links})),
+        acceptance_ids=acceptance_ids,
+        task_ids=tuple(sorted({link[0] for link in task_acceptance_links})),
+        qualification_ids=qualification_ids,
+        target_ids=target_ids,
+        execution_ids=execution_ids,
+        validation_ids=validation_ids,
+        ineligible_validation_ids=tuple(
+            fact.id for fact in ineligible_validation_facts
+        ),
+        judgment_validation_ids=tuple(
+            fact.id for fact in judgment_validation_facts
+        ),
+        failure_mode_ids=tuple(fact.id for fact in failure_mode_facts),
+        finding_ids=tuple(fact.id for fact in finding_facts),
+        gate_ids=(gate_fact.id,) if gate_fact is not None else (),
+        requirement_acceptance_links=requirement_acceptance_links,
+        task_acceptance_links=task_acceptance_links,
+        qualification_links=qualification_links,
+        validation_facts=tuple(validation_facts),
+        ineligible_validation_facts=tuple(ineligible_validation_facts),
+        judgment_validation_facts=tuple(judgment_validation_facts),
+        failure_mode_facts=failure_mode_facts,
+        finding_facts=finding_facts,
+        gate=gate_fact,
+        changed_files_status=changed_files_status,
+        changed_files=changed_files,
     )
 
 
@@ -1419,22 +2197,28 @@ def _delivered_consistency_blockers(
     cycle: sqlite3.Row,
     *,
     historical: bool = False,
+    current_candidate_override: str | None = None,
 ) -> list[DeliveryBlocker]:
     cycle_id = str(cycle["id"])
     current_candidate = (
         str(cycle["candidate_sha"] or "")
         if historical
-        else current_candidate_sha(root)
+        else (
+            current_candidate_override
+            if current_candidate_override is not None
+            else current_candidate_sha(root)
+        )
     )
     blockers: list[DeliveryBlocker] = []
-    delivery = conn.execute(
+    delivery_rows = conn.execute(
         """
         select * from deliveries
         where cycle_id = ?
-        order by created_at desc, id desc limit 1
+        order by created_at desc, id desc
         """,
         (cycle_id,),
-    ).fetchone()
+    ).fetchall()
+    delivery = delivery_rows[0] if delivery_rows else None
     if delivery is None:
         blockers.append(
             _blocker(
@@ -1444,6 +2228,62 @@ def _delivered_consistency_blockers(
                 cycle_id,
             )
         )
+    else:
+        if len(delivery_rows) != 1:
+            blockers.append(
+                _blocker(
+                    "delivery-row-count-invalid",
+                    "delivered cycle requires exactly one delivery row: "
+                    f"cycle={cycle_id} actual={len(delivery_rows)} "
+                    f"ids={[str(row['id']) for row in delivery_rows]}",
+                    "delivery_cycle",
+                    cycle_id,
+                )
+            )
+        expected_acceptance_ids = {
+            str(row[0])
+            for row in conn.execute(
+                """
+                select id from acceptance
+                where cycle_id = ? and status = 'active'
+                order by id
+                """,
+                (cycle_id,),
+            ).fetchall()
+        }
+        relation_rows = conn.execute(
+            """
+            select cycle_id, acceptance_id from delivery_acceptance
+            where delivery_id = ? order by cycle_id, acceptance_id
+            """,
+            (delivery["id"],),
+        ).fetchall()
+        linked_acceptance_ids = {
+            str(row["acceptance_id"])
+            for row in relation_rows
+            if str(row["cycle_id"]) == cycle_id
+        }
+        cross_cycle_links = tuple(
+            f"{row['cycle_id']}:{row['acceptance_id']}"
+            for row in relation_rows
+            if str(row["cycle_id"]) != cycle_id
+        )
+        if (
+            linked_acceptance_ids != expected_acceptance_ids
+            or cross_cycle_links
+        ):
+            blockers.append(
+                _blocker(
+                    "delivery-acceptance-set-mismatch",
+                    "delivery acceptance relation must equal the complete "
+                    "active proven set for its own cycle: "
+                    f"expected={sorted(expected_acceptance_ids)} "
+                    f"actual={sorted(linked_acceptance_ids)} "
+                    f"cross_cycle={list(cross_cycle_links)}",
+                    "delivery",
+                    delivery["id"],
+                )
+            )
     cycle_candidate = str(cycle["candidate_sha"] or "")
     delivery_candidate = str(delivery["candidate_sha"] or "") if delivery else ""
     if (
@@ -1497,6 +2337,7 @@ def _structured_prerequisite_blockers(
     mode: DeliveryEvaluationMode,
     cycle_id_override: str | None = None,
     historical: bool = False,
+    candidate_override: str | None = None,
 ) -> tuple[list[DeliveryBlocker], str, str]:
     project = conn.execute("select * from project where id = 1").fetchone()
     if project is None:
@@ -1534,13 +2375,21 @@ def _structured_prerequisite_blockers(
                 )
             ],
             str(project["current_cycle_id"] or ""),
-            current_candidate_sha(root),
+            (
+                candidate_override
+                if candidate_override is not None
+                else current_candidate_sha(root)
+            ),
         )
     cycle_id = str(cycle["id"])
     candidate = (
         str(cycle["candidate_sha"] or "")
         if historical
-        else current_candidate_sha(root)
+        else (
+            candidate_override
+            if candidate_override is not None
+            else current_candidate_sha(root)
+        )
     )
     blockers: list[DeliveryBlocker] = (
         _delivered_consistency_blockers(
@@ -1549,6 +2398,7 @@ def _structured_prerequisite_blockers(
             project,
             cycle,
             historical=historical,
+            current_candidate_override=candidate,
         )
         if mode == "delivered-consistency"
         else []
@@ -1661,42 +2511,12 @@ def _structured_prerequisite_blockers(
         )
 
     for acceptance in acceptances:
-        accepted_tasks = conn.execute(
-            """
-            select t.* from task_acceptance ta
-            join tasks t on t.cycle_id = ta.cycle_id and t.id = ta.task_id
-            where ta.cycle_id = ? and ta.acceptance_id = ?
-              and t.status = 'accepted'
-            order by t.id
-            """,
-            (cycle_id, acceptance["id"]),
-        ).fetchall()
-        eligible_task = None
-        for task in accepted_tasks:
-            has_actor = bool(str(task["accepted_by"] or "").strip())
-            if not has_actor:
-                for event in conn.execute(
-                    """
-                    select after_json from events
-                    where event_type = 'task_accepted' and entity_id = ?
-                    order by sequence desc
-                    """,
-                    (task["id"],),
-                ).fetchall():
-                    try:
-                        payload = json.loads(str(event["after_json"] or "{}"))
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    if (
-                        isinstance(payload, dict)
-                        and str(payload.get("cycle_id") or "") == cycle_id
-                    ):
-                        has_actor = True
-                        break
-            if str(task["evidence"] or "").strip() and has_actor:
-                eligible_task = task
-                break
-        if eligible_task is None:
+        eligible_tasks = _eligible_accepted_tasks_for_acceptance(
+            conn,
+            cycle_id=cycle_id,
+            acceptance_id=str(acceptance["id"]),
+        )
+        if not eligible_tasks:
             blockers.append(
                 _blocker(
                     "accepted-task-missing",
@@ -1991,6 +2811,7 @@ def evaluate_delivery_report(
     mode: DeliveryEvaluationMode,
     is_expired: Callable[[str], bool],
     observed_at: str | None = None,
+    candidate_override: str | None = None,
 ) -> DeliveryPrerequisiteReport:
     if mode not in {
         "enter-readiness",
@@ -1998,10 +2819,16 @@ def evaluate_delivery_report(
         "delivered-consistency",
     }:
         raise ValueError(f"unknown delivery prerequisite mode: {mode}")
+    candidate_snapshot = (
+        candidate_override
+        if candidate_override is not None
+        else current_candidate_sha(root)
+    )
     blockers, cycle_id, candidate = _structured_prerequisite_blockers(
         conn,
         root,
         mode=mode,
+        candidate_override=candidate_snapshot,
     )
     from .invariant_checker import check_runtime_invariants
 
@@ -2014,6 +2841,7 @@ def evaluate_delivery_report(
         is_expired=is_expired,
         observed_at=observed_at,
         include_graph_issues=False,
+        candidate_override=candidate,
     )
     existing_identities = {
         (blocker.code, blocker.entity_type, blocker.entity_id)
@@ -2030,6 +2858,51 @@ def evaluate_delivery_report(
             continue
         blockers.append(policy_blocker)
         existing_identities.add(identity)
+    if mode == "delivered-consistency":
+        decision_blocker = _delivery_decision_trust_blocker(
+            conn,
+            cycle_id=cycle_id,
+            trust=policy_trust,
+        )
+        if decision_blocker is not None:
+            blockers.append(decision_blocker)
+            existing_identities.add(
+                (
+                    decision_blocker.code,
+                    decision_blocker.entity_type,
+                    decision_blocker.entity_id,
+                )
+            )
+        historical_report = evaluate_historical_cycle_report(
+            conn,
+            root,
+            cycle_id,
+        )
+        for historical_blocker in historical_report.blockers:
+            identity = (
+                historical_blocker.code,
+                historical_blocker.entity_type,
+                historical_blocker.entity_id,
+            )
+            if identity in existing_identities:
+                continue
+            blockers.append(historical_blocker)
+            existing_identities.add(identity)
+    final_candidate = current_candidate_sha(root)
+    if final_candidate != candidate_snapshot:
+        candidate_change_reason = (
+            "current candidate changed while delivery prerequisites were evaluated: "
+            f"started={candidate_snapshot} finished={final_candidate}"
+        )
+        blockers.append(
+            _blocker(
+                "candidate-snapshot-changed",
+                candidate_change_reason,
+                "delivery_cycle",
+                cycle_id,
+            )
+        )
+        policy_trust = _human_review_decision(candidate_change_reason)
     if mode == "delivered-consistency":
         allowed = not blockers and policy_trust.delivery_allowed
         trust = LocalTrustDecision(
@@ -2050,12 +2923,29 @@ def evaluate_delivery_report(
             trust=trust,
             cycle_id=cycle_id,
             candidate_sha=candidate,
+            proven_acceptance_ids=(),
         )
+    proven_acceptance_ids = (
+        tuple(
+            str(row[0])
+            for row in conn.execute(
+                """
+                select id from acceptance
+                where cycle_id = ? and status = 'active'
+                order by id
+                """,
+                (cycle_id,),
+            ).fetchall()
+        )
+        if not blockers and policy_trust.delivery_allowed
+        else ()
+    )
     return DeliveryPrerequisiteReport(
         blockers=_ordered_blockers(blockers),
         trust=policy_trust,
         cycle_id=cycle_id,
         candidate_sha=candidate,
+        proven_acceptance_ids=proven_acceptance_ids,
     )
 
 
@@ -2066,6 +2956,7 @@ def evaluate_delivery_prerequisites(
     mode: DeliveryEvaluationMode,
     is_expired: Callable[[str], bool],
     observed_at: str | None = None,
+    candidate_override: str | None = None,
 ) -> tuple[DeliveryBlocker, ...]:
     """Return the one canonical read-only delivery prerequisite decision."""
 
@@ -2075,15 +2966,16 @@ def evaluate_delivery_prerequisites(
         mode=mode,
         is_expired=is_expired,
         observed_at=observed_at,
+        candidate_override=candidate_override,
     ).blockers
 
 
-def evaluate_historical_cycle_prerequisites(
+def evaluate_historical_cycle_report(
     conn: sqlite3.Connection,
     root: Path,
     cycle_id: str,
-) -> tuple[DeliveryBlocker, ...]:
-    """Audit one closed cycle without changing the project's current cycle.
+) -> HistoricalDeliveryReport:
+    """Audit one closed cycle and preserve its canonical trust decision.
 
     Historical audit binds execution eligibility to the candidate persisted on
     that cycle. It never compares an old delivery to the source tree of a later
@@ -2102,7 +2994,18 @@ def evaluate_historical_cycle_prerequisites(
         (resolved_cycle_id,),
     ).fetchone()
     if cycle is None:
-        return _ordered_blockers(blockers)
+        ordered = _ordered_blockers(blockers)
+        reason = (
+            ordered[0].render()
+            if ordered
+            else f"historical cycle is missing: {resolved_cycle_id}"
+        )
+        return HistoricalDeliveryReport(
+            blockers=ordered,
+            trust=_human_review_decision(reason),
+            cycle_id=resolved_cycle_id,
+            candidate_sha=candidate,
+        )
 
     baseline = latest_baseline(conn, resolved_cycle_id)
     delivery = conn.execute(
@@ -2141,9 +3044,23 @@ def evaluate_historical_cycle_prerequisites(
         if confirmation is not None
         else None
     )
-    observed_at = str(
-        (delivery["created_at"] if delivery is not None else cycle["closed_at"])
-        or ""
+    delivery_events = (
+        conn.execute(
+            """
+            select created_at from events
+            where event_type = 'delivery_recorded'
+              and entity_type = 'delivery' and entity_id = ?
+            order by sequence
+            """,
+            (delivery["id"],),
+        ).fetchall()
+        if delivery is not None
+        else []
+    )
+    observed_at = (
+        str(delivery_events[0]["created_at"] or "")
+        if len(delivery_events) == 1
+        else str(cycle["closed_at"] or "")
     )
     observed_timestamp = _timestamp(observed_at)
 
@@ -2155,7 +3072,7 @@ def evaluate_historical_cycle_prerequisites(
             or expiry <= observed_timestamp
         )
 
-    policy_issues, _trust = _evaluate_local_delivery_policy(
+    policy_issues, policy_trust = _evaluate_local_delivery_policy(
         conn,
         root,
         is_expired=expired_at_delivery,
@@ -2181,7 +3098,39 @@ def evaluate_historical_cycle_prerequisites(
             continue
         blockers.append(policy_blocker)
         existing_identities.add(identity)
-    return _ordered_blockers(blockers)
+    decision_blocker = _delivery_decision_trust_blocker(
+        conn,
+        cycle_id=resolved_cycle_id,
+        trust=policy_trust,
+    )
+    if decision_blocker is not None:
+        blockers.append(decision_blocker)
+    ordered = _ordered_blockers(blockers)
+    effective_trust = (
+        policy_trust
+        if not ordered
+        else _human_review_decision(ordered[0].render())
+    )
+    return HistoricalDeliveryReport(
+        blockers=ordered,
+        trust=effective_trust,
+        cycle_id=resolved_cycle_id,
+        candidate_sha=candidate,
+    )
+
+
+def evaluate_historical_cycle_prerequisites(
+    conn: sqlite3.Connection,
+    root: Path,
+    cycle_id: str,
+) -> tuple[DeliveryBlocker, ...]:
+    """Return the compatibility blocker view of the historical report."""
+
+    return evaluate_historical_cycle_report(
+        conn,
+        root,
+        cycle_id,
+    ).blockers
 
 
 def evaluate_schema30_delivery(

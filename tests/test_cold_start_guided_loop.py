@@ -61,7 +61,8 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
                 self.assertNotIn("Traceback", text)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("not initialized", text)
-                self.assertIn("harness.py --root", text)
+                self.assertIn("harness.py", text)
+                self.assertIn("--root", text)
                 self.assertIn("init", text)
 
     def test_init_updates_gitignore_without_overwriting_user_rules(self) -> None:
@@ -82,7 +83,8 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             root = Path(temp)
             run_harness(root, "init")
 
-            report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            envelope = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            report = envelope["details"]
 
             self.assertFalse(report["ready_for_delivery"])
             self.assertIn("requirement", report["missing"])
@@ -112,7 +114,7 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
                 "--execute",
             )
             cycle = json.loads(run_harness(root, "cycle", "status", "--json").stdout)
-            status = run_harness(root, "status").stdout
+            status = run_harness(root, "status", "--verbose").stdout
 
             self.assertIn("OK: quickstart minimal verified setup SMOKE", result.stdout)
             self.assertIn("OK: verify run execution=", result.stdout)
@@ -172,7 +174,9 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
                 "--execute",
             )
 
-            report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            report = json.loads(
+                run_harness(root, "quickstart", "status", "--json").stdout
+            )["details"]
 
             self.assertFalse(report["ready_for_delivery"])
             self.assertEqual(report["cycle_status"], "active")
@@ -223,7 +227,9 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
                 text=True,
             )
 
-            report = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            report = json.loads(
+                run_harness(root, "quickstart", "status", "--json").stdout
+            )["details"]
             verify_command = next(
                 command for command in report["next_commands"] if "verify run" in command
             )
@@ -236,7 +242,9 @@ class ColdStartGuidedLoopTest(unittest.TestCase):
             verified = run_guided_command(root, verify_command)
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 
-            followup = json.loads(run_harness(root, "quickstart", "status", "--json").stdout)
+            followup = json.loads(
+                run_harness(root, "quickstart", "status", "--json").stdout
+            )["details"]
             self.assertNotIn("controller_execution", followup["missing"])
             with closing(sqlite3.connect(root / ".ai-team/state/harness.db")) as conn:
                 self.assertEqual(conn.execute("select count(*) from executions").fetchone()[0], 2)

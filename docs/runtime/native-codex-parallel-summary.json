@@ -1,0 +1,44 @@
+{
+  "binary": [
+    {
+      "kind": "codex-cli",
+      "name": "codex.js",
+      "sha256": "d3be844c45c4fd89392536e56e1010963f94785592596b50cd0c45bb8a341406"
+    }
+  ],
+  "digest": {
+    "bytes": 6488,
+    "sha256": "f958739777ddc4e6c953c77ea9b8a59590457af9b842ae5154dd73e911663a11"
+  },
+  "kind": "native-parallel",
+  "report_version": "kafa-evidence-summary-v1",
+  "retention": {
+    "class": "repository",
+    "days": null,
+    "locator": "docs/runtime/native-codex-parallel-eval.json"
+  },
+  "scope": {
+    "change_scopes": [
+      "docs-only",
+      "host",
+      "native-evaluator",
+      "packaging",
+      "schema-runtime"
+    ],
+    "profile": "live-codex-parallel",
+    "requirement": "blocking"
+  },
+  "source": {
+    "clean": false,
+    "kind": "native-evaluation-source-v1",
+    "revision": "7c7aa41929426bc1d89350497ceb2c9266290b88",
+    "sha256": "dc36ca23b5b8944faefdb4ea6c5d7bad7dd4908e22cc25825e639fb3017392b8",
+    "status_sha256": "59cfb1f4ddbacb5a43505b143fdd7dbc1ba41d95cdb0b62dc65168469d82fd3c"
+  },
+  "state": "historical",
+  "status": "passed",
+  "timing": {
+    "duration_seconds": 51.461533,
+    "generated_at": "2026-07-22T17:16:04+00:00"
+  }
+}
