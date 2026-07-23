@@ -392,6 +392,11 @@ class EvidenceSummaryTest(unittest.TestCase):
             )
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
                 ["git", "config", "user.email", "snapshot@example.com"],
                 cwd=repo,
                 check=True,
@@ -492,6 +497,11 @@ class EvidenceSummaryTest(unittest.TestCase):
             (scripts / "harness_lib.py").symlink_to(external)
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
                 ["git", "config", "user.email", "snapshot@example.com"],
                 cwd=repo,
                 check=True,
@@ -524,6 +534,11 @@ class EvidenceSummaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp)
             subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=repo,
+                check=True,
+            )
             subprocess.run(
                 ["git", "config", "user.email", "evidence@example.com"],
                 cwd=repo,
@@ -634,15 +649,21 @@ class EvidenceSummaryTest(unittest.TestCase):
                     swapped = True
                     os.replace(detail, original)
                     os.replace(forged, detail)
-                    descriptor = real_open(path, flags, *args)
-                    os.replace(detail, displaced_forged)
-                    os.replace(original, detail)
-                    return descriptor
+                    return real_open(path, flags, *args)
                 return real_open(path, flags, *args)
 
-            with mock.patch("kafa.artifact_subject.os.open", side_effect=racing_open):
-                with self.assertRaises(EvidenceSummaryError):
-                    read_regular_detail(detail)
+            try:
+                with mock.patch(
+                    "kafa.artifact_subject.os.open",
+                    side_effect=racing_open,
+                ):
+                    with self.assertRaises(EvidenceSummaryError):
+                        read_regular_detail(detail)
+            finally:
+                if original.exists():
+                    if detail.exists():
+                        os.replace(detail, displaced_forged)
+                    os.replace(original, detail)
 
             self.assertTrue(swapped)
             self.assertEqual(detail.read_bytes(), b'{"trusted":true}\n')

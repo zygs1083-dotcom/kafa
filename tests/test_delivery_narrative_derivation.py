@@ -664,6 +664,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
+            subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,
             )
@@ -749,6 +753,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
+            subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,
             )
@@ -802,6 +810,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,
@@ -867,6 +879,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,
@@ -1108,6 +1124,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
+            subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,
             )
@@ -1149,6 +1169,10 @@ class DerivedDeliveryNarrativeRedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "core.autocrlf", "false"],
+                check=True,
+            )
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Kafa Test"],
                 check=True,

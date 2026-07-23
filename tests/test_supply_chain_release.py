@@ -35,6 +35,7 @@ def create_source_repo(root: Path) -> Path:
     (repo / "release.json").write_bytes((REPO_ROOT / "release.json").read_bytes())
     (repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
     run(["git", "init"], cwd=repo)
+    run(["git", "config", "core.autocrlf", "false"], cwd=repo)
     run(["git", "config", "user.email", "supply-chain-test@example.invalid"], cwd=repo)
     run(["git", "config", "user.name", "Supply Chain Test"], cwd=repo)
     run(["git", "add", "."], cwd=repo)
@@ -428,7 +429,6 @@ class SupplyChainTamperContractTest(unittest.TestCase):
             good_copy.write_bytes(checksums.read_bytes())
             corrupt_bytes = b"0" * 64 + b"  corrupted-artifact.whl\n"
             checksums.write_bytes(corrupt_bytes)
-            original_open = Path.open
             original_os_open = os.open
             swap_count = 0
 
@@ -438,63 +438,32 @@ class SupplyChainTamperContractTest(unittest.TestCase):
                 mode: int = 0o777,
             ) -> int:
                 nonlocal swap_count
-                if isinstance(path, (str, os.PathLike)) and Path(path) == checksums:
+                if (
+                    isinstance(path, (str, os.PathLike))
+                    and Path(path) == checksums
+                    and swap_count == 0
+                ):
                     os.replace(checksums, corrupt_holder)
                     os.replace(good_copy, checksums)
-                    try:
-                        descriptor = original_os_open(path, flags, mode)
-                    finally:
-                        os.replace(checksums, good_copy)
-                        os.replace(corrupt_holder, checksums)
                     swap_count += 1
-                    return descriptor
+                    return original_os_open(path, flags, mode)
                 return original_os_open(path, flags, mode)
 
-            def open_good_copy_during_race(
-                path: Path,
-                mode: str = "r",
-                buffering: int = -1,
-                encoding: str | None = None,
-                errors: str | None = None,
-                newline: str | None = None,
-            ):  # type: ignore[no-untyped-def]
-                nonlocal swap_count
-                if path == checksums and mode == "rb":
-                    os.replace(checksums, corrupt_holder)
-                    os.replace(good_copy, checksums)
-                    try:
-                        handle = original_open(
-                            path,
-                            mode,
-                            buffering,
-                            encoding,
-                            errors,
-                            newline,
-                        )
-                    finally:
-                        os.replace(checksums, good_copy)
-                        os.replace(corrupt_holder, checksums)
-                    swap_count += 1
-                    return handle
-                return original_open(
-                    path,
-                    mode,
-                    buffering,
-                    encoding,
-                    errors,
-                    newline,
-                )
-
             try:
-                with (
-                    patch.object(Path, "open", new=open_good_copy_during_race),
-                    patch.object(os, "open", new=open_good_descriptor_during_race),
+                with patch.object(
+                    os,
+                    "open",
+                    new=open_good_descriptor_during_race,
                 ):
                     with self.assertRaises(SupplyChainError):
                         verify_release_evidence(repo, dist)
             finally:
-                self.assertGreater(swap_count, 0)
-                self.assertEqual(checksums.read_bytes(), corrupt_bytes)
+                if corrupt_holder.exists():
+                    if checksums.exists():
+                        os.replace(checksums, good_copy)
+                    os.replace(corrupt_holder, checksums)
+            self.assertGreater(swap_count, 0)
+            self.assertEqual(checksums.read_bytes(), corrupt_bytes)
 
     def test_verifier_rejects_each_bound_input_tamper(self) -> None:
         from kafa.supply_chain import SupplyChainError, verify_release_evidence
