@@ -30,6 +30,8 @@ from .change_scope import (
     BLOCKING_NATIVE_PROFILES,
     BLOCKING_SCOPES,
     CHANGE_SCOPE_VERSION,
+    NO_RELEASE_BASE_OID,
+    changed_paths_sha256,
     classify_repository,
     validate_decision_report,
 )
@@ -231,9 +233,22 @@ def validate_evidence_summary(summary: Mapping[str, Any]) -> list[str]:
                 errors.append("summary classifier decision version is unsupported")
             if decision.get("state") not in {"classified", "unknown"}:
                 errors.append("summary classifier decision state is invalid")
-            for field in ("base_oid", "head_oid"):
-                if not _valid_oid(decision.get(field)):
-                    errors.append(f"summary classifier decision {field} is invalid")
+            base_oid = decision.get("base_oid")
+            if not _valid_oid(base_oid) and not (
+                base_oid == NO_RELEASE_BASE_OID
+                and decision.get("state") == "unknown"
+            ):
+                errors.append("summary classifier decision base_oid is invalid")
+            if (
+                base_oid == NO_RELEASE_BASE_OID
+                and decision.get("state") == "unknown"
+                and decision.get("changed_paths_sha256") != changed_paths_sha256(())
+            ):
+                errors.append(
+                    "summary no-release decision must bind an empty changed path set"
+                )
+            if not _valid_oid(decision.get("head_oid")):
+                errors.append("summary classifier decision head_oid is invalid")
             for field in ("changed_paths_sha256", "sha256"):
                 if not _valid_sha256(decision.get(field)):
                     errors.append(f"summary classifier decision {field} is invalid")

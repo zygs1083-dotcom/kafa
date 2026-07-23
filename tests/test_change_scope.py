@@ -243,6 +243,44 @@ class ChangeScopeTest(unittest.TestCase):
             self.assertEqual(decision.required_profiles, BLOCKING_NATIVE_PROFILES)
             self.assertTrue(decision.issues)
 
+    def test_first_release_zero_base_is_only_valid_as_canonical_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            git(repo, "init")
+            git(repo, "config", "core.autocrlf", "false")
+            git(repo, "config", "user.email", "scope@example.com")
+            git(repo, "config", "user.name", "Scope Test")
+            head = commit_file(repo, "README.md", "first release\n", "first release")
+
+            decision = classify_repository(
+                repo,
+                base_oid="0" * 40,
+                head_oid=head,
+            )
+
+        self.assertEqual(decision.state, "unknown")
+        self.assertEqual(decision.changed_paths, ())
+        self.assertEqual(decision.scopes, ("unknown",))
+        self.assertEqual(decision.native_requirement, "blocking")
+        self.assertEqual(decision.required_profiles, BLOCKING_NATIVE_PROFILES)
+        self.assertEqual(
+            decision.issues,
+            ("no published release base is available",),
+        )
+        self.assertEqual(change_scope.validate_decision_report(decision.to_dict()), [])
+
+        forged = classify_changed_paths(
+            ["README.md"],
+            base_oid="a" * 40,
+            head_oid=head,
+        ).to_dict()
+        forged["base_oid"] = "0" * 40
+        self.assertTrue(change_scope.validate_decision_report(forged))
+
+        misleading = decision.to_dict()
+        misleading["issues"] = ["change diff is unavailable"]
+        self.assertTrue(change_scope.validate_decision_report(misleading))
+
     def test_json_shape_is_closed_and_cli_emits_one_object(self) -> None:
         decision = classify_changed_paths(
             ["README.md"],

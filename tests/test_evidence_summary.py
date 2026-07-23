@@ -24,6 +24,7 @@ from kafa.evidence_summary import (
     summary_json_bytes,
     read_regular_detail,
     validate_evidence_summary,
+    _decision_binding,
     _native_validator_errors,
     _repository_decision_errors,
 )
@@ -583,6 +584,11 @@ class EvidenceSummaryTest(unittest.TestCase):
                 capture_output=True,
             ).stdout.strip()
             valid = classify_repository(repo, base_oid=base, head_oid=head).to_dict()
+            first_release = classify_repository(
+                repo,
+                base_oid="0" * 40,
+                head_oid=head,
+            ).to_dict()
             forged = classify_changed_paths(
                 ["README.md"],
                 base_oid="b" * 40,
@@ -590,6 +596,35 @@ class EvidenceSummaryTest(unittest.TestCase):
             ).to_dict()
 
             self.assertEqual(_repository_decision_errors(valid, repo), [])
+            self.assertEqual(_repository_decision_errors(first_release, repo), [])
+            first_release_bytes = (
+                json.dumps(first_release, indent=2, sort_keys=True) + "\n"
+            ).encode()
+            first_release_binding = _decision_binding(
+                first_release,
+                first_release_bytes,
+                expected_sha256=hashlib.sha256(first_release_bytes).hexdigest(),
+                validator_repo=repo,
+                require_repository_binding=True,
+            )
+            self.assertEqual(first_release_binding["base_oid"], "0" * 40)
+            self.assertEqual(first_release_binding["state"], "unknown")
+            first_release_summary = valid_summary(
+                source={
+                    "kind": "native-evaluation-source-v1",
+                    "revision": head,
+                    "sha256": "1" * 64,
+                    "clean": True,
+                    "status_sha256": EMPTY_STATUS_SHA256,
+                },
+                scope={
+                    "profile": "live-codex",
+                    "requirement": "blocking",
+                    "change_scopes": ["unknown"],
+                    "decision": first_release_binding,
+                },
+            )
+            self.assertEqual(validate_evidence_summary(first_release_summary), [])
             self.assertTrue(_repository_decision_errors(forged, repo))
 
             workflow.write_text("name: changed-after-native\n", encoding="utf-8")
@@ -614,6 +649,38 @@ class EvidenceSummaryTest(unittest.TestCase):
         self.assertTrue(
             any("decision head" in error for error in validate_evidence_summary(summary))
         )
+
+    def test_first_release_summary_accepts_zero_base_only_for_unknown_decision(self) -> None:
+        summary = valid_summary()
+        summary["scope"] = {
+            "profile": "live-codex",
+            "requirement": "blocking",
+            "change_scopes": ["unknown"],
+            "decision": {
+                "version": DECISION_REPORT["version"],
+                "state": "unknown",
+                "base_oid": "0" * 40,
+                "head_oid": "a" * 40,
+                "changed_paths_sha256": hashlib.sha256(b"").hexdigest(),
+                "required_profiles": ["live-codex", "live-codex-parallel"],
+                "sha256": "4" * 64,
+            },
+        }
+
+        self.assertEqual(validate_evidence_summary(summary), [])
+
+        nonempty_paths = copy.deepcopy(summary)
+        nonempty_paths["scope"]["decision"]["changed_paths_sha256"] = "5" * 64
+        self.assertTrue(validate_evidence_summary(nonempty_paths))
+
+        classified = copy.deepcopy(summary)
+        classified["scope"]["decision"]["state"] = "classified"
+        self.assertTrue(validate_evidence_summary(classified))
+
+        zero_head = copy.deepcopy(summary)
+        zero_head["source"]["revision"] = "0" * 40
+        zero_head["scope"]["decision"]["head_oid"] = "0" * 40
+        self.assertTrue(validate_evidence_summary(zero_head))
 
     def test_new_historical_summary_cannot_self_author_scope_without_decision(self) -> None:
         detail_bytes = (REPO_ROOT / "docs/runtime/native-codex-live-eval.json").read_bytes()

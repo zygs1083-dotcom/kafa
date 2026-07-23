@@ -45,6 +45,8 @@ BLOCKING_SCOPES: frozenset[Scope] = frozenset(
     {"host", "packaging", "release-tooling", "native-evaluator", "unknown"}
 )
 FULL_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+NO_RELEASE_BASE_OID = "0" * 40
+NO_RELEASE_BASE_ISSUE = "no published release base is available"
 
 _HOST_EXACT = frozenset(
     {
@@ -220,10 +222,24 @@ def validate_decision_report(
         errors.append("change-scope report state is invalid")
     base_oid = report.get("base_oid")
     head_oid = report.get("head_oid")
-    if not isinstance(base_oid, str) or not FULL_OID.fullmatch(base_oid):
+    if (
+        not isinstance(base_oid, str)
+        or not FULL_OID.fullmatch(base_oid)
+        or (
+            base_oid == "0" * len(base_oid)
+            and base_oid != NO_RELEASE_BASE_OID
+        )
+    ):
         errors.append("change-scope report base_oid is invalid")
-    if not isinstance(head_oid, str) or not FULL_OID.fullmatch(head_oid):
+    if (
+        not isinstance(head_oid, str)
+        or not FULL_OID.fullmatch(head_oid)
+        or head_oid == "0" * len(head_oid)
+    ):
         errors.append("change-scope report head_oid is invalid")
+    no_release_base = base_oid == NO_RELEASE_BASE_OID
+    if no_release_base and state != "unknown":
+        errors.append("no-release base must remain an unknown change-scope decision")
     if expected_base_oid is not None and base_oid != expected_base_oid:
         errors.append("change-scope report base_oid does not match the independent comparison")
     if expected_head_oid is not None and head_oid != expected_head_oid:
@@ -293,6 +309,8 @@ def validate_decision_report(
             not isinstance(issue, str) or not issue.strip() for issue in issues
         ):
             errors.append("unknown change-scope report requires actionable issues")
+        elif no_release_base and issues != [NO_RELEASE_BASE_ISSUE]:
+            errors.append("no-release change-scope report issue is invalid")
     return errors
 
 
@@ -380,8 +398,18 @@ def classify_changed_paths(
     base_oid: str,
     head_oid: str,
 ) -> ChangeScopeDecision:
-    if not FULL_OID.fullmatch(base_oid) or not FULL_OID.fullmatch(head_oid):
+    if (
+        not FULL_OID.fullmatch(base_oid)
+        or not FULL_OID.fullmatch(head_oid)
+        or head_oid == "0" * len(head_oid)
+        or (
+            base_oid == "0" * len(base_oid)
+            and base_oid != NO_RELEASE_BASE_OID
+        )
+    ):
         return _unknown_decision(base_oid, head_oid, "base and head must be exact full object ids")
+    if base_oid == NO_RELEASE_BASE_OID:
+        return _unknown_decision(base_oid, head_oid, NO_RELEASE_BASE_ISSUE)
     changed_paths = tuple(sorted(set(paths)))
     if not changed_paths:
         return _unknown_decision(base_oid, head_oid, "changed path set is empty or unavailable")
@@ -405,8 +433,18 @@ def classify_changed_paths(
 
 
 def classify_repository(repo: Path, *, base_oid: str, head_oid: str) -> ChangeScopeDecision:
-    if not FULL_OID.fullmatch(base_oid) or not FULL_OID.fullmatch(head_oid):
+    if (
+        not FULL_OID.fullmatch(base_oid)
+        or not FULL_OID.fullmatch(head_oid)
+        or head_oid == "0" * len(head_oid)
+        or (
+            base_oid == "0" * len(base_oid)
+            and base_oid != NO_RELEASE_BASE_OID
+        )
+    ):
         return _unknown_decision(base_oid, head_oid, "base and head must be exact full object ids")
+    if base_oid == NO_RELEASE_BASE_OID:
+        return _unknown_decision(base_oid, head_oid, NO_RELEASE_BASE_ISSUE)
     repo = repo.expanduser().resolve()
     if not repo.is_dir():
         return _unknown_decision(base_oid, head_oid, f"repository directory is unavailable: {repo}")

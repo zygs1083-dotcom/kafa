@@ -366,6 +366,10 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertIn("changed_paths_sha256", scope)
         self.assertIn('--base-oid "$base_oid"', scope)
         self.assertIn('--head-oid "$head_oid"', scope)
+        self.assertIn('candidates[0][2] if candidates else "0" * 40', scope)
+        self.assertIn('if [[ "$base_oid" == "$(printf \'0%.0s\' {1..40})" ]]', scope)
+        self.assertIn(': > "$raw_paths"', scope)
+        self.assertIn('if base_oid == "0" * 40 or self_guard.intersection(changed_paths)', scope)
         self.assertIn("deterministic_gates_required", scope)
         self.assertIn("advisory / not-run", scope)
         verify = workflow.split("\n  verify:\n", 1)[1].split("\n  real_host_compatibility:", 1)[0]
