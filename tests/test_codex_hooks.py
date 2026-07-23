@@ -6,6 +6,7 @@ import py_compile
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -15,16 +16,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RELEASE = json.loads((REPO_ROOT / "release.json").read_text(encoding="utf-8"))
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
+SCRIPTS = PLUGIN_ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from harness_lib import load_distribution_manifest  # noqa: E402
+
+
 HOOKS_ROOT = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT = HOOKS_ROOT / "harness_hook.py"
 HOOKS_JSON = HOOKS_ROOT / "hooks.json"
 HARNESS = PLUGIN_ROOT / "scripts" / "harness.py"
-APPROVED_EVENTS = {"SessionStart", "SubagentStart", "Stop"}
+DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
+APPROVED_EVENTS = set(DISTRIBUTION["hooks"]["events"])
 
 
 class CodexHooksTest(unittest.TestCase):
     def test_hooks_json_exposes_exactly_three_existing_commands(self) -> None:
         data = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
+        self.assertEqual(len(APPROVED_EVENTS), 3)
         self.assertEqual(set(data), {"hooks"})
         self.assertEqual(set(data["hooks"]), APPROVED_EVENTS)
         for event, groups in data["hooks"].items():
@@ -56,6 +66,10 @@ class CodexHooksTest(unittest.TestCase):
                     self.assertTrue(payload["continue"])
                     self.assertIn("skipped", payload["systemMessage"])
                     self.assertIn("not initialized", payload["systemMessage"])
+                elif event == "SessionStart":
+                    self.assertIn("state: not-initialized", result.stdout)
+                    self.assertIn("not initialized", result.stdout)
+                    self.assertNotIn("passed", result.stdout.lower())
                 else:
                     self.assertIn("skipped", result.stdout)
                     self.assertIn("not initialized", result.stdout)
@@ -69,7 +83,78 @@ class CodexHooksTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("unknown event", result.stdout)
 
-    def test_session_start_reads_only_schema30_status(self) -> None:
+    def test_hook_runner_uses_the_installed_manifest_event_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed = root / "installed/codex-project-harness"
+            project = root / "business-project"
+            shutil.copytree(
+                PLUGIN_ROOT,
+                installed,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            project.mkdir()
+
+            replacement = "AgentStart"
+            distribution_path = installed / "references/distribution-manifest.json"
+            distribution = json.loads(distribution_path.read_text(encoding="utf-8"))
+            distribution["hooks"]["events"] = [
+                replacement if event == "SubagentStart" else event
+                for event in distribution["hooks"]["events"]
+            ]
+            distribution_path.write_text(
+                json.dumps(distribution, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            hooks_path = installed / "hooks/hooks.json"
+            hooks_payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+            groups = hooks_payload["hooks"].pop("SubagentStart")
+            for group in groups:
+                for hook in group["hooks"]:
+                    hook["command"] = hook["command"].replace(
+                        "SubagentStart", replacement
+                    )
+                    hook["commandWindows"] = hook["commandWindows"].replace(
+                        "SubagentStart", replacement
+                    )
+            hooks_payload["hooks"][replacement] = groups
+            hooks_path.write_text(
+                json.dumps(hooks_payload, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["HARNESS_PROJECT_ROOT"] = str(project)
+            renamed = subprocess.run(
+                [sys.executable, str(installed / "hooks/harness_hook.py"), replacement],
+                input=json.dumps({"subagent_type": "developer"}),
+                text=True,
+                capture_output=True,
+                cwd=project,
+                env=env,
+                check=False,
+            )
+            retired = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed / "hooks/harness_hook.py"),
+                    "SubagentStart",
+                ],
+                input=json.dumps({"subagent_type": "developer"}),
+                text=True,
+                capture_output=True,
+                cwd=project,
+                env=env,
+                check=False,
+            )
+
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertIn(f"Codex Project Harness hook: {replacement}", renamed.stdout)
+        self.assertEqual(retired.returncode, 2, retired.stdout + retired.stderr)
+        self.assertIn("unknown event", retired.stdout)
+
+    def test_session_start_reads_only_concise_status(self) -> None:
         with self._initialized_root() as root:
             before = self._counts(root)
             result = self._run_hook("SessionStart", root, {"source": "startup"})
@@ -77,10 +162,69 @@ class CodexHooksTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Project Harness hook: SessionStart", result.stdout)
-        self.assertIn(f"schema_version: {RELEASE['schema_version_runtime']}", result.stdout)
-        self.assertIn(f"runtime_version: {RELEASE['runtime_version']}", result.stdout)
+        self.assertIn("state: needs-work", result.stdout)
+        self.assertIn("blocker: [requirement-missing]", result.stdout)
+        self.assertIn("next:", result.stdout)
+        self.assertNotIn("schema_version:", result.stdout)
+        self.assertNotIn("runtime_version:", result.stdout)
         self.assertNotIn("dispatch", result.stdout.lower())
         self.assertEqual(before, after)
+
+    def test_session_start_surfaces_recovery_instead_of_uninitialized_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(root / ".ai-team/backups/recovery/manifest.json"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            results = {
+                event: self._run_hook(event, root, {"source": "startup"})
+                for event in ("SessionStart", "SubagentStart")
+            }
+
+        for event, result in results.items():
+            with self.subTest(event=event):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("state: recovery-required", result.stdout)
+                self.assertIn("rollback-incomplete", result.stdout)
+                self.assertIn("next: none", result.stdout)
+                self.assertNotIn("skipped: harness is not initialized", result.stdout)
+
+    def test_subagent_start_surfaces_recovery_when_database_still_exists(self) -> None:
+        with self._initialized_root() as root:
+            sentinel = root / ".ai-team/state/local-core-migration.lock"
+            sentinel.write_text(
+                json.dumps(
+                    {
+                        "pid": 999999,
+                        "status": "rollback-incomplete",
+                        "manifest_path": str(root / ".ai-team/backups/recovery/manifest.json"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_hook(
+                "SubagentStart",
+                root,
+                {"subagent_type": "developer"},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("state: recovery-required", result.stdout)
+        self.assertIn("rollback-incomplete", result.stdout)
+        self.assertNotIn("role boundary:", result.stdout)
 
     def test_subagent_start_returns_local_single_writer_boundary_and_redacts(self) -> None:
         secret = "HARNESS_SECRET=must-not-leak"

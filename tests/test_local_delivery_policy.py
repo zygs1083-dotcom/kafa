@@ -594,16 +594,39 @@ class HonestHighRiskPolicyTests(unittest.TestCase):
 
 class Schema30DeliveryDecisionTests(unittest.TestCase):
     def test_candidate_identity_excludes_only_exact_generated_non_state_paths(self) -> None:
+        distribution = harness_lib.load_distribution_manifest(PLUGIN_ROOT)
         expected = {
             path.as_posix()
             for path in PROJECTION_ROLLBACK_PATHS
             if path.as_posix().startswith("docs/harness/")
         } | {
-            ".codex/agents/architect.toml",
-            ".codex/agents/developer.toml",
-            ".codex/agents/qa-reviewer.toml",
+            f".codex/agents/{name}"
+            for name in distribution["templates"]["native_agents"]
         }
-        self.assertEqual(harness_lib.HARNESS_EXACT_SOURCE_PATHS, expected)
+        self.assertEqual(harness_lib.harness_exact_source_paths(), expected)
+
+    def test_candidate_template_exclusions_follow_the_manifest(self) -> None:
+        distribution = harness_lib.load_distribution_manifest(PLUGIN_ROOT)
+        changed = {
+            **distribution,
+            "templates": {
+                **distribution["templates"],
+                "native_agents": ("new-native.toml",),
+            },
+        }
+        with patch.object(
+            harness_lib,
+            "_EXACT_SOURCE_PATH_CACHE",
+            None,
+        ), patch.object(
+            harness_lib,
+            "load_distribution_manifest",
+            return_value=changed,
+        ):
+            paths = harness_lib.harness_exact_source_paths()
+
+        self.assertIn(".codex/agents/new-native.toml", paths)
+        self.assertNotIn(".codex/agents/architect.toml", paths)
 
     def test_schema30_degraded_gate_cannot_pass_high_risk_with_accepted_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

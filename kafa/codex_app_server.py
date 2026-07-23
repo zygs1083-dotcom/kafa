@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -12,31 +13,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .cli import (
-    REQUIRED_AGENT_TEMPLATES,
-    REQUIRED_SCHEMAS,
-    REQUIRED_SCRIPTS,
-    REQUIRED_SKILLS,
+    KafaError,
     RETIRED_CORE_FILES,
-)
-
-
-APPROVED_SKILLS = frozenset(REQUIRED_SKILLS)
-APPROVED_APP_SERVER_HOOK_EVENTS = frozenset({"sessionStart", "subagentStart", "stop"})
-APPROVED_AGENT_TEMPLATES = frozenset(REQUIRED_AGENT_TEMPLATES)
-APPROVED_RUNTIME_SCRIPTS = frozenset(REQUIRED_SCRIPTS)
-APPROVED_SCHEMA_FILES = frozenset(REQUIRED_SCHEMAS)
-REQUIRED_RUNTIME_ANCHORS = frozenset(
-    {
-        "core/api.py",
-        "core/delivery.py",
-        "core/execution.py",
-        "core/schema_lifecycle.py",
-        "core/store.py",
-        "hooks/harness_hook.py",
-        "scripts/harness.py",
-        "scripts/harness_db.py",
-        "skills/project-harness/scripts/harness.py",
-    }
+    distribution_file_inventory,
+    distribution_inventory_issues,
+    load_distribution_manifest,
+    managed_tree_is_safe,
+    static_runtime_domains,
 )
 RETIRED_RUNTIME_PATHS = frozenset(
     {
@@ -179,11 +162,16 @@ class AppServerClient:
         self.close()
 
 
-def _hook_command_paths(command: str, cache_root: Path) -> list[Path]:
+def _hook_command_paths(
+    command: str,
+    cache_root: Path,
+    runner_relative: str,
+) -> list[Path]:
     paths: list[Path] = []
+    runner_suffix = "/" + runner_relative.replace("\\", "/")
     for token in shlex.split(command, posix=False):
         value = token.strip('"').replace("\\", "/")
-        if not value.lower().endswith("/hooks/harness_hook.py"):
+        if not value.endswith(runner_suffix):
             continue
         expanded = value.replace("${PLUGIN_ROOT}", cache_root.as_posix()).replace(
             "%PLUGIN_ROOT%", cache_root.as_posix()
@@ -202,9 +190,94 @@ def validate_app_server_discovery(
     """Require the fixed local-only plugin surface from the installed cache."""
 
     cache_root = cache_root.resolve()
+    if not managed_tree_is_safe(cache_root):
+        raise RuntimeError(
+            f"installed cache is missing or contains a link/junction: {cache_root}"
+        )
+    retired_paths = sorted(
+        relative for relative in RETIRED_RUNTIME_PATHS if (cache_root / relative).exists()
+    )
+    if retired_paths:
+        raise RuntimeError(f"installed cache contains retired runtime files: {retired_paths}")
+    try:
+        distribution = load_distribution_manifest(cache_root)
+    except KafaError as exc:
+        raise RuntimeError(str(exc)) from exc
+    inventory_issues = distribution_inventory_issues(cache_root, distribution)
+    if inventory_issues:
+        raise RuntimeError(
+            "installed cache distribution inventory mismatch: "
+            + "; ".join(inventory_issues)
+        )
+    metadata_path = cache_root / ".codex-plugin/plugin.json"
+    def reject_metadata_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise RuntimeError(f"duplicate installed cache plugin metadata key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        cache_metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_metadata_duplicates,
+        )
+    except RuntimeError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"installed cache plugin metadata is invalid: {exc}") from exc
+    if not isinstance(cache_metadata, dict):
+        raise RuntimeError("installed cache plugin metadata must be an object")
+    requested_name = plugin_id.split("@", 1)[0]
+    if (
+        requested_name != distribution["plugin_name"]
+        or cache_metadata.get("name") != distribution["plugin_name"]
+    ):
+        raise RuntimeError(
+            "installed cache plugin name mismatch: "
+            f"requested={requested_name!r} metadata={cache_metadata.get('name')!r} "
+            f"manifest={distribution['plugin_name']!r}"
+        )
+    if cache_metadata.get("version") != version:
+        raise RuntimeError(
+            "installed cache plugin version mismatch: "
+            f"metadata={cache_metadata.get('version')!r} expected={version!r}"
+        )
+    approved_skills = frozenset(distribution["skills"])
+    approved_hook_events = frozenset(
+        event[:1].lower() + event[1:]
+        for event in distribution["hooks"]["events"]
+    )
+    approved_agent_templates = frozenset(
+        distribution["templates"]["native_agents"]
+    )
+    approved_project_templates = frozenset(
+        distribution["templates"]["project_support"]
+    )
+    approved_runtime_scripts = frozenset(distribution["scripts"])
+    approved_schema_files = frozenset(distribution["schemas"])
+    approved_core_files = frozenset(distribution["core"])
+    approved_hook_files = frozenset(distribution["hooks"]["files"])
+    approved_reference_files = frozenset(distribution["references"])
+    hook_definitions = [
+        name for name in distribution["hooks"]["files"] if Path(name).suffix == ".json"
+    ]
+    hook_runners = [
+        name for name in distribution["hooks"]["files"] if Path(name).suffix == ".py"
+    ]
+    if len(hook_definitions) != 1 or len(hook_runners) != 1:
+        raise RuntimeError(
+            "installed cache Hook inventory requires one JSON definition and one Python runner"
+        )
+    hook_definition_path = (cache_root / "hooks" / hook_definitions[0]).resolve()
+    hook_runner_relative = f"hooks/{hook_runners[0]}"
+    hook_runner_path = (cache_root / hook_runner_relative).resolve()
     skill_prefix = plugin_id.split("@", 1)[0]
-    expected_skills = {f"{skill_prefix}:{name}" for name in APPROVED_SKILLS}
-    expected_hook_events = set(APPROVED_APP_SERVER_HOOK_EVENTS)
+    expected_skills = {f"{skill_prefix}:{name}" for name in approved_skills}
+    expected_hook_events = set(approved_hook_events)
     plugin_result = discovery.get("plugin", {})
     marketplace_errors = plugin_result.get("marketplaceLoadErrors", [])
     if marketplace_errors:
@@ -239,12 +312,17 @@ def validate_app_server_discovery(
             f"app-server skill discovery mismatch: actual={sorted(actual_skills)} expected={sorted(expected_skills)}"
         )
     for skill in skills:
+        skill_name = str(skill.get("name", ""))
+        short_name = skill_name.split(":", 1)[1] if ":" in skill_name else ""
         skill_path = Path(str(skill.get("path", ""))).resolve()
+        expected_skill_path = (
+            cache_root / "skills" / short_name / "SKILL.md"
+        ).resolve()
         if (
             skill.get("enabled") is not True
             or skill.get("scope") != "user"
-            or not skill_path.is_relative_to(cache_root)
-            or not skill_path.is_file()
+            or skill_path != expected_skill_path
+            or not expected_skill_path.is_file()
         ):
             raise RuntimeError(f"app-server skill did not resolve from installed cache: {skill}")
 
@@ -265,56 +343,110 @@ def validate_app_server_discovery(
         )
     for hook in hooks:
         source_path = Path(str(hook.get("sourcePath", ""))).resolve()
-        command_paths = _hook_command_paths(str(hook.get("command", "")), cache_root)
+        command = str(hook.get("command", ""))
+        command_tokens = shlex.split(command, posix=False)
+        interpreter = (
+            Path(command_tokens[0].strip('"')).name.lower()
+            if command_tokens
+            else ""
+        )
+        event_argument = (
+            command_tokens[2].strip('"')
+            if len(command_tokens) == 3
+            else ""
+        )
+        command_paths = _hook_command_paths(
+            command,
+            cache_root,
+            hook_runner_relative,
+        )
+        event_name = str(hook.get("eventName", ""))
+        manifest_event = next(
+            (
+                event
+                for event in distribution["hooks"]["events"]
+                if event[:1].lower() + event[1:] == event_name
+            ),
+            "",
+        )
         if (
             hook.get("enabled") is not True
             or hook.get("source") != "plugin"
-            or not source_path.is_relative_to(cache_root)
-            or not source_path.is_file()
+            or source_path != hook_definition_path
+            or not hook_definition_path.is_file()
             or len(command_paths) != 1
-            or not command_paths[0].is_relative_to(cache_root)
-            or not command_paths[0].is_file()
+            or command_paths[0] != hook_runner_path
+            or not hook_runner_path.is_file()
+            or re.fullmatch(r"python(?:3(?:\.\d+)*)?(?:\.exe)?", interpreter) is None
+            or not manifest_event
+            or event_argument != manifest_event
         ):
             raise RuntimeError(f"app-server hook did not resolve from installed cache: {hook}")
 
     actual_skill_dirs = {
         path.name for path in (cache_root / "skills").iterdir() if path.is_dir()
     } if (cache_root / "skills").is_dir() else set()
-    if actual_skill_dirs != APPROVED_SKILLS:
+    if actual_skill_dirs != approved_skills:
         raise RuntimeError(
             f"installed cache skill inventory mismatch: actual={sorted(actual_skill_dirs)} "
-            f"expected={sorted(APPROVED_SKILLS)}"
+            f"expected={sorted(approved_skills)}"
         )
 
     actual_templates = _file_inventory(cache_root / "templates/agents", ".toml")
-    if actual_templates != APPROVED_AGENT_TEMPLATES:
+    if actual_templates != approved_agent_templates:
         raise RuntimeError(
             f"installed cache template inventory mismatch: actual={sorted(actual_templates)} "
-            f"expected={sorted(APPROVED_AGENT_TEMPLATES)}"
+            f"expected={sorted(approved_agent_templates)}"
+        )
+    actual_project_templates = _file_inventory(
+        cache_root / "templates/project", ""
+    )
+    if actual_project_templates != approved_project_templates:
+        raise RuntimeError(
+            "installed cache project template inventory mismatch: "
+            f"actual={sorted(actual_project_templates)} "
+            f"expected={sorted(approved_project_templates)}"
         )
     actual_scripts = _file_inventory(cache_root / "scripts", ".py")
-    if actual_scripts != APPROVED_RUNTIME_SCRIPTS:
+    if actual_scripts != approved_runtime_scripts:
         raise RuntimeError(
             f"installed cache runtime script inventory mismatch: actual={sorted(actual_scripts)} "
-            f"expected={sorted(APPROVED_RUNTIME_SCRIPTS)}"
+            f"expected={sorted(approved_runtime_scripts)}"
         )
     actual_schemas = _file_inventory(cache_root / "schemas", ".json")
-    if actual_schemas != APPROVED_SCHEMA_FILES:
+    if actual_schemas != approved_schema_files:
         raise RuntimeError(
             f"installed cache schema inventory mismatch: actual={sorted(actual_schemas)} "
-            f"expected={sorted(APPROVED_SCHEMA_FILES)}"
+            f"expected={sorted(approved_schema_files)}"
         )
-    missing_anchors = sorted(
-        relative for relative in REQUIRED_RUNTIME_ANCHORS if not (cache_root / relative).is_file()
-    )
-    if missing_anchors:
-        raise RuntimeError(f"installed cache missing local runtime files: {missing_anchors}")
-    retired_paths = sorted(
-        relative for relative in RETIRED_RUNTIME_PATHS if (cache_root / relative).exists()
-    )
-    if retired_paths:
-        raise RuntimeError(f"installed cache contains retired runtime files: {retired_paths}")
-
+    actual_core = _file_inventory(cache_root / "core", ".py")
+    if actual_core != approved_core_files:
+        raise RuntimeError(
+            f"installed cache core inventory mismatch: actual={sorted(actual_core)} "
+            f"expected={sorted(approved_core_files)}"
+        )
+    actual_hook_files = _file_inventory(cache_root / "hooks", "")
+    if actual_hook_files != approved_hook_files:
+        raise RuntimeError(
+            "installed cache hook file inventory mismatch: "
+            f"actual={sorted(actual_hook_files)} "
+            f"expected={sorted(approved_hook_files)}"
+        )
+    actual_references = _file_inventory(cache_root / "references", "")
+    if actual_references != approved_reference_files:
+        raise RuntimeError(
+            "installed cache reference inventory mismatch: "
+            f"actual={sorted(actual_references)} "
+            f"expected={sorted(approved_reference_files)}"
+        )
+    actual_domains = static_runtime_domains(cache_root / "scripts/harness.py")
+    expected_domains = set(distribution["public_runtime_domains"])
+    if actual_domains != expected_domains:
+        raise RuntimeError(
+            "installed cache public runtime domain inventory mismatch: "
+            f"actual={sorted(actual_domains)} expected={sorted(expected_domains)}"
+        )
+    runtime_file_count = len(distribution_file_inventory(distribution))
     return {
         "plugin_id": plugin_id,
         "plugin_local_version": str(plugin.get("localVersion", "")),
@@ -324,11 +456,22 @@ def validate_app_server_discovery(
         "hook_events": sorted(actual_hook_events),
         "template_count": len(actual_templates),
         "template_names": sorted(actual_templates),
+        "project_template_count": len(actual_project_templates),
+        "project_template_names": sorted(actual_project_templates),
         "runtime_script_count": len(actual_scripts),
         "runtime_script_names": sorted(actual_scripts),
         "schema_count": len(actual_schemas),
         "schema_names": sorted(actual_schemas),
-        "runtime_anchor_count": len(REQUIRED_RUNTIME_ANCHORS),
+        "core_count": len(actual_core),
+        "core_names": sorted(actual_core),
+        "hook_file_count": len(actual_hook_files),
+        "hook_file_names": sorted(actual_hook_files),
+        "reference_count": len(actual_references),
+        "reference_names": sorted(actual_references),
+        "public_runtime_domain_count": len(actual_domains),
+        "public_runtime_domains": sorted(actual_domains),
+        "runtime_anchor_count": runtime_file_count,
+        "runtime_file_count": runtime_file_count,
         "retired_runtime_absent": True,
     }
 
@@ -336,4 +479,8 @@ def validate_app_server_discovery(
 def _file_inventory(root: Path, suffix: str) -> set[str]:
     if not root.is_dir():
         return set()
-    return {path.name for path in root.iterdir() if path.is_file() and path.suffix == suffix}
+    return {
+        path.name
+        for path in root.iterdir()
+        if path.is_file()
+    }

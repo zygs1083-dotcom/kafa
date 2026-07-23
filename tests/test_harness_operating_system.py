@@ -123,7 +123,8 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                     self.assertIn("rollback-incomplete", output)
                     self.assertIn(str(manifest).lower(), output)
                     self.assertIn("do not remove", output)
-                    self.assertNotIn("next:", output)
+                    if args != ("validate",):
+                        self.assertIn("next: none", output)
                     self.assertNotIn(" init", output)
                     self.assertFalse(db_path(root).exists())
 
@@ -251,7 +252,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 )
                 conn.commit()
 
-            doctor = run_harness(root, "doctor", check=False)
+            doctor = run_harness(root, "doctor", "--verbose", check=False)
 
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn("invalid event before_json: bad-event", doctor.stdout + doctor.stderr)
@@ -277,7 +278,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 )
                 conn.commit()
 
-            doctor = run_harness(root, "doctor", check=False)
+            doctor = run_harness(root, "doctor", "--verbose", check=False)
 
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn(
@@ -296,7 +297,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 )
                 conn.commit()
 
-            doctor = run_harness(root, "doctor", check=False)
+            doctor = run_harness(root, "doctor", "--verbose", check=False)
 
         output = doctor.stdout + doctor.stderr
         self.assertNotEqual(doctor.returncode, 0)
@@ -318,7 +319,7 @@ class HarnessOperatingSystemTest(unittest.TestCase):
                 text=True,
             )
 
-            doctor = run_harness(root, "doctor", check=False)
+            doctor = run_harness(root, "doctor", "--verbose", check=False)
 
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn("runtime state is tracked by git", doctor.stdout + doctor.stderr)

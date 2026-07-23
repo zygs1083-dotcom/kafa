@@ -14,10 +14,13 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import harness_db  # noqa: E402
+from harness_lib import load_distribution_manifest  # noqa: E402
 
 
-APPROVED_TEMPLATES = {"architect.toml", "developer.toml", "qa-reviewer.toml"}
-TEMPLATE_ROOT = REPO_ROOT / "plugins/codex-project-harness/templates"
+PLUGIN_ROOT = REPO_ROOT / "plugins/codex-project-harness"
+TEMPLATE_ROOT = PLUGIN_ROOT / "templates"
+DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
+APPROVED_TEMPLATES = set(DISTRIBUTION["templates"]["native_agents"])
 
 
 def run_harness(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -31,6 +34,7 @@ def run_harness(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 class NativeAgentsInstallTest(unittest.TestCase):
     def test_project_init_installs_exactly_three_native_templates(self) -> None:
+        self.assertEqual(len(APPROVED_TEMPLATES), 3)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             result = run_harness(root, "init")
@@ -88,7 +92,10 @@ class NativeAgentsInstallTest(unittest.TestCase):
             for path in (TEMPLATE_ROOT / "agents").glob("*.toml")
         }
 
-        self.assertEqual(set(templates), {"architect", "developer", "qa-reviewer"})
+        self.assertEqual(
+            set(templates),
+            {name.removesuffix(".toml") for name in APPROVED_TEMPLATES},
+        )
         for name, text in templates.items():
             self.assertIn("do not write kafa facts", text, name)
             self.assertIn("root controller", text, name)

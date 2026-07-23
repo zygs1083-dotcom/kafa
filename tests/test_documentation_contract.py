@@ -14,7 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 import run_agent_e2e_eval  # noqa: E402
+from harness_lib import load_distribution_manifest  # noqa: E402
+from kafa.evidence_summary import summary_detail_errors, validate_evidence_summary
 
+DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
 ACTIVE_GUIDANCE = [
     "README.md",
     "INSTALL.md",
@@ -25,24 +28,11 @@ ACTIVE_GUIDANCE = [
     "examples/full-project-flow.md",
     "examples/forward-tests.md",
     "plugins/codex-project-harness/docs/TRIGGER_MATRIX.md",
-    "plugins/codex-project-harness/skills/project-harness/SKILL.md",
-    "plugins/codex-project-harness/skills/minimal-safe-change/SKILL.md",
-    "plugins/codex-project-harness/skills/bug-fix-loop/SKILL.md",
-    "plugins/codex-project-harness/skills/test-first-delivery/SKILL.md",
-    "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md",
-    "plugins/codex-project-harness/skills/harness-audit/SKILL.md",
-    "plugins/codex-project-harness/skills/project-retrospective/SKILL.md",
+    *(
+        f"plugins/codex-project-harness/skills/{skill}/SKILL.md"
+        for skill in DISTRIBUTION["skills"]
+    ),
 ]
-
-RETAINED_SKILLS = {
-    "project-harness",
-    "minimal-safe-change",
-    "bug-fix-loop",
-    "test-first-delivery",
-    "independent-quality-gate",
-    "harness-audit",
-    "project-retrospective",
-}
 
 CANONICAL_KERNEL_SPEC = "openspec/specs/local-delivery-kernel/spec.md"
 HARDENING_ARCHIVE = (
@@ -52,6 +42,14 @@ HARDENING_ARCHIVE = (
 
 def shell_command(argv: list[str]) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def skill_eval_fixture_lines() -> list[str]:
+    path = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    begin = "<!-- BEGIN GENERATED: workflow-contract:skill-eval-transcript -->"
+    end = "<!-- END GENERATED: workflow-contract:skill-eval-transcript -->"
+    return lines[lines.index(begin) + 1 : lines.index(end)]
 
 RETIRED_COMMAND_FRAGMENTS = [
     " connector profile",
@@ -101,7 +99,9 @@ class DocumentationContractTest(unittest.TestCase):
             line.strip().lower()
             for line in normalized.splitlines()
             if "harness.py" in line.lower()
-            or line.strip().lower().startswith(("harness ", "$ harness"))
+            or line.strip().lower().startswith(
+                ("harness ", "$ harness", "kafa project ", "$ kafa project ")
+            )
         )
 
     def test_primary_docs_define_one_local_only_delivery_journey(self) -> None:
@@ -122,6 +122,27 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("verified code handoff", readme)
         self.assertIn("human-review-required", readme)
         self.assertIn("schema 31", readme)
+
+    def test_ordinary_project_docs_use_only_the_kafa_project_entrypoint(self) -> None:
+        guidance = "\n".join(
+            self.read(relative)
+            for relative in (
+                "README.md",
+                "INSTALL.md",
+                "QUICKSTART.md",
+                "examples/full-project-flow.md",
+                *(
+                    f"plugins/codex-project-harness/skills/{skill}/SKILL.md"
+                    for skill in DISTRIBUTION["skills"]
+                ),
+            )
+        )
+
+        self.assertNotIn("skills/project-harness/scripts/harness.py", guidance)
+        self.assertNotIn("scripts/harness.py --root", guidance)
+        self.assertNotIn("harness.py --root", guidance)
+        self.assertIn("kafa project init --repo", guidance)
+        self.assertIn("kafa project validate --repo", guidance)
 
     def test_canonical_path_safety_and_remediation_are_documented(self) -> None:
         guidance = self.read("README.md") + "\n" + self.read("INSTALL.md")
@@ -162,9 +183,10 @@ class DocumentationContractTest(unittest.TestCase):
             "`project-runtime`",
             "`requirement-baseline`",
             "`team-architecture`",
-            "`delivery-readiness`",
         ]:
             self.assertNotIn(retired_skill, guidance, retired_skill)
+        # delivery-readiness remains a workflow stage ID, not a retained Skill.
+        self.assertFalse((PLUGIN_ROOT / "skills" / "delivery-readiness").exists())
 
     def test_current_guidance_uses_immutable_controller_verification(self) -> None:
         for relative in [
@@ -183,10 +205,16 @@ class DocumentationContractTest(unittest.TestCase):
             "plugins/codex-project-harness/skills/independent-quality-gate/SKILL.md"
         )
         self.assertIn("test-target", quality)
-        self.assertIn("verify run", quality)
+        self.assertIn("kafa project verify --repo . run", quality)
         self.assertIn("human-review-required", quality)
 
     def test_schema31_provenance_and_legal_manual_journey_are_documented(self) -> None:
+        contract = json.loads(
+            (PLUGIN_ROOT / "references/workflow-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        commands = contract["commands"]
         guidance = "\n".join(
             self.read(relative)
             for relative in (
@@ -211,38 +239,42 @@ class DocumentationContractTest(unittest.TestCase):
             self.assertIn(marker, guidance, marker)
 
         flow = self.read("examples/full-project-flow.md")
-        for command in (
-            "baseline confirm",
-            "test-target qualify",
-            "--qualification",
-            "delivery ready",
+        for command_key in (
+            "delivery-plan",
+            "baseline-confirmation",
+            "verified-patch",
+            "quality-gate",
+            "delivery-readiness",
+            "delivery-record",
+            "delivery-validation",
         ):
-            self.assertIn(command, flow, command)
+            self.assertIn(commands[command_key], flow, command_key)
         self.assertNotIn("harness baseline freeze", flow)
         self.assertIn("schema 31", flow)
 
         quickstart = self.read("QUICKSTART.md")
         self.assertLess(
-            quickstart.index("task accept T1"),
-            quickstart.index("gate record"),
+            quickstart.index(commands["task-accept"]),
+            quickstart.index(commands["quality-gate"]),
             "task acceptance must precede the revision-bound gate",
         )
 
         eval_prompts = self.read("docs/runtime/fresh-skill-eval-prompts.md")
-        for command in (
-            "baseline confirm",
-            "test-target add/link/qualify",
-            "delivery ready",
+        for command_key in (
+            "delivery-plan",
+            "baseline-confirmation",
+            "verified-patch",
+            "delivery-readiness",
         ):
-            self.assertIn(command, eval_prompts, command)
+            self.assertIn(commands[command_key], eval_prompts, command_key)
         self.assertNotIn("baseline freeze", eval_prompts)
         self.assertLess(
-            eval_prompts.index("task add/start/submit/accept"),
-            eval_prompts.index("gate record"),
+            eval_prompts.index(commands["task-accept"]),
+            eval_prompts.index(commands["quality-gate"]),
         )
         self.assertLess(
-            eval_prompts.index("delivery record"),
-            eval_prompts.index("validate --delivery"),
+            eval_prompts.index(commands["delivery-record"]),
+            eval_prompts.index(commands["delivery-validation"]),
         )
 
         commands = self.documented_commands()
@@ -286,11 +318,19 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("Native Host maps capability hints to actual models", reference)
         self.assertIn("Parallelism is a wall-clock optimization, not a token optimization", reference)
         self.assertIn("batch them into one producer", reference)
-        self.assertLessEqual(len(skill.encode("utf-8")), 12_800)
+        entry_skill_bytes = len(skill.encode("utf-8"))
+        required_default_reference_bytes = 0
+        triggered_matrix_bytes = len(reference.encode("utf-8"))
+        self.assertLessEqual(entry_skill_bytes, 12_800)
         self.assertLessEqual(
-            len(skill.encode("utf-8")) + len(reference.encode("utf-8")),
+            entry_skill_bytes + required_default_reference_bytes,
             16_000,
         )
+        self.assertLessEqual(
+            entry_skill_bytes + triggered_matrix_bytes,
+            16_000,
+        )
+        self.assertIn("Do not load the full matrix by default", skill)
         for routing_contract in [
             "Default one producer",
             "Use two or three only",
@@ -304,6 +344,27 @@ class DocumentationContractTest(unittest.TestCase):
         ]:
             self.assertIn(routing_contract, reference, routing_contract)
 
+    def test_advanced_skills_are_non_default_and_keep_triggered_evidence_obligations(self) -> None:
+        contract = json.loads(
+            (PLUGIN_ROOT / "references/workflow-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        triggers = {item["id"]: item for item in contract["advanced_triggers"]}
+        skills = {
+            "harness-audit": "plugins/codex-project-harness/skills/harness-audit/SKILL.md",
+            "project-retrospective": "plugins/codex-project-harness/skills/project-retrospective/SKILL.md",
+        }
+        for trigger_id, relative in skills.items():
+            with self.subTest(trigger_id=trigger_id):
+                text = self.read(relative)
+                trigger = triggers[trigger_id]
+                self.assertIn("## Trigger (Non-Default)", text)
+                self.assertIn(f"Trigger when: {trigger['when']}", text)
+                self.assertIn(f"Activates: {trigger['activates']}", text)
+                self.assertIn("blocked, skipped, not-run, or unavailable", text)
+                self.assertIn("fixture cannot substitute", text)
+
     def test_plugin_inventory_is_exact_and_documented(self) -> None:
         skills = {
             path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()
@@ -316,10 +377,10 @@ class DocumentationContractTest(unittest.TestCase):
             for path in (PLUGIN_ROOT / "templates" / "agents").glob("*.toml")
         }
 
-        self.assertEqual(skills, RETAINED_SKILLS)
-        self.assertEqual(set(hooks), {"SessionStart", "SubagentStart", "Stop"})
+        self.assertEqual(skills, set(DISTRIBUTION["skills"]))
+        self.assertEqual(set(hooks), set(DISTRIBUTION["hooks"]["events"]))
         self.assertEqual(
-            templates, {"architect.toml", "developer.toml", "qa-reviewer.toml"}
+            templates, set(DISTRIBUTION["templates"]["native_agents"])
         )
 
         install = self.read("INSTALL.md")
@@ -340,7 +401,45 @@ class DocumentationContractTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("local-only skill eval transcript passed", result.stdout)
+        self.assertIn("fixture-only local contract matched", result.stdout)
+        self.assertIn("not fresh Host evidence", result.stdout)
+
+    def test_skill_eval_covers_default_and_advanced_trigger_scenarios(self) -> None:
+        contract = json.loads(
+            (PLUGIN_ROOT / "references/workflow-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        prompts = self.read("docs/runtime/fresh-skill-eval-prompts.md")
+        fixture = self.read("docs/runtime/skill-eval-transcript-fixture.txt")
+
+        self.assertIn("## Advanced Trigger Scenarios", prompts)
+        self.assertIn("Small single-producer work", prompts)
+        self.assertIn("source: fixture-only", fixture)
+        self.assertIn(
+            "scenario-verdict: id=small-single-producer; selected=none; result=pass",
+            fixture,
+        )
+        for trigger in contract["advanced_triggers"]:
+            with self.subTest(trigger=trigger["id"]):
+                self.assertIn(f"`{trigger['id']}`", prompts)
+                self.assertIn(trigger["when"], prompts)
+                self.assertIn(trigger["activates"], prompts)
+                self.assertIn(
+                    "scenario-verdict: "
+                    f"id={trigger['id']}; selected={trigger['id']}; result=pass; "
+                    f"when={trigger['when']}; activates={trigger['activates']}",
+                    fixture,
+                )
+        for scenario_marker in (
+            "parallel",
+            "shared-file",
+            "repeated escapes",
+            "schema or runtime change",
+            "milestone review",
+            "release surface",
+        ):
+            self.assertIn(scenario_marker, prompts.lower(), scenario_marker)
 
     def test_skill_eval_help_does_not_execute_the_fixture(self) -> None:
         result = subprocess.run(
@@ -360,8 +459,18 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertNotIn("transcript passed", result.stdout.lower())
 
     def test_skill_eval_rejects_failed_host_command_even_with_all_markers(self) -> None:
-        fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
         with tempfile.TemporaryDirectory() as temp:
+            transcript = Path(temp) / "host transcript.txt"
+            transcript.write_text(
+                "\n".join(
+                    "source: host-evaluated"
+                    if line == "source: fixture-only"
+                    else line
+                    for line in skill_eval_fixture_lines()
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             producer = Path(temp) / "marker producer.py"
             producer.write_text(
                 "from pathlib import Path\n"
@@ -372,7 +481,7 @@ class DocumentationContractTest(unittest.TestCase):
             )
             env = os.environ.copy()
             env["CODEX_EVAL_CMD"] = shell_command(
-                [sys.executable, str(producer), str(fixture), "7"]
+                [sys.executable, str(producer), str(transcript), "7"]
             )
             result = subprocess.run(
                 [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
@@ -389,11 +498,13 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertNotIn("missing skill eval marker", result.stdout.lower())
 
     def test_skill_eval_rejects_reversed_workflow_markers(self) -> None:
-        fixture = REPO_ROOT / "docs/runtime/skill-eval-transcript-fixture.txt"
         with tempfile.TemporaryDirectory() as temp:
             reversed_transcript = Path(temp) / "reversed transcript.txt"
+            fixture_lines = skill_eval_fixture_lines()
             reversed_transcript.write_text(
-                "\n".join(reversed(fixture.read_text(encoding="utf-8").splitlines())) + "\n",
+                "source: host-evaluated\n"
+                + "\n".join(reversed(fixture_lines[1:]))
+                + "\n",
                 encoding="utf-8",
             )
             producer = Path(temp) / "marker producer.py"
@@ -423,6 +534,83 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("out-of-order skill eval marker", result.stdout.lower())
         self.assertNotIn("host skill eval command failed", result.stdout.lower())
         self.assertNotIn("missing skill eval marker", result.stdout.lower())
+
+    def test_skill_eval_rejects_missing_advanced_scenario_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            transcript = Path(temp) / "missing scenario.txt"
+            transcript.write_text(
+                "\n".join(
+                    "source: host-evaluated"
+                    if line == "source: fixture-only"
+                    else line
+                    for line in skill_eval_fixture_lines()
+                    if not line.startswith("scenario-verdict: id=deep-kernel-review;")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            producer = Path(temp) / "marker producer.py"
+            producer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "print(Path(sys.argv[1]).read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["CODEX_EVAL_CMD"] = shell_command(
+                [sys.executable, str(producer), str(transcript)]
+            )
+            result = subprocess.run(
+                [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing skill eval marker", result.stdout.lower())
+        self.assertIn("deep-kernel-review", result.stdout)
+
+    def test_skill_eval_rejects_contradictory_or_extra_host_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            transcript = Path(temp) / "contradictory transcript.txt"
+            text = "\n".join(
+                "source: host-evaluated"
+                if line == "source: fixture-only"
+                else line
+                for line in skill_eval_fixture_lines()
+            )
+            transcript.write_text(
+                text
+                + "\n"
+                + "contradiction: delegate schema/runtime/gate work to a fast producer\n",
+                encoding="utf-8",
+            )
+            producer = Path(temp) / "marker producer.py"
+            producer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "print(Path(sys.argv[1]).read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["CODEX_EVAL_CMD"] = shell_command(
+                [sys.executable, str(producer), str(transcript)]
+            )
+            result = subprocess.run(
+                [sys.executable, str(PLUGIN_ROOT / "scripts/run_skill_eval.py")],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected skill eval line", result.stdout.lower())
+        self.assertIn("contradiction", result.stdout.lower())
 
     def test_e2e_example_reports_only_current_local_scenarios(self) -> None:
         report = json.loads(
@@ -545,8 +733,25 @@ class DocumentationContractTest(unittest.TestCase):
     def test_persistent_native_host_evidence_is_compact_and_truthful(self) -> None:
         live = json.loads(self.read("docs/runtime/native-codex-live-eval.json"))
         parallel = json.loads(self.read("docs/runtime/native-codex-parallel-eval.json"))
+        live_summary = json.loads(self.read("docs/runtime/native-codex-live-summary.json"))
+        parallel_summary = json.loads(
+            self.read("docs/runtime/native-codex-parallel-summary.json")
+        )
 
-        for name, report in [("live", live), ("parallel", parallel)]:
+        for name, report, summary, detail_path in [
+            (
+                "live",
+                live,
+                live_summary,
+                REPO_ROOT / "docs/runtime/native-codex-live-eval.json",
+            ),
+            (
+                "parallel",
+                parallel,
+                parallel_summary,
+                REPO_ROOT / "docs/runtime/native-codex-parallel-eval.json",
+            ),
+        ]:
             self.assertEqual(report["live_status"], "passed", name)
             self.assertFalse(report["live_skipped"], name)
             self.assertGreater(report["token_count"], 0, name)
@@ -560,11 +765,20 @@ class DocumentationContractTest(unittest.TestCase):
             self.assertIsNone(report["estimated_cost"], name)
             self.assertEqual(len(report["evaluation_source"]["workspace_sha256"]), 64, name)
             self.assertIn("plugins/", report["evaluation_source"]["source_scope"], name)
+            self.assertEqual(validate_evidence_summary(summary), [], name)
             self.assertEqual(
-                run_agent_e2e_eval.persistent_report_consistency_errors(report),
+                summary_detail_errors(
+                    summary,
+                    detail_path,
+                    eligibility="historical-integrity",
+                    validator_repo=REPO_ROOT,
+                ),
                 [],
                 name,
             )
+            self.assertEqual(summary["status"], "passed", name)
+            self.assertEqual(summary["state"], "historical", name)
+            self.assertFalse(summary["source"]["clean"], name)
             self.assertEqual(
                 report["native_host"]["trust"],
                 "local-capability-only-not-delivery-provenance",
@@ -582,10 +796,12 @@ class DocumentationContractTest(unittest.TestCase):
                 self.assertNotIn(verbose, serialized, f"{name}: {verbose}")
 
         details = parallel["scenarios"][0]["details"]
-        current_source = run_agent_e2e_eval.evaluation_source_identity()
         for field in ["workspace_sha256", "source_scope"]:
-            self.assertEqual(live["evaluation_source"][field], current_source[field], field)
-            self.assertEqual(parallel["evaluation_source"][field], current_source[field], field)
+            self.assertEqual(
+                live["evaluation_source"][field],
+                parallel["evaluation_source"][field],
+                field,
+            )
         for field in [
             "git_head",
             "git_dirty",

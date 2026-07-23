@@ -250,6 +250,8 @@ def _qualified_validation_ids(
         """,
         (cycle_id, acceptance_id),
     ).fetchall()
+    if not rows:
+        return []
     eligible: list[str] = []
     candidate = candidate_override or current_candidate_sha(root)
     for validation in rows:

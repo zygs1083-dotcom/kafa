@@ -4,64 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = ROOT / "docs" / "runtime" / "skill-eval-transcript-fixture.txt"
-
-REQUIRED_MARKERS = [
-    "harness.py --root . init",
-    "harness.py --root . requirement link",
-    "harness.py --root . baseline confirm",
-    "harness.py --root . task add",
-    "harness.py --root . task start",
-    "harness.py --root . task submit",
-    "--context-id producer-context",
-    "harness.py --root . test-target add",
-    "--result-format pytest-json",
-    "--result-path .ai-team/results/unit.json",
-    "harness.py --root . test-target link",
-    "harness.py --root . test-target qualify",
-    "harness.py --root . verify run",
-    "harness.py --root . task accept",
-    "harness.py --root . gate record",
-    "--reviewer-context-id reviewer-context",
-    "--qualification Q1",
-    "harness.py --root . delivery ready",
-    "harness.py --root . delivery record",
-    "harness.py --root . validate --delivery",
-    "Native Codex/ChatGPT owns",
-    "human-review-required",
-]
-
-ORDERED_MARKERS = [
-    "Native Codex/ChatGPT owns",
-    "harness.py --root . init",
-    "harness.py --root . requirement link",
-    "harness.py --root . baseline confirm",
-    "harness.py --root . task add",
-    "harness.py --root . task start",
-    "harness.py --root . task submit",
-    "--context-id producer-context",
-    "harness.py --root . test-target add",
-    "--result-format pytest-json",
-    "--result-path .ai-team/results/unit.json",
-    "harness.py --root . test-target link",
-    "harness.py --root . test-target qualify",
-    "harness.py --root . verify run",
-    "harness.py --root . task accept",
-    "harness.py --root . gate record",
-    "--reviewer-context-id reviewer-context",
-    "--qualification Q1",
-    "harness.py --root . delivery ready",
-    "harness.py --root . delivery record",
-    "harness.py --root . validate --delivery",
-    "human-review-required",
-]
+CONTRACT = (
+    Path(__file__).resolve().parents[1] / "references" / "workflow-contract.json"
+)
 
 FORBIDDEN_MARKERS = [
     "harness.py --root . phase ",
@@ -73,12 +28,114 @@ FORBIDDEN_MARKERS = [
     "--reviewer-session-id",
     "--reviewer-attestation-id",
 ]
+EXPECTED_ADVANCED_TRIGGER_IDS = (
+    "parallel-delegation",
+    "deep-kernel-review",
+    "harness-audit",
+    "project-retrospective",
+    "live-host-compatibility",
+    "release-rehearsal",
+)
+FIXTURE_BEGIN = "<!-- BEGIN GENERATED: workflow-contract:skill-eval-transcript -->"
+FIXTURE_END = "<!-- END GENERATED: workflow-contract:skill-eval-transcript -->"
 
 
-def transcript_evidence() -> tuple[str, int, str]:
+def fixture_transcript() -> str:
+    text = FIXTURE.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if lines.count(FIXTURE_BEGIN) != 1 or lines.count(FIXTURE_END) != 1:
+        raise RuntimeError("skill eval fixture must contain one generated transcript block")
+    begin = lines.index(FIXTURE_BEGIN)
+    end = lines.index(FIXTURE_END)
+    if begin >= end:
+        raise RuntimeError("skill eval fixture transcript markers are out of order")
+    return "\n".join(lines[begin + 1 : end]) + "\n"
+
+
+def evaluation_markers() -> list[str]:
+    try:
+        contract: Any = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load workflow contract: {exc}") from exc
+    if not isinstance(contract, dict) or contract.get("contract_version") != 1:
+        raise RuntimeError("workflow contract must be a version-1 object")
+    commands = contract.get("commands")
+    dependencies = contract.get("dependencies")
+    advanced_triggers = contract.get("advanced_triggers")
+    labels = contract.get("output_labels")
+    if not isinstance(commands, dict) or not commands or not all(
+        isinstance(value, str) and value for value in commands.values()
+    ):
+        raise RuntimeError("workflow contract commands must be non-empty strings")
+    if not isinstance(dependencies, list) or not dependencies:
+        raise RuntimeError("workflow contract dependencies must be a non-empty list")
+    if not isinstance(advanced_triggers, list):
+        raise RuntimeError("workflow contract advanced_triggers must be a list")
+    trigger_ids = tuple(
+        trigger.get("id") if isinstance(trigger, dict) else None
+        for trigger in advanced_triggers
+    )
+    if trigger_ids != EXPECTED_ADVANCED_TRIGGER_IDS:
+        raise RuntimeError(
+            "workflow contract advanced trigger IDs mismatch: "
+            f"expected={list(EXPECTED_ADVANCED_TRIGGER_IDS)} actual={list(trigger_ids)}"
+        )
+    scenario_markers = [
+        "scenario-verdict: id=small-single-producer; selected=none; result=pass"
+    ]
+    for trigger in advanced_triggers:
+        if not isinstance(trigger, dict) or set(trigger) != {"id", "when", "activates"}:
+            raise RuntimeError(
+                "workflow advanced trigger requires only id, when, and activates"
+            )
+        if not all(
+            isinstance(trigger.get(field), str) and trigger[field].strip()
+            for field in ("id", "when", "activates")
+        ):
+            raise RuntimeError("workflow advanced trigger fields must be non-empty strings")
+        scenario_markers.append(
+            "scenario-verdict: "
+            f"id={trigger['id']}; selected={trigger['id']}; result=pass; "
+            f"when={trigger['when']}; activates={trigger['activates']}"
+        )
+    dependency_markers: list[str] = []
+    for dependency in dependencies:
+        if not isinstance(dependency, dict) or set(dependency) != {"before", "after"}:
+            raise RuntimeError("workflow dependency requires only before and after")
+        before = dependency.get("before")
+        after = dependency.get("after")
+        if not isinstance(before, str) or not isinstance(after, str):
+            raise RuntimeError("workflow dependency endpoints must be strings")
+        dependency_markers.append(f"dependency: {before} -> {after}")
+    if not isinstance(labels, dict) or not isinstance(
+        labels.get("human_review_required"), str
+    ):
+        raise RuntimeError("workflow contract is missing human_review_required label")
+    command_markers = [f"$ {command}" for command in commands.values()]
+    handoff = contract.get("handoff_obligations")
+    if not isinstance(handoff, list) or not handoff or not all(
+        isinstance(item, str) and item for item in handoff
+    ):
+        raise RuntimeError("workflow contract handoff_obligations must be non-empty strings")
+    return (
+        [
+            "evaluation: Kafa workflow contract",
+            "authority: OpenSpec -> Kafa SQLite -> evaluate_delivery_prerequisites",
+            "host: Native Codex/ChatGPT owns task/subagent/worktree/model/cancel/handoff",
+            "writer: root controller only",
+        ]
+        + scenario_markers
+        + dependency_markers
+        + command_markers
+        + [f"handoff: {item}" for item in handoff]
+        + [labels["human_review_required"]]
+    )
+
+
+def transcript_evidence() -> tuple[str, str, int, str]:
     command = os.environ.get("CODEX_EVAL_CMD", "").strip()
     if not command:
-        return FIXTURE.read_text(encoding="utf-8"), 0, "fixture"
+        return fixture_transcript(), "", 0, "fixture-only"
 
     try:
         with tempfile.TemporaryDirectory() as temp:
@@ -94,8 +151,8 @@ def transcript_evidence() -> tuple[str, int, str]:
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return stdout + "\n" + stderr, 124, "host-command"
-    return result.stdout + "\n" + result.stderr, result.returncode, "host-command"
+        return stdout, stderr, 124, "host-evaluated"
+    return result.stdout, result.stderr, result.returncode, "host-evaluated"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,36 +161,61 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.parse_args(argv)
 
-    text, command_returncode, source = transcript_evidence()
-    missing = [marker for marker in REQUIRED_MARKERS if marker not in text]
-    retired = [marker for marker in FORBIDDEN_MARKERS if marker in text]
-    positions = [(marker, text.find(marker)) for marker in ORDERED_MARKERS]
-    ordered_positions = [(marker, position) for marker, position in positions if position >= 0]
-    out_of_order = [
+    try:
+        required_markers = evaluation_markers()
+        stdout, stderr, command_returncode, source = transcript_evidence()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    expected = [f"source: {source}", *required_markers]
+    actual = stdout.splitlines()
+    while actual and not actual[-1]:
+        actual.pop()
+    missing = [line for line in expected if actual.count(line) < expected.count(line)]
+    unexpected = [line for line in actual if actual.count(line) > expected.count(line)]
+    retired = [
         marker
-        for index, (marker, position) in enumerate(ordered_positions)
-        if index and position < ordered_positions[index - 1][1]
+        for marker in FORBIDDEN_MARKERS
+        if marker in stdout or marker in stderr
     ]
+    out_of_order = not missing and not unexpected and actual != expected
     if command_returncode != 0:
         print(
             "ERROR: host skill eval command failed "
             f"(source={source}, returncode={command_returncode})"
         )
+    if stderr:
+        print("ERROR: host skill eval emitted stderr")
     if missing:
         for marker in missing:
             print(f"ERROR: missing skill eval marker: {marker}")
+    if unexpected:
+        for line in unexpected:
+            print(f"ERROR: unexpected skill eval line: {line}")
     if retired:
         for marker in retired:
             print(f"ERROR: retired skill eval marker present: {marker}")
     if out_of_order:
-        for marker in out_of_order:
-            print(f"ERROR: out-of-order skill eval marker: {marker}")
-    if command_returncode != 0 or missing or retired or out_of_order:
+        print("ERROR: out-of-order skill eval marker")
+    if (
+        command_returncode != 0
+        or bool(stderr)
+        or missing
+        or unexpected
+        or retired
+        or out_of_order
+    ):
         return 1
-    print(
-        "OK: local-only skill eval transcript passed "
-        f"({len(REQUIRED_MARKERS)} required markers)"
-    )
+    if source == "fixture-only":
+        print(
+            "OK: fixture-only local contract matched "
+            f"({len(required_markers)} required markers); not fresh Host evidence"
+        )
+    else:
+        print(
+            "OK: host-evaluated local contract matched "
+            f"({len(required_markers)} required markers)"
+        )
     return 0
 
 

@@ -14,7 +14,7 @@ business-project runtime is local-only and uses schema 30.
 | Native Codex/ChatGPT host | Own visible tasks, threads, subagents, worktrees, approval, model, cancellation, steering, and handoff. | Kafa does not implement a second lifecycle or treat self-reported host identifiers as trust anchors. |
 | Hooks advisory layer | Read local status, inject role boundaries, and warn at Stop. | Hooks are warn-only, skip uninitialized projects, and never write delivery-eligible facts. |
 | Local delivery runtime | Store current-cycle facts in SQLite, run controller verification, record review findings, and make the delivery decision. | This is the only layer that can determine Kafa handoff readiness. Generated Markdown is read-only projection output. |
-| Release evaluation | Test the Kafa distribution, migrations, negative gates, and real native-host compatibility. | A Kafa release evaluation does not prove that an arbitrary project candidate passed its own acceptance criteria. |
+| Release evaluation | Test the Kafa distribution, migrations, negative gates, and change-scoped real native-host compatibility. | Deterministic gates always run; unknown scope is blocking; stable summaries cannot replace retained detail or prove an arbitrary project candidate. |
 
 ## Responsibility Split
 

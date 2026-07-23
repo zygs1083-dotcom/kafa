@@ -9,6 +9,175 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      native_requirement: ${{ steps.classify.outputs.native_requirement }}
+      deterministic_gates_required: ${{ steps.classify.outputs.deterministic_gates_required }}
+      change_scopes: ${{ steps.classify.outputs.change_scopes }}
+      decision_sha256: ${{ steps.classify.outputs.decision_sha256 }}
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch published release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases="$RUNNER_TEMP/kafa-published-releases.json"
+          if ! curl --fail --location --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$releases" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100"; then
+            printf '[]\n' > "$releases"
+          fi
+
+      - name: Classify immutable release comparison
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_oid="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          base_oid="$(python -I -S - "$head_oid" "$RUNNER_TEMP/kafa-published-releases.json" <<'PY'
+          import json
+          import subprocess
+          import sys
+          from datetime import datetime
+          from pathlib import Path
+
+          head_oid, releases_path = sys.argv[1:]
+          try:
+              releases = json.loads(Path(releases_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              releases = []
+          candidates = []
+          if isinstance(releases, list):
+              for release in releases:
+                  if not isinstance(release, dict) or release.get("draft") is not False:
+                      continue
+                  tag = release.get("tag_name")
+                  published_at = release.get("published_at")
+                  if not isinstance(tag, str) or not tag or not isinstance(published_at, str):
+                      continue
+                  try:
+                      published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                      if published.tzinfo is None:
+                          continue
+                      base = subprocess.run(
+                          ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                      ).stdout.strip()
+                      if base == head_oid:
+                          continue
+                      subprocess.run(
+                          ["git", "merge-base", "--is-ancestor", base, head_oid],
+                          check=True,
+                          capture_output=True,
+                      )
+                  except (OSError, ValueError, subprocess.SubprocessError):
+                      continue
+                  candidates.append((published, tag, base))
+          candidates.sort(reverse=True)
+          print(candidates[0][2] if candidates else "0" * 40)
+          PY
+          )"
+          raw_paths="$RUNNER_TEMP/kafa-change-paths.bin"
+          if [[ "$base_oid" == "$(printf '0%.0s' {1..40})" ]]; then
+            : > "$raw_paths"
+          else
+            git diff --no-ext-diff --no-textconv --no-renames --name-only -z \
+              --diff-filter=ACDMRTUXB "$base_oid" "$head_oid" -- > "$raw_paths"
+          fi
+          python -I -S kafa/change_scope.py \
+            --repo . \
+            --base-oid "$base_oid" \
+            --head-oid "$head_oid" \
+            > "$RUNNER_TEMP/kafa-change-scope.json"
+          python -I -S - "$base_oid" "$head_oid" "$raw_paths" <<'PY'
+          import json
+          import os
+          import sys
+          import hashlib
+          from pathlib import Path
+
+          sys.path.insert(0, os.getcwd())
+          from kafa.change_scope import (
+              BLOCKING_NATIVE_PROFILES,
+              changed_paths_sha256,
+              validate_decision_report,
+          )
+
+          base_oid, head_oid, raw_path = sys.argv[1:]
+          raw = Path(raw_path).read_bytes()
+          if raw and not raw.endswith(b"\0"):
+              raise SystemExit("independent Git path inventory is not NUL terminated")
+          changed_paths = (
+              [part.decode("utf-8", errors="strict") for part in raw[:-1].split(b"\0")]
+              if raw
+              else []
+          )
+          report_path = Path(os.environ["RUNNER_TEMP"]) / "kafa-change-scope.json"
+          report_bytes = report_path.read_bytes()
+          report = json.loads(report_bytes.decode("utf-8"))
+          errors = validate_decision_report(
+              report,
+              expected_base_oid=base_oid,
+              expected_head_oid=head_oid,
+              expected_changed_paths=changed_paths,
+          )
+          if errors:
+              raise SystemExit("invalid change-scope report: " + "; ".join(errors))
+          if report.get("changed_paths_sha256") != changed_paths_sha256(changed_paths):
+              raise SystemExit("change-scope path-set digest does not match the independent Git diff")
+          requirement = report.get("native_requirement")
+          if requirement not in {"blocking", "advisory"}:
+              raise SystemExit("invalid Native requirement in change-scope report")
+          if report.get("deterministic_gates_required") is not True:
+              raise SystemExit("change-scope report attempted to disable deterministic gates")
+          self_guard = {
+              ".github/workflows/release.yml",
+              "kafa/__init__.py",
+              "kafa/change_scope.py",
+          }
+          if base_oid == "0" * 40 or self_guard.intersection(changed_paths):
+              requirement = "blocking"
+          if requirement == "blocking":
+              required_profiles = tuple(report.get("required_profiles", ()))
+              if required_profiles != BLOCKING_NATIVE_PROFILES:
+                  raise SystemExit("blocking change scope omitted a required Native profile")
+          elif report.get("required_profiles") != []:
+              raise SystemExit("advisory change scope unexpectedly requires Native profiles")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="\n") as handle:
+              handle.write(f"native_requirement={requirement}\n")
+              handle.write("deterministic_gates_required=true\n")
+              handle.write(f"change_scopes={','.join(report['scopes'])}\n")
+              handle.write(f"decision_sha256={hashlib.sha256(report_bytes).hexdigest()}\n")
+          evidence_state = "blocking / required" if requirement == "blocking" else "advisory / not-run"
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8", newline="\n") as handle:
+              handle.write(f"Real Native evidence: {evidence_state}\n")
+          PY
+
+      - name: Preserve change-scope decision
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafa-change-scope-${{ github.sha }}
+          path: ${{ runner.temp }}/kafa-change-scope.json
+          if-no-files-found: error
+          retention-days: 30
+
   verify:
     strategy:
       fail-fast: false
@@ -81,6 +250,12 @@ jobs:
 
   real_host_compatibility:
     name: Real Codex host compatibility
+    needs: scope
+    if: needs.scope.outputs.native_requirement == 'blocking'
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [live-codex, live-codex-parallel]
     runs-on: [self-hosted, kafa-codex-live]
     environment: codex-live-release
     timeout-minutes: 30
@@ -102,6 +277,12 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Download exact change-scope decision
+        uses: actions/download-artifact@v4
+        with:
+          name: kafa-change-scope-${{ github.sha }}
+          path: ${{ runner.temp }}/kafa-change-scope
+
       - name: Install pinned Codex CLI for the live profile
         run: |
           codex_version="$(python -c 'import json; print(json.load(open("release.json"))["codex_cli_smoke_version"])')"
@@ -114,25 +295,78 @@ jobs:
           codex --version
           codex login status
 
-      - name: Run real Codex host compatibility profile
+      - name: Run real Codex single profile
+        if: matrix.profile == 'live-codex'
         env:
           HARNESS_E2E_ENABLE_LIVE_CODEX: "1"
           HARNESS_E2E_LIVE_TIMEOUT: "900"
-        run: python plugins/codex-project-harness/scripts/run_agent_e2e_eval.py --mode live-codex --out "$RUNNER_TEMP/kafa-live-codex-report.json"
+        run: >-
+          python plugins/codex-project-harness/scripts/run_agent_e2e_eval.py
+          --mode live-codex
+          --out "$RUNNER_TEMP/kafa-live-codex-diagnostic.json"
+          --evidence-out "$RUNNER_TEMP/kafa-live-codex-report.json"
+
+      - name: Run real Codex parallel profile
+        if: matrix.profile == 'live-codex-parallel'
+        env:
+          HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL: "1"
+          HARNESS_E2E_LIVE_TIMEOUT: "900"
+        run: >-
+          python plugins/codex-project-harness/scripts/run_agent_e2e_eval.py
+          --mode live-codex-parallel
+          --out "$RUNNER_TEMP/kafa-live-codex-parallel-diagnostic.json"
+          --evidence-out "$RUNNER_TEMP/kafa-live-codex-parallel-report.json"
+
+      - name: Create stable evidence summary
+        if: always()
+        run: |
+          python -m kafa.evidence_summary native \
+            --detail "$RUNNER_TEMP/kafa-${{ matrix.profile }}-report.json" \
+            --out "$RUNNER_TEMP/kafa-${{ matrix.profile }}-summary.json" \
+            --change-scope-report "$RUNNER_TEMP/kafa-change-scope/kafa-change-scope.json" \
+            --expected-decision-sha256 "${{ needs.scope.outputs.decision_sha256 }}" \
+            --eligibility current-eligible \
+            --validator-repo "$GITHUB_WORKSPACE" \
+            --retention-class ci-artifact \
+            --retention-locator "real-codex-host-compatibility-${{ matrix.profile }}" \
+            --retention-days 30
+          python -m kafa.evidence_summary verify \
+            --summary "$RUNNER_TEMP/kafa-${{ matrix.profile }}-summary.json" \
+            --detail "$RUNNER_TEMP/kafa-${{ matrix.profile }}-report.json" \
+            --change-scope-report "$RUNNER_TEMP/kafa-change-scope/kafa-change-scope.json" \
+            --expected-decision-sha256 "${{ needs.scope.outputs.decision_sha256 }}" \
+            --eligibility current-eligible \
+            --validator-repo "$GITHUB_WORKSPACE"
+          {
+            echo '### Stable Native evidence summary'
+            echo '```json'
+            cat "$RUNNER_TEMP/kafa-${{ matrix.profile }}-summary.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve real-host compatibility evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: real-codex-host-compatibility
-          path: ${{ runner.temp }}/kafa-live-codex-report.json
+          name: real-codex-host-compatibility-${{ matrix.profile }}
+          path: |
+            ${{ runner.temp }}/kafa-${{ matrix.profile }}-report.json
+            ${{ runner.temp }}/kafa-${{ matrix.profile }}-summary.json
+            ${{ runner.temp }}/kafa-${{ matrix.profile }}-diagnostic.json
           if-no-files-found: error
           retention-days: 30
 
   candidate:
     needs:
+      - scope
       - verify
       - real_host_compatibility
+    if: >-
+      always() &&
+      needs.scope.result == 'success' &&
+      needs.verify.result == 'success' &&
+      (needs.scope.outputs.native_requirement == 'advisory' ||
+       needs.real_host_compatibility.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read

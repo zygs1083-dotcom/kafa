@@ -24,13 +24,7 @@ for path in [PLUGIN_ROOT, SCRIPTS]:
 import harness  # noqa: E402
 import harness_db  # noqa: E402
 from core import KERNEL_VERSION, RUNTIME_VERSION, SCHEMA_VERSION  # noqa: E402
-from validate_structure import (  # noqa: E402
-    REQUIRED_CORE,
-    REQUIRED_HOOKS,
-    REQUIRED_SCHEMAS,
-    REQUIRED_SCRIPTS,
-    REQUIRED_SKILLS,
-)
+from harness_lib import load_distribution_manifest  # noqa: E402
 
 
 EXPECTED_TABLES = {
@@ -98,8 +92,10 @@ EXPECTED_CLI_SURFACE = {
     "projection",
     "projection.rebuild",
     "quickstart",
+    "quickstart.delivery-plan",
     "quickstart.minimal",
     "quickstart.status",
+    "quickstart.verified-patch",
     "repair",
     "requirement",
     "requirement.add",
@@ -174,22 +170,54 @@ class FeatureFreezeTest(unittest.TestCase):
         self.assertEqual(tables, EXPECTED_TABLES)
 
     def test_feature_freeze_rejects_cli_surface_growth(self) -> None:
-        self.assertEqual(len(EXPECTED_CLI_SURFACE), 59)
+        self.assertEqual(len(EXPECTED_CLI_SURFACE), 61)
         self.assertEqual(_cli_surface(harness.build_parser()), EXPECTED_CLI_SURFACE)
 
     def test_feature_freeze_protects_public_files(self) -> None:
+        distribution = load_distribution_manifest(PLUGIN_ROOT)
         skill_dirs = {path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()}
         schema_files = {path.name for path in (PLUGIN_ROOT / "schemas").glob("*.json")}
         core_files = {path.name for path in (PLUGIN_ROOT / "core").glob("*.py")}
         script_files = {path.name for path in (PLUGIN_ROOT / "scripts").glob("*.py")}
         hook_files = {path.name for path in (PLUGIN_ROOT / "hooks").iterdir() if path.is_file()}
+        hook_events = set(
+            json.loads((PLUGIN_ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
+        )
+        agent_templates = {
+            path.name for path in (PLUGIN_ROOT / "templates/agents").iterdir()
+            if path.is_file()
+        }
+        project_templates = {
+            path.name for path in (PLUGIN_ROOT / "templates/project").iterdir()
+            if path.is_file()
+        }
+        references = {
+            path.name for path in (PLUGIN_ROOT / "references").iterdir()
+            if path.is_file()
+        }
+        runtime_domains = {
+            value.split(".", 1)[0] for value in _cli_surface(harness.build_parser())
+        }
 
-        self.assertEqual(skill_dirs, set(REQUIRED_SKILLS))
-        self.assertEqual(schema_files, set(REQUIRED_SCHEMAS))
-        self.assertEqual(set(REQUIRED_CORE), {"__init__.py", "api.py"})
-        self.assertTrue(set(REQUIRED_CORE).issubset(core_files))
-        self.assertEqual(script_files, set(REQUIRED_SCRIPTS))
-        self.assertEqual(hook_files, set(REQUIRED_HOOKS))
+        self.assertEqual(skill_dirs, set(distribution["skills"]))
+        self.assertEqual(schema_files, set(distribution["schemas"]))
+        self.assertEqual(core_files, set(distribution["core"]))
+        self.assertEqual(script_files, set(distribution["scripts"]))
+        self.assertEqual(hook_files, set(distribution["hooks"]["files"]))
+        self.assertEqual(hook_events, set(distribution["hooks"]["events"]))
+        self.assertEqual(
+            agent_templates, set(distribution["templates"]["native_agents"])
+        )
+        self.assertEqual(
+            project_templates,
+            set(distribution["templates"]["project_support"]),
+        )
+        self.assertEqual(references, set(distribution["references"]))
+        self.assertEqual(runtime_domains, set(distribution["public_runtime_domains"]))
+        self.assertEqual(len(distribution["skills"]), 7)
+        self.assertEqual(len(distribution["hooks"]["events"]), 3)
+        self.assertEqual(len(distribution["templates"]["native_agents"]), 3)
+        self.assertEqual(len(distribution["schemas"]), 18)
 
     def test_validate_structure_rejects_extra_schema_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -198,7 +226,7 @@ class FeatureFreezeTest(unittest.TestCase):
             result = self.run_structure(plugin_copy)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unexpected schema file", result.stdout)
+        self.assertIn("schema inventory mismatch", result.stdout)
 
     def test_validate_structure_rejects_extra_hook_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -207,9 +235,9 @@ class FeatureFreezeTest(unittest.TestCase):
             result = self.run_structure(plugin_copy)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unexpected hook file", result.stdout)
+        self.assertIn("hook file inventory mismatch", result.stdout)
 
-    def test_internal_core_modules_are_not_frozen_by_filename(self) -> None:
+    def test_manifest_rejects_undeclared_internal_core_module(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             plugin_copy = copy_source_layout(Path(temp))
             (plugin_copy / "core" / "internal_delivery_module.py").write_text(
@@ -220,8 +248,10 @@ class FeatureFreezeTest(unittest.TestCase):
 
             structure_ok, structure_details = static_plugin_structure(plugin_copy)
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(structure_ok, structure_details)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("core inventory mismatch", result.stdout)
+        self.assertFalse(structure_ok)
+        self.assertIn("core inventory mismatch", structure_details)
 
     def test_validate_structure_rejects_a_missing_imported_core_module(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

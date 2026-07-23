@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
+import os
+import sqlite3
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 from harness_lib import ensure_parent, markdown_row, write_state
 from .errors import HarnessError
-from .project_fs import ProjectFS
+from .project_fs import ProjectFS, pin_project_filesystem
 from .schema_guard import (
     ACCEPTANCE_STATUSES,
     FAILURE_MODE_STATUSES,
@@ -22,6 +28,25 @@ def _runtime():
     return harness_db
 
 
+_ACTIVE_PROJECTION_CONNECTION: ContextVar[
+    tuple[Path, sqlite3.Connection] | None
+] = ContextVar("active_projection_connection", default=None)
+
+
+@contextmanager
+def _projection_connection(root: Path) -> Iterator[sqlite3.Connection]:
+    """Reuse one verified read connection across a multi-view publication."""
+
+    normalized_root = Path(os.path.abspath(root))
+    active = _ACTIVE_PROJECTION_CONNECTION.get()
+    if active is not None and active[0] == normalized_root:
+        yield active[1]
+        return
+    runtime = _runtime()
+    with runtime.connection(root) as conn:
+        yield conn
+
+
 def render_all(
     root: Path,
     *,
@@ -29,6 +54,9 @@ def render_all(
     failure_mode_candidate: str | None = None,
     trace_evidence_root: Path | None = None,
     trace_candidate: str | None = None,
+    delivery_evidence_root: Path | None = None,
+    delivery_git_root: Path | None = None,
+    delivery_candidate: str | None = None,
 ) -> None:
     render_affected(
         root,
@@ -37,12 +65,15 @@ def render_all(
         failure_mode_candidate=failure_mode_candidate,
         trace_evidence_root=trace_evidence_root,
         trace_candidate=trace_candidate,
+        delivery_evidence_root=delivery_evidence_root,
+        delivery_git_root=delivery_git_root,
+        delivery_candidate=delivery_candidate,
     )
 
 
 def render_project_state(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         row = runtime.project_row(conn)
     write_state(
         root,
@@ -82,7 +113,7 @@ def _remove_retired_projection(root: Path, relative: Path) -> None:
 
 def render_requirements(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from requirements where cycle_id = ? order by id", (cycle_id,)).fetchall()
     lines = ["# Requirements", "", "| ID | Kind | Body | Priority | Status | Revision |", "| --- | --- | --- | --- | --- | --- |"]
@@ -101,7 +132,8 @@ def render_traceability(
         root,
         ".ai-team/requirements/traceability.md",
         "\n".join(
-            runtime.trace_show(
+            _traceability_lines(
+                runtime,
                 root,
                 evidence_root=evidence_root,
                 candidate_override=candidate_override,
@@ -110,9 +142,25 @@ def render_traceability(
     )
 
 
+def _traceability_lines(
+    runtime: object,
+    root: Path,
+    *,
+    evidence_root: Path | None,
+    candidate_override: str | None,
+) -> list[str]:
+    with _projection_connection(root) as conn:
+        return runtime._trace_show_conn(  # type: ignore[attr-defined]
+            conn,
+            root,
+            evidence_root=evidence_root,
+            candidate_override=candidate_override,
+        )
+
+
 def render_acceptance(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from acceptance where cycle_id = ? order by id", (cycle_id,)).fetchall()
     lines = ["# Acceptance Criteria", "", "| ID | Criterion | Priority | Status |", "| --- | --- | --- | --- |"]
@@ -140,7 +188,7 @@ def render_failure_modes(
     from .cycle_ledger import current_candidate_sha
     from .delivery import qualified_validation_execution_issues
 
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from failure_modes where cycle_id = ? order by id", (cycle_id,)).fetchall()
         mappings = {
@@ -170,10 +218,31 @@ def render_failure_modes(
             }
         else:
             evidence_authority = evidence_root or root
-            candidate = candidate_override or current_candidate_sha(
-                evidence_authority
-            )
             covered = set()
+            has_coverage_candidates = conn.execute(
+                """
+                select 1
+                from validation_failure_modes vfm
+                join failure_modes fm
+                  on fm.cycle_id = vfm.cycle_id and fm.id = vfm.failure_mode_id
+                join validations v on v.id = vfm.validation_id
+                join failure_mode_acceptance fma
+                  on fma.cycle_id = vfm.cycle_id
+                 and fma.failure_mode_id = vfm.failure_mode_id
+                 and fma.acceptance_id = v.acceptance_id
+                where vfm.cycle_id = ? and v.cycle_id = vfm.cycle_id
+                  and v.result = 'pass'
+                  and v.validation_status = 'active'
+                  and v.qualification_id is not null
+                limit 1
+                """,
+                (cycle_id,),
+            ).fetchone()
+            candidate = ""
+            if has_coverage_candidates is not None:
+                candidate = candidate_override or current_candidate_sha(
+                    evidence_authority
+                )
             coverage_candidates = conn.execute(
                 """
                 select vfm.failure_mode_id, fm.risk, v.*
@@ -192,7 +261,7 @@ def render_failure_modes(
                 order by vfm.failure_mode_id, v.created_at desc, v.id desc
                 """,
                 (cycle_id, candidate),
-            ).fetchall()
+            ).fetchall() if has_coverage_candidates is not None else []
             for validation in coverage_candidates:
                 qualification = conn.execute(
                     "select * from acceptance_target_qualifications where id = ?",
@@ -239,7 +308,7 @@ def render_failure_modes(
 
 def render_tasks(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from tasks where cycle_id = ? order by id", (cycle_id,)).fetchall()
         acceptance = runtime.grouped(conn, "task_acceptance", "task_id", "acceptance_id", cycle_id)
@@ -266,7 +335,7 @@ def render_tasks(root: Path) -> None:
     write_view(root, ".ai-team/planning/task-board.md", "\n".join(lines))
 def render_test_targets(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         targets = conn.execute("select * from test_targets order by id").fetchall()
         has_qualifications = conn.execute(
             "select 1 from sqlite_master where type='table' "
@@ -390,7 +459,7 @@ def render_test_targets(root: Path) -> None:
 
 def render_validation(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from validations where cycle_id = ? order by created_at, id", (cycle_id,)).fetchall()
         failure_modes = runtime.grouped(conn, "validation_failure_modes", "validation_id", "failure_mode_id", cycle_id)
@@ -447,7 +516,7 @@ def render_validation(root: Path) -> None:
 
 def render_executions(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         rows = conn.execute("select * from executions order by created_at, id").fetchall()
         project = conn.execute(
             "select schema_version from project where id = 1"
@@ -508,7 +577,7 @@ def render_executions(root: Path) -> None:
 
 def render_findings(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         rows = conn.execute("select * from findings order by created_at, id").fetchall()
     lines = ["# Findings", "", "| ID | Cycle | Candidate | Surface | Severity | Status | Summary | Accepted By | Reason | Scope | Revision | Expires | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     lines.extend(markdown_row([row["id"], row["cycle_id"], row["candidate_sha"], row["surface"], row["severity"], row["status"], row["summary"], row["waived_by"], row["waiver_reason"], row["waiver_scope"], row["waived_revision"] or "", row["waiver_expires_at"], row["created_at"]]) for row in rows)
@@ -517,7 +586,7 @@ def render_findings(root: Path) -> None:
 
 def render_gates(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         cycle_id = runtime.current_cycle_id(conn)
         rows = conn.execute("select * from quality_gates where cycle_id = ? order by sequence", (cycle_id,)).fetchall()
     lines = ["# Quality Gates", "", "| Gate | Candidate | Producer Context | Reviewer Context | Review Status | Result | Blocking Findings | Residual Risk | Revision | Created At |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
@@ -525,52 +594,349 @@ def render_gates(root: Path) -> None:
     write_view(root, "docs/harness/quality-gates.md", "\n".join(lines))
 
 
-def render_deliveries(root: Path) -> None:
-    runtime = _runtime()
-    with runtime.connection(root) as conn:
-        cycle_id = runtime.current_cycle_id(conn)
-        rows = conn.execute("select * from deliveries where cycle_id = ? order by created_at, id", (cycle_id,)).fetchall()
+def _safe_markdown_cell(value: object) -> str:
+    return (
+        html.escape(str(value), quote=False)
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def _safe_markdown_row(values: Iterable[object]) -> str:
+    return markdown_row([_safe_markdown_cell(value) for value in values])
+
+
+def _quoted_human_text(value: object) -> list[str]:
+    """Render arbitrary human prose without allowing Markdown structure injection."""
+
+    normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        normalized = "(none recorded)"
+    return [
+        "> " + html.escape(line, quote=False) if line else ">"
+        for line in normalized.split("\n")
+    ]
+
+
+def _render_id_list(values: Iterable[str]) -> str:
+    normalized = tuple(values)
+    if not normalized:
+        return "none"
+    return ", ".join(
+        html.escape(json.dumps(value, ensure_ascii=False), quote=False)
+        for value in normalized
+    )
+
+
+def render_deliveries(
+    root: Path,
+    *,
+    evidence_root: Path | None = None,
+    git_root: Path | None = None,
+    candidate_override: str | None = None,
+) -> None:
+    with _projection_connection(root) as conn:
+        rows = conn.execute(
+            "select * from deliveries order by created_at, id"
+        ).fetchall()
+        from .delivery import derive_delivery_narrative_facts
+
+        facts_by_id = {
+            str(row["id"]): derive_delivery_narrative_facts(
+                conn,
+                root,
+                str(row["id"]),
+                evidence_root=evidence_root,
+                git_root=git_root,
+                candidate_override=candidate_override,
+            )
+            for row in rows
+        }
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                facts_by_id[str(row["id"])].recorded_at,
+                str(row["id"]),
+            ),
+        )
     lines = ["# Delivery", ""]
     for row in rows:
+        facts = facts_by_id[str(row["id"])]
         lines.extend(
             [
-                f"## Delivery Record {row['created_at']}",
+                f"## Delivery Record {_safe_markdown_cell(facts.recorded_at)}",
                 "",
-                "### Decision Status",
-                row["decision_status"],
+                "### Authoritative Structured Facts",
+                f"- Delivery ID: {_render_id_list((facts.delivery_id,))}",
+                f"- Cycle ID: {_render_id_list((facts.cycle_id,))}",
+                f"- Cycle status / phase: {_safe_markdown_cell(facts.cycle_status)} / {_safe_markdown_cell(facts.cycle_phase)}",
+                f"- Candidate SHA: {_render_id_list((facts.candidate_sha,))}",
+                f"- Persisted decision status: {_safe_markdown_cell(facts.decision_status)}",
+                f"- Derived trust status: {_safe_markdown_cell(facts.trust_status)}",
+                f"- Requirement IDs: {_render_id_list(facts.requirement_ids)}",
+                f"- Acceptance IDs: {_render_id_list(facts.acceptance_ids)}",
+                f"- Task IDs: {_render_id_list(facts.task_ids)}",
+                f"- Qualification IDs: {_render_id_list(facts.qualification_ids)}",
+                f"- Target IDs: {_render_id_list(facts.target_ids)}",
+                f"- Execution IDs: {_render_id_list(facts.execution_ids)}",
+                f"- Validation IDs: {_render_id_list(facts.validation_ids)}",
+                f"- Ineligible execution-linked validation IDs: {_render_id_list(facts.ineligible_validation_ids)}",
+                f"- Gate IDs: {_render_id_list(facts.gate_ids)}",
                 "",
-                "### Scope",
-                row["scope"],
+                "### Requirement / Acceptance Relations",
+                "| Requirement ID | Acceptance ID |",
+                "| --- | --- |",
+            ]
+        )
+        if facts.requirement_acceptance_links:
+            lines.extend(
+                _safe_markdown_row(link)
+                for link in facts.requirement_acceptance_links
+            )
+        else:
+            lines.append("| none | none |")
+        lines.extend(
+            [
                 "",
-                "### Acceptance Mapping",
-                row["acceptance"],
+                "### Accepted Task Coverage",
+                "| Task ID | Acceptance ID |",
+                "| --- | --- |",
+            ]
+        )
+        if facts.task_acceptance_links:
+            lines.extend(
+                _safe_markdown_row(link) for link in facts.task_acceptance_links
+            )
+        else:
+            lines.append("| none | none |")
+        lines.extend(
+            [
                 "",
-                "### Changed Files",
-                row["changed_files"],
+                "### Qualified Validation And Execution Evidence",
+                "| Validation ID | Surface | Acceptance ID | Qualification ID | Execution IDs |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        if facts.validation_facts:
+            lines.extend(
+                _safe_markdown_row(
+                    (
+                        fact.id,
+                        fact.surface,
+                        fact.acceptance_id,
+                        fact.qualification_id,
+                        ", ".join(fact.execution_ids),
+                    )
+                )
+                for fact in facts.validation_facts
+            )
+        else:
+            lines.append("| none | none | none | none | none |")
+        lines.extend(
+            [
                 "",
-                "### Validation",
-                row["validation"],
+                "### Ineligible Execution-linked Validations",
+                "These records retain execution relations but are not eligible delivery evidence.",
                 "",
-                "### Independent QA",
-                row["qa"],
+                "| Validation ID | Surface | Result | Execution IDs | Eligibility Issues |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        if facts.ineligible_validation_facts:
+            lines.extend(
+                _safe_markdown_row(
+                    (
+                        fact.id,
+                        fact.surface,
+                        fact.result,
+                        ", ".join(fact.execution_ids),
+                        "; ".join(fact.eligibility_issues),
+                    )
+                )
+                for fact in facts.ineligible_validation_facts
+            )
+        else:
+            lines.append("| none | none | none | none | none |")
+        lines.extend(
+            [
+                "",
+                "### Judgment-only Validations",
+                "These records are judgments and are not execution evidence for delivery.",
+                "",
+                "| Validation ID | Surface | Result | Acceptance ID |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        if facts.judgment_validation_facts:
+            lines.extend(
+                _safe_markdown_row(
+                    (fact.id, fact.surface, fact.result, fact.acceptance_id)
+                )
+                for fact in facts.judgment_validation_facts
+            )
+        else:
+            lines.append("| none | none | none | none |")
+        lines.extend(
+            [
                 "",
                 "### Failure Mode Coverage",
-                row["failure_mode_coverage"],
+                "| Failure Mode ID | Risk | Status | Policy-eligible Coverage Validation IDs | Accepted By | Revision | Expires |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        if facts.failure_mode_facts:
+            lines.extend(
+                _safe_markdown_row(
+                    (
+                        fact.id,
+                        fact.risk,
+                        fact.status,
+                        ", ".join(fact.validation_ids) or "none",
+                        fact.accepted_by,
+                        fact.accepted_revision or "",
+                        fact.expires_at,
+                    )
+                )
+                for fact in facts.failure_mode_facts
+            )
+        else:
+            lines.append("| none | none | none | none | none | none | none |")
+        lines.extend(
+            [
                 "",
-                "### Quality Gate",
-                row["quality_gate"],
+                "### Findings",
+                "| Finding ID | Surface | Severity | Status | Accepted By | Revision | Expires |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        if facts.finding_facts:
+            lines.extend(
+                _safe_markdown_row(
+                    (
+                        fact.id,
+                        fact.surface,
+                        fact.severity,
+                        fact.status,
+                        fact.waived_by,
+                        fact.waived_revision or "",
+                        fact.waiver_expires_at,
+                    )
+                )
+                for fact in facts.finding_facts
+            )
+        else:
+            lines.append("| none | none | none | none | none | none | none |")
+        lines.extend(["", "### Gate Review"])
+        if facts.gate is None:
+            lines.append("- Gate: none")
+        else:
+            lines.extend(
+                [
+                    f"- Gate ID: {_render_id_list((facts.gate.id,))}",
+                    f"- Result: {_safe_markdown_cell(facts.gate.result)}",
+                    f"- Review status: {_safe_markdown_cell(facts.gate.review_status)}",
+                    f"- Producer context ID: {_render_id_list((facts.gate.producer_context_id,))}",
+                    f"- Reviewer context ID: {_render_id_list((facts.gate.reviewer_context_id,))}",
+                    f"- Reviewed revision: {facts.gate.reviewed_revision}",
+                    f"- Reviewed qualification IDs: {_render_id_list(facts.gate.qualification_ids)}",
+                    f"- Linked finding IDs: {_render_id_list(facts.gate.finding_ids)}",
+                ]
+            )
+        lines.extend(["", "### Changed Files"])
+        if facts.changed_files_status == "derived":
+            if facts.changed_files:
+                lines.extend(
+                    "- "
+                    + html.escape(
+                        json.dumps(path, ensure_ascii=False),
+                        quote=False,
+                    )
+                    for path in facts.changed_files
+                )
+            else:
+                lines.append("none (derived from an immutable comparable Git base)")
+        else:
+            lines.append("unknown/not derivable")
+        lines.extend(
+            [
                 "",
-                "### Data / Config Notes",
-                row["data_config_notes"],
+                "### Human Judgment / Exceptions",
+                "#### Scope / Rationale",
+                *_quoted_human_text(row["scope"]),
                 "",
-                "### Known Gaps",
-                row["known_gaps"],
+                "#### Recorded Residual Risk",
+                *_quoted_human_text(
+                    facts.gate.residual_risk if facts.gate is not None else ""
+                ),
                 "",
-                "### Handoff Notes",
-                row["handoff"],
+            ]
+        )
+        for failure_mode in facts.failure_mode_facts:
+            if failure_mode.status not in {"accepted", "exempt"}:
+                continue
+            lines.extend(
+                [
+                    f"#### Failure-mode Risk Decision {_safe_markdown_cell(failure_mode.id)}",
+                    f"Actor: {_safe_markdown_cell(failure_mode.accepted_by)}; revision: {failure_mode.accepted_revision or 'unknown'}; expires: {_safe_markdown_cell(failure_mode.expires_at or 'unknown')}",
+                    "",
+                    "Reason:",
+                    *_quoted_human_text(failure_mode.acceptance_reason),
+                    "",
+                    "Scope:",
+                    *_quoted_human_text(failure_mode.acceptance_scope),
+                    "",
+                ]
+            )
+        for finding in facts.finding_facts:
+            if finding.status != "accepted":
+                continue
+            lines.extend(
+                [
+                    f"#### Finding Risk Decision {_safe_markdown_cell(finding.id)}",
+                    f"Actor: {_safe_markdown_cell(finding.waived_by)}; revision: {finding.waived_revision or 'unknown'}; expires: {_safe_markdown_cell(finding.waiver_expires_at or 'unknown')}",
+                    "",
+                    "Reason:",
+                    *_quoted_human_text(finding.waiver_reason),
+                    "",
+                    "Scope:",
+                    *_quoted_human_text(finding.waiver_scope),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "#### Data / Config Notes",
+                *_quoted_human_text(row["data_config_notes"]),
+                "",
+                "#### Known Gaps",
+                *_quoted_human_text(row["known_gaps"]),
+                "",
+                "#### Handoff Notes",
+                *_quoted_human_text(row["handoff"]),
                 "",
                 "### Out Of Scope",
                 "Deployment, production release, infrastructure provisioning, production migrations, secret changes, and paid-resource creation.",
+                "",
+                "### Legacy / Supplemental Notes",
+                "These compatibility inputs are auditable but are not delivery authority.",
+                "",
+                "#### Acceptance Prose",
+                *_quoted_human_text(row["acceptance"]),
+                "",
+                "#### Changed-files Prose",
+                *_quoted_human_text(row["changed_files"]),
+                "",
+                "#### Validation Prose",
+                *_quoted_human_text(row["validation"]),
+                "",
+                "#### Independent-QA Prose",
+                *_quoted_human_text(row["qa"]),
+                "",
+                "#### Failure-mode-coverage Prose",
+                *_quoted_human_text(row["failure_mode_coverage"]),
+                "",
+                "#### Quality-gate Prose",
+                *_quoted_human_text(row["quality_gate"]),
                 "",
             ]
         )
@@ -579,7 +945,7 @@ def render_deliveries(root: Path) -> None:
 
 def render_decisions(root: Path) -> None:
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         rows = conn.execute("select * from decisions order by created_at, id").fetchall()
     lines = ["# Decision Log", "", "| Date | Decision | Reason |", "| --- | --- | --- |"]
     lines.extend(markdown_row([row["created_at"], row["decision"], row["reason"]]) for row in rows)
@@ -636,7 +1002,7 @@ def _preflight_projection_states(root: Path) -> None:
     """Reject non-canonical entity states before publishing any view bytes."""
 
     runtime = _runtime()
-    with runtime.connection(root) as conn:
+    with _projection_connection(root) as conn:
         project = conn.execute(
             "select schema_version from project where id = 1"
         ).fetchone()
@@ -671,6 +1037,9 @@ def render_affected(
     failure_mode_candidate: str | None = None,
     trace_evidence_root: Path | None = None,
     trace_candidate: str | None = None,
+    delivery_evidence_root: Path | None = None,
+    delivery_git_root: Path | None = None,
+    delivery_candidate: str | None = None,
 ) -> None:
     """Rebuild only explicitly affected generated views in stable order."""
 
@@ -678,24 +1047,44 @@ def render_affected(
     unknown = sorted(selected - set(PROJECTION_NAMES))
     if unknown:
         raise ValueError(f"unknown projection(s): {', '.join(unknown)}")
-    preflight_projection_paths(root)
-    _preflight_projection_states(root)
-    for name, renderer in PROJECTION_RENDERERS:
-        if name in selected:
-            if name == "failure-modes":
-                render_failure_modes(
-                    root,
-                    evidence_root=failure_mode_evidence_root,
-                    candidate_override=failure_mode_candidate,
+    # A multi-view publication is one filesystem operation.  Pinning the
+    # already-verified root lets every nested writer borrow the same authority
+    # instead of repeatedly reopening and re-resolving the project path.
+    with ProjectFS.open(root) as project_fs:
+        with pin_project_filesystem(project_fs):
+            preflight_projection_paths(root)
+            runtime = _runtime()
+            with runtime.connection(root) as conn:
+                token = _ACTIVE_PROJECTION_CONNECTION.set(
+                    (Path(os.path.abspath(root)), conn)
                 )
-            elif name == "traceability":
-                render_traceability(
-                    root,
-                    evidence_root=trace_evidence_root,
-                    candidate_override=trace_candidate,
-                )
-            else:
-                renderer(root)
+                try:
+                    _preflight_projection_states(root)
+                    for name, renderer in PROJECTION_RENDERERS:
+                        if name in selected:
+                            if name == "failure-modes":
+                                render_failure_modes(
+                                    root,
+                                    evidence_root=failure_mode_evidence_root,
+                                    candidate_override=failure_mode_candidate,
+                                )
+                            elif name == "traceability":
+                                render_traceability(
+                                    root,
+                                    evidence_root=trace_evidence_root,
+                                    candidate_override=trace_candidate,
+                                )
+                            elif name == "deliveries":
+                                render_deliveries(
+                                    root,
+                                    evidence_root=delivery_evidence_root,
+                                    git_root=delivery_git_root,
+                                    candidate_override=delivery_candidate,
+                                )
+                            else:
+                                renderer(root)
+                finally:
+                    _ACTIVE_PROJECTION_CONNECTION.reset(token)
 
 
 def _snapshot_projection_execution_artifacts(
@@ -805,6 +1194,11 @@ def projection_content_issues(root: Path) -> list[str]:
                         evidence_root if strict_coverage else None
                     ),
                     trace_candidate=candidate,
+                    delivery_evidence_root=(
+                        evidence_root if strict_coverage else None
+                    ),
+                    delivery_git_root=(root if strict_coverage else None),
+                    delivery_candidate=candidate,
                 )
 
                 with ProjectFS.open(expected_root) as expected_fs:

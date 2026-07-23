@@ -18,6 +18,7 @@ for path in (PLUGIN_ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 import harness_db  # noqa: E402
+from harness_lib import load_distribution_manifest  # noqa: E402
 from core.schema_lifecycle import (  # noqa: E402
     ACTIVE_JSON_SCHEMAS,
     ACTIVE_SCHEMA_VERSION,
@@ -121,10 +122,7 @@ APPROVED_ACTIVE_TABLES = APPROVED_SCHEMA30_TABLES | {
     "outcome_observations",
 }
 
-APPROVED_ACTIVE_JSON_SCHEMAS = APPROVED_SCHEMA30_JSON_SCHEMAS | {
-    "acceptance-target-qualification.schema.json",
-    "outcome-observation.schema.json",
-}
+DISTRIBUTION_SCHEMAS = set(load_distribution_manifest(PLUGIN_ROOT)["schemas"])
 
 RETIRED_TABLES = {
     "adapters",
@@ -220,7 +218,8 @@ class Schema30ContractTests(unittest.TestCase):
         ddl_properties = {row[1] for row in execution_columns}
         ddl_required = {row[1] for row in execution_columns if row[3] or row[5]}
 
-        self.assertEqual(ACTIVE_JSON_SCHEMAS, APPROVED_ACTIVE_JSON_SCHEMAS)
+        self.assertEqual(len(DISTRIBUTION_SCHEMAS), 18)
+        self.assertEqual(ACTIVE_JSON_SCHEMAS, DISTRIBUTION_SCHEMAS)
         self.assertEqual(ddl_properties, ACTIVE_EXECUTION_PROPERTIES)
         self.assertEqual(ddl_required, ACTIVE_EXECUTION_PROPERTIES - {"target_id"})
         self.assertEqual(set(execution_schema["properties"]), ACTIVE_EXECUTION_PROPERTIES)

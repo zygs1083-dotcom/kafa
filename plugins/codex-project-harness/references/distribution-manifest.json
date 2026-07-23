@@ -1,0 +1,123 @@
+{
+  "manifest_version": 1,
+  "plugin_name": "codex-project-harness",
+  "skills": [
+    "project-harness",
+    "minimal-safe-change",
+    "test-first-delivery",
+    "bug-fix-loop",
+    "independent-quality-gate",
+    "harness-audit",
+    "project-retrospective"
+  ],
+  "hooks": {
+    "files": [
+      "hooks.json",
+      "harness_hook.py"
+    ],
+    "events": [
+      "SessionStart",
+      "SubagentStart",
+      "Stop"
+    ]
+  },
+  "templates": {
+    "native_agents": [
+      "architect.toml",
+      "developer.toml",
+      "qa-reviewer.toml"
+    ],
+    "project_support": [
+      "AGENTS.md",
+      "task-board.md",
+      "team-architecture.md"
+    ]
+  },
+  "schemas": [
+    "project-state.schema.json",
+    "delivery-cycle.schema.json",
+    "requirement.schema.json",
+    "acceptance.schema.json",
+    "task.schema.json",
+    "task-test-target.schema.json",
+    "event.schema.json",
+    "quality-gate.schema.json",
+    "failure-mode.schema.json",
+    "validation.schema.json",
+    "test-target.schema.json",
+    "execution.schema.json",
+    "finding.schema.json",
+    "invalidation.schema.json",
+    "delivery.schema.json",
+    "baseline.schema.json",
+    "acceptance-target-qualification.schema.json",
+    "outcome-observation.schema.json"
+  ],
+  "core": [
+    "__init__.py",
+    "api.py",
+    "cycle_ledger.py",
+    "delivery.py",
+    "delivery_plan.py",
+    "errors.py",
+    "event_bus.py",
+    "execution.py",
+    "invariant_checker.py",
+    "json_schema_contract.py",
+    "local_core_migration.py",
+    "lock_manager.py",
+    "operator_output.py",
+    "outcome_metrics.py",
+    "project_fs.py",
+    "projections.py",
+    "scheduler.py",
+    "schema_guard.py",
+    "schema_lifecycle.py",
+    "store.py"
+  ],
+  "scripts": [
+    "validate_structure.py",
+    "harness_lib.py",
+    "harness_db.py",
+    "harness.py",
+    "run_runtime_smoke.py",
+    "run_skill_eval.py",
+    "run_agent_e2e_eval.py"
+  ],
+  "references": [
+    "delegation-matrix.md",
+    "distribution-manifest.json",
+    "workflow-contract.json"
+  ],
+  "additional_files": [
+    ".codex-plugin/plugin.json",
+    "docs/TRIGGER_MATRIX.md",
+    "scripts/fixtures/schema27-v1.21.3-seed.sql",
+    "scripts/fixtures/schema27-v1.21.3.sql.gz.b64",
+    "skills/project-harness/scripts/harness.py"
+  ],
+  "public_runtime_domains": [
+    "init",
+    "status",
+    "doctor",
+    "quickstart",
+    "cycle",
+    "validate",
+    "repair",
+    "migrate",
+    "baseline",
+    "acceptance",
+    "requirement",
+    "trace",
+    "failure-mode",
+    "task",
+    "validation",
+    "test-target",
+    "verify",
+    "decision",
+    "finding",
+    "gate",
+    "delivery",
+    "projection"
+  ]
+}

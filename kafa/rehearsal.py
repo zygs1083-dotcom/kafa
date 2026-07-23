@@ -15,8 +15,14 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+from .artifact_subject import (
+    ArtifactSubject,
+    ArtifactSubjectError,
+    assert_exact_subjects,
+    subjects_by_kind,
+)
 from .cli import PLUGIN_NAME, managed_tree_is_safe, path_is_link, plugin_tree_digest
 from .release import release_report
 from .supply_chain import (
@@ -35,6 +41,267 @@ REPORT_VERSION = "kafa-release-rehearsal-v1"
 
 class RehearsalError(RuntimeError):
     """Raised when the no-publish rehearsal cannot prove its invariants."""
+
+
+_REPORT_KEYS = {
+    "ok",
+    "report_version",
+    "evidence_mode",
+    "source",
+    "build",
+    "syft",
+    "artifact_count",
+    "sbom_count",
+    "artifacts",
+    "supply_chain_assurance",
+    "isolated_install",
+    "user_installation_before",
+    "user_installation_after",
+    "steps",
+    "commands",
+    "invariants",
+    "external_effects",
+    "generated_at",
+}
+_STEPS = [
+    "snapshot",
+    "build",
+    "generate",
+    "verify-before-install",
+    "isolated-install",
+    "verify-after-install",
+]
+_EXTERNAL_EFFECTS = {
+    "tag": False,
+    "release": False,
+    "upload": False,
+    "deployment": False,
+    "user_installation_change": False,
+}
+
+
+def rehearsal_report_errors(report: Mapping[str, Any]) -> list[str]:
+    """Return complete contract errors for a persisted no-publish rehearsal."""
+
+    if not isinstance(report, Mapping) or set(report) != _REPORT_KEYS:
+        actual = sorted(report) if isinstance(report, Mapping) else type(report).__name__
+        return [f"rehearsal report keys mismatch: actual={actual} expected={sorted(_REPORT_KEYS)}"]
+    errors: list[str] = []
+    if report.get("ok") is not True:
+        errors.append("rehearsal report is not successful")
+    if report.get("report_version") != REPORT_VERSION:
+        errors.append("rehearsal report version is unsupported")
+    if report.get("evidence_mode") != "local-no-publish-rehearsal":
+        errors.append("rehearsal evidence mode is invalid")
+
+    source = report.get("source")
+    if not isinstance(source, Mapping) or set(source) != {
+        "git_commit",
+        "git_status_sha256",
+        "source_tree_sha256",
+        "source_file_count",
+        "dirty",
+    }:
+        errors.append("rehearsal source shape is invalid")
+    else:
+        if not _hex_digest(source.get("git_commit"), lengths=(40, 64)):
+            errors.append("rehearsal source commit is invalid")
+        if not _hex_digest(source.get("git_status_sha256")):
+            errors.append("rehearsal source status digest is invalid")
+        if not _hex_digest(source.get("source_tree_sha256")):
+            errors.append("rehearsal source tree digest is invalid")
+        count = source.get("source_file_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            errors.append("rehearsal source file count is invalid")
+        if not isinstance(source.get("dirty"), bool):
+            errors.append("rehearsal source dirty flag is invalid")
+        elif source.get("dirty") is False and source.get("git_status_sha256") != hashlib.sha256(b"").hexdigest():
+            errors.append("clean rehearsal source has a non-empty status digest")
+
+    build = report.get("build")
+    started: datetime | None = None
+    finished: datetime | None = None
+    if not isinstance(build, Mapping) or set(build) != {
+        "frontend",
+        "backend",
+        "python",
+        "source_date_epoch",
+        "started_at",
+        "finished_at",
+    }:
+        errors.append("rehearsal build shape is invalid")
+    else:
+        for field in ("frontend", "backend", "python"):
+            if not isinstance(build.get(field), str) or not build.get(field):
+                errors.append(f"rehearsal build {field} is invalid")
+        epoch = build.get("source_date_epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
+            errors.append("rehearsal source_date_epoch is invalid")
+        started = _report_timestamp(build.get("started_at"))
+        finished = _report_timestamp(build.get("finished_at"))
+        if started is None or finished is None:
+            errors.append("rehearsal build timestamps are invalid")
+        elif started > finished:
+            errors.append("rehearsal build timestamps are reversed")
+
+    syft = report.get("syft")
+    if not isinstance(syft, Mapping) or set(syft) != {"version", "commit", "format"}:
+        errors.append("rehearsal Syft shape is invalid")
+    else:
+        if not isinstance(syft.get("version"), str) or not syft.get("version"):
+            errors.append("rehearsal Syft version is invalid")
+        if not _hex_digest(syft.get("commit"), lengths=(40, 64)):
+            errors.append("rehearsal Syft commit is invalid")
+        if syft.get("format") != "cyclonedx-json@1.6":
+            errors.append("rehearsal Syft format is invalid")
+
+    artifact_records = report.get("artifacts")
+    artifacts: dict[str, ArtifactSubject] = {}
+    if not isinstance(artifact_records, list) or len(artifact_records) != 2:
+        errors.append("rehearsal requires exactly two artifact records")
+    else:
+        try:
+            parsed = []
+            for record in artifact_records:
+                if not isinstance(record, Mapping) or set(record) != {
+                    "name",
+                    "kind",
+                    "sha256",
+                    "sbom",
+                    "sbom_sha256",
+                }:
+                    raise RehearsalError("artifact record shape is invalid")
+                subject = ArtifactSubject(
+                    name=record["name"],
+                    kind=record["kind"],
+                    sha256=record["sha256"],
+                )
+                if record.get("sbom") != f"{subject.name}.cdx.json" or not _hex_digest(
+                    record.get("sbom_sha256")
+                ):
+                    raise RehearsalError("artifact SBOM subject is invalid")
+                parsed.append(subject)
+            artifacts = subjects_by_kind(parsed)
+            if set(artifacts) != {"wheel", "sdist"}:
+                raise RehearsalError("artifact kinds are incomplete")
+        except (ArtifactSubjectError, RehearsalError, TypeError) as exc:
+            errors.append(f"rehearsal artifact contract is invalid: {exc}")
+    if report.get("artifact_count") != 2 or report.get("sbom_count") != 2:
+        errors.append("rehearsal artifact or SBOM count is invalid")
+    if report.get("supply_chain_assurance") != "unsigned-local-integrity-statement":
+        errors.append("rehearsal supply-chain assurance is invalid")
+
+    smoke = report.get("isolated_install")
+    if not isinstance(smoke, dict):
+        errors.append("rehearsal isolated install detail is invalid")
+    elif artifacts:
+        try:
+            _validate_smoke(smoke, artifacts)
+        except RehearsalError as exc:
+            errors.append(str(exc))
+
+    before = report.get("user_installation_before")
+    after = report.get("user_installation_after")
+    if before != after:
+        errors.append("rehearsal user installation state changed")
+    user_status = _validate_user_state(before)
+    if user_status is None:
+        errors.append("rehearsal user installation state is invalid")
+
+    if report.get("steps") != _STEPS:
+        errors.append("rehearsal steps are incomplete or reordered")
+    commands = report.get("commands")
+    if (
+        not isinstance(commands, list)
+        or len(commands) != 2
+        or any(not isinstance(command, str) or not command for command in commands)
+        or "-m build --no-isolation --wheel --sdist" not in commands[0]
+        or "run_isolated_install_smoke.py" not in commands[1]
+        or any(term in " ".join(commands).lower() for term in ("gh release", "publish", "deploy"))
+    ):
+        errors.append("rehearsal command inventory is invalid")
+
+    invariants = report.get("invariants")
+    expected_user_unchanged = True if user_status == "observed" else None
+    expected_invariants = {
+        "source_unchanged": True,
+        "tag_refs_unchanged": True,
+        "user_install_unchanged": expected_user_unchanged,
+        "isolated_home": True,
+        "artifact_bytes_unchanged": True,
+    }
+    if invariants != expected_invariants:
+        errors.append("rehearsal invariants are invalid")
+    if report.get("external_effects") != _EXTERNAL_EFFECTS:
+        errors.append("rehearsal external effects are not closed")
+
+    generated = _report_timestamp(report.get("generated_at"))
+    if generated is None:
+        errors.append("rehearsal generated_at is invalid")
+    elif finished is not None and generated < finished:
+        errors.append("rehearsal generated_at precedes the build")
+    return errors
+
+
+def validate_rehearsal_report(report: Mapping[str, Any]) -> None:
+    errors = rehearsal_report_errors(report)
+    if errors:
+        raise RehearsalError("; ".join(errors))
+
+
+def _hex_digest(value: object, *, lengths: tuple[int, ...] = (64,)) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) in lengths
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _report_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _validate_user_state(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("status") == "not-run":
+        return (
+            "not-run"
+            if set(value) == {"status", "reason"}
+            and isinstance(value.get("reason"), str)
+            and bool(value.get("reason"))
+            else None
+        )
+    if value.get("status") != "observed" or set(value) != {
+        "status",
+        "kafa_version",
+        "kafa_executable",
+        "managed_plugin",
+        "plugin_cache",
+        "plugin",
+    }:
+        return None
+    if not isinstance(value.get("kafa_version"), str) or not value.get("kafa_version"):
+        return None
+    executable = value.get("kafa_executable")
+    managed = value.get("managed_plugin")
+    cache = value.get("plugin_cache")
+    plugin = value.get("plugin")
+    if not all(isinstance(item, Mapping) for item in (executable, managed, cache, plugin)):
+        return None
+    if not _hex_digest(executable.get("sha256")):
+        return None
+    if not _hex_digest(managed.get("sha256")) or managed.get("sha256") != cache.get("sha256"):
+        return None
+    if plugin.get("installed") is not True or plugin.get("enabled") is not True:
+        return None
+    return "observed"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,7 +437,17 @@ def run_release_rehearsal(
         verified_before = verify_release_evidence(repo, dist)
         if generated != verified_before:
             raise RehearsalError("generation and pre-install verification disagree")
-        artifacts = {item["kind"]: item for item in verified_before["artifacts"]}
+        try:
+            artifacts = subjects_by_kind(
+                ArtifactSubject(
+                    name=item["name"],
+                    kind=item["kind"],
+                    sha256=item["sha256"],
+                )
+                for item in verified_before["artifacts"]
+            )
+        except (ArtifactSubjectError, KeyError, TypeError) as exc:
+            raise RehearsalError(f"verified artifact subjects are invalid: {exc}") from exc
         if set(artifacts) != {"wheel", "sdist"}:
             raise RehearsalError("verified artifact kinds are incomplete")
 
@@ -183,9 +460,9 @@ def run_release_rehearsal(
             "--codex-bin",
             codex_bin,
             "--wheel",
-            str(dist / artifacts["wheel"]["name"]),
+            str(dist / artifacts["wheel"].name),
             "--source-archive",
-            str(dist / artifacts["sdist"]["name"]),
+            str(dist / artifacts["sdist"].name),
             "--json",
         ]
         commands.append(_display_command(smoke_command))
@@ -219,7 +496,7 @@ def run_release_rehearsal(
     if user_state_probe and not user_unchanged:
         raise RehearsalError("user Kafa/plugin installation changed during rehearsal")
 
-    return {
+    report = {
         "ok": True,
         "report_version": REPORT_VERSION,
         "evidence_mode": "local-no-publish-rehearsal",
@@ -269,6 +546,8 @@ def run_release_rehearsal(
         },
         "generated_at": now_iso(),
     }
+    validate_rehearsal_report(report)
+    return report
 
 
 def copy_source_snapshot(repo: Path, target: Path) -> dict[str, Any]:
@@ -633,7 +912,10 @@ def _run_read_only(command: list[str]) -> tuple[str, str]:
     return completed.stdout, completed.stderr
 
 
-def _validate_smoke(smoke: dict[str, Any], artifacts: dict[str, dict[str, Any]]) -> None:
+def _validate_smoke(
+    smoke: dict[str, Any],
+    artifacts: dict[str, ArtifactSubject | dict[str, Any]],
+) -> None:
     required_true = {
         "ok",
         "artifact_mode",
@@ -654,10 +936,34 @@ def _validate_smoke(smoke: dict[str, Any], artifacts: dict[str, dict[str, Any]])
     failed = sorted(name for name in required_true if smoke.get(name) is not True)
     if failed:
         raise RehearsalError(f"isolated install smoke checks failed: {failed}")
-    if smoke.get("wheel_sha256") != artifacts["wheel"]["sha256"]:
-        raise RehearsalError("isolated install wheel digest mismatch")
-    if smoke.get("source_archive_sha256") != artifacts["sdist"]["sha256"]:
-        raise RehearsalError("isolated install sdist digest mismatch")
+    try:
+        expected = []
+        for kind in ("wheel", "sdist"):
+            value = artifacts[kind]
+            expected.append(
+                value
+                if isinstance(value, ArtifactSubject)
+                else ArtifactSubject(
+                    name=value["name"],
+                    kind=value["kind"],
+                    sha256=value["sha256"],
+                )
+            )
+        actual = [
+            ArtifactSubject(
+                name=smoke["wheel_name"],
+                kind="wheel",
+                sha256=smoke["wheel_sha256"],
+            ),
+            ArtifactSubject(
+                name=smoke["source_archive_name"],
+                kind="sdist",
+                sha256=smoke["source_archive_sha256"],
+            ),
+        ]
+        assert_exact_subjects(expected, actual)
+    except (ArtifactSubjectError, KeyError, TypeError) as exc:
+        raise RehearsalError(f"isolated install artifact subject mismatch: {exc}") from exc
     digest_fields = (
         "plugin_source_tree_sha256",
         "managed_plugin_tree_sha256",

@@ -63,8 +63,16 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
     @staticmethod
     def _artifact_manifest() -> dict[str, dict[str, str]]:
         return {
-            "wheel": {"sha256": "1" * 64},
-            "sdist": {"sha256": "3" * 64},
+            "wheel": {
+                "name": "kafa-2.0.0b1-py3-none-any.whl",
+                "kind": "wheel",
+                "sha256": "1" * 64,
+            },
+            "sdist": {
+                "name": "kafa-2.0.0b1.tar.gz",
+                "kind": "sdist",
+                "sha256": "3" * 64,
+            },
         }
 
     @staticmethod
@@ -89,7 +97,9 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
             "plugin_source_tree_sha256": digest,
             "managed_plugin_tree_sha256": digest,
             "cache_plugin_tree_sha256": digest,
+            "wheel_name": "kafa-2.0.0b1-py3-none-any.whl",
             "wheel_sha256": "1" * 64,
+            "source_archive_name": "kafa-2.0.0b1.tar.gz",
             "source_archive_sha256": "3" * 64,
         }
 
@@ -181,6 +191,22 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
                     smoke["cache_plugin_tree_sha256"] = value
 
                 with self.assertRaisesRegex(RehearsalError, "plugin digest"):
+                    _validate_smoke(smoke, self._artifact_manifest())
+
+    def test_rehearsal_requires_exact_artifact_subject_name_and_digest(self) -> None:
+        from kafa.rehearsal import RehearsalError, _validate_smoke
+
+        cases = {
+            "wheel-name": ("wheel_name", "renamed.whl"),
+            "wheel-digest": ("wheel_sha256", "9" * 64),
+            "sdist-name": ("source_archive_name", "renamed.tar.gz"),
+            "sdist-digest": ("source_archive_sha256", "8" * 64),
+        }
+        for label, (field, value) in cases.items():
+            with self.subTest(label=label):
+                smoke = self._complete_smoke()
+                smoke[field] = value
+                with self.assertRaisesRegex(RehearsalError, "artifact subject"):
                     _validate_smoke(smoke, self._artifact_manifest())
 
     def test_user_state_accepts_the_unique_managed_kafa_plugin_for_any_marketplace(self) -> None:
@@ -499,6 +525,9 @@ class ReleaseRehearsalContractTest(unittest.TestCase):
         user_state = {
             "status": "observed",
             "kafa_version": "2.0.0-beta.1",
+            "kafa_executable": {"sha256": "5" * 64},
+            "managed_plugin": {"sha256": "6" * 64},
+            "plugin_cache": {"sha256": "6" * 64},
             "plugin": {
                 "pluginId": "codex-project-harness@personal",
                 "version": "2.0.0-beta.1",

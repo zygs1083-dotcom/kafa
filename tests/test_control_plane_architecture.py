@@ -12,6 +12,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-project-harness"
+SCRIPTS = PLUGIN_ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from harness_lib import load_distribution_manifest  # noqa: E402
+
+DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
 
 
 class ControlPlaneArchitectureTest(unittest.TestCase):
@@ -20,12 +27,31 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
 
     def test_project_harness_is_local_delivery_entry_not_fact_source(self) -> None:
         text = self.read(PLUGIN_ROOT / "skills" / "project-harness" / "SKILL.md")
+        contract = json.loads(
+            self.read(PLUGIN_ROOT / "references" / "workflow-contract.json")
+        )
 
-        self.assertIn("OpenSpec is the specification authority", text)
-        self.assertIn("Kafa SQLite is the delivery authority", text)
+        self.assertEqual(contract["contract_version"], 1)
+        self.assertEqual(
+            {item["id"] for item in contract["authorities"]},
+            {
+                "openspec",
+                "sqlite",
+                "delivery-evaluator",
+                "workflow-contract",
+                "native-host",
+                "root-controller",
+            },
+        )
+        for item in contract["safeguards"]:
+            self.assertIn(item["id"], text)
+            self.assertIn(item["rule"], text)
+        for item in contract["routes"]:
+            self.assertIn(item["when"], text)
+            self.assertIn(item["obligation"], text)
         self.assertIn("Generated Markdown is a human-readable projection, not a fact source", text)
-        self.assertIn("Native Codex/ChatGPT owns task", text)
         self.assertIn("Only the root controller writes Kafa delivery facts", text)
+        self.assertIn("BEGIN GENERATED: workflow-contract:entry-workflow", text)
 
     def test_hooks_are_advisory_and_do_not_write_evidence(self) -> None:
         hook_json = json.loads(self.read(PLUGIN_ROOT / "hooks" / "hooks.json"))
@@ -33,7 +59,7 @@ class ControlPlaneArchitectureTest(unittest.TestCase):
 
         self.assertEqual(
             set(hook_json["hooks"]),
-            {"SessionStart", "SubagentStart", "Stop"},
+            set(DISTRIBUTION["hooks"]["events"]),
         )
         self.assertIn("Hooks are advisory", hook_dispatcher)
         self.assertIn("never create delivery facts or evidence", hook_dispatcher)

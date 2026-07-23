@@ -351,22 +351,68 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertNotIn(" kernel doctor", workflow)
         self.assertNotIn(" invariant validate", workflow)
 
-    def test_publish_requires_a_non_optional_real_host_compatibility_profile(self) -> None:
+    def test_release_scopes_real_host_profiles_without_weakening_deterministic_gates(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("\n  scope:\n", workflow)
+        scope = workflow.split("\n  scope:\n", 1)[1].split("\n  verify:\n", 1)[0]
         self.assertIn("\n  real_host_compatibility:", workflow)
         compatibility = workflow.split("\n  real_host_compatibility:", 1)[1].split("\n  candidate:", 1)[0]
         candidate = workflow.split("\n  candidate:", 1)[1].split("\n  publish:", 1)[0]
         publish = workflow.split("\n  publish:", 1)[1]
 
+        self.assertIn("python -I -S kafa/change_scope.py", scope)
+        self.assertNotIn("git describe --tags", scope)
+        self.assertIn("/releases?per_page=100", scope)
+        self.assertIn("changed_paths_sha256", scope)
+        self.assertIn('--base-oid "$base_oid"', scope)
+        self.assertIn('--head-oid "$head_oid"', scope)
+        self.assertIn("deterministic_gates_required", scope)
+        self.assertIn("advisory / not-run", scope)
+        verify = workflow.split("\n  verify:\n", 1)[1].split("\n  real_host_compatibility:", 1)[0]
+        self.assertIn("Run unit regression gate", verify)
+        self.assertIn("Run real isolated install smoke", verify)
+        self.assertNotIn("if: needs.scope.outputs.native_requirement", verify)
         self.assertIn("runs-on: [self-hosted, kafa-codex-live]", compatibility)
         self.assertIn("environment: codex-live-release", compatibility)
+        self.assertIn("needs: scope", compatibility)
+        self.assertIn("if: needs.scope.outputs.native_requirement == 'blocking'", compatibility)
+        self.assertIn("fail-fast: false", compatibility)
+        self.assertIn("profile: [live-codex, live-codex-parallel]", compatibility)
         self.assertIn('HARNESS_E2E_ENABLE_LIVE_CODEX: "1"', compatibility)
+        self.assertIn('HARNESS_E2E_ENABLE_LIVE_CODEX_PARALLEL: "1"', compatibility)
         self.assertIn('HARNESS_E2E_LIVE_TIMEOUT: "900"', compatibility)
         self.assertNotIn("HARNESS_E2E_LIVE_TIMEOUT_SECONDS", compatibility)
-        self.assertIn("run_agent_e2e_eval.py --mode live-codex --out", compatibility)
+        self.assertIn("run_agent_e2e_eval.py", compatibility)
+        self.assertIn("--mode live-codex", compatibility)
+        self.assertIn("--mode live-codex-parallel", compatibility)
+        self.assertIn("--evidence-out", compatibility)
+        self.assertIn("python -m kafa.evidence_summary native", compatibility)
+        self.assertIn("python -m kafa.evidence_summary verify", compatibility)
+        self.assertIn("kafa-${{ matrix.profile }}-summary.json", compatibility)
+        self.assertIn("GITHUB_STEP_SUMMARY", compatibility)
+        self.assertIn("--retention-class ci-artifact", compatibility)
+        self.assertIn("--retention-days 30", compatibility)
+        self.assertIn("--change-scope-report", compatibility)
+        self.assertIn("--expected-decision-sha256", compatibility)
+        self.assertIn("needs.scope.outputs.decision_sha256", compatibility)
+        self.assertIn("--eligibility current-eligible", compatibility)
+        self.assertIn('--validator-repo "$GITHUB_WORKSPACE"', compatibility)
         self.assertIn("actions/upload-artifact@v4", compatibility)
+        self.assertIn("--out", compatibility)
+        self.assertIn("diagnostic.json", compatibility)
+        self.assertNotIn("--mode fixture", compatibility)
+        self.assertNotIn("--mode stability", compatibility)
         self.assertNotIn("continue-on-error: true", compatibility)
-        self.assertRegex(candidate, re.compile(r"\n    needs:\s*\n      - verify\s*\n      - real_host_compatibility\s*\n"))
+        self.assertRegex(
+            candidate,
+            re.compile(
+                r"\n    needs:\s*\n      - scope\s*\n      - verify\s*\n"
+                r"      - real_host_compatibility\s*\n"
+            ),
+        )
+        self.assertIn("always()", candidate)
+        self.assertIn("needs.scope.outputs.native_requirement == 'advisory'", candidate)
+        self.assertIn("needs.real_host_compatibility.result == 'success'", candidate)
         self.assertRegex(publish, re.compile(r"\n    needs:\s*\n      - candidate\s*\n"))
 
     def test_install_smoke_wraps_windows_npm_command_shims(self) -> None:

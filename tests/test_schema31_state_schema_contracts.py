@@ -276,7 +276,7 @@ class CanonicalStateContractRedTests(unittest.TestCase):
                 conn.execute("update failure_modes set status='nonsense' where id='FM1'")
                 conn.commit()
 
-            result = run_harness(root, "doctor")
+            result = run_harness(root, "doctor", "--verbose")
 
         self.assertNotEqual(result.returncode, 0)
         output = result.stdout + result.stderr

@@ -25,18 +25,12 @@ for path in (PLUGIN_ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 import harness  # noqa: E402
+from harness_lib import load_distribution_manifest  # noqa: E402
 
 
-APPROVED_SKILLS = {
-    "project-harness",
-    "minimal-safe-change",
-    "bug-fix-loop",
-    "test-first-delivery",
-    "independent-quality-gate",
-    "harness-audit",
-    "project-retrospective",
-}
-APPROVED_HOOKS = {"SessionStart", "SubagentStart", "Stop"}
+DISTRIBUTION = load_distribution_manifest(PLUGIN_ROOT)
+APPROVED_SKILLS = set(DISTRIBUTION["skills"])
+APPROVED_HOOKS = set(DISTRIBUTION["hooks"]["events"])
 APPROVED_TOP_LEVEL_COMMANDS = {
     "acceptance",
     "baseline",
@@ -61,11 +55,7 @@ APPROVED_TOP_LEVEL_COMMANDS = {
     "validation",
     "verify",
 }
-APPROVED_AGENT_TEMPLATES = {
-    "architect.toml",
-    "developer.toml",
-    "qa-reviewer.toml",
-}
+APPROVED_AGENT_TEMPLATES = set(DISTRIBUTION["templates"]["native_agents"])
 RETIRED_EXTERNAL_COMMANDS = {
     "connector",
     "connector.profile",
@@ -163,9 +153,9 @@ def digest(path: Path) -> str:
 
 
 class LocalCoreSurfaceBudgetTests(unittest.TestCase):
-    def test_cli_parser_budget_is_at_most_60(self) -> None:
+    def test_cli_parser_budget_is_exactly_61(self) -> None:
         surface = cli_surface(harness.build_parser())
-        self.assertLessEqual(len(surface), 60, sorted(surface))
+        self.assertEqual(len(surface), 61, sorted(surface))
 
     def test_cli_top_level_matches_the_locked_local_domains(self) -> None:
         parser = harness.build_parser()
@@ -205,16 +195,19 @@ class LocalCoreSurfaceBudgetTests(unittest.TestCase):
 
     def test_skill_inventory_is_exactly_the_seven_local_entrypoints(self) -> None:
         actual = {path.name for path in (PLUGIN_ROOT / "skills").iterdir() if path.is_dir()}
+        self.assertEqual(len(APPROVED_SKILLS), 7)
         self.assertEqual(actual, APPROVED_SKILLS)
 
     def test_hook_inventory_is_exactly_three(self) -> None:
         payload = json.loads((PLUGIN_ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))
         actual = set(payload["hooks"])
+        self.assertEqual(len(APPROVED_HOOKS), 3)
         self.assertEqual(actual, APPROVED_HOOKS)
 
     def test_agent_template_inventory_is_exactly_three_and_local_only(self) -> None:
         template_root = PLUGIN_ROOT / "templates/agents"
         actual = {path.name for path in template_root.iterdir() if path.is_file()}
+        self.assertEqual(len(APPROVED_AGENT_TEMPLATES), 3)
         self.assertEqual(actual, APPROVED_AGENT_TEMPLATES)
         combined = ""
         for name in sorted(APPROVED_AGENT_TEMPLATES):
@@ -256,9 +249,9 @@ class LocalCoreSurfaceBudgetTests(unittest.TestCase):
             "`project-runtime`",
             "`requirement-baseline`",
             "`team-architecture`",
-            "`delivery-readiness`",
         ):
             self.assertNotIn(retired_entrypoint, skill)
+        self.assertFalse((PLUGIN_ROOT / "skills/delivery-readiness").exists())
         self.assertTrue((PLUGIN_ROOT / "skills/project-harness/scripts/harness.py").is_file())
 
 

@@ -15,34 +15,58 @@ from pathlib import Path
 from typing import Any
 
 
-EVENTS = {"SessionStart", "SubagentStart", "Stop"}
 SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "API")
 MAX_LINES = 12
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    plugin_root = Path(__file__).resolve().parents[1]
+    try:
+        events = supported_events(plugin_root)
+    except (OSError, ValueError) as exc:
+        print(f"Codex Project Harness hook: invalid distribution manifest: {exc}")
+        return 2
     event = argv[0] if argv else ""
-    if event not in EVENTS:
+    if event not in events:
         print("Codex Project Harness hook: unknown event")
-        print(f"supported events: {', '.join(sorted(EVENTS))}")
+        print(f"supported events: {', '.join(sorted(events))}")
         return 2
 
-    plugin_root = Path(__file__).resolve().parents[1]
     repo_root = locate_repo_root()
     if event == "Stop":
         return stop(plugin_root, repo_root)
 
     print(f"Codex Project Harness hook: {event}")
     print(f"repo: {repo_root}")
+    if event == "SessionStart":
+        return session_start(plugin_root, repo_root)
+    status = run_harness(plugin_root, repo_root, ["status"])
+    if any(
+        marker in status.stdout
+        for marker in ("state: recovery-required", "state: error")
+    ):
+        print_block("harness status", status)
+        return 0
     if not harness_db_exists(repo_root):
         print("skipped: harness is not initialized in this project")
         return 0
 
     payload, payload_ok = read_payload()
-    if event == "SessionStart":
-        return session_start(plugin_root, repo_root)
     return subagent_start(payload, payload_ok)
+
+
+def supported_events(plugin_root: Path) -> frozenset[str]:
+    scripts_root = plugin_root / "scripts"
+    if str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    from harness_lib import DistributionManifestError, load_distribution_manifest
+
+    try:
+        distribution = load_distribution_manifest(plugin_root)
+    except DistributionManifestError as exc:
+        raise ValueError(str(exc)) from exc
+    return frozenset(distribution["hooks"]["events"])
 
 
 def locate_repo_root() -> Path:
@@ -115,11 +139,11 @@ def stop(plugin_root: Path, repo_root: Path) -> int:
         f"repo: {repo_root}",
     ]
     if not harness_db_exists(repo_root):
+        status = run_harness(plugin_root, repo_root, ["status"])
         lines.extend(
             [
                 "readiness command: skipped",
-                "readiness result:",
-                "- harness is not initialized in this project",
+                *block_lines("project state", status),
             ]
         )
         print(stop_output(lines))

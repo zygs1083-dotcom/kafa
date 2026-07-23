@@ -1,41 +1,46 @@
-User:
-Use Codex Project Harness to implement a small feature in this repository.
-
-Assistant:
-I will use the local-only Kernel and stop at verified code handoff.
-Native Codex/ChatGPT owns task, subagent, worktree, approval, model, cancellation,
-steering, and handoff lifecycle; only the root controller writes Kafa facts.
-
-$ harness.py --root . init
-$ harness.py --root . requirement add --id R1 --kind functional --body "User can create a task"
-$ harness.py --root . acceptance add --id AC1 --criterion "Create exactly one task"
-$ harness.py --root . requirement link --requirement R1 --acceptance AC1
-$ harness.py --root . failure-mode add --id FM1 --feature "Task creation" --scenario "Duplicate submit" --trigger "same form twice" --expected "one task" --risk medium --acceptance AC1
-$ harness.py --root . baseline confirm --id B1 --summary "Confirmed task creation scope" --by root-controller
-$ harness.py --root . task add --id T1 --task "Implement task creation" --owner developer --acceptance AC1 --failure-mode FM1
-$ harness.py --root . task start T1
-
-Assistant:
-A Native Host producer returns the changed files and commands to the root
-controller. It does not write Kafa state.
-
-$ harness.py --root . task submit T1 --context-id producer-context --evidence "Implementation and tests returned to root controller"
-$ harness.py --root . test-target add --id UNIT --kind unit --command-template "python3 -m pytest --json-report --json-report-file=.ai-team/results/unit.json" --description "Structured unit test suite" --result-format pytest-json --result-path .ai-team/results/unit.json
-$ harness.py --root . test-target link --task T1 --target UNIT
-$ harness.py --root . test-target qualify --id Q1 --target UNIT --acceptance AC1 --rationale "UNIT directly exercises task creation and duplicate-submit behavior" --by root-controller
-$ harness.py --root . verify run --target UNIT --acceptance AC1 --failure-mode FM1
-
-Assistant:
-A distinct Native Host reviewer inspects the current candidate and returns no
-blocking findings. The root controller records the review decision.
-
-$ harness.py --root . task accept T1 --evidence "Distinct reviewer accepted the current candidate"
-$ harness.py --root . gate record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification Q1
-$ harness.py --root . delivery ready
-$ harness.py --root . delivery record --scope "Task creation" --acceptance AC1 --changed-files "src/tasks.py tests/test_tasks.py" --validation "UNIT immutable execution passed" --qa "fresh reviewer context passed" --failure-mode-coverage "FM1 covered" --quality-gate pass --known-gaps "none" --handoff "verified code only; no deployment"
-$ harness.py --root . validate --delivery
-
-Assistant:
-If this were high/critical work without verifiable current-candidate provenance
-and distinct producer/reviewer context, the delivery result would be
-human-review-required rather than an autonomous pass.
+<!-- BEGIN GENERATED: workflow-contract:skill-eval-transcript -->
+source: fixture-only
+evaluation: Kafa workflow contract
+authority: OpenSpec -> Kafa SQLite -> evaluate_delivery_prerequisites
+host: Native Codex/ChatGPT owns task/subagent/worktree/model/cancel/handoff
+writer: root controller only
+scenario-verdict: id=small-single-producer; selected=none; result=pass
+scenario-verdict: id=parallel-delegation; selected=parallel-delegation; result=pass; when=two or more producers run in parallel, shared-file integration is required, or explicit advanced review is requested; activates=full delegation matrix and root integration checkpoint
+scenario-verdict: id=deep-kernel-review; selected=deep-kernel-review; result=pass; when=schema, migration, runtime ownership, trust, delivery gate, security, permissions, concurrency, data loss, public API, or cross-module authority changes; activates=root/deep ownership and adversarial review
+scenario-verdict: id=harness-audit; selected=harness-audit; result=pass; when=multi-day work, repeated escapes, schema or runtime change or drift, or milestone review; activates=harness-audit
+scenario-verdict: id=project-retrospective; selected=project-retrospective; result=pass; when=delivery milestone completes or a failure loop exposes a stable lesson; activates=project-retrospective
+scenario-verdict: id=live-host-compatibility; selected=live-host-compatibility; result=pass; when=Native Host integration, evaluator, packaging, or release surface changes; activates=real Native single and parallel evidence
+scenario-verdict: id=release-rehearsal; selected=release-rehearsal; result=pass; when=packaging, supply-chain, release tooling, or an authorized release candidate changes; activates=non-publishing isolated rehearsal
+dependency: delivery-plan -> baseline-confirmation
+dependency: delivery-plan -> qualification
+dependency: delivery-plan -> task-start
+dependency: task-start -> task-submit
+dependency: qualification -> controller-verification
+dependency: task-submit -> task-accept
+dependency: controller-verification -> task-accept
+dependency: task-accept -> quality-gate
+dependency: baseline-confirmation -> delivery-readiness
+dependency: quality-gate -> delivery-readiness
+dependency: delivery-readiness -> delivery-record
+dependency: delivery-record -> delivery-validation
+$ kafa project init --repo .
+$ kafa project quickstart --repo . status
+$ kafa project quickstart --repo . delivery-plan --file delivery-plan.json --json
+$ kafa project baseline --repo . confirm --id BL1 --summary 'confirmed scope' --by root-controller
+$ kafa project task --repo . start PATCH-T1
+$ kafa project quickstart --repo . verified-patch --id PATCH --json
+$ kafa project task --repo . submit PATCH-T1 --context-id producer-context --evidence 'root inspected returned code'
+$ kafa project task --repo . accept PATCH-T1 --evidence 'verification and review complete'
+$ kafa project gate --repo . record --reviewer-context fresh --reviewer-context-id reviewer-context --result pass --qualification PATCH-Q1
+$ kafa project delivery --repo . ready
+$ kafa project delivery --repo . record --scope 'verified local handoff' --handoff 'return code and residual risks'
+$ kafa project validate --repo . --delivery
+handoff: delivered behavior and acceptance IDs
+handoff: changed files or an explicit not-derivable statement
+handoff: exact tests with counts and outcomes
+handoff: quality-gate and failure-mode status
+handoff: known gaps, not-run checks, and residual risk
+handoff: local artifact paths
+handoff: explicit statement that deployment is not included
+human-review-required
+<!-- END GENERATED: workflow-contract:skill-eval-transcript -->

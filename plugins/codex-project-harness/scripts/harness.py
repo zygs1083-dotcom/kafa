@@ -9,12 +9,15 @@ import sys
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
+SCRIPTS_ROOT = Path(__file__).resolve().parent
+for runtime_path in (SCRIPTS_ROOT, PLUGIN_ROOT):
+    if str(runtime_path) not in sys.path:
+        sys.path.insert(0, str(runtime_path))
 
 from core.api import (
     HarnessError,
     accept_task,
+    apply_delivery_plan,
     add_acceptance,
     add_failure_mode,
     add_requirement,
@@ -30,6 +33,7 @@ from core.api import (
     cycle_start,
     cycle_status,
     doctor,
+    doctor_operator_report,
     enter_delivery_readiness,
     freeze_baseline,
     init_runtime,
@@ -39,6 +43,8 @@ from core.api import (
     list_test_targets,
     migrate,
     outcome_report,
+    operator_error_report,
+    operator_verbose_lines,
     record_decision,
     record_delivery,
     record_finding,
@@ -49,19 +55,24 @@ from core.api import (
     quickstart_minimal,
     quickstart_status,
     quickstart_status_lines,
+    quickstart_operator_report,
     qualify_test_target,
     repair,
     start_task,
     status_lines,
+    status_operator_report,
     submit_task,
     trace_show,
     trace_validate,
     validate_runtime,
+    verified_patch,
     verify_run,
     runtime_initialized,
     uninitialized_lines,
 )
+from core.operator_output import render_concise, render_json, render_verbose
 from core.errors import exception_text
+from core.delivery_plan import DeliveryPlanError, load_delivery_plan
 from core.schema_guard import (
     FAILURE_MODE_STATUS_VALUES,
     OUTCOME_KIND_VALUES,
@@ -109,13 +120,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = sub.add_parser("init")
     init_parser.add_argument("--dry-run", action="store_true")
-    sub.add_parser("status")
-    sub.add_parser("doctor")
+    status_parser = sub.add_parser("status")
+    status_output = status_parser.add_mutually_exclusive_group()
+    status_output.add_argument("--verbose", action="store_true")
+    status_output.add_argument("--json", action="store_true")
+    doctor_parser = sub.add_parser("doctor")
+    doctor_output = doctor_parser.add_mutually_exclusive_group()
+    doctor_output.add_argument("--verbose", action="store_true")
+    doctor_output.add_argument("--json", action="store_true")
 
     quickstart = sub.add_parser("quickstart")
     quickstart_sub = quickstart.add_subparsers(dest="quickstart_command", required=True)
     quickstart_status_parser = quickstart_sub.add_parser("status")
-    quickstart_status_parser.add_argument("--json", action="store_true")
+    quickstart_status_output = quickstart_status_parser.add_mutually_exclusive_group()
+    quickstart_status_output.add_argument("--verbose", action="store_true")
+    quickstart_status_output.add_argument("--json", action="store_true")
     quickstart_minimal_parser = quickstart_sub.add_parser("minimal")
     quickstart_minimal_parser.add_argument("--id", required=True)
     quickstart_minimal_parser.add_argument("--goal", required=True)
@@ -123,6 +142,17 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_minimal_parser.add_argument("--task", required=True)
     quickstart_minimal_parser.add_argument("--test-command", required=True)
     quickstart_minimal_parser.add_argument("--execute", action="store_true")
+    quickstart_plan_parser = quickstart_sub.add_parser("delivery-plan")
+    quickstart_plan_parser.add_argument("--file", required=True)
+    quickstart_plan_parser.add_argument("--dry-run", action="store_true")
+    quickstart_plan_output = quickstart_plan_parser.add_mutually_exclusive_group()
+    quickstart_plan_output.add_argument("--json", action="store_true")
+    quickstart_plan_output.add_argument("--verbose", action="store_true")
+    quickstart_verified_parser = quickstart_sub.add_parser("verified-patch")
+    quickstart_verified_parser.add_argument("--id", required=True)
+    quickstart_verified_output = quickstart_verified_parser.add_mutually_exclusive_group()
+    quickstart_verified_output.add_argument("--json", action="store_true")
+    quickstart_verified_output.add_argument("--verbose", action="store_true")
 
     cycle = sub.add_parser("cycle")
     cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
@@ -365,16 +395,40 @@ def build_parser() -> argparse.ArgumentParser:
     delivery_sub = delivery.add_subparsers(dest="delivery_command", required=True)
     delivery_sub.add_parser("ready")
     delivery_record = delivery_sub.add_parser("record")
-    delivery_record.add_argument("--scope", required=True)
-    delivery_record.add_argument("--acceptance", default="")
-    delivery_record.add_argument("--changed-files", default="")
-    delivery_record.add_argument("--validation", default="")
-    delivery_record.add_argument("--qa", default="")
-    delivery_record.add_argument("--failure-mode-coverage", default="")
-    delivery_record.add_argument("--quality-gate", default="")
-    delivery_record.add_argument("--data-config-notes", default="")
-    delivery_record.add_argument("--known-gaps", default="")
-    delivery_record.add_argument("--handoff", default="")
+    delivery_record.add_argument(
+        "--scope",
+        required=True,
+        help="human scope/rationale; structured relations remain authoritative",
+    )
+    supplemental_help = (
+        "legacy supplemental note only; does not affect authoritative "
+        "relations, readiness, gate, or trust"
+    )
+    delivery_record.add_argument("--acceptance", default="", help=supplemental_help)
+    delivery_record.add_argument("--changed-files", default="", help=supplemental_help)
+    delivery_record.add_argument("--validation", default="", help=supplemental_help)
+    delivery_record.add_argument("--qa", default="", help=supplemental_help)
+    delivery_record.add_argument(
+        "--failure-mode-coverage",
+        default="",
+        help=supplemental_help,
+    )
+    delivery_record.add_argument("--quality-gate", default="", help=supplemental_help)
+    delivery_record.add_argument(
+        "--data-config-notes",
+        default="",
+        help="human data/config exception note",
+    )
+    delivery_record.add_argument(
+        "--known-gaps",
+        default="",
+        help="human known-gap note",
+    )
+    delivery_record.add_argument(
+        "--handoff",
+        default="",
+        help="human handoff note",
+    )
 
     projection = sub.add_parser("projection")
     projection_sub = projection.add_subparsers(dest="projection_command", required=True)
@@ -395,9 +449,19 @@ def main() -> int:
     def mutate(_command: str, fn) -> None:
         print(fn())
 
+    def emit_operator(report) -> None:
+        if getattr(args, "json", False):
+            sys.stdout.write(render_json(report))
+        elif getattr(args, "verbose", False):
+            sys.stdout.write(
+                render_verbose(operator_verbose_lines(report))
+            )
+        else:
+            sys.stdout.write(render_concise(report))
+
     try:
         needs_initialized = (
-            args.command in {"status", "doctor", "validate", "verify"}
+            args.command in {"validate", "verify"}
             or (
                 args.command == "cycle"
                 and args.cycle_command in {"status", "audit", "outcome-report"}
@@ -413,14 +477,15 @@ def main() -> int:
             init_runtime(root)
             print("OK: project harness initialized")
         elif args.command == "status":
-            print("\n".join(status_lines(root)))
-        elif args.command == "doctor":
-            issues = doctor(root)
-            if issues:
-                for issue in issues:
-                    print(f"ERROR: {issue}")
+            report = status_operator_report(root)
+            emit_operator(report)
+            if report.state in {"not-initialized", "recovery-required", "error"}:
                 return 1
-            print("OK: harness doctor passed")
+        elif args.command == "doctor":
+            report = doctor_operator_report(root)
+            emit_operator(report)
+            if report.state != "healthy":
+                return 1
         elif args.command == "cycle" and args.cycle_command == "start":
             mutate(
                 "cycle.start",
@@ -484,11 +549,10 @@ def main() -> int:
                     f"observations={report['observation_count']}"
                 )
         elif args.command == "quickstart" and args.quickstart_command == "status":
-            report = quickstart_status(root)
-            if args.json:
-                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-            else:
-                print("\n".join(quickstart_status_lines(root)))
+            report = quickstart_operator_report(root)
+            emit_operator(report)
+            if report.state in {"recovery-required", "error"}:
+                return 1
         elif args.command == "quickstart" and args.quickstart_command == "minimal":
             print(
                 "\n".join(
@@ -503,6 +567,39 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "quickstart" and args.quickstart_command == "delivery-plan":
+            try:
+                plan = load_delivery_plan(Path(args.file).expanduser())
+            except DeliveryPlanError as exc:
+                raise HarnessError(str(exc)) from exc
+            report = apply_delivery_plan(root, plan, dry_run=args.dry_run)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            else:
+                prefix = "DRY-RUN" if args.dry_run else "OK"
+                print(
+                    f"{prefix}: delivery-plan {report['plan_id']} "
+                    f"changed={str(report['changed']).lower()}"
+                )
+                if args.verbose:
+                    for key, value in sorted(report["ids"].items()):
+                        print(f"{key}: {value}")
+                    for mutation in report["mutations"]:
+                        print(f"mutation: {mutation}")
+        elif args.command == "quickstart" and args.quickstart_command == "verified-patch":
+            report = verified_patch(root, args.id)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            else:
+                print(
+                    "OK: verified-patch "
+                    f"verification={report['verification_status']} "
+                    f"task={report['task_status']} gate={report['gate_status']} "
+                    f"delivery={report['delivery_status']}"
+                )
+                if args.verbose:
+                    for key, value in sorted(report.items()):
+                        print(f"{key}: {value}")
         elif args.command == "validate":
             issues = validate_runtime(root, delivery=args.delivery)
             if issues:
@@ -774,7 +871,34 @@ def main() -> int:
         else:
             parser.error("unknown command")
     except HarnessError as exc:
-        print(f"ERROR: {exception_text(exc)}")
+        operator_command = (
+            args.command in {"status", "doctor"}
+            or (
+                args.command == "quickstart"
+                and args.quickstart_command == "status"
+            )
+        )
+        if operator_command and getattr(args, "json", False):
+            print(
+                render_json(
+                    operator_error_report(root, exc, allow_init=False)
+                ),
+                end="",
+            )
+        elif (
+            args.command == "quickstart"
+            and args.quickstart_command in {"delivery-plan", "verified-patch"}
+            and getattr(args, "json", False)
+        ):
+            print(
+                json.dumps(
+                    {"ok": False, "error": exception_text(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"ERROR: {exception_text(exc)}")
         return 1
     return 0
 
