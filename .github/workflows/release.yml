@@ -259,6 +259,8 @@ jobs:
     runs-on: [self-hosted, kafa-codex-live]
     environment: codex-live-release
     timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
     permissions:
       contents: read
     steps:

@@ -357,6 +357,7 @@ class ReleaseContractTest(unittest.TestCase):
         scope = workflow.split("\n  scope:\n", 1)[1].split("\n  verify:\n", 1)[0]
         self.assertIn("\n  real_host_compatibility:", workflow)
         compatibility = workflow.split("\n  real_host_compatibility:", 1)[1].split("\n  candidate:", 1)[0]
+        compatibility_header = compatibility.split("\n    steps:", 1)[0]
         candidate = workflow.split("\n  candidate:", 1)[1].split("\n  publish:", 1)[0]
         publish = workflow.split("\n  publish:", 1)[1]
 
@@ -378,6 +379,10 @@ class ReleaseContractTest(unittest.TestCase):
         self.assertNotIn("if: needs.scope.outputs.native_requirement", verify)
         self.assertIn("runs-on: [self-hosted, kafa-codex-live]", compatibility)
         self.assertIn("environment: codex-live-release", compatibility)
+        self.assertIn(
+            '\n    env:\n      PYTHONDONTWRITEBYTECODE: "1"',
+            compatibility_header,
+        )
         self.assertIn("needs: scope", compatibility)
         self.assertIn("if: needs.scope.outputs.native_requirement == 'blocking'", compatibility)
         self.assertIn("fail-fast: false", compatibility)
