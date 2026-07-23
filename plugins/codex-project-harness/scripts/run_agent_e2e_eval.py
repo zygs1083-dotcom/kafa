@@ -1642,12 +1642,12 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         _require_ok(run_harness(root, "init", check=False))
-        results: list[subprocess.CompletedProcess[str]] = []
+        results: list[tuple[int, subprocess.CompletedProcess[str]]] = []
         result_lock = threading.Lock()
 
-        def worker(index: int) -> None:
+        def add_acceptance(index: int) -> subprocess.CompletedProcess[str]:
             acceptance_id = f"AC{index // 2}"
-            result = run_harness(
+            return run_harness(
                 root,
                 "acceptance",
                 "add",
@@ -1658,8 +1658,11 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
                 check=False,
                 timeout=30,
             )
+
+        def worker(index: int) -> None:
+            result = add_acceptance(index)
             with result_lock:
-                results.append(result)
+                results.append((index, result))
 
         threads = [threading.Thread(target=worker, args=(index,)) for index in range(12)]
         for thread in threads:
@@ -1667,11 +1670,104 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
         for thread in threads:
             thread.join(timeout=30)
         alive = sum(thread.is_alive() for thread in threads)
-        lock_errors = sum("database is locked" in (result.stdout + result.stderr).lower() for result in results)
-        failed = [result.returncode for result in results if result.returncode != 0]
+        results.sort(key=lambda item: item[0])
+        successful_acceptance_ids = [
+            f"AC{index // 2}"
+            for index, result in results
+            if result.returncode == 0
+        ]
+        expected_initial_revisions: dict[str, int] = {}
+        for acceptance_id in successful_acceptance_ids:
+            expected_initial_revisions[acceptance_id] = (
+                expected_initial_revisions.get(acceptance_id, 0) + 1
+            )
+        initial_revisions = {
+            str(row["id"]): int(row["revision"])
+            for row in db_rows(
+                root,
+                "select id, revision from acceptance order by id",
+            )
+        }
+        initial_event_count = int(
+            _scalar(
+                root,
+                "select count(*) from events where event_type='acceptance_recorded'",
+            )
+        )
+        initial_state_consistent = (
+            initial_revisions == expected_initial_revisions
+            and initial_event_count == len(successful_acceptance_ids)
+        )
+        initial_failed = [
+            result.returncode
+            for _index, result in results
+            if result.returncode != 0
+        ]
+
+        def is_operation_timeout(
+            result: subprocess.CompletedProcess[str],
+        ) -> bool:
+            return any(
+                line.startswith("ERROR: project-db-operation-timeout:")
+                for line in (result.stdout + result.stderr).splitlines()
+            )
+
+        operation_timeouts = [
+            (index, result)
+            for index, result in results
+            if result.returncode != 0
+            and is_operation_timeout(result)
+        ]
+        unexpected_failures = [
+            result
+            for _index, result in results
+            if result.returncode != 0
+            and not is_operation_timeout(result)
+        ]
+        retries: list[subprocess.CompletedProcess[str]] = []
+        if alive == 0 and initial_state_consistent and not unexpected_failures:
+            for index, _timed_out in operation_timeouts:
+                retries.append(add_acceptance(index))
+        final_failures = [
+            *unexpected_failures,
+            *(result for result in retries if result.returncode != 0),
+        ]
+        observed_results = [
+            *(result for _index, result in results),
+            *retries,
+        ]
+        lock_errors = sum(
+            "database is locked" in (result.stdout + result.stderr).lower()
+            for result in observed_results
+        )
         doctor = run_harness(root, "doctor", check=False)
-        acceptance_count = int(_scalar(root, "select count(*) from acceptance"))
-        ok = len(results) == 12 and alive == 0 and not failed and lock_errors == 0 and doctor.returncode == 0 and acceptance_count == 6
+        final_revisions = {
+            str(row["id"]): int(row["revision"])
+            for row in db_rows(
+                root,
+                "select id, revision from acceptance order by id",
+            )
+        }
+        final_event_count = int(
+            _scalar(
+                root,
+                "select count(*) from events where event_type='acceptance_recorded'",
+            )
+        )
+        acceptance_count = len(final_revisions)
+        final_state_consistent = (
+            final_revisions == {f"AC{index}": 2 for index in range(6)}
+            and final_event_count == 12
+        )
+        ok = (
+            len(results) == 12
+            and alive == 0
+            and initial_state_consistent
+            and not final_failures
+            and lock_errors == 0
+            and doctor.returncode == 0
+            and final_state_consistent
+        )
         return scenario_result(
             "sqlite_contention_stress",
             started,
@@ -1679,9 +1775,25 @@ def scenario_sqlite_contention_stress() -> dict[str, Any]:
             {
                 "operation_count": len(results),
                 "thread_leak_count": alive,
-                "failed_returncodes": failed,
+                "initial_failed_returncodes": initial_failed,
+                "initial_operation_timeout_count": len(operation_timeouts),
+                "unexpected_failure_count": len(unexpected_failures),
+                "retry_count": len(retries),
+                "retry_failed_returncodes": [
+                    result.returncode
+                    for result in retries
+                    if result.returncode != 0
+                ],
+                "failed_returncodes": [
+                    result.returncode for result in final_failures
+                ],
+                "initial_state_consistent": initial_state_consistent,
+                "initial_acceptance_revisions": initial_revisions,
+                "initial_acceptance_event_count": initial_event_count,
                 "sqlite_lock_error_count": lock_errors,
                 "acceptance_count": acceptance_count,
+                "final_acceptance_revisions": final_revisions,
+                "final_acceptance_event_count": final_event_count,
                 "doctor_returncode": doctor.returncode,
             },
             category="sqlite",

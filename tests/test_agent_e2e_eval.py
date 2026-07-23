@@ -1372,6 +1372,136 @@ class AgentE2EEvalTest(unittest.TestCase):
         self.assertEqual(installed_details["reference_count"], 3)
         self.assertEqual(installed_details["public_runtime_domain_count"], 22)
 
+    def test_sqlite_contention_stress_retries_only_explicit_operation_timeouts(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        call_lock = threading.Lock()
+
+        def inject_timeouts(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] == ("acceptance", "add"):
+                with call_lock:
+                    acceptance_calls += 1
+                    inject = acceptance_calls <= 8
+                if inject:
+                    return subprocess.CompletedProcess(
+                        args=["harness", *args],
+                        returncode=1,
+                        stdout="",
+                        stderr=(
+                            "ERROR: project-db-operation-timeout: could not acquire "
+                            "exclusive operation lock within 5.0 seconds\n"
+                        ),
+                    )
+            return real_run_harness(root, *args, **kwargs)
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_timeouts,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertTrue(scenario["pass"], details)
+        self.assertEqual(details["initial_operation_timeout_count"], 8)
+        self.assertEqual(details["unexpected_failure_count"], 0)
+        self.assertEqual(details["retry_count"], 8)
+        self.assertEqual(details["retry_failed_returncodes"], [])
+        self.assertEqual(details["failed_returncodes"], [])
+        self.assertEqual(details["acceptance_count"], 6)
+        self.assertTrue(details["initial_state_consistent"])
+        self.assertEqual(
+            details["final_acceptance_revisions"],
+            {f"AC{index}": 2 for index in range(6)},
+        )
+        self.assertEqual(details["final_acceptance_event_count"], 12)
+        self.assertEqual(details["doctor_returncode"], 0)
+
+    def test_sqlite_contention_stress_does_not_retry_unexpected_failures(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        acceptance_lock = threading.Lock()
+
+        def inject_unexpected_failure(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] != ("acceptance", "add"):
+                return real_run_harness(root, *args, **kwargs)
+            with acceptance_lock:
+                acceptance_calls += 1
+                if acceptance_calls == 1:
+                    return subprocess.CompletedProcess(
+                        args=["harness", *args],
+                        returncode=1,
+                        stdout="",
+                        stderr="ERROR: unrelated mutation failure\n",
+                    )
+                return real_run_harness(root, *args, **kwargs)
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_unexpected_failure,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertFalse(scenario["pass"])
+        self.assertEqual(details["initial_operation_timeout_count"], 0)
+        self.assertEqual(details["unexpected_failure_count"], 1)
+        self.assertEqual(details["retry_count"], 0)
+        self.assertEqual(details["failed_returncodes"], [1])
+
+    def test_sqlite_contention_stress_rejects_timeout_after_partial_commit(self) -> None:
+        real_run_harness = run_agent_e2e_eval.run_harness
+        acceptance_calls = 0
+        acceptance_lock = threading.Lock()
+
+        def inject_partial_commit_timeout(
+            root: Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal acceptance_calls
+            if args[:2] != ("acceptance", "add"):
+                return real_run_harness(root, *args, **kwargs)
+            with acceptance_lock:
+                acceptance_calls += 1
+                result = real_run_harness(root, *args, **kwargs)
+                if acceptance_calls == 1:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    return subprocess.CompletedProcess(
+                        args=result.args,
+                        returncode=1,
+                        stdout=result.stdout,
+                        stderr=(
+                            result.stderr
+                            + "ERROR: project-db-operation-timeout: injected after commit\n"
+                        ),
+                    )
+                return result
+
+        with mock.patch.object(
+            run_agent_e2e_eval,
+            "run_harness",
+            side_effect=inject_partial_commit_timeout,
+        ):
+            scenario = run_agent_e2e_eval.scenario_sqlite_contention_stress()
+
+        details = scenario["details"]
+        self.assertFalse(scenario["pass"])
+        self.assertEqual(details["initial_operation_timeout_count"], 1)
+        self.assertFalse(details["initial_state_consistent"])
+        self.assertEqual(details["retry_count"], 0)
+
     def test_installed_surface_rejects_undeclared_nested_runtime_file(self) -> None:
         nested_relative = Path("core/nested/undeclared.py")
 
